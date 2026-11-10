@@ -1,5 +1,5 @@
-//! Streaming an OpenAI-compatible Chat Completions SSE response (shared by
-//! providers with that wire format: OpenRouter, Volcengine Ark).
+//! Streaming an SSE response through a dialect parser (Chat Completions chunks,
+//! Responses events, Messages events), shared by all providers.
 
 use std::time::Duration;
 
@@ -10,14 +10,35 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{ErrorKind, LlmError, Retry};
 use crate::event::StreamEvent;
 use crate::openrouter::chat::{ChunkParser, ErrorMapper};
+
+/// A dialect's stream parser.
+pub trait EventParser: Send {
+    /// One SSE event (`name` is the `event:` field, if any).
+    fn event(&mut self, name: Option<&str>, data: &Value) -> Result<Vec<StreamEvent>, LlmError>;
+    /// The stream reached its terminal event (finish reason, `response.completed`, `message_stop`…).
+    fn finished(&self) -> bool;
+    fn any_output(&self) -> bool;
+}
+
+impl EventParser for ChunkParser {
+    fn event(&mut self, _name: Option<&str>, data: &Value) -> Result<Vec<StreamEvent>, LlmError> {
+        self.chunk(data)
+    }
+    fn finished(&self) -> bool {
+        self.finished
+    }
+    fn any_output(&self) -> bool {
+        ChunkParser::any_output(self)
+    }
+}
 use crate::sse::{SseItem, SseParser};
 use crate::{EventSink, Observer};
 
 /// Result of [`run`]: the stream outcome, the parser (accumulated native
 /// payload and extras) and the id from the response header, if any.
-pub struct Streamed {
+pub struct Streamed<P> {
     pub result: Result<(), LlmError>,
-    pub parser: ChunkParser,
+    pub parser: P,
     pub header_id: Option<String>,
 }
 
@@ -36,9 +57,26 @@ pub async fn run(
     sink: &mut dyn EventSink,
     observer: &dyn Observer,
     cancel: &CancellationToken,
-) -> Streamed {
+) -> Streamed<ChunkParser> {
     let mut cp = ChunkParser::default();
     cp.map_error = Some(map_error);
+    run_with(rb, url, body, idle_timeout, id_header, map_error, cp, sink, observer, cancel).await
+}
+
+/// [`run`] with any dialect parser.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with<P: EventParser>(
+    rb: reqwest::RequestBuilder,
+    url: &str,
+    body: &Value,
+    idle_timeout: Duration,
+    id_header: Option<&str>,
+    map_error: ErrorMapper,
+    mut cp: P,
+    sink: &mut dyn EventSink,
+    observer: &dyn Observer,
+    cancel: &CancellationToken,
+) -> Streamed<P> {
     observer.request(url, body);
     let send = rb.send();
     let resp = tokio::select! {
@@ -106,13 +144,13 @@ pub async fn run(
                     Retry::Backoff,
                     format!("stream idle for {}s", idle_timeout.as_secs()),
                 );
-                e.partial_output = cp.any_output();
+                e.partial_output = EventParser::any_output(&cp);
                 break Err(e);
             }
             Ok(None) => break Ok(()),
             Ok(Some(Err(e))) => {
                 let mut le = LlmError::network(format!("stream read error: {e}"));
-                le.partial_output = cp.any_output();
+                le.partial_output = EventParser::any_output(&cp);
                 break Err(le);
             }
             Ok(Some(Ok(b))) => b,
@@ -130,9 +168,9 @@ pub async fn run(
             let tail = parser.finish();
             match handle_items(tail, &mut cp, sink, observer, &mut done) {
                 Err(e) => Err(e),
-                Ok(()) if !cp.finished && !done => {
+                Ok(()) if !cp.finished() && !done => {
                     let mut e = LlmError::network("stream ended without a finish reason or [DONE]");
-                    e.partial_output = cp.any_output();
+                    e.partial_output = EventParser::any_output(&cp);
                     Err(e)
                 }
                 Ok(()) => Ok(()),
@@ -143,9 +181,9 @@ pub async fn run(
     Streamed { result, parser: cp, header_id }
 }
 
-fn handle_items(
+fn handle_items<P: EventParser>(
     items: Vec<SseItem>,
-    cp: &mut ChunkParser,
+    cp: &mut P,
     sink: &mut dyn EventSink,
     observer: &dyn Observer,
     done: &mut bool,
@@ -170,7 +208,7 @@ fn handle_items(
                     LlmError::new(ErrorKind::Decode, Retry::Backoff, format!("bad JSON chunk: {e}"))
                         .with_details(Value::String(data.to_string()))
                 })?;
-                for e in cp.chunk(&v)? {
+                for e in cp.event(ev.event.as_deref(), &v)? {
                     sink.event(e);
                 }
             }

@@ -8,7 +8,7 @@ use omni_core::trigger::{OptionToken, SpecToken, parse_spec};
 use omni_llm::openrouter::OpenRouter;
 use parking_lot::{Mutex, RwLock};
 use rusqlite::params;
-use serde_json::Value;
+
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -242,12 +242,13 @@ impl App {
     }
 
     /// Config presets (JSON merge patches) matching a canonical model id.
-    pub fn presets_for(&self, canonical: &str) -> Vec<(String, Value)> {
+    /// Default options from config presets matching a canonical model id.
+    pub fn presets_for(&self, canonical: &str) -> Vec<omni_llm::request::Requested> {
         self.cfg
             .presets
             .iter()
             .filter(|p| glob_match(&p.pattern, canonical))
-            .filter_map(|p| p.body_json().ok().flatten().map(|b| (p.pattern.clone(), b)))
+            .filter_map(|p| p.requested().ok())
             .collect()
     }
 

@@ -1,39 +1,19 @@
-//! User-facing option vocabulary for OpenRouter requests (`+flag`, `+key=value`, `+{json}`)
-//! and the "max capability" auto-presets.
-//!
-//! Resolution order (later wins), all as JSON merge patches on the request body:
-//! 1. fidelity defaults (first-party provider pin, no fallbacks, no silent
-//!    param dropping, context compression off) — disable with `+p=any`;
-//! 2. auto-max presets derived from the live model catalog (highest reasoning
-//!    effort, max output tokens, detailed summaries, image output) — disable with `+pure`;
-//! 3. config presets matching the model;
-//! 4. user options in the order typed;
-//! 5. user JSON patches.
-//!
-//! Every step is recorded in [`Resolved::applied`] so the bot can show exactly
-//! what was sent and why.
+//! OpenRouter as a route: which of the vendor's capabilities it can deliver
+//! ([`OrCaps`]), which of its API skins is closest to each vendor's own API
+//! ([`dialect_for`]), and the request plan ([`Plan`]): the bot's defaults (the
+//! highest the model officially offers) combined with the user's validated
+//! options. Dialect modules turn a plan into a request body.
 
-use omni_core::json::merge_patch;
-use omni_core::trigger::OptionToken;
 use serde_json::{Value, json};
 
-use super::catalog::ModelInfo;
+use super::catalog::{EndpointInfo, ModelInfo};
+use crate::request::{self, Requested, RouteCaps, Tool};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Applied {
-    /// Where the patch came from: `fidelity`, `auto-max`, `preset:<pattern>`, `option:<raw>`, `json`.
+    /// Where a setting came from: `default`, `option`, `budget` (the bot's max_tokens).
     pub source: String,
     pub patch: Value,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Resolved {
-    pub body: Value,
-    pub applied: Vec<Applied>,
-    /// Display-only flags (not request params).
-    pub show_debug: bool,
-    /// Warnings to show the user (e.g. unsupported effort for this model).
-    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -101,310 +81,363 @@ pub fn default_first_party() -> Vec<(String, String)> {
     .collect()
 }
 
-/// Help text for the option vocabulary (shown by /help options).
-pub const OPTIONS_HELP: &str = "\
-s | search | s=<engine>     web search via the provider's native tool (engine: native|auto|exa|parallel|firecrawl|perplexity)
-e=<effort> | effort=<e>     reasoning effort: none|minimal|low|medium|high|xhigh|max
-l                           shorthand for e=low (old bot flag)
-nothink                     disable reasoning (effort none)
-budget=<n>                  reasoning token budget (reasoning.max_tokens)
-summary=<s>                 reasoning summary: auto|concise|detailed
-max=<n>                     max output tokens
-t=<x> | temp=<x>            temperature;  top_p=<x>  top_k=<n>  seed=<n>
-v=<x> | verbosity=<x>       verbosity: low|medium|high|xhigh|max
-tier=<x>                    service tier: flex (cheaper); priority/fast only for users on the priority list
-p=<slug>[|<slug>...]        another official provider of this model, e.g. p=google-vertex, p=azure (whitelist)
-img | text                  output modalities image+text / text only
-ar=<w:h> | 1k | 2k | 4k     image aspect ratio / size (S W H w h = 1:1 16:9 9:16 4:3 3:4)
-pure                        no automatic max-capability presets
-debug                       show the exact upstream request echoed by OpenRouter
-{json}                      JSON merge patch applied to the request body last";
+/// OpenRouter API skin used for a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// `/chat/completions` — the vendors' OpenAI-compatible API (Gemini, DeepSeek, GLM, Kimi, Qwen, …).
+    Chat,
+    /// `/responses` — OpenAI's own API (also xAI's recommended one).
+    Responses,
+    /// `/messages` — Anthropic's own API.
+    Messages,
+}
 
-/// Resolve options into a request body patch on top of `base`.
-pub fn resolve(
-    base: Value,
+/// The skin closest to the vendor's own API with the most features.
+pub fn dialect_for(model: &str) -> Dialect {
+    match model.split('/').next().unwrap_or("") {
+        "openai" | "x-ai" => Dialect::Responses,
+        "anthropic" => Dialect::Messages,
+        _ => Dialect::Chat,
+    }
+}
+
+const TIER_SEGMENTS: &[&str] = &["flex", "priority", "fast", "ultrafast", "scale"];
+
+/// What OpenRouter can deliver for a model through the pinned endpoint(s).
+pub struct OrCaps<'a> {
+    pub model: &'a str,
+    pub info: Option<&'a ModelInfo>,
+    /// All endpoints of the model (empty if unknown).
+    pub endpoints: &'a [EndpointInfo],
+    /// Base provider slugs the request is pinned to (empty = no pin).
+    pub pinned: Vec<String>,
+    pub dialect: Dialect,
+}
+
+impl OrCaps<'_> {
+    fn pinned_endpoints(&self) -> Vec<&EndpointInfo> {
+        self.endpoints
+            .iter()
+            .filter(|e| {
+                let tag = e.tag.as_deref().unwrap_or("");
+                // the default tier of each pinned provider (any region), not tier endpoints
+                let is_tier = tag.split('/').skip(1).any(|s| TIER_SEGMENTS.contains(&s));
+                !is_tier && e.base_slug().is_some_and(|b| self.pinned.is_empty() || self.pinned.iter().any(|p| p == b))
+            })
+            .collect()
+    }
+
+    fn all_pinned_have(&self, native_tool: &str) -> bool {
+        let eps = self.pinned_endpoints();
+        !eps.is_empty() && eps.iter().all(|e| e.has_native_tool(native_tool))
+    }
+}
+
+impl RouteCaps for OrCaps<'_> {
+    fn name(&self) -> &str {
+        "OpenRouter"
+    }
+
+    fn tool(&self, tool: Tool) -> bool {
+        let author = self.model.split('/').next().unwrap_or("");
+        match tool {
+            // Only the provider's own search (the endpoint maps it to a native tool).
+            Tool::Search => self.all_pinned_have("openrouter:web_search"),
+            // OpenAI's hosted code_interpreter is passed through on the Responses skin.
+            Tool::Code => author == "openai" && self.dialect == Dialect::Responses,
+            Tool::Fetch => self.all_pinned_have("openrouter:web_fetch"),
+        }
+    }
+
+    fn efforts(&self) -> Option<Vec<String>> {
+        self.info?.reasoning.as_ref()?.supported_efforts.clone()
+    }
+
+    fn can_disable_reasoning(&self) -> bool {
+        self.info.and_then(|i| i.reasoning.as_ref()).is_some_and(|r| r.mandatory == Some(false))
+    }
+
+    fn budget(&self) -> bool {
+        self.info.and_then(|i| i.reasoning.as_ref()).is_some_and(|r| r.supports_max_tokens == Some(true))
+    }
+
+    fn verbosity(&self) -> bool {
+        self.info.is_some_and(|i| i.supports("verbosity"))
+    }
+
+    fn image_options(&self) -> bool {
+        self.info.is_some_and(|i| i.outputs("image")) && self.dialect == Dialect::Chat
+    }
+
+    fn tiers(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for e in self.endpoints {
+            let Some(tag) = e.tag.as_deref() else { continue };
+            let base = tag.split('/').next().unwrap_or(tag);
+            if !(self.pinned.is_empty() || self.pinned.iter().any(|p| p == base)) {
+                continue;
+            }
+            for seg in tag.split('/').skip(1) {
+                if TIER_SEGMENTS.contains(&seg) && !out.iter().any(|x| x == seg) {
+                    out.push(seg.to_string());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Reasoning part of a plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reasoning {
+    /// Not a reasoning model (send nothing).
+    Unset,
+    /// Reasoning on with the model's own default depth (no effort levels exposed).
+    On,
+    Off,
+    Effort(String),
+    Budget(u64),
+}
+
+/// A validated request, independent of the API skin.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub reasoning: Reasoning,
+    /// Detailed reasoning summaries (OpenAI).
+    pub summary: Option<&'static str>,
+    pub verbosity: Option<String>,
+    pub tools: Vec<Tool>,
+    /// The model outputs images (request image + text output).
+    pub image_output: bool,
+    pub image_size: Option<String>,
+    pub aspect_ratio: Option<String>,
+    /// Highest `image_url.detail` the vendor offers for image input (OpenAI only).
+    pub image_detail: Option<&'static str>,
+    pub max_tokens: Option<u64>,
+    pub tier: Option<String>,
+    /// `provider.only` (first-party or the user's choice), with tier endpoints added.
+    pub providers: Vec<String>,
+    /// Human-readable settings (footer).
+    pub described: Vec<String>,
+    /// Where each setting came from (/info).
+    pub applied: Vec<Applied>,
+}
+
+/// Merge `over` onto `base` field by field (presets first, then the user's options).
+pub fn overlay(base: &Requested, over: &Requested) -> Requested {
+    let mut r = base.clone();
+    for t in &over.tools {
+        if !r.tools.contains(t) {
+            r.tools.push(*t);
+        }
+    }
+    macro_rules! take {
+        ($f:ident) => {
+            if over.$f.is_some() {
+                r.$f = over.$f.clone();
+            }
+        };
+    }
+    take!(effort);
+    take!(budget);
+    take!(verbosity);
+    take!(image_size);
+    take!(aspect_ratio);
+    take!(providers);
+    take!(tier);
+    if over.effort.is_some() {
+        r.budget = None;
+    }
+    if over.budget.is_some() {
+        r.effort = None;
+    }
+    r
+}
+
+/// Build the plan: defaults (the highest the model officially offers) plus the
+/// validated options `req` (`user` = what the user typed, for attribution).
+pub fn plan(
     model: &str,
     info: Option<&ModelInfo>,
+    caps: &OrCaps<'_>,
+    req: &Requested,
+    user: &Requested,
     auto_max_tokens: Option<u64>,
-    fidelity: &FidelityConfig,
-    config_presets: &[(String, Value)],
-    options: &[OptionToken],
-) -> Result<Resolved, String> {
-    let mut r = Resolved { body: base, ..Default::default() };
-    let pure = options.iter().any(|o| matches!(o, OptionToken::Flag(f) if f == "pure"));
-    let any_provider = options.iter().any(
-        |o| matches!(o, OptionToken::KeyValue(k, v) if (k == "p" || k == "provider") && (v == "any" || v == "auto")),
-    );
+) -> Result<Plan, String> {
+    request::validate(model, req, caps)?;
+    let mut described = Vec::new();
+    let mut applied = Vec::new();
+    let src = |by_user: bool| if by_user { "option" } else { "default" };
 
-    // 1. fidelity defaults
-    let mut fid = json!({});
+    // Reasoning: the highest level by default.
+    let ri = info.and_then(|i| i.reasoning.as_ref());
+    let none_listed = caps.efforts().is_some_and(|l| l.iter().any(|x| x == "none"));
+    let reasoning = match (&req.effort, req.budget) {
+        (Some(e), _) if e == "none" && !none_listed => Reasoning::Off,
+        (Some(e), _) => Reasoning::Effort(e.clone()),
+        (None, Some(n)) => Reasoning::Budget(n),
+        (None, None) => match ri {
+            None => Reasoning::Unset,
+            Some(r) => match r.supported_efforts.as_ref().and_then(|l| l.first()) {
+                Some(top) => Reasoning::Effort(top.clone()),
+                None => Reasoning::On,
+            },
+        },
+    };
+    let user_reasoning = user.effort.is_some() || user.budget.is_some();
+    let rdesc = match &reasoning {
+        Reasoning::Unset => None,
+        Reasoning::On => Some("reasoning on".to_string()),
+        Reasoning::Off => Some("reasoning off".to_string()),
+        Reasoning::Effort(e) => Some(format!("effort {e}")),
+        Reasoning::Budget(n) => Some(format!("thinking budget {n}")),
+    };
+    if let Some(d) = rdesc {
+        applied.push(Applied { source: src(user_reasoning).into(), patch: json!({"reasoning": d}) });
+        described.push(d);
+    }
+    let author = model.split('/').next().unwrap_or("");
+    let summary =
+        (author == "openai" && matches!(&reasoning, Reasoning::Effort(e) if e != "none")).then_some("detailed");
+    if let Some(s) = summary {
+        applied.push(Applied { source: "default".into(), patch: json!({"reasoning summary": s}) });
+    }
+    if let Some(v) = &req.verbosity {
+        described.push(format!("verbosity {v}"));
+        applied.push(Applied { source: src(user.verbosity.is_some()).into(), patch: json!({"verbosity": v}) });
+    }
+    for t in &req.tools {
+        described.push(t.describe().to_string());
+        applied.push(Applied { source: src(user.tools.contains(t)).into(), patch: json!({"tool": t.describe()}) });
+    }
+    let image_output = info.is_some_and(|i| i.outputs("image"));
+    if let Some(s) = &req.image_size {
+        described.push(format!("image size {s}"));
+        applied.push(Applied { source: src(user.image_size.is_some()).into(), patch: json!({"image size": s}) });
+    }
+    if let Some(a) = &req.aspect_ratio {
+        described.push(format!("aspect ratio {a}"));
+        applied.push(Applied { source: src(user.aspect_ratio.is_some()).into(), patch: json!({"aspect ratio": a}) });
+    }
+
+    // Providers: the user's choice or the vendor's own endpoint; tier endpoints added.
+    let mut providers: Vec<String> = caps.pinned.clone();
+    if let Some(p) = &req.providers {
+        described.push(format!("provider {}", p.join("|")));
+        applied.push(Applied { source: "option".into(), patch: json!({"provider": p}) });
+        providers = p.clone();
+    }
+    let tier = req.tier.clone().filter(|t| !matches!(t.as_str(), "default" | "auto"));
+    if let Some(t) = &tier {
+        described.push(format!("tier {t}"));
+        applied.push(Applied { source: "option".into(), patch: json!({"service tier": t}) });
+        let tiered: Vec<String> = providers.iter().filter(|p| !p.contains('/')).map(|p| format!("{p}/{t}")).collect();
+        providers.extend(tiered);
+    }
+    if let Some(n) = auto_max_tokens {
+        applied.push(Applied { source: "budget".into(), patch: json!({"max output tokens": n}) });
+    }
+    Ok(Plan {
+        reasoning,
+        summary,
+        verbosity: req.verbosity.clone(),
+        tools: req.tools.clone(),
+        image_output,
+        image_size: req.image_size.clone(),
+        aspect_ratio: req.aspect_ratio.clone(),
+        image_detail: request::official::max_image_detail(model),
+        max_tokens: auto_max_tokens,
+        tier,
+        providers,
+        described,
+        applied,
+    })
+}
+
+/// OpenRouter routing fields shared by all skins.
+pub fn routing(plan: &Plan, fidelity: &FidelityConfig) -> Value {
+    let mut provider = json!({"allow_fallbacks": false});
+    if fidelity.require_parameters {
+        provider["require_parameters"] = json!(true);
+    }
+    if !plan.providers.is_empty() {
+        provider["only"] = json!(plan.providers);
+    }
+    let mut v = json!({"provider": provider});
     if fidelity.disable_context_compression {
-        fid["plugins"] = json!([{"id": "context-compression", "enabled": false}]);
+        v["plugins"] = json!([{"id": "context-compression", "enabled": false}]);
     }
-    if !any_provider {
-        let mut provider = json!({"allow_fallbacks": false});
-        if fidelity.require_parameters {
-            provider["require_parameters"] = json!(true);
-        }
-        if fidelity.pin_first_party
-            && let Some(slug) = fidelity.first_party_for(model)
-        {
-            provider["only"] = json!([slug]);
-        }
-        fid["provider"] = provider;
+    if let Some(t) = &plan.tier {
+        v["service_tier"] = json!(t);
     }
-    apply(&mut r, "fidelity", fid);
-
-    // 2. auto-max presets from the catalog
-    if !pure && let Some(info) = info {
-        let mut p = json!({});
-        if let Some(max) = auto_max_tokens {
-            p["max_tokens"] = json!(max);
-        }
-        if info.supports("reasoning") {
-            let mut reasoning = json!({});
-            match info.max_effort() {
-                Some(e) => reasoning["effort"] = json!(e),
-                // No effort levels published (e.g. Qwen): just make sure reasoning is on.
-                None => reasoning["enabled"] = json!(true),
-            }
-            if info.author() == "openai" {
-                reasoning["summary"] = json!("detailed");
-            }
-            p["reasoning"] = reasoning;
-        }
-        if info.outputs("image") {
-            let mods: Vec<&str> = if info.outputs("text") { vec!["image", "text"] } else { vec!["image"] };
-            p["modalities"] = json!(mods);
-        }
-        if p.as_object().is_some_and(|o| !o.is_empty()) {
-            apply(&mut r, "auto-max", p);
-        }
-    }
-
-    // 3. config presets
-    for (pattern, patch) in config_presets {
-        apply(&mut r, &format!("preset:{pattern}"), patch.clone());
-    }
-
-    // 4. user options
-    for o in options {
-        match o {
-            OptionToken::Json(_) => {}
-            OptionToken::Flag(f) => {
-                if f == "pure" {
-                    continue;
-                }
-                if f == "debug" {
-                    r.show_debug = true;
-                    apply(&mut r, "option:debug", json!({"debug": {"echo_upstream_body": true}}));
-                    continue;
-                }
-                let patch = flag_patch(f, info)?;
-                apply(&mut r, &format!("option:{f}"), patch);
-            }
-            OptionToken::KeyValue(k, v) => {
-                if (k == "p" || k == "provider") && (v == "any" || v == "auto") {
-                    r.applied.push(Applied {
-                        source: format!("option:{k}={v}"),
-                        patch: json!({"provider": "(OpenRouter default routing)"}),
-                    });
-                    continue;
-                }
-                let patch = kv_patch(k, v, info)?;
-                apply(&mut r, &format!("option:{k}={v}"), patch);
-            }
-        }
-    }
-
-    // 5. JSON patches
-    for o in options {
-        if let OptionToken::Json(v) = o {
-            apply(&mut r, "json", v.clone());
-        }
-    }
-
-    validate_effort(&mut r, info);
-    Ok(r)
+    v
 }
 
-fn apply(r: &mut Resolved, source: &str, patch: Value) {
-    merge_patch(&mut r.body, &patch);
-    r.applied.push(Applied { source: source.to_string(), patch });
+/// The provider's own web search (never a fallback engine).
+pub fn search_tool() -> Value {
+    json!({"type": "openrouter:web_search", "parameters": {"engine": "native"}})
 }
 
-fn search_tool(engine: &str) -> Value {
-    json!({"tools": [{"type": "openrouter:web_search", "parameters": {"engine": engine}}]})
-}
-
-fn flag_patch(f: &str, _info: Option<&ModelInfo>) -> Result<Value, String> {
-    Ok(match f {
-        "s" | "search" | "web" => search_tool("native"),
-        "l" => json!({"reasoning": {"effort": "low", "enabled": null}}),
-        "nothink" => json!({"reasoning": {"effort": "none", "enabled": null, "summary": null}}),
-        "img" | "image" => json!({"modalities": ["image", "text"]}),
-        "text" => json!({"modalities": ["text"]}),
-        "1k" | "1K" | "1" => json!({"image_config": {"image_size": "1K"}}),
-        "2k" | "2K" | "2" => json!({"image_config": {"image_size": "2K"}}),
-        "4k" | "4K" | "4" => json!({"image_config": {"image_size": "4K"}}),
-        "S" => json!({"image_config": {"aspect_ratio": "1:1"}}),
-        "W" => json!({"image_config": {"aspect_ratio": "16:9"}}),
-        "H" => json!({"image_config": {"aspect_ratio": "9:16"}}),
-        "w" => json!({"image_config": {"aspect_ratio": "4:3"}}),
-        "h" => json!({"image_config": {"aspect_ratio": "3:4"}}),
-        "json" => json!({"response_format": {"type": "json_object"}}),
-        other => {
-            // Old-style concatenated single-letter flags, e.g. `+s4W`.
-            if other.len() > 1 && other.chars().all(|c| "sl124SWHwh".contains(c)) {
-                let mut acc = json!({});
-                for c in other.chars() {
-                    merge_patch(&mut acc, &flag_patch(&c.to_string(), _info)?);
-                }
-                return Ok(acc);
-            }
-            return Err(format!("unknown option `{other}`"));
-        }
-    })
-}
-
-fn num(v: &str) -> Result<Value, String> {
-    if let Ok(i) = v.parse::<i64>() {
-        return Ok(json!(i));
-    }
-    v.parse::<f64>().map(|f| json!(f)).map_err(|_| format!("`{v}` is not a number"))
-}
-
-fn kv_patch(k: &str, v: &str, _info: Option<&ModelInfo>) -> Result<Value, String> {
-    Ok(match k {
-        "s" | "search" | "web" => search_tool(v),
-        "e" | "effort" | "reasoning" => json!({"reasoning": {"effort": v, "enabled": null}}),
-        "budget" => json!({"reasoning": {"max_tokens": num(v)?, "effort": null}}),
-        "summary" => json!({"reasoning": {"summary": v}}),
-        "max" | "max_tokens" => json!({"max_tokens": num(v)?}),
-        "t" | "temp" | "temperature" => json!({"temperature": num(v)?}),
-        "top_p" => json!({"top_p": num(v)?}),
-        "top_k" => json!({"top_k": num(v)?}),
-        "seed" => json!({"seed": num(v)?}),
-        "v" | "verbosity" => json!({"verbosity": v}),
-        "tier" | "service_tier" => json!({"service_tier": v}),
-        "p" | "provider" => {
-            let slugs: Vec<&str> = v.split('|').map(str::trim).filter(|s| !s.is_empty()).collect();
-            json!({"provider": {"only": slugs, "order": null}})
-        }
-        "ar" | "aspect" | "aspect_ratio" => json!({"image_config": {"aspect_ratio": v}}),
-        "size" | "image_size" => json!({"image_config": {"image_size": v.to_ascii_uppercase()}}),
-        other => return Err(format!("unknown option `{other}=`")),
-    })
-}
-
-/// If the model publishes its effort list, warn (don't silently map) about unsupported values.
-fn validate_effort(r: &mut Resolved, info: Option<&ModelInfo>) {
-    let Some(effort) = r.body.pointer("/reasoning/effort").and_then(Value::as_str).map(str::to_string) else { return };
-    let Some(info) = info else { return };
-    let Some(ri) = &info.reasoning else { return };
-    if let Some(list) = &ri.supported_efforts
-        && effort != "none"
-        && !list.iter().any(|e| e == &effort)
-    {
-        r.warnings.push(format!(
-            "effort `{effort}` is not in this model's supported list [{}]; OpenRouter will map it to the nearest level",
-            list.join(", ")
-        ));
-    }
-    if effort == "none" && ri.mandatory == Some(true) {
-        r.warnings.push("reasoning is mandatory for this model; `none` will be rejected".into());
-    }
+/// The provider's own URL fetching (Anthropic `web_fetch`).
+pub fn fetch_tool() -> Value {
+    json!({"type": "openrouter:web_fetch", "parameters": {"engine": "native"}})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openrouter::catalog::*;
+    use omni_core::trigger::OptionToken;
 
-    fn info() -> ModelInfo {
+    fn info(efforts: &[&str]) -> ModelInfo {
         serde_json::from_value(json!({
-            "id": "anthropic/claude-opus-5.5",
+            "id": "openai/gpt-6.1-sol",
             "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
-            "supported_parameters": ["reasoning", "max_tokens"],
-            "reasoning": {"supported_efforts": ["max", "high"], "mandatory": true},
+            "supported_parameters": ["reasoning", "max_tokens", "verbosity"],
+            "reasoning": {"supported_efforts": efforts, "mandatory": false},
             "top_provider": {"max_completion_tokens": 128000}
         }))
         .unwrap()
     }
 
-    fn base() -> Value {
-        json!({"model": "anthropic/claude-opus-5.5", "stream": true})
+    fn ep(tag: &str, tools: Value) -> EndpointInfo {
+        serde_json::from_value(json!({"tag": tag, "native_tools": tools})).unwrap()
     }
 
     #[test]
-    fn defaults_are_max_and_pinned() {
-        let r = resolve(
-            base(),
-            "anthropic/claude-opus-5.5",
-            Some(&info()),
-            Some(128000),
-            &FidelityConfig::standard(),
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            r.body["provider"],
-            json!({"allow_fallbacks": false, "require_parameters": true, "only": ["anthropic"]})
-        );
-        assert_eq!(r.body["reasoning"], json!({"effort": "max"}));
-        assert_eq!(r.body["max_tokens"], json!(128000));
-        assert_eq!(r.body["plugins"][0]["id"], "context-compression");
+    fn defaults_are_the_highest_level() {
+        let i = info(&["max", "high", "low", "none"]);
+        let eps =
+            vec![ep("openai", json!({"openrouter:web_search": {"type": "web_search"}})), ep("openai/flex", json!({}))];
+        let caps = OrCaps {
+            model: "openai/gpt-6.1-sol",
+            info: Some(&i),
+            endpoints: &eps,
+            pinned: vec!["openai".into()],
+            dialect: Dialect::Responses,
+        };
+        let none = Requested::default();
+        let p = plan("openai/gpt-6.1-sol", Some(&i), &caps, &none, &none, Some(1000)).unwrap();
+        assert_eq!(p.reasoning, Reasoning::Effort("max".into()));
+        assert_eq!(p.summary, Some("detailed"));
+        assert_eq!(p.image_detail, Some("high"));
+        assert_eq!(p.described, vec!["effort max"]);
+        let req =
+            request::parse(&[OptionToken::Flag("sc".into()), OptionToken::KeyValue("tier".into(), "flex".into())])
+                .unwrap();
+        let p = plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &req, None).unwrap();
+        assert_eq!(p.providers, vec!["openai", "openai/flex"]);
+        assert_eq!(p.described, vec!["effort max", "web search", "code execution", "tier flex"]);
+        // URL fetching: OpenAI has none officially.
+        let req = request::parse(&[OptionToken::Flag("u".into())]).unwrap();
+        assert!(plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &req, None).is_err());
     }
 
     #[test]
-    fn user_options_override_and_pure() {
-        let opts = vec![
-            OptionToken::Flag("pure".into()),
-            OptionToken::KeyValue("e".into(), "low".into()),
-            OptionToken::Flag("s".into()),
-            OptionToken::Json(json!({"max_tokens": 10})),
-        ];
-        let r = resolve(
-            base(),
-            "anthropic/claude-opus-5.5",
-            Some(&info()),
-            Some(128000),
-            &FidelityConfig::standard(),
-            &[],
-            &opts,
-        )
-        .unwrap();
-        assert_eq!(r.body["reasoning"], json!({"effort": "low"}));
-        assert_eq!(r.body["max_tokens"], json!(10));
-        assert_eq!(r.body["tools"][0]["type"], "openrouter:web_search");
-        assert!(r.warnings.iter().any(|w| w.contains("`low`")));
-    }
-
-    #[test]
-    fn any_provider_unpins() {
-        let opts = vec![OptionToken::KeyValue("p".into(), "any".into())];
-        let r = resolve(
-            base(),
-            "anthropic/claude-opus-5.5",
-            Some(&info()),
-            Some(128000),
-            &FidelityConfig::standard(),
-            &[],
-            &opts,
-        )
-        .unwrap();
-        assert!(r.body.get("provider").is_none());
-    }
-
-    #[test]
-    fn old_style_flags() {
-        let opts = vec![OptionToken::Flag("s4W".into())];
-        let r = resolve(base(), "google/gemini-x", None, None, &FidelityConfig::standard(), &[], &opts).unwrap();
-        assert_eq!(r.body["image_config"], json!({"image_size": "4K", "aspect_ratio": "16:9"}));
-        assert!(
-            resolve(base(), "x/y", None, None, &FidelityConfig::standard(), &[], &[OptionToken::Flag("zzz".into())])
-                .is_err()
-        );
+    fn overlay_user_over_presets() {
+        let preset = Requested { image_size: Some("4K".into()), ..Default::default() };
+        let user = Requested { image_size: Some("1K".into()), effort: Some("low".into()), ..Default::default() };
+        let r = overlay(&preset, &user);
+        assert_eq!(r.image_size.as_deref(), Some("1K"));
+        assert_eq!(r.effort.as_deref(), Some("low"));
     }
 }

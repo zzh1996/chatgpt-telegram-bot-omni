@@ -248,19 +248,18 @@ name = "db2m"
 spec = "ark:doubao-seed-2-0-mini-260428"
 
 # ------------------------------------------------------------------ presets
-# Extra default request parameters by model pattern (JSON merge patch on the
-# OpenRouter request body), applied after the automatic max-capability presets
-# (highest supported reasoning effort, max output tokens, detailed summaries for
-# OpenAI, image output for image models) and before user options.
-# Every applied patch is listed by /info. `+pure` skips automatic presets.
+# Default options for matching models, in the same syntax as after a prefix
+# (validated like the user's; the user's options override them). Requests
+# otherwise default to the highest the model officially offers (reasoning
+# effort, output length, reasoning summaries, image output).
 
-# Image models: request the largest image size by default.
+# Image models: the largest image size by default.
 [[presets]]
 match = "openrouter:google/gemini-*image*"
 note = "largest image size"
-body = { image_config = { image_size = "4K" } }
+options = "4"
 
 [[presets]]
 match = "openrouter:google/gemini-nano-banana*"
 note = "largest image size"
-body = { image_config = { image_size = "4K" } }
+options = "4"

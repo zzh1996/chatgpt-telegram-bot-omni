@@ -45,8 +45,9 @@ fn audio_format(mime: &str, filename: Option<&str>) -> String {
 pub struct Flavor {
     /// Dialect tag stored with native outputs (replay only within the same dialect and model).
     pub dialect: &'static str,
-    /// `image_url.detail` sent with images (the highest fidelity the API offers).
-    pub image_detail: &'static str,
+    /// `image_url.detail` sent with images (the highest fidelity the API offers),
+    /// or `None` where the vendor has no such parameter.
+    pub image_detail: Option<&'static str>,
     /// Build the replayed assistant message from a stored native payload.
     pub replay: fn(&Value) -> Value,
 }
@@ -61,7 +62,54 @@ fn openrouter_replay(p: &Value) -> Value {
     Value::Object(msg)
 }
 
-pub const OPENROUTER: Flavor = Flavor { dialect: DIALECT, image_detail: "original", replay: openrouter_replay };
+/// Chat Completions on OpenRouter serves Gemini, DeepSeek, GLM, Kimi, Qwen…:
+/// none of them has an image `detail` parameter, so it is not sent.
+pub const OPENROUTER: Flavor = Flavor { dialect: DIALECT, image_detail: None, replay: openrouter_replay };
+
+/// The Chat Completions request body (without OpenRouter routing fields).
+pub fn body(model: &str, messages: Vec<Value>, plan: &super::options::Plan) -> Value {
+    use super::options::Reasoning;
+    let mut b = json!({"model": model, "messages": messages, "stream": true});
+    match &plan.reasoning {
+        Reasoning::Effort(e) => b["reasoning"] = json!({"effort": e}),
+        Reasoning::Budget(n) => b["reasoning"] = json!({"max_tokens": n}),
+        Reasoning::On => b["reasoning"] = json!({"enabled": true}),
+        Reasoning::Off => b["reasoning"] = json!({"enabled": false}),
+        Reasoning::Unset => {}
+    }
+    if let Some(n) = plan.max_tokens {
+        b["max_tokens"] = json!(n);
+    }
+    if let Some(v) = &plan.verbosity {
+        b["verbosity"] = json!(v);
+    }
+    let tools: Vec<Value> = plan
+        .tools
+        .iter()
+        .filter_map(|t| match t {
+            crate::request::Tool::Search => Some(super::options::search_tool()),
+            crate::request::Tool::Fetch => Some(super::options::fetch_tool()),
+            crate::request::Tool::Code => None, // rejected by validation on this skin
+        })
+        .collect();
+    if !tools.is_empty() {
+        b["tools"] = Value::Array(tools);
+    }
+    if plan.image_output {
+        b["modalities"] = json!(["image", "text"]);
+        let mut ic = serde_json::Map::new();
+        if let Some(s) = &plan.image_size {
+            ic.insert("image_size".into(), json!(s));
+        }
+        if let Some(a) = &plan.aspect_ratio {
+            ic.insert("aspect_ratio".into(), json!(a));
+        }
+        if !ic.is_empty() {
+            b["image_config"] = Value::Object(ic);
+        }
+    }
+    b
+}
 
 /// Convert the conversation to OpenRouter Chat Completions `messages`.
 pub async fn convert_history(
@@ -119,7 +167,7 @@ pub async fn convert_history_with(
                                 )));
                             }
                             let bytes = load(blobs, blob).await?;
-                            content.push(json!({"type": "image_url", "image_url": {"url": data_url(&blob.mime, &bytes), "detail": flavor.image_detail}}));
+                            content.push(image_part(data_url(&blob.mime, &bytes), flavor.image_detail));
                         }
                         Part::File { blob, filename, .. } => {
                             let bytes = load(blobs, blob).await?;
@@ -166,7 +214,7 @@ pub async fn convert_history_with(
                                     content.push(json!({"type": "video_url", "video_url": {"url": data_url(&blob.mime, &bytes)}}));
                                 }
                                 MediaClass::Image => {
-                                    content.push(json!({"type": "image_url", "image_url": {"url": data_url(&blob.mime, &bytes), "detail": flavor.image_detail}}));
+                                    content.push(image_part(data_url(&blob.mime, &bytes), flavor.image_detail));
                                 }
                                 MediaClass::Text => {
                                     // No native text-document input on Chat Completions: inline verbatim as a separate part.
@@ -208,6 +256,13 @@ pub async fn convert_history_with(
         }
     }
     Ok((out, notes))
+}
+
+fn image_part(url: String, detail: Option<&str>) -> Value {
+    match detail {
+        Some(d) => json!({"type": "image_url", "image_url": {"url": url, "detail": d}}),
+        None => json!({"type": "image_url", "image_url": {"url": url}}),
+    }
 }
 
 async fn load(blobs: &dyn BlobLoader, r: &omni_core::BlobRef) -> Result<Vec<u8>, LlmError> {

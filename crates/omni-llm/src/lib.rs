@@ -15,6 +15,7 @@ pub mod chatstream;
 pub mod error;
 pub mod event;
 pub mod openrouter;
+pub mod request;
 pub mod settings;
 pub mod sse;
 
@@ -99,6 +100,8 @@ pub struct Prepared {
     pub auto_max_tokens: Option<u64>,
     /// The model supports long decode (continuation hops).
     pub long_decode: bool,
+    /// What the request asks for, in words (footer): effort, tools, options.
+    pub settings: Vec<String>,
 }
 
 impl Prepared {
@@ -112,8 +115,9 @@ impl Prepared {
         p
     }
 
+    /// The output budget of the request (`max_tokens`, or Responses' `max_output_tokens`).
     pub fn max_tokens(&self) -> Option<u64> {
-        self.body.get("max_tokens").and_then(Value::as_u64)
+        self.body.get("max_tokens").or_else(|| self.body.get("max_output_tokens")).and_then(Value::as_u64)
     }
 }
 

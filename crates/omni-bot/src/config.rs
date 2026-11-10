@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -260,9 +259,10 @@ pub struct PresetConfig {
     /// Glob over canonical model ids, e.g. `openrouter:anthropic/*`.
     #[serde(rename = "match")]
     pub pattern: String,
-    /// JSON merge patch applied to the request body (provider dialect).
-    #[serde(default)]
-    pub body: Option<toml::Value>,
+    /// Default options for matching models, in the trigger option syntax
+    /// (e.g. `"4"` for 4K images); the user's options override them. They are
+    /// validated like the user's (no free-form request fields).
+    pub options: String,
     /// Free-form documentation in the config file (not used by the bot).
     #[serde(default)]
     #[allow(dead_code)]
@@ -270,11 +270,11 @@ pub struct PresetConfig {
 }
 
 impl PresetConfig {
-    pub fn body_json(&self) -> Result<Option<Value>> {
-        Ok(match &self.body {
-            None => None,
-            Some(v) => Some(serde_json::to_value(v)?),
-        })
+    /// The preset's options, parsed (`+` between options is optional).
+    pub fn requested(&self) -> Result<omni_llm::request::Requested> {
+        let spec = format!("x+{}", self.options.trim().trim_start_matches('+'));
+        let t = omni_core::trigger::parse_spec(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        omni_llm::request::parse(&t.options).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -414,7 +414,7 @@ impl Config {
             }
         }
         for p in &self.presets {
-            p.body_json().with_context(|| format!("preset {:?}", p.pattern))?;
+            p.requested().with_context(|| format!("preset {:?}", p.pattern))?;
         }
         self.telegram.api_id.as_i32().context("telegram.api_id")?;
         Ok(())

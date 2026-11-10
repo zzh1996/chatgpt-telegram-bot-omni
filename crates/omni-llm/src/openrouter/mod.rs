@@ -2,7 +2,9 @@
 
 pub mod catalog;
 pub mod chat;
+pub mod messages;
 pub mod options;
+pub mod responses;
 
 use std::time::Duration;
 
@@ -136,83 +138,126 @@ impl OpenRouter {
         Ok(resp.error_for_status()?.json().await?)
     }
 
-    /// Build a Chat Completions request.
+    /// Build a request in the skin closest to the vendor's own API (see
+    /// [`options::dialect_for`]), after validating the options against what
+    /// the vendor offers and what OpenRouter can deliver.
+    ///
+    /// `presets` are default options from the config (applied before the user's).
     pub async fn prepare_chat(
         &self,
         input: &CallInput<'_>,
-        config_presets: &[(String, Value)],
+        presets: &[crate::request::Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
-        let info = self.model_info(input.model).await;
-        let (messages, notes) = chat::convert_history(input.history, input.model, info.as_deref(), blobs).await?;
-        let mut base = json!({"model": input.model, "messages": messages, "stream": true});
-        if let Some(s) = &input.session_id {
-            base["session_id"] = json!(s);
+        let model = input.model;
+        let info = self.model_info(model).await;
+        let dialect = options::dialect_for(model);
+        let user = crate::request::parse(input.options).map_err(LlmError::request)?;
+        let mut req = crate::request::Requested::default();
+        for p in presets {
+            req = options::overlay(&req, p);
         }
-        if let Some(u) = &input.user {
-            base["user"] = json!(u);
-        }
+        let req = options::overlay(&req, &user);
+        // Pin: the user's choice, else the vendor's own endpoint.
+        let pinned: Vec<String> = match &req.providers {
+            Some(p) => p.iter().map(|s| s.split('/').next().unwrap_or(s).to_string()).collect(),
+            None if self.cfg.fidelity.pin_first_party => {
+                self.cfg.fidelity.first_party_for(model).map(|s| vec![s.to_string()]).unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        // Endpoint metadata decides tools and tiers: fetch it if a request needs it.
+        let needs_endpoints = !req.tools.is_empty() || req.tier.is_some();
+        let endpoints: std::sync::Arc<Vec<EndpointInfo>> = match self.catalog.endpoints(model) {
+            Some(e) => e,
+            None if needs_endpoints => self
+                .endpoints(model)
+                .await
+                .map_err(|e| LlmError::request(format!("cannot check what OpenRouter offers for {model}: {e:#}")))?,
+            None => std::sync::Arc::new(Vec::new()),
+        };
+        let caps = options::OrCaps { model, info: info.as_deref(), endpoints: &endpoints, pinned, dialect };
         let auto_max = match input.max_tokens_override {
             Some(v) => Some(v),
             None => self.auto_max_tokens(input, info.as_deref()),
         };
-        let mut resolved = options::resolve(
-            base,
-            input.model,
-            info.as_deref(),
-            auto_max,
-            &self.cfg.fidelity,
-            config_presets,
-            input.options,
-        )
-        .map_err(LlmError::request)?;
-        let auto_max_tokens = auto_max.filter(|v| resolved.body.get("max_tokens").and_then(Value::as_u64) == Some(*v));
-        if notes.needs_file_parser {
-            // Force native file handling; detect router-side parsing via annotations.
-            let plugins = resolved.body["plugins"].as_array().cloned().unwrap_or_default();
-            let mut plugins: Vec<Value> = plugins.into_iter().filter(|p| p["id"] != "file-parser").collect();
-            plugins.push(json!({"id": "file-parser", "pdf": {"engine": "native"}}));
-            resolved.body["plugins"] = Value::Array(plugins);
-            resolved.applied.push(options::Applied {
-                source: "fidelity".into(),
-                patch: json!({"plugins": [{"id": "file-parser", "pdf": {"engine": "native"}}]}),
-            });
-        }
-        self.check_native_search(&mut resolved, input.model).await?;
-        // Service tiers are separate endpoints (`openai/flex`); include them in the pin.
-        if let (Some(tier), Some(only)) = (
-            resolved.body.get("service_tier").and_then(Value::as_str).map(str::to_string),
-            resolved.body.pointer("/provider/only").and_then(Value::as_array).cloned(),
-        ) && !matches!(tier.as_str(), "auto" | "default")
-        {
-            let mut slugs = only.clone();
-            for s in only.iter().filter_map(Value::as_str) {
-                if !s.contains('/') {
-                    slugs.push(json!(format!("{s}/{tier}")));
-                }
-            }
-            resolved.body["provider"]["only"] = Value::Array(slugs);
-        }
-        if self.cfg.echo_upstream_body && resolved.body.get("debug").is_none() {
-            resolved.body["debug"] = json!({"echo_upstream_body": true});
-        }
+        let plan = options::plan(model, info.as_deref(), &caps, &req, &user, auto_max).map_err(LlmError::request)?;
+        let mut warnings = Vec::new();
         if info.is_none() {
-            resolved.warnings.push(format!(
-                "model `{}` is not in OpenRouter's catalog (yet); sending anyway without capability-based defaults",
-                input.model
+            warnings.push(format!(
+                "model `{model}` is not in OpenRouter's catalog (yet); sending without capability-based defaults"
             ));
         }
+        let (mut body, notes, path, mut applied) = match dialect {
+            options::Dialect::Chat => {
+                let (messages, notes) = chat::convert_history(input.history, model, info.as_deref(), blobs).await?;
+                let mut b = chat::body(model, messages, &plan);
+                let mut applied = Vec::new();
+                if notes.needs_file_parser {
+                    // Force native file handling; router-side parsing is detected via annotations.
+                    b["plugins_file_parser"] = json!(true);
+                    applied.push(options::Applied {
+                        source: "fidelity".into(),
+                        patch: json!({"plugins": [{"id": "file-parser", "pdf": {"engine": "native"}}]}),
+                    });
+                }
+                (b, notes.notes, "/chat/completions", applied)
+            }
+            options::Dialect::Responses => {
+                let detail = plan.image_detail.unwrap_or("high");
+                let (items, notes) =
+                    responses::convert_history(input.history, model, info.as_deref(), detail, blobs).await?;
+                (responses::body(model, items, &plan), notes, "/responses", Vec::new())
+            }
+            options::Dialect::Messages => {
+                let (system, messages, notes) =
+                    messages::convert_history(input.history, model, info.as_deref(), blobs).await?;
+                let budget_models = info
+                    .as_deref()
+                    .and_then(|i| i.reasoning.as_ref())
+                    .is_some_and(|r| r.supported_efforts.is_none() && r.supports_max_tokens == Some(true));
+                (messages::body(model, system, messages, &plan, budget_models), notes, "/messages", Vec::new())
+            }
+        };
+        // OpenRouter fields: routing pin, no context compression, upstream echo.
+        let routing = options::routing(&plan, &self.cfg.fidelity);
+        omni_core::json::merge_patch(&mut body, &routing);
+        if body.get("plugins_file_parser").is_some() {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("plugins_file_parser");
+            }
+            let mut plugins = body["plugins"].as_array().cloned().unwrap_or_default();
+            plugins.push(json!({"id": "file-parser", "pdf": {"engine": "native"}}));
+            body["plugins"] = Value::Array(plugins);
+        }
+        if self.cfg.echo_upstream_body && dialect != options::Dialect::Messages {
+            body["debug"] = json!({"echo_upstream_body": true});
+        }
+        if let Some(s) = &input.session_id {
+            body["session_id"] = json!(s);
+        }
+        if let Some(u) = &input.user {
+            body["user"] = json!(u);
+        }
+        let mut all_applied = plan.applied.clone();
+        all_applied.append(&mut applied);
+        all_applied.push(options::Applied { source: "fidelity".into(), patch: routing });
         Ok(Prepared {
-            dialect: chat::DIALECT,
-            model: input.model.to_string(),
-            url: self.url("/chat/completions"),
-            body: resolved.body,
-            applied: resolved.applied,
-            warnings: resolved.warnings,
-            notes: notes.notes,
-            show_debug: resolved.show_debug,
-            auto_max_tokens,
-            long_decode: self.cfg.fidelity.is_long_decode(input.model),
+            dialect: match dialect {
+                options::Dialect::Chat => chat::DIALECT,
+                options::Dialect::Responses => responses::DIALECT,
+                options::Dialect::Messages => messages::DIALECT,
+            },
+            model: model.to_string(),
+            url: self.url(path),
+            body,
+            applied: all_applied,
+            warnings,
+            notes,
+            show_debug: false,
+            auto_max_tokens: auto_max,
+            long_decode: dialect == options::Dialect::Chat && self.cfg.fidelity.is_long_decode(model),
+            settings: plan.described.clone(),
         })
     }
 
@@ -287,61 +332,7 @@ impl OpenRouter {
         Ok(v.get("data").cloned())
     }
 
-    /// `engine: "native"` web search silently falls back to Exa on endpoints
-    /// without a native search tool. Refuse instead (users can opt into another
-    /// engine explicitly with `+s=exa`).
-    async fn check_native_search(&self, r: &mut options::Resolved, model: &str) -> Result<(), LlmError> {
-        let wants_native = r.body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|t| {
-                t["type"] == "openrouter:web_search"
-                    && t.pointer("/parameters/engine").and_then(Value::as_str) == Some("native")
-            })
-        });
-        if !wants_native {
-            return Ok(());
-        }
-        let pinned: Vec<String> = r
-            .body
-            .pointer("/provider/only")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-            .unwrap_or_default();
-        let eps = match self.endpoints(model).await {
-            Ok(e) => e,
-            Err(e) => {
-                r.warnings.push(format!(
-                    "could not verify native web search support ({e:#}); OpenRouter may fall back to Exa"
-                ));
-                return Ok(());
-            }
-        };
-        let candidates: Vec<&EndpointInfo> = eps
-            .iter()
-            .filter(|e| {
-                pinned.is_empty()
-                    || e.base_slug().is_some_and(|b| pinned.iter().any(|p| p.split('/').next() == Some(b)))
-            })
-            .collect();
-        if candidates.is_empty() {
-            return Ok(()); // routing will fail with its own (verbatim) error
-        }
-        let native: Vec<&&EndpointInfo> =
-            candidates.iter().filter(|e| e.has_native_tool("openrouter:web_search")).collect();
-        if native.is_empty() {
-            return Err(LlmError::request(format!(
-                "{model} has no provider-native web search on the selected endpoint(s) [{}]; OpenRouter would silently use Exa instead. \
-                 Use `+s=exa` (or another engine) to opt into OpenRouter's search explicitly.",
-                candidates.iter().filter_map(|e| e.tag.clone()).collect::<Vec<_>>().join(", ")
-            )));
-        }
-        if native.len() < candidates.len() {
-            r.warnings
-                .push("some of the allowed endpoints have no native web search; OpenRouter may use Exa there".into());
-        }
-        Ok(())
-    }
-
-    /// Run a prepared Chat Completions request, streaming events into `sink`.
+    /// Run a prepared request (any skin), streaming events into `sink`.
     /// On success returns the native assistant payload for replay.
     pub async fn stream_chat(
         &self,
@@ -354,27 +345,67 @@ impl OpenRouter {
         if self.cfg.router_metadata {
             rb = rb.header("X-OpenRouter-Metadata", "enabled");
         }
-        let crate::chatstream::Streamed { result, parser: mut cp, header_id } = crate::chatstream::run(
-            rb,
-            &p.url,
-            &p.body,
-            self.cfg.idle_timeout,
-            Some("x-generation-id"),
-            chat::error_from_json,
-            sink,
-            observer,
-            cancel,
-        )
-        .await;
-        let outcome = CallOutcome {
-            upstream_id: header_id,
-            continuation: cp.continuation().cloned(),
-            upstream_echo: std::mem::take(&mut cp.upstream_body_echo),
-            router_metadata: cp.router_metadata.take(),
-        };
-        match result {
-            Err(e) => (Err(e), outcome),
-            Ok(()) => (Ok(cp.native_payload()), outcome),
+        let idle = self.cfg.idle_timeout;
+        let hdr = Some("x-generation-id");
+        match p.dialect {
+            responses::DIALECT => {
+                let crate::chatstream::Streamed { result, parser: mut ep, header_id } = crate::chatstream::run_with(
+                    rb,
+                    &p.url,
+                    &p.body,
+                    idle,
+                    hdr,
+                    chat::error_from_json,
+                    responses::EventParser::default(),
+                    sink,
+                    observer,
+                    cancel,
+                )
+                .await;
+                let outcome = CallOutcome {
+                    upstream_id: header_id,
+                    upstream_echo: std::mem::take(&mut ep.upstream_body_echo),
+                    ..Default::default()
+                };
+                (result.map(|()| ep.native_payload()), outcome)
+            }
+            messages::DIALECT => {
+                let crate::chatstream::Streamed { result, parser: ep, header_id } = crate::chatstream::run_with(
+                    rb,
+                    &p.url,
+                    &p.body,
+                    idle,
+                    hdr,
+                    chat::error_from_json,
+                    messages::EventParser::default(),
+                    sink,
+                    observer,
+                    cancel,
+                )
+                .await;
+                (result.map(|()| ep.native_payload()), CallOutcome { upstream_id: header_id, ..Default::default() })
+            }
+            _ => {
+                let crate::chatstream::Streamed { result, parser: mut cp, header_id } = crate::chatstream::run(
+                    rb,
+                    &p.url,
+                    &p.body,
+                    idle,
+                    hdr,
+                    chat::error_from_json,
+                    sink,
+                    observer,
+                    cancel,
+                )
+                .await;
+                let outcome = CallOutcome {
+                    upstream_id: header_id,
+                    continuation: cp.continuation().cloned(),
+                    upstream_echo: std::mem::take(&mut cp.upstream_body_echo),
+                    router_metadata: cp.router_metadata.take(),
+                };
+                (result.map(|()| cp.native_payload()), outcome)
+            }
         }
     }
 }

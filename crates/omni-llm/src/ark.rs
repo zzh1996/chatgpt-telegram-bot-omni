@@ -18,8 +18,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use omni_core::Usage;
-use omni_core::json::merge_patch;
-use omni_core::trigger::OptionToken;
 use omni_core::usage::CostSource;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -89,21 +87,37 @@ fn replay(p: &Value) -> Value {
     m
 }
 
-pub const FLAVOR: Flavor = Flavor { dialect: DIALECT, image_detail: "xhigh", replay };
+pub const FLAVOR: Flavor = Flavor { dialect: DIALECT, image_detail: Some("xhigh"), replay };
 
-/// Options understood for Ark (anything else is rejected, never silently ignored).
-pub const OPTIONS_HELP: &str = "\
-Volcengine Ark (ark:…) options:
-e=<none|minimal|low|medium|high>   reasoning_effort (default high; minimal = no thinking)
-nothink                            thinking disabled (thinking.type=disabled, effort minimal)
-max=<n>                            max_tokens (answer only; default: model max, capped)
-t=<x> / top_p=<x>                  temperature / top_p
-detail=<low|high|xhigh>            image detail (default xhigh)
-s                                  Doubao Search (web_search_options; must be enabled in the Ark console)
-json                               response_format json_object
-tier=<default|fast|flex|auto>      service_tier
-pure                               no automatic defaults
-{json}                             JSON merge patch applied to the request body last";
+/// What Ark's Chat API offers (the vendor's own API, so official = route).
+struct ArkCaps;
+
+impl crate::request::RouteCaps for ArkCaps {
+    fn name(&self) -> &str {
+        "Volcengine Ark"
+    }
+    fn tool(&self, tool: crate::request::Tool) -> bool {
+        tool == crate::request::Tool::Search // Doubao search (`web_search_options`)
+    }
+    fn efforts(&self) -> Option<Vec<String>> {
+        Some(["high", "medium", "low", "minimal"].map(String::from).to_vec())
+    }
+    fn can_disable_reasoning(&self) -> bool {
+        true
+    }
+    fn budget(&self) -> bool {
+        false
+    }
+    fn verbosity(&self) -> bool {
+        false
+    }
+    fn image_options(&self) -> bool {
+        false
+    }
+    fn tiers(&self) -> Vec<String> {
+        vec!["flex".into(), "fast".into()]
+    }
+}
 
 #[derive(Clone)]
 pub struct Ark {
@@ -139,9 +153,19 @@ impl Ark {
     pub async fn prepare_chat(
         &self,
         input: &CallInput<'_>,
-        config_presets: &[(String, Value)],
+        presets: &[crate::request::Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        let user = crate::request::parse(input.options).map_err(LlmError::request)?;
+        let mut req = crate::request::Requested::default();
+        for p in presets {
+            req = crate::openrouter::options::overlay(&req, p);
+        }
+        let req = crate::openrouter::options::overlay(&req, &user);
+        if req.providers.is_some() {
+            return Err(LlmError::request("`p=` (provider choice) does not apply to Volcengine Ark"));
+        }
+        crate::request::validate(input.model, &req, &ArkCaps).map_err(LlmError::request)?;
         let (messages, notes) = chat::convert_history_with(input.history, input.model, None, blobs, &FLAVOR).await?;
         let mut body = json!({
             "model": input.model,
@@ -149,92 +173,42 @@ impl Ark {
             "stream": true,
             "stream_options": {"include_usage": true},
         });
-        let mut applied: Vec<Applied> = Vec::new();
-        let mut warnings = Vec::new();
-        let mut apply = |body: &mut Value, source: &str, patch: Value| {
-            merge_patch(body, &patch);
-            applied.push(Applied { source: source.to_string(), patch });
-        };
-        let pure = input.options.iter().any(|o| matches!(o, OptionToken::Flag(f) if f == "pure"));
-        let auto_max = input.max_tokens_override.or_else(|| self.auto_max_tokens(input));
-        if !pure {
-            let mut p = json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high"});
-            if let Some(m) = auto_max {
-                p["max_tokens"] = json!(m);
+        let mut applied = Vec::new();
+        let mut settings = Vec::new();
+        // Reasoning: the highest level by default; e=none turns thinking off.
+        match req.effort.as_deref() {
+            Some("none") | Some("minimal") => {
+                body["thinking"] = json!({"type": "disabled"});
+                body["reasoning_effort"] = json!("minimal");
+                settings.push("thinking off".to_string());
             }
-            apply(&mut body, "auto-max", p);
+            e => {
+                let e = e.unwrap_or("high");
+                body["thinking"] = json!({"type": "enabled"});
+                body["reasoning_effort"] = json!(e);
+                settings.push(format!("effort {e}"));
+            }
         }
-        for (pattern, patch) in config_presets {
-            apply(&mut body, &format!("preset:{pattern}"), patch.clone());
+        applied.push(Applied {
+            source: if user.effort.is_some() { "option" } else { "default" }.into(),
+            patch: json!({"thinking": body["thinking"], "reasoning_effort": body["reasoning_effort"]}),
+        });
+        let auto_max = input.max_tokens_override.or_else(|| self.auto_max_tokens(input));
+        if let Some(m) = auto_max {
+            body["max_tokens"] = json!(m);
+            applied.push(Applied { source: "budget".into(), patch: json!({"max_tokens": m}) });
         }
-        let mut detail: Option<String> = None;
-        let mut json_patches = Vec::new();
-        for o in input.options {
-            let (source, patch) = match o {
-                OptionToken::Json(v) => {
-                    json_patches.push(v.clone());
-                    continue;
-                }
-                OptionToken::Flag(f) => match f.as_str() {
-                    "pure" => continue,
-                    "nothink" => (
-                        "option:nothink".to_string(),
-                        json!({"thinking": {"type": "disabled"}, "reasoning_effort": "minimal"}),
-                    ),
-                    "s" | "search" | "web" => (format!("option:{f}"), json!({"web_search_options": {}})),
-                    "json" => ("option:json".into(), json!({"response_format": {"type": "json_object"}})),
-                    "debug" => {
-                        warnings.push("`+debug`: Ark has no upstream body echo; the request is shown by /info".into());
-                        continue;
-                    }
-                    other => {
-                        return Err(LlmError::request(format!("unknown option `+{other}` for Ark\n\n{OPTIONS_HELP}")));
-                    }
-                },
-                OptionToken::KeyValue(k, v) => {
-                    let num = |v: &str| -> Result<Value, LlmError> {
-                        v.parse::<f64>()
-                            .map(|x| json!(x))
-                            .map_err(|_| LlmError::request(format!("`+{k}=` needs a number, got `{v}`")))
-                    };
-                    let src = format!("option:{k}={v}");
-                    match k.as_str() {
-                        "e" | "effort" => (src, json!({"reasoning_effort": v})),
-                        "max" | "max_tokens" => {
-                            let n: u64 = v
-                                .parse()
-                                .map_err(|_| LlmError::request(format!("`+{k}=` needs an integer, got `{v}`")))?;
-                            (src, json!({"max_tokens": n}))
-                        }
-                        "t" | "temperature" => (src, json!({"temperature": num(v)?})),
-                        "top_p" => (src, json!({"top_p": num(v)?})),
-                        "tier" | "service_tier" => (src, json!({"service_tier": v})),
-                        "detail" => {
-                            detail = Some(v.clone());
-                            continue;
-                        }
-                        other => {
-                            return Err(LlmError::request(format!(
-                                "unknown option `+{other}=` for Ark\n\n{OPTIONS_HELP}"
-                            )));
-                        }
-                    }
-                }
-            };
-            apply(&mut body, &source, patch);
+        if req.tools.contains(&crate::request::Tool::Search) {
+            body["web_search_options"] = json!({});
+            settings.push("Doubao search".into());
+            applied.push(Applied { source: "option".into(), patch: json!({"web_search_options": {}}) });
         }
-        if let Some(d) = detail {
-            set_image_detail(&mut body, &d);
-            applied.push(Applied {
-                source: format!("option:detail={d}"),
-                patch: json!({"messages[].image_url.detail": d}),
-            });
+        if let Some(t) = &req.tier {
+            body["service_tier"] = json!(t);
+            settings.push(format!("tier {t}"));
+            applied.push(Applied { source: "option".into(), patch: json!({"service_tier": t}) });
         }
-        for p in json_patches {
-            merge_patch(&mut body, &p);
-            applied.push(Applied { source: "json".into(), patch: p });
-        }
-        let auto_max_tokens = auto_max.filter(|v| body.get("max_tokens").and_then(Value::as_u64) == Some(*v));
+        let mut warnings = Vec::new();
         if model_spec(input.model).is_none() {
             warnings.push(format!(
                 "`{}` is not in the bot's Ark model table: limits and price unknown (max_tokens {}; cost not estimated)",
@@ -251,8 +225,9 @@ impl Ark {
             warnings,
             notes: notes.notes,
             show_debug: false,
-            auto_max_tokens,
+            auto_max_tokens: auto_max,
             long_decode: false,
+            settings,
         })
     }
 
@@ -282,20 +257,6 @@ impl Ark {
         match result {
             Err(e) => (Err(e), outcome),
             Ok(()) => (Ok(parser.native_payload()), outcome),
-        }
-    }
-}
-
-/// Set `image_url.detail` on every image part.
-fn set_image_detail(body: &mut Value, detail: &str) {
-    let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else { return };
-    for m in msgs {
-        if let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) {
-            for p in parts {
-                if let Some(iu) = p.get_mut("image_url").and_then(Value::as_object_mut) {
-                    iu.insert("detail".into(), json!(detail));
-                }
-            }
         }
     }
 }
@@ -445,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn request_defaults_and_options() {
         let history = vec![omni_core::Turn::user_text("hi")];
-        let opts = vec![OptionToken::Flag("nothink".into()), OptionToken::KeyValue("max".into(), "100".into())];
+        let opts = vec![omni_core::trigger::OptionToken::KeyValue("e".into(), "none".into())];
         let input = CallInput {
             model: "doubao-seed-2-1-pro-260915",
             options: &opts,
@@ -459,7 +420,7 @@ mod tests {
         assert_eq!(p.url, "https://ark.cn-beijing.volces.com/api/v3/chat/completions");
         assert_eq!(p.body["thinking"]["type"], "disabled");
         assert_eq!(p.body["reasoning_effort"], "minimal");
-        assert_eq!(p.body["max_tokens"], 100);
+        assert_eq!(p.body["max_tokens"], 65_536);
         assert_eq!(p.body["stream_options"]["include_usage"], true);
         assert!(p.body.get("user").is_none(), "Ark Chat has no `user` field");
         // Defaults without options: max effort, explicit max_tokens (answer only, capped).
@@ -469,7 +430,7 @@ mod tests {
         assert_eq!(p.body["max_tokens"], 65_536);
         assert_eq!(p.auto_max_tokens, Some(65_536));
         // Unknown options are rejected, never ignored.
-        let bad = vec![OptionToken::Flag("frobnicate".into())];
+        let bad = vec![omni_core::trigger::OptionToken::Flag("frobnicate".into())];
         assert!(ark().prepare_chat(&CallInput { options: &bad, ..input }, &[], &NoBlobs).await.is_err());
     }
 

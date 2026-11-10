@@ -103,7 +103,7 @@ fn data(v: Value) -> Step {
 async fn call(or: &OpenRouter) -> (Result<Value, omni_llm::LlmError>, Vec<StreamEvent>) {
     let history = vec![Turn::user_text("hi")];
     let input = CallInput {
-        model: "anthropic/claude-test",
+        model: "google/gemini-test",
         options: &[],
         history: &history,
         session_id: Some("tg-1".into()),
@@ -124,7 +124,7 @@ async fn normal_stream_with_keepalive_and_usage() {
         200,
         vec![
             Step::Bytes(": OPENROUTER PROCESSING\n\n".into()),
-            data(json!({"id": "gen-test", "provider": "Anthropic", "model": "anthropic/claude-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "", "reasoning_details": [{"type": "reasoning.text", "text": "think", "index": 0}]}}]})),
+            data(json!({"id": "gen-test", "provider": "Anthropic", "model": "google/gemini-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "", "reasoning_details": [{"type": "reasoning.text", "text": "think", "index": 0}]}}]})),
             Step::Sleep(30),
             data(json!({"id": "gen-test", "choices": [{"index": 0, "delta": {"content": "Hel"}}]})),
             data(json!({"id": "gen-test", "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": "stop", "native_finish_reason": "end_turn"}]})),
@@ -142,7 +142,7 @@ async fn normal_stream_with_keepalive_and_usage() {
     assert!(events.iter().any(|e| matches!(e, StreamEvent::Meta { upstream_id: Some(id), .. } if id == "gen-test")));
     // Fidelity defaults were sent.
     let body = captured.lock().unwrap().clone().unwrap();
-    assert_eq!(body["provider"]["only"], json!(["anthropic"]));
+    assert_eq!(body["provider"]["only"], json!(["google-ai-studio"]));
     assert_eq!(body["provider"]["allow_fallbacks"], json!(false));
     assert_eq!(body["plugins"][0]["id"], "context-compression");
     assert_eq!(body["debug"]["echo_upstream_body"], json!(true));
