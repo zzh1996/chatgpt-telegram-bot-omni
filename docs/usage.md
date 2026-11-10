@@ -20,43 +20,41 @@ spec   := <模型>[+<选项>...]
 
 ### 选项
 
-| 选项 | 作用（OpenRouter 请求体） |
-|---|---|
-| `s` / `search` | 厂商**原生**网页搜索（`openrouter:web_search`, `engine: native`）。所选 endpoint 没有原生搜索时直接报错，绝不静默换成 Exa |
-| `s=exa` / `s=auto` / `s=parallel` … | 显式选择 OpenRouter 的搜索引擎（第三方，非厂商原生） |
-| `e=<effort>` / `effort=` | `reasoning.effort`：none/minimal/low/medium/high/xhigh/max（不在模型支持列表里会给出提示） |
-| `l` | 同 `e=low`（旧版写法） |
-| `nothink` | `reasoning.effort = none` |
-| `budget=<n>` | `reasoning.max_tokens`（思考 token 预算） |
-| `summary=<auto\|concise\|detailed>` | 推理摘要粒度（OpenAI） |
-| `max=<n>` | `max_tokens` |
-| `t=` `top_p=` `top_k=` `seed=` | 采样参数 |
-| `v=<…>` | `verbosity` |
-| `tier=<flex\|priority\|…>` | `service_tier`（自动把对应的 tier endpoint 加进固定 provider 列表）。默认大家都用平台默认等级；`flex`（更便宜）谁都能用；`priority`/`fast`/`ultrafast` 等更贵的等级只有 `[access].priority_users` 里的人能指定 |
-| `p=<slug>[\|<slug>…]` | 换成该模型的另一个**官方**提供方，如 Gemini `p=google-vertex`、GPT `p=azure`、Claude `p=amazon-bedrock`（白名单见配置 `allowed_providers`；区域如 `google-vertex/us` 也行）。不允许任意第三方，也没有 `p=any` |
-| `img` / `text` | 输出模态 image+text / 仅 text |
-| `1k` `2k` `4k` / `size=` | 图片尺寸 `image_config.image_size` |
-| `ar=16:9` 及旧写法 `S W H w h` | 图片宽高比 1:1 16:9 9:16 4:3 3:4 |
-| `json` | `response_format: json_object` |
-| `pure` | 不应用自动"能力拉满"预设（仍保留固定第一方 provider 等保真措施） |
-| `debug` | 要求 OpenRouter 回显真实上游请求（配置 `echo_upstream_body` 默认已对所有请求开启），用回复 + `/info` 查看 |
-| `{...}` | JSON merge patch，最后应用，可改任何字段；值为 `null` 表示删除该字段 |
+选项写在前缀里 `+` 后面，可以连写（`g+s4W$` = 搜索 + 4K + 16:9）。用法按各家**官方 API** 理解：你面对的是官方模型，OpenRouter 只是通道。每个选项在发出前都会本地校验：
 
-旧版的连写单字母仍可用：`g+s4W$` = 搜索 + 4K + 16:9。
+- 官方 API 没有的功能/取值：直接报错（如 `GPT 没有 URL 抓取`）；
+- 官方有、但经 OpenRouter 做不到：报错"OpenRouter 不支持 …（官方 API 有）"；
+- 不认识的选项：报错。绝不把请求交给 OpenRouter 去"纠正"或静默丢弃。
+
+| 选项 | 作用 |
+|---|---|
+| `s` | 厂商自己的网页搜索（OpenAI、Claude、Gemini、Grok；经 OpenRouter 时 DeepSeek/GLM/Kimi/Qwen 的官方搜索不可用） |
+| `c` | 厂商自己的代码执行（经 OpenRouter 只有 OpenAI 可用；执行的代码会显示在工具调用里，执行输出与生成的文件 OpenRouter 不返回） |
+| `u` | 让模型读取消息里的网址（Claude 的 web_fetch；Gemini 的 URL context 经 OpenRouter 不可用） |
+| `e=<档位>` | 推理强度，取值为该模型官方支持的档位（报错时会列出）；`e=none` 关闭推理（仅限官方允许关闭的模型） |
+| `budget=<n>` | 思考 token 预算（仅限官方支持预算的模型；与 `e=` 二选一） |
+| `v=<low\|medium\|high>` | 回答详细程度（OpenAI） |
+| `1` `2` `4` | 图片尺寸 1K / 2K / 4K（出图模型） |
+| `S` `W` `H` `w` `h`，`ar=<w:h>` | 图片比例 1:1 / 16:9 / 9:16 / 4:3 / 3:4；`ar=` 可写模型官方支持的任意比例（如 `ar=21:9`） |
+| `p=<slug>` | 换成该模型的另一个官方提供方，如 Gemini `p=google-vertex`、GPT `p=azure`、Claude `p=amazon-bedrock`（白名单见配置 `allowed_providers`） |
+| `tier=<等级>` | 服务等级：`flex`（更便宜）谁都能用；`priority`/`fast` 等更贵的等级只有 `[access].priority_users` 里的人能指定 |
+
+### 默认参数（能力拉满）
+
+不带选项时，请求就是官方 API 允许的"最大"配置：
+
+- 推理强度 = 该模型支持的最高档（只有开关的推理模型则开启推理）；OpenAI 推理摘要 = detailed；Claude 思考显示 = summarized（官方默认 omitted 会看不到思考）；
+- 输出上限 = 该模型第一方 endpoint 的最大输出，但不超过上下文窗口剩余空间，上限 393216；Gemini 4 long decode 为跨多次续写的总预算（回复 `/continue` 继续）；
+- 图片输入用官方最高精度（OpenAI `detail` = original 或 high；其它厂商没有这个参数就不发）；
+- 出图模型同时输出图片和文字；配置预设（如 Gemini 出图默认 4K）。
+
+经 OpenRouter 时还有始终生效的**保真措施**：固定厂商自己的 endpoint、禁止 fallback、`require_parameters`、关闭 context-compression；PDF 强制原生解析。每个请求实际发送了什么，用 `/info` 查看。
+
+各模型走 OpenRouter 的哪种接口：OpenAI、xAI 用 Responses API，Anthropic 用 Messages API（与官方原生接口一致），其余用 Chat Completions（这些厂商官方提供的 OpenAI 兼容格式）。
 
 ### 火山方舟（豆包，`ark:`）
 
-`db$`、`dbe$`、`dbl$`、`dbt$`、`db2$`、`db2l$`、`db2m$`、`db21$` 等 alias 直连方舟 Chat API（需要 `ARK_API_KEY`）。可用选项（其它选项直接报错，不会被静默忽略）：
-
-| 选项 | 作用（方舟请求体） |
-|---|---|
-| `e=<none\|minimal\|low\|medium\|high>` | `reasoning_effort`（默认 high；`minimal` = 不思考） |
-| `nothink` | `thinking.type = disabled` + `reasoning_effort = minimal` |
-| `max=<n>` | `max_tokens`（方舟的 max_tokens **只计回答**，不含思考） |
-| `t=` `top_p=` | 采样参数 |
-| `detail=<low\|high\|xhigh>` | 图片精度（默认 xhigh） |
-| `s` | 豆包搜索 `web_search_options`（需先在方舟控制台开通） |
-| `json` / `tier=` / `pure` / `{...}` | 同上 |
+`db$`、`dbe$`、`dbl$`、`dbt$`、`db2$`、`db2l$`、`db2m$`、`db21$` 等 alias 直连方舟 Chat API（需要 `ARK_API_KEY`）。选项与上面相同，方舟支持 `s`（豆包搜索，需先在方舟控制台开通）、`e=<high|medium|low|minimal>`、`e=none`（关闭思考）、`tier=flex`/`tier=fast`；其它选项报错。
 
 方舟默认 `max_tokens` 只有 4096 且会静默截断，所以 bot 总是显式发送：模型最大回答长度（受上下文限制），上限 65536（`[providers.ark].max_tokens_cap`；方舟按"输入 + max_tokens"预扣 TPM，设得过大会更快触发 429）。方舟响应不带费用，统计里的费用按价目表（人民币，最低档位）估算，汇率见 `cny_per_usd`。
 

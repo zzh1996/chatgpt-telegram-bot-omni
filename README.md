@@ -28,16 +28,15 @@ docker compose logs -f
 
 | 写法 | 含义 |
 |---|---|
-| `$ 你好` | bot 的默认模型 |
-| `c$ 你好` | alias（`/models` 查看） |
-| `anthropic/claude-opus-5.5$ 你好` | 任意 OpenRouter 模型 ID，新模型无需改配置 |
-| `c,g,gpt$ 比较一下` | 多个模型并行 |
-| `c+s$` / `c+e=low$` / `g+4k+ar=16:9$` | 选项：原生搜索、推理强度、图片尺寸/比例… |
-| `c+{"temperature":0.2}$` | 任意 JSON merge patch 直接改请求体 |
-| `c$ ::system` + 换行 + 角色段落 | 自定义 system prompt 和前文历史 |
+| `$你好` | bot 的默认模型 |
+| `c$你好` | alias（`/models` 查看）；`$` 后的正文原样发送 |
+| `anthropic/claude-opus-5.5$你好` | 任意 OpenRouter 模型 ID，新模型无需改配置 |
+| `c,g,gpt$比较一下` | 多个模型并行 |
+| `c+s$` / `c+e=low$` / `g+4W$` | 选项：官方搜索、推理强度、图片尺寸/比例…（本地校验，`/help options`） |
+| `c$::system` + 换行 + 角色段落 | 自定义 system prompt 和前文历史 |
 | 回复 bot 消息 | 原样作为下一轮用户消息（开头的 `\` 会被去掉，用于转义） |
-| 回复 + `/m g$ 文字` | 换模型继续这段对话 |
-| 回复 + `/raw` `/info` `/retry` | 原始 Markdown/文件、请求详情、重试失败的回答 |
+| 回复 + `/m g$文字` | 换模型继续这段对话 |
+| 回复 + `/raw` `/info` `/retry` `/continue` | 原始 Markdown/文件、请求详情、重试失败的回答、继续写撞到预算的回答 |
 
 完整说明见 [docs/usage.md](docs/usage.md)。
 

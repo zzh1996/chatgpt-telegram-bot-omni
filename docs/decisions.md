@@ -29,6 +29,10 @@
 | D21 | 日志默认永久保存。 |
 | D22 | 只有一个进程处理所有 bot，所以群里不认识的前缀直接报错（每个群只由一个 bot 报）。 |
 | D23 | 上游提供方白名单（配置 `allowed_providers`，按模型厂商）：只允许厂商自己和官方云（如 Gemini ↔ Vertex、GPT ↔ Azure），不允许任意第三方或 OpenRouter 自由路由。 |
+| D25 | 选项是封闭的小集合（旧版选项 + 作者点名要的）：`s` `c` `u` `e=` `budget=` `v=` 图片尺寸/比例 `p=` `tier=`；没有任意 JSON（安全：新功能、更贵的选项、服务端选项）。推理强度只有一种写法 `e=`，关闭是 `e=none`。 |
+| D26 | 用户面对的是"官方 API"，OpenRouter 只是能力有缺的通道：选项按官方 API 解析，先按官方能力校验，再按通道能力校验；官方有而 OpenRouter 做不到时报"OpenRouter 不支持"。绝不发 OpenRouter 会自动纠错/映射/丢弃的请求。 |
+| D27 | 每个模型走 OpenRouter 上最接近官方原生、功能最多的接口：OpenAI/xAI → Responses，Anthropic → Messages，其余 → Chat Completions。各家官方直连 provider 随后实现（作者提供低额度测试 key），OpenRouter 优先。 |
+| D28 | 只接厂商自己执行、无状态的内置工具（搜索、代码执行、URL 抓取）；需要上传文件/服务端状态的、或要求本地执行的（bash、computer use）、以及 OpenRouter 用自家实现替换的（OpenAI image_generation → openrouter:image_generation）都不接。 |
 | D24 | 所有人（包括管理员）默认用平台默认服务等级；只有 `[access].priority_users` 里的人可以指定更贵的高优先级等级（priority/fast/ultrafast、Anthropic fast、`:nitro`、tier endpoint），名单内的人默认也不是高优先级。 |
 
 ## 假设（可推翻）
