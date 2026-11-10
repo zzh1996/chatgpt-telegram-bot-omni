@@ -45,6 +45,15 @@ struct Injected {
     /// Like `probe`, with Markdown rendered by the answer renderer.
     #[serde(default)]
     probe_md: Vec<(String, String)>,
+    /// Attach this local file: the bot uploads it (as the simulated message,
+    /// with `text` as caption) and the inbound message carries its media, so
+    /// the real download/dedupe/conversion path runs.
+    #[serde(default)]
+    file: Option<PathBuf>,
+    #[serde(default)]
+    mime: Option<String>,
+    #[serde(default)]
+    as_photo: bool,
 }
 
 pub fn spawn(app: Arc<App>, dir: PathBuf) {
@@ -131,11 +140,42 @@ async fn inject(app: &Arc<App>, path: &Path) -> Result<i32> {
     let h = Sha256::digest(&raw);
     let tag = i64::from_be_bytes(h[..8].try_into().unwrap()) & 0x3fff_ffff_ffff_ffff;
     let link = Link { turn_id: -1, attempt_id: None, part_index: tag };
-    let msg_id =
-        outbox::send(&app.db, &bot, SendReq { chat_id: req.chat_id, reply_to: req.reply_to, content: &content, link })
+    let mut payload = InboundPayload { sender_name: Some("simulated".into()), ..Default::default() };
+    let msg_id = match &req.file {
+        None => outbox::send(
+            &app.db,
+            &bot,
+            SendReq { chat_id: req.chat_id, reply_to: req.reply_to, content: &content, link },
+        )
+        .await
+        .map_err(|e| anyhow!("send: {e}"))?,
+        Some(f) => {
+            let bytes = std::fs::read(f).with_context(|| format!("read {}", f.display()))?;
+            let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+            let mime = req.mime.clone().unwrap_or_else(|| "application/octet-stream".into());
+            let caption = format!("🧪 simulated message from user {}:\n{}", req.user_id, req.text);
+            let id = outbox::send_file(
+                &app.db,
+                &bot,
+                req.chat_id,
+                req.reply_to,
+                bytes,
+                &name,
+                &mime,
+                req.as_photo,
+                &caption,
+                link,
+            )
             .await
-            .map_err(|e| anyhow!("send: {e}"))?;
-    let payload = InboundPayload { sender_name: Some("simulated".into()), ..Default::default() };
+            .map_err(|e| anyhow!("send file: {e}"))?;
+            // Read the message back to get its media exactly as an incoming update would.
+            let msgs = bot.get_messages(req.chat_id, &[id]).await?;
+            if let Some(grammers_tl_types::enums::Message::Message(m)) = msgs.first() {
+                payload.media = crate::media::media_of(m);
+            }
+            id
+        }
+    };
     let payload = serde_json::to_string(&payload)?;
     let (b, chat, user, text, reply_to) = (bot.name.clone(), req.chat_id, req.user_id, req.text.clone(), req.reply_to);
     let id: Option<i64> = app

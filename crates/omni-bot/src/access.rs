@@ -192,13 +192,21 @@ pub async fn check_quota(app: &App, chat_id: i64, user_id: i64) -> Result<Result
         if let Some((lvl, rule)) = level(&app.db, scope, id).await?
             && lvl <= 0.0
         {
-            let wait_h =
-                if rule.refill_per_day > 0.0 { (-lvl + 0.0001) / rule.refill_per_day * 24.0 } else { f64::INFINITY };
+            // Usable again once the bucket is back above zero.
+            let wait_h = if rule.refill_per_day > 0.0 { -lvl / rule.refill_per_day * 24.0 } else { f64::INFINITY };
+            let usd = |v: f64| {
+                if v < 0.0 { format!("-{}", crate::compose::fmt_cost(-v)) } else { crate::compose::fmt_cost(v) }
+            };
             return Ok(Err(format!(
-                "{scope} spend limit reached (bucket {lvl:.4} USD, capacity {:.2} USD, refill {:.2} USD/day){}",
-                rule.capacity,
-                rule.refill_per_day,
-                if wait_h.is_finite() { format!("; available again in ~{wait_h:.1} h") } else { String::new() }
+                "{scope} spend limit reached (balance {}, capacity {}, refill {}/day){}",
+                usd(lvl),
+                usd(rule.capacity),
+                usd(rule.refill_per_day),
+                if wait_h.is_finite() {
+                    format!("; available again in ~{:.1} h", wait_h.max(0.1))
+                } else {
+                    String::new()
+                }
             )));
         }
     }
