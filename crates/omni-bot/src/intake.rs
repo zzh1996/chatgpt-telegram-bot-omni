@@ -40,6 +40,7 @@ pub const COMMANDS: &[&str] = &[
     "model",
     "raw",
     "retry",
+    "continue",
     "m",
     "info",
     "stats",
@@ -322,8 +323,8 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
     if let Some((name, _, addressed)) = parse_command(text, &bot.username) {
         // Un-addressed commands in groups are answered by one bot only.
         if addressed || chat_id > 0 || app.primary_bot(chat_id, &bot.name) == bot.name {
-            // `/m`, `/raw`, `/retry`, `/info` in replies are handled by the bot that owns the replied message.
-            if matches!(name.as_str(), "m" | "raw" | "retry" | "info")
+            // `/m`, `/raw`, `/retry`, `/continue`, `/info` in replies are handled by the bot that owns the replied message.
+            if matches!(name.as_str(), "m" | "raw" | "retry" | "continue" | "info")
                 && !addressed
                 && let Some(rt) = reply_target(m)
             {

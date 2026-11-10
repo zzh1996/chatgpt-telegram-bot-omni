@@ -40,7 +40,7 @@ A line that literally is `::user` can be sent by escaping it as `\::user`.
 
 **Continue**: reply to any of my messages. The whole reply is sent verbatim (a leading `\` is removed, so `\/raw` sends the text `/raw`). Replying to a failed message is rejected; use /retry on it.
 
-**Commands (reply to a bot message)**: /m `spec$ text` continue with another model · /raw original Markdown and files · /info request details · /retry regenerate a failed answer.
+**Commands (reply to a bot message)**: /m `spec$ text` continue with another model · /raw original Markdown and files · /info request details · /retry regenerate a failed answer · /continue keep writing an answer that stopped at the long-decode budget.
 
 **Other**: /models [search] · /model `id` · /stats [today|7d|30d|all] · /usage · /whoami · /ping
 
@@ -165,6 +165,7 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         "raw" => cmd_raw(app, bot, ib).await?,
         "info" => cmd_info(app, bot, ib).await?,
         "retry" => cmd_retry(app, bot, ib).await?,
+        "continue" => cmd_continue(app, bot, ib).await?,
         "m" => cmd_m(app, bot, ib, args).await?,
         "stats" => cmd_stats(app, bot, ib, args.trim(), admin).await?,
         "usage" => cmd_usage(app, bot, ib).await?,
@@ -484,6 +485,25 @@ async fn cmd_retry(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
         })
         .await?;
     jobs::spawn_turn(app.clone(), id);
+    Ok(())
+}
+
+async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
+    let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    if t.status != TurnStatus::Done || !jobs::can_continue(app, t.id).await? {
+        say(
+            app,
+            bot,
+            ib,
+            "only answers that stopped at the long-decode output budget can be continued (a model with long decode, \
+             footer shows finish: length (MAX_TOKENS))",
+        )
+        .await;
+        return Ok(());
+    }
+    if !jobs::spawn_continue(app.clone(), t.id, ib.msg_id) {
+        say(app, bot, ib, "this answer is still being generated").await;
+    }
     Ok(())
 }
 

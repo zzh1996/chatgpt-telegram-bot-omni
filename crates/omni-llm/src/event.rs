@@ -32,6 +32,9 @@ pub enum StreamEvent {
     /// A notice from the adapter/router that the user should see (e.g. a
     /// router-side transformation was detected). Shown in the bot info area.
     Notice(String),
+    /// A resumable checkpoint (e.g. a Gemini long-decode continuation item):
+    /// generation can be resumed from here after a drop or restart.
+    Checkpoint(Value),
 }
 
 /// Builds an assistant turn incrementally. Rendering reads `turn()` at any time.
@@ -159,7 +162,14 @@ impl Accumulator {
                     self.notices.push(n);
                 }
             }
+            StreamEvent::Checkpoint(_) => {}
         }
+    }
+
+    /// Replace the accumulated parts (resume from a checkpoint snapshot).
+    pub fn restore_parts(&mut self, parts: Vec<Part>) {
+        self.parts = parts;
+        self.last_reasoning_block = None;
     }
 
     /// Generated images not yet stored as blobs. The caller stores them and
@@ -189,7 +199,8 @@ impl Accumulator {
 
     /// Set (or replace) the native payload kept for replay.
     pub fn set_native(&mut self, dialect: &str, model: &str, payload: Value) {
-        self.native = Some(NativeOutput { dialect: dialect.into(), model: model.into(), payload });
+        self.native =
+            Some(NativeOutput { dialect: dialect.into(), model: model.into(), payload, context_tokens: None });
     }
 }
 

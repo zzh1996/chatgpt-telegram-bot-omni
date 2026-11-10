@@ -154,6 +154,18 @@ pub struct OpenRouterConfig {
     /// Cap for the automatic max_tokens (0 = no cap).
     #[serde(default = "default_max_tokens_cap")]
     pub max_tokens_cap: u64,
+    /// Models (glob patterns) that support Gemini-style long decode
+    /// (continuation hops); `max_tokens` is then a total budget across hops.
+    #[serde(default = "default_long_decode")]
+    pub long_decode: Vec<String>,
+    /// Default total output budget for long-decode models (`+max=` overrides;
+    /// `/continue` extends a reply that hit it).
+    #[serde(default = "default_max_tokens_cap")]
+    pub long_decode_budget: u64,
+}
+
+fn default_long_decode() -> Vec<String> {
+    vec!["google/gemini-4*".into()]
 }
 
 fn default_max_tokens_cap() -> u64 {

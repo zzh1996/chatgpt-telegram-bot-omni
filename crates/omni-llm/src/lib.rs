@@ -8,6 +8,7 @@
 //! Direct official APIs (OpenAI Responses, Anthropic Messages, Gemini) can be
 //! added as further [`Provider`] implementations reusing the same events.
 
+pub mod budget;
 pub mod error;
 pub mod event;
 pub mod openrouter;
@@ -71,6 +72,10 @@ pub struct CallInput<'a> {
     pub session_id: Option<String>,
     /// Stable end-user identifier (already hashed).
     pub user: Option<String>,
+    /// Exact token count of a prefix of `history` (from earlier usage), for budgeting.
+    pub known_context: Option<budget::KnownContext>,
+    /// Force this `max_tokens` (after a context-overflow error), unless the user set one.
+    pub max_tokens_override: Option<u64>,
 }
 
 /// A fully built request, inspectable before sending.
@@ -86,12 +91,34 @@ pub struct Prepared {
     /// Notes about input conversion (e.g. text file inlined).
     pub notes: Vec<String>,
     pub show_debug: bool,
+    /// The `max_tokens` the bot chose automatically (None if the user set it or none was set).
+    pub auto_max_tokens: Option<u64>,
+    /// The model supports long decode (continuation hops).
+    pub long_decode: bool,
+}
+
+impl Prepared {
+    /// Request that resumes generation from a continuation item: the same
+    /// conversation plus an assistant turn carrying only that item.
+    pub fn with_continuation(&self, item: &Value) -> Prepared {
+        let mut p = self.clone();
+        if let Some(msgs) = p.body.get_mut("messages").and_then(Value::as_array_mut) {
+            msgs.push(serde_json::json!({"role": "assistant", "content": "", "reasoning_details": [item]}));
+        }
+        p
+    }
+
+    pub fn max_tokens(&self) -> Option<u64> {
+        self.body.get("max_tokens").and_then(Value::as_u64)
+    }
 }
 
 /// Result metadata of a finished (or failed) stream.
 #[derive(Debug, Clone, Default)]
 pub struct CallOutcome {
     pub upstream_id: Option<String>,
+    /// Latest long-decode continuation item of this stream.
+    pub continuation: Option<Value>,
     /// Exact upstream request bodies echoed by the router (OpenRouter `debug`).
     pub upstream_echo: Vec<Value>,
     pub router_metadata: Option<Value>,

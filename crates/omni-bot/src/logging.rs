@@ -40,25 +40,38 @@ pub fn filter_for(level: &str) -> String {
     }
 }
 
-/// Initialize logging. Returns a guard that must be kept alive (flushes the file writer).
-pub fn init(
-    level: &str,
-    timezone: &str,
-    log_dir: Option<&Path>,
-) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+/// Guards that flush the background log writers on drop; keep them alive.
+pub struct LogGuards(#[allow(dead_code)] Vec<tracing_appender::non_blocking::WorkerGuard>);
+
+/// Initialize logging.
+///
+/// Both stdout and the log file are written by background threads so that the
+/// streaming code never waits on I/O, and both are **lossless**
+/// (`lossy(false)`): under extreme load the producer is slowed down instead of
+/// silently dropping lines — verbose logs must contain every raw payload.
+pub fn init(level: &str, timezone: &str, log_dir: Option<&Path>) -> Result<LogGuards> {
     let tz = jiff::tz::TimeZone::get(timezone).unwrap_or(jiff::tz::TimeZone::UTC);
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| filter_for(level));
-    let stdout_layer = fmt::layer().with_timer(Timer { tz: tz.clone() }).with_target(true);
+    let mut guards = Vec::new();
+    let (stdout, g) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(false)
+        .buffered_lines_limit(1 << 16)
+        .finish(std::io::stdout());
+    guards.push(g);
+    let stdout_layer = fmt::layer().with_timer(Timer { tz: tz.clone() }).with_target(true).with_writer(stdout);
     let registry = tracing_subscriber::registry().with(EnvFilter::try_new(&filter)?).with(stdout_layer);
     if let Some(dir) = log_dir {
         std::fs::create_dir_all(dir)?;
         let appender = tracing_appender::rolling::daily(dir, "omni.log");
-        let (writer, guard) = tracing_appender::non_blocking(appender);
+        let (writer, g) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .lossy(false)
+            .buffered_lines_limit(1 << 16)
+            .finish(appender);
+        guards.push(g);
         let file_layer = fmt::layer().with_ansi(false).with_timer(Timer { tz }).with_writer(writer);
         registry.with(file_layer).init();
-        Ok(Some(guard))
     } else {
         registry.init();
-        Ok(None)
     }
+    Ok(LogGuards(guards))
 }

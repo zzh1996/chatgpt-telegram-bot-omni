@@ -13,6 +13,9 @@ use super::catalog::ModelInfo;
 
 pub const DIALECT: &str = "openrouter.chat";
 
+/// `id` of Gemini long-decode continuation items in `reasoning_details`.
+pub const CONTINUATION_ID: &str = "gemini-continuation";
+
 /// Notes produced while converting history (shown to the user for transparency).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ConvertNotes {
@@ -184,6 +187,8 @@ pub struct ChunkParser {
     pub any_output: bool,
     pub upstream_body_echo: Vec<Value>,
     pub router_metadata: Option<Value>,
+    /// Latest long-decode continuation item (`id: "gemini-continuation"`).
+    continuation: Option<Value>,
 }
 
 impl ChunkParser {
@@ -323,6 +328,15 @@ impl ChunkParser {
     /// Merge one streamed `reasoning_details` fragment. Fragments with the same
     /// `index` belong to the same block; string payloads are concatenated.
     fn merge_detail(&mut self, item: &Value) -> Option<StreamEvent> {
+        // Continuation items are complete, opaque and replace each other; never merge them.
+        if item.get("id").and_then(Value::as_str) == Some(CONTINUATION_ID) {
+            let mut it = item.clone();
+            if let Some(o) = it.as_object_mut() {
+                o.remove("index");
+            }
+            self.continuation = Some(it.clone());
+            return Some(StreamEvent::Checkpoint(it));
+        }
         let ty = item.get("type").and_then(Value::as_str).unwrap_or("").to_string();
         let index = item.get("index").and_then(Value::as_u64);
         let pos = index.and_then(|i| {
@@ -380,7 +394,13 @@ impl ChunkParser {
         }
     }
 
-    /// The assistant message as it should be replayed to the same model.
+    /// Latest continuation item seen in this stream, if any.
+    pub fn continuation(&self) -> Option<&Value> {
+        self.continuation.as_ref()
+    }
+
+    /// The assistant message as it should be replayed to the same model
+    /// (continuation items are excluded: they only matter for resuming).
     pub fn native_payload(&self) -> Value {
         let mut m = json!({"role": "assistant", "content": self.content});
         if !self.reasoning_text.is_empty() {

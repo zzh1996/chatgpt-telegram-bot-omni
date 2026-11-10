@@ -108,6 +108,8 @@ async fn call(or: &OpenRouter) -> (Result<Value, omni_llm::LlmError>, Vec<Stream
         history: &history,
         session_id: Some("tg-1".into()),
         user: None,
+        known_context: None,
+        max_tokens_override: None,
     };
     let p = or.prepare_chat(&input, &[], &NoBlobs).await.unwrap();
     let mut events = Vec::new();

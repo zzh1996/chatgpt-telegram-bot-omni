@@ -229,4 +229,50 @@ CREATE TABLE aliases (
     created_at INTEGER NOT NULL
 );
 "#,
+    // ---- v2: resumable checkpoints (long decode) per attempt
+    r#"
+ALTER TABLE attempts ADD COLUMN checkpoint TEXT;   -- JSON: {item, parts, usage, hops, prompt_tokens}
+"#,
+    // ---- v3: one ledger row per billed upstream call (idempotent by generation id),
+    //          and calls whose usage never arrived (looked up later)
+    r#"
+CREATE TABLE usage_ledger_v3 (
+    id INTEGER PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    bot TEXT,
+    chat_id INTEGER,
+    user_id INTEGER,
+    turn_id INTEGER,
+    attempt_id INTEGER,
+    generation_id TEXT UNIQUE,         -- upstream generation / response id
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    cached_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    cost_usd REAL,
+    cost_source TEXT,                  -- reported (in the stream) | fetched (looked up afterwards) | unknown
+    raw TEXT
+);
+INSERT INTO usage_ledger_v3(id, ts, bot, chat_id, user_id, turn_id, attempt_id, provider, model, input_tokens,
+    output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, cost_usd, cost_source, raw)
+  SELECT id, ts, bot, chat_id, user_id, turn_id, attempt_id, provider, model, input_tokens,
+    output_tokens, reasoning_tokens, cached_tokens, cache_write_tokens, cost_usd, cost_source, raw FROM usage_ledger;
+DROP TABLE usage_ledger;
+ALTER TABLE usage_ledger_v3 RENAME TO usage_ledger;
+CREATE INDEX usage_ts ON usage_ledger(ts);
+CREATE INDEX usage_user ON usage_ledger(user_id, ts);
+CREATE INDEX usage_chat ON usage_ledger(chat_id, ts);
+CREATE INDEX usage_attempt ON usage_ledger(attempt_id);
+
+CREATE TABLE pending_costs (
+    generation_id TEXT PRIMARY KEY,
+    attempt_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    tries INTEGER NOT NULL DEFAULT 0,
+    next_at INTEGER NOT NULL
+);
+"#,
 ];

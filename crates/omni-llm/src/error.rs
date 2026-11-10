@@ -89,6 +89,28 @@ impl LlmError {
         self
     }
 
+    /// The request did not fit the context window (prompt + max_tokens).
+    pub fn is_context_overflow(&self) -> bool {
+        if matches!(
+            self.error_type.as_deref(),
+            Some("context_length_exceeded" | "max_tokens_exceeded" | "token_limit_exceeded")
+        ) {
+            return true;
+        }
+        let m = self.message.to_ascii_lowercase();
+        [
+            "maximum context length",
+            "context window",
+            "context length",
+            "too many tokens",
+            "prompt is too long",
+            "max_tokens",
+        ]
+        .iter()
+        .any(|k| m.contains(k))
+            && matches!(self.kind, ErrorKind::Http | ErrorKind::InBand)
+    }
+
     pub fn is_retryable(&self) -> bool {
         !matches!(self.retry, Retry::Never)
     }

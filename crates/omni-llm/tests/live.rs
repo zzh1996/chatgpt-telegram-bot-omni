@@ -70,7 +70,15 @@ async fn live_stream_small_completion() {
     let history = vec![Turn::user_text("Reply with exactly: pong")];
     let opts =
         vec![OptionToken::KeyValue("e".into(), "low".into()), OptionToken::KeyValue("max".into(), "2000".into())];
-    let input = CallInput { model: &model, options: &opts, history: &history, session_id: None, user: None };
+    let input = CallInput {
+        model: &model,
+        options: &opts,
+        history: &history,
+        session_id: None,
+        user: None,
+        known_context: None,
+        max_tokens_override: None,
+    };
     let p = or.prepare_chat(&input, &[], &NoBlobs).await.unwrap();
     println!("request: {}", serde_json::to_string_pretty(&p.body).unwrap());
     let mut text = String::new();

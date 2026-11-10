@@ -155,9 +155,21 @@ impl OpenRouter {
         if let Some(u) = &input.user {
             base["user"] = json!(u);
         }
-        let mut resolved =
-            options::resolve(base, input.model, info.as_deref(), &self.cfg.fidelity, config_presets, input.options)
-                .map_err(LlmError::request)?;
+        let auto_max = match input.max_tokens_override {
+            Some(v) => Some(v),
+            None => self.auto_max_tokens(input, info.as_deref()),
+        };
+        let mut resolved = options::resolve(
+            base,
+            input.model,
+            info.as_deref(),
+            auto_max,
+            &self.cfg.fidelity,
+            config_presets,
+            input.options,
+        )
+        .map_err(LlmError::request)?;
+        let auto_max_tokens = auto_max.filter(|v| resolved.body.get("max_tokens").and_then(Value::as_u64) == Some(*v));
         if notes.needs_file_parser {
             // Force native file handling; detect router-side parsing via annotations.
             let plugins = resolved.body["plugins"].as_array().cloned().unwrap_or_default();
@@ -202,7 +214,80 @@ impl OpenRouter {
             warnings: resolved.warnings,
             notes: notes.notes,
             show_debug: resolved.show_debug,
+            auto_max_tokens,
+            long_decode: self.cfg.fidelity.is_long_decode(input.model),
         })
+    }
+
+    /// The endpoint the request will most likely be served by (pinned provider), from cache.
+    /// Cache misses trigger a background refresh, so request latency never grows.
+    fn cached_endpoint(&self, model: &str, options: &[omni_core::trigger::OptionToken]) -> Option<EndpointInfo> {
+        let user_slug = options.iter().rev().find_map(|o| match o {
+            omni_core::trigger::OptionToken::KeyValue(k, v)
+                if (k == "p" || k == "provider") && v != "any" && v != "auto" =>
+            {
+                v.split('|').next().map(str::to_string)
+            }
+            _ => None,
+        });
+        let slug = user_slug.or_else(|| self.cfg.fidelity.first_party_for(model).map(str::to_string))?;
+        match self.catalog.endpoints(model) {
+            Some(eps) => {
+                let base = slug.split('/').next().unwrap_or(&slug).to_string();
+                eps.iter()
+                    .find(|e| e.tag.as_deref() == Some(slug.as_str()))
+                    .or_else(|| eps.iter().find(|e| e.base_slug() == Some(base.as_str())))
+                    .cloned()
+            }
+            None => {
+                let this = self.clone();
+                let m = model.to_string();
+                tokio::spawn(async move {
+                    let _ = this.endpoints(&m).await;
+                });
+                None
+            }
+        }
+    }
+
+    /// Automatic `max_tokens`: as large as the model allows, within the context window.
+    fn auto_max_tokens(&self, input: &CallInput<'_>, info: Option<&ModelInfo>) -> Option<u64> {
+        let ep = self.cached_endpoint(input.model, input.options);
+        let ctx = ep.as_ref().and_then(|e| e.context_length).or(info.and_then(|i| i.context_length));
+        let prompt = crate::budget::estimate_prompt(input.history, input.known_context);
+        if self.cfg.fidelity.is_long_decode(input.model) {
+            // Long decode: the budget spans several continuation hops; the context window is unified in+out.
+            return crate::budget::choose(ctx, Some(self.cfg.fidelity.long_decode_budget), None, prompt);
+        }
+        let model_max = ep
+            .as_ref()
+            .and_then(|e| e.max_completion_tokens)
+            .or(info.and_then(|i| i.top_provider.max_completion_tokens));
+        crate::budget::choose(ctx, model_max, self.cfg.fidelity.max_tokens_cap, prompt)
+    }
+
+    /// Prefetch endpoint metadata (startup), so budgeting never waits on the network.
+    pub async fn warm_endpoints(&self, models: &[String]) {
+        for m in models {
+            if let Err(e) = self.endpoints(m).await {
+                debug!(model = %m, error = %format!("{e:#}"), "endpoint prefetch failed");
+            }
+        }
+    }
+
+    /// `GET /generation/content?id=` (requires Input & Output Logging on the account):
+    /// the stored prompt and the output *as delivered before any disconnect*.
+    pub async fn generation_content(&self, id: &str) -> anyhow::Result<Option<Value>> {
+        let resp = self
+            .auth(self.http.get(self.url("/generation/content")).query(&[("id", id)]))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let v: Value = resp.error_for_status()?.json().await?;
+        Ok(v.get("data").cloned())
     }
 
     /// `engine: "native"` web search silently falls back to Exa on endpoints
@@ -369,6 +454,7 @@ impl OpenRouter {
         }
         outcome.upstream_echo = std::mem::take(&mut cp.upstream_body_echo);
         outcome.router_metadata = cp.router_metadata.take();
+        outcome.continuation = cp.continuation().cloned();
         match result {
             Err(e) => (Err(e), outcome),
             Ok(()) => {

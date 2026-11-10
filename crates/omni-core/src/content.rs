@@ -94,6 +94,11 @@ pub struct NativeOutput {
     pub model: String,
     /// Dialect-specific payload (e.g. the assistant message object for chat completions).
     pub payload: Value,
+    /// Tokens of the whole conversation up to and including this turn, as
+    /// reported by the provider for this model (prompt + completion). Used to
+    /// budget `max_tokens` of later turns without guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,6 +243,7 @@ mod tests {
                 dialect: "openrouter.chat".into(),
                 model: "x/y".into(),
                 payload: serde_json::json!({"role": "assistant", "content": "answer"}),
+                context_tokens: Some(12),
             }),
         };
         let s = serde_json::to_string(&t).unwrap();

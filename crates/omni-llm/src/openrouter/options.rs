@@ -47,6 +47,10 @@ pub struct FidelityConfig {
     /// some models; OpenRouter reserves credit for `max_tokens`, so an unbounded value
     /// can cause 402s under concurrency). `None` = no cap.
     pub max_tokens_cap: Option<u64>,
+    /// Model patterns with Gemini-style "long decode" (output beyond the
+    /// per-request limit via continuation tokens) and their total budget.
+    pub long_decode: Vec<String>,
+    pub long_decode_budget: u64,
 }
 
 impl FidelityConfig {
@@ -57,7 +61,17 @@ impl FidelityConfig {
             require_parameters: true,
             disable_context_compression: true,
             max_tokens_cap: Some(393_216),
+            long_decode: vec!["google/gemini-4*".into()],
+            long_decode_budget: 393_216,
         }
+    }
+
+    pub fn is_long_decode(&self, model: &str) -> bool {
+        let base = model.split(':').next().unwrap_or(model);
+        self.long_decode.iter().any(|p| match p.strip_suffix('*') {
+            Some(prefix) => base.starts_with(prefix),
+            None => base == p,
+        })
     }
 
     pub fn first_party_for(&self, model: &str) -> Option<&str> {
@@ -80,6 +94,7 @@ pub fn default_first_party() -> Vec<(String, String)> {
         ("meta-llama", "meta"),
         ("minimax", "minimax"),
         ("xiaomi", "xiaomi"),
+        ("bytedance-seed", "seed"),
     ]
     .into_iter()
     .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -110,6 +125,7 @@ pub fn resolve(
     base: Value,
     model: &str,
     info: Option<&ModelInfo>,
+    auto_max_tokens: Option<u64>,
     fidelity: &FidelityConfig,
     config_presets: &[(String, Value)],
     options: &[OptionToken],
@@ -142,8 +158,7 @@ pub fn resolve(
     // 2. auto-max presets from the catalog
     if !pure && let Some(info) = info {
         let mut p = json!({});
-        if let Some(max) = info.top_provider.max_completion_tokens {
-            let max = fidelity.max_tokens_cap.map_or(max, |c| max.min(c));
+        if let Some(max) = auto_max_tokens {
             p["max_tokens"] = json!(max);
         }
         if info.supports("reasoning") {
@@ -323,8 +338,16 @@ mod tests {
 
     #[test]
     fn defaults_are_max_and_pinned() {
-        let r =
-            resolve(base(), "anthropic/claude-opus-5.5", Some(&info()), &FidelityConfig::standard(), &[], &[]).unwrap();
+        let r = resolve(
+            base(),
+            "anthropic/claude-opus-5.5",
+            Some(&info()),
+            Some(128000),
+            &FidelityConfig::standard(),
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(
             r.body["provider"],
             json!({"allow_fallbacks": false, "require_parameters": true, "only": ["anthropic"]})
@@ -342,8 +365,16 @@ mod tests {
             OptionToken::Flag("s".into()),
             OptionToken::Json(json!({"max_tokens": 10})),
         ];
-        let r = resolve(base(), "anthropic/claude-opus-5.5", Some(&info()), &FidelityConfig::standard(), &[], &opts)
-            .unwrap();
+        let r = resolve(
+            base(),
+            "anthropic/claude-opus-5.5",
+            Some(&info()),
+            Some(128000),
+            &FidelityConfig::standard(),
+            &[],
+            &opts,
+        )
+        .unwrap();
         assert_eq!(r.body["reasoning"], json!({"effort": "low"}));
         assert_eq!(r.body["max_tokens"], json!(10));
         assert_eq!(r.body["tools"][0]["type"], "openrouter:web_search");
@@ -353,18 +384,27 @@ mod tests {
     #[test]
     fn any_provider_unpins() {
         let opts = vec![OptionToken::KeyValue("p".into(), "any".into())];
-        let r = resolve(base(), "anthropic/claude-opus-5.5", Some(&info()), &FidelityConfig::standard(), &[], &opts)
-            .unwrap();
+        let r = resolve(
+            base(),
+            "anthropic/claude-opus-5.5",
+            Some(&info()),
+            Some(128000),
+            &FidelityConfig::standard(),
+            &[],
+            &opts,
+        )
+        .unwrap();
         assert!(r.body.get("provider").is_none());
     }
 
     #[test]
     fn old_style_flags() {
         let opts = vec![OptionToken::Flag("s4W".into())];
-        let r = resolve(base(), "google/gemini-x", None, &FidelityConfig::standard(), &[], &opts).unwrap();
+        let r = resolve(base(), "google/gemini-x", None, None, &FidelityConfig::standard(), &[], &opts).unwrap();
         assert_eq!(r.body["image_config"], json!({"image_size": "4K", "aspect_ratio": "16:9"}));
         assert!(
-            resolve(base(), "x/y", None, &FidelityConfig::standard(), &[], &[OptionToken::Flag("zzz".into())]).is_err()
+            resolve(base(), "x/y", None, None, &FidelityConfig::standard(), &[], &[OptionToken::Flag("zzz".into())])
+                .is_err()
         );
     }
 }

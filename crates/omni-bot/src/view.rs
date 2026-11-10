@@ -39,6 +39,8 @@ pub struct RenderState {
     pub started: Instant,
     pub elapsed_override: Option<Duration>,
     pub images: usize,
+    /// Completed long-decode continuation hops.
+    pub hops: u32,
     pub show_usage: bool,
     pub mode: Mode,
     /// Final state: sync it and stop.
@@ -66,6 +68,7 @@ impl RenderState {
             mode: self.mode,
             raw_ai,
             images: self.images,
+            hops: self.hops,
         })
     }
 }

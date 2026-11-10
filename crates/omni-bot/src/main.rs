@@ -9,6 +9,7 @@ mod conv;
 mod handler;
 mod intake;
 mod jobs;
+mod ledger;
 mod logging;
 mod media;
 mod rawlog;
@@ -106,6 +107,8 @@ async fn run(cfg: Config) -> Result<()> {
             require_parameters: orc.require_parameters,
             disable_context_compression: true,
             max_tokens_cap: (orc.max_tokens_cap > 0).then_some(orc.max_tokens_cap),
+            long_decode: orc.long_decode.clone(),
+            long_decode_budget: orc.long_decode_budget,
         },
         echo_upstream_body: orc.echo_upstream_body,
         router_metadata: true,
@@ -160,6 +163,26 @@ async fn run(cfg: Config) -> Result<()> {
     }
     handler::recover(app.clone()).await?;
     jobs::recover(app.clone()).await?;
+    ledger::spawn_settler(app.clone());
+
+    // Prefetch endpoint limits of the configured models, so `max_tokens` budgeting never waits.
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut models: Vec<String> = app
+                .aliases
+                .read()
+                .values()
+                .filter_map(|s| omni_core::trigger::parse_spec(s).ok())
+                .map(|t| t.model.strip_prefix("openrouter:").unwrap_or(&t.model).to_string())
+                .filter(|m| m.contains('/'))
+                .collect();
+            models.sort();
+            models.dedup();
+            app.openrouter.warm_endpoints(&models).await;
+            info!(models = models.len(), "prefetched endpoint limits");
+        });
+    }
 
     // Periodic catalog refresh.
     {

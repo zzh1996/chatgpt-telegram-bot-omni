@@ -58,6 +58,8 @@ pub struct ComposeInput<'a> {
     /// Show AI-generated content as raw Markdown (fallback after Telegram rejected the rendering).
     pub raw_ai: bool,
     pub images: usize,
+    /// Completed long-decode continuation hops (0 = single request).
+    pub hops: u32,
 }
 
 fn label(s: &str) -> RText {
@@ -282,6 +284,16 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         Status::Failed if inp.error.is_none() => {
             out.push(RBlock::Paragraph(RText::concat(vec![RText::plain("⚠️ "), label("Failed")])));
         }
+        Status::Done => {
+            if let Some(why) = abnormal_finish(inp.finish_reason) {
+                let native = inp.native_finish_reason.map(|n| format!(" ({n})")).unwrap_or_default();
+                out.push(RBlock::Paragraph(RText::concat(vec![
+                    RText::plain("⚠️ "),
+                    label("Incomplete"),
+                    RText::plain(format!(" {why} — finish_reason: {}{native}", inp.finish_reason.unwrap_or_default())),
+                ])));
+            }
+        }
         _ => {}
     }
 
@@ -324,6 +336,9 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     if let Some(p) = inp.provider {
         f.push(format!("via {p}"));
     }
+    if inp.hops > 0 {
+        f.push(format!("long decode: {} hops", inp.hops + 1));
+    }
     if let Some(fr) = inp.finish_reason
         && fr != "stop"
     {
@@ -334,6 +349,16 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         out.push(RBlock::Footer(RText::plain(f.join(" · "))));
     }
     out
+}
+
+/// Why a successfully streamed answer may be incomplete, from its finish reason.
+fn abnormal_finish(fr: Option<&str>) -> Option<&'static str> {
+    match fr? {
+        "length" => Some("the output limit was reached"),
+        "content_filter" => Some("stopped by the provider's content filter"),
+        "error" => Some("the provider stopped the generation with an error"),
+        _ => None,
+    }
 }
 
 fn pretty(v: &Value) -> String {
@@ -477,6 +502,7 @@ mod tests {
             mode: Mode::Clean,
             raw_ai: false,
             images: 0,
+            hops: 0,
         }
     }
 
