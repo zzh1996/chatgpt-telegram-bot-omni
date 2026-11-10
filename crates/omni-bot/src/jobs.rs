@@ -329,6 +329,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         elapsed_override: None,
         images: 0,
         hops: 0,
+        continuation: false,
         show_usage: true,
         mode: app.cfg.render.markdown,
         done: false,
@@ -838,6 +839,7 @@ async fn run_attempt(
         } else {
             (None, ctx.reply_to)
         };
+        state.continuation = append_mode;
         let first_delay = Duration::from_secs_f64(app.cfg.render.first_flush_delay_secs);
         let view =
             ReplyView::start(app.clone(), ctx.bot.clone(), ctx.chat_id, reply_to, ctx.turn_id, attempt.id, first_delay);

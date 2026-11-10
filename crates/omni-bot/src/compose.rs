@@ -62,6 +62,8 @@ pub struct ComposeInput<'a> {
     pub images: usize,
     /// Completed long-decode continuation hops (0 = single request).
     pub hops: u32,
+    /// This attempt continues a finished answer (`/continue`).
+    pub continuation: bool,
 }
 
 pub fn label(s: &str) -> RText {
@@ -267,7 +269,9 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     if !inp.options.is_empty() {
         f.push(inp.options.to_string());
     }
-    if inp.attempt > 1 {
+    if inp.continuation {
+        f.push("continued".into());
+    } else if inp.attempt > 1 {
         f.push(format!("attempt {}/{}", inp.attempt, inp.max_attempts));
     }
     let hidden = match opaque {
@@ -302,7 +306,7 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
             f.push(fmt_cost(c));
         }
     }
-    if finished {
+    if finished && !inp.elapsed.is_zero() {
         f.push(format!("{:.1}s", inp.elapsed.as_secs_f64()));
     }
     if let Some(p) = inp.provider {
@@ -468,6 +472,7 @@ mod tests {
             raw_ai: false,
             images: 0,
             hops: 0,
+            continuation: false,
         }
     }
 

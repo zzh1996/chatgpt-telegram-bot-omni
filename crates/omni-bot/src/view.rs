@@ -41,6 +41,8 @@ pub struct RenderState {
     pub images: usize,
     /// Completed long-decode continuation hops.
     pub hops: u32,
+    /// This attempt continues a finished answer (`/continue`).
+    pub continuation: bool,
     pub show_usage: bool,
     pub mode: Mode,
     /// Final state: sync it and stop.
@@ -69,6 +71,7 @@ impl RenderState {
             raw_ai,
             images: self.images,
             hops: self.hops,
+            continuation: self.continuation,
         })
     }
 }

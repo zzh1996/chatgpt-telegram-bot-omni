@@ -359,39 +359,67 @@ async fn target_turn(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result
     Ok(Some(conv::get_turn(&app.db, turn_id).await?))
 }
 
+/// Raw answers up to this size are sent inline (code block with a copy button), longer ones as a file.
+const RAW_INLINE_MAX: usize = 2000;
+
 async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
     let mut md = String::new();
+    let mut reasoning = String::new();
+    let mut answer = String::new();
     for p in &t.turn.parts {
         match p {
             Part::Reasoning(r) => {
                 if let Some(text) = &r.text {
                     let kind = if r.kind == ReasoningKind::Summary { "reasoning summary" } else { "reasoning" };
                     md.push_str(&format!("<!-- {kind} -->\n{text}\n<!-- end {kind} -->\n\n"));
+                    if !reasoning.is_empty() {
+                        reasoning.push_str("\n\n");
+                    }
+                    reasoning.push_str(text);
                 }
             }
-            Part::Text { text, .. } => md.push_str(text),
-            Part::Refusal { text } => md.push_str(&format!("<!-- refusal -->\n{text}\n")),
+            Part::Text { text, .. } => {
+                md.push_str(text);
+                answer.push_str(text);
+            }
+            Part::Refusal { text } => {
+                md.push_str(&format!("<!-- refusal -->\n{text}\n"));
+                answer.push_str(text);
+            }
             _ => {}
         }
     }
-    let name = format!("answer-{}.md", t.id);
-    let link = Link { turn_id: -(ib.msg_id as i64), attempt_id: None, part_index: 9000 };
-    if let Err(e) = outbox::send_file(
-        &app.db,
-        bot,
-        ib.chat_id,
-        Some(ib.msg_id),
-        md.into_bytes(),
-        &name,
-        "text/markdown",
-        false,
-        "",
-        link,
-    )
-    .await
-    {
-        say(app, bot, ib, &format!("⚠️ {e}")).await;
+    if answer.chars().count() <= RAW_INLINE_MAX && reasoning.chars().count() <= 28_000 {
+        let mut blocks = Vec::new();
+        if !reasoning.is_empty() {
+            blocks.push(RBlock::Details {
+                open: false,
+                title: RText::plain("💭 Reasoning (raw)"),
+                blocks: vec![RBlock::Pre { text: reasoning, language: "markdown".into() }],
+            });
+        }
+        blocks.push(RBlock::Pre { text: answer, language: "markdown".into() });
+        reply::send_blocks(app, bot, ib.chat_id, ib.msg_id, blocks).await;
+    } else {
+        let name = format!("answer-{}.md", t.id);
+        let link = Link { turn_id: -(ib.msg_id as i64), attempt_id: None, part_index: 9000 };
+        if let Err(e) = outbox::send_file(
+            &app.db,
+            bot,
+            ib.chat_id,
+            Some(ib.msg_id),
+            md.into_bytes(),
+            &name,
+            "text/markdown",
+            false,
+            "",
+            link,
+        )
+        .await
+        {
+            say(app, bot, ib, &format!("⚠️ {e}")).await;
+        }
     }
     let mut i = 0;
     for p in &t.turn.parts {
