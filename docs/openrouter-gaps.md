@@ -75,6 +75,7 @@
 | 功能 | 官方 API 能做什么 | 为什么 OpenRouter 做不到 | 来源 |
 |---|---|---|---|
 | `web_search` 的部分参数 | `filters.blocked_domains`、`external_web_access`（只用缓存/离线）、`return_token_budget`、图片搜索（`search_content_types` + `image_settings`） | 任何 `web_search`/`web_search_preview` 工具都会被提升为 `openrouter:web_search`，只带 OR 自己的参数：后三者没有，`excluded_domains` 对 OpenAI 原生搜索被静默忽略 | OA§3.1, OA§10.2, OR§5.1–5.2 |
+| `code_interpreter` 的执行输出和生成的文件 | `include: ["code_interpreter_call.outputs"]` 返回执行日志和图片输出；生成的文件（图表等）经 `container_file_citation` + 容器文件接口下载 | 工具本身能透传并执行，但：CC 的流里没有任何 `code_interpreter_call` 项（只有加密推理，index 中间有缺口）；RSP 能看到 `code` 和 `container_id`，带了 `include` 后 `outputs` 仍是 `null`；回答里只有 `sandbox:/mnt/data/…` 链接，没有可下载的途径 | 实测 2026-11-11（`gpt-6-luna`，CC 与 RSP 各一次） |
 
 **疑似缺口（待实测）**
 
@@ -114,6 +115,7 @@
 |---|---|---|---|
 | 托管 agent | Interactions API 的 `agent`（Deep Research 等） | OR 没有 Interactions 或 agent 接口 | GE§2.2, GE§10 |
 | 其它内置工具 | URL context、代码执行、Google Maps grounding、File Search、Computer Use、MCP，以及与函数工具组合（`includeServerSideToolInvocations`） | endpoint 的 `native_tools` 只有 `google_search`；`openrouter:web_fetch`、`shell` 是 OR 自己执行的 | GE§1.8, GE§10, GE§11 |
+| 图像模型的"思考草稿图" | Gemini 3 图像模型在思考中生成最多两张中间草稿图（`thought: true` 的 inline image part），`includeThoughts` 时随思考一起返回 | 两次实测（`gemini-nano-banana-2.1`，effort low 和默认 high）流里只有推理文字和最终图片，没有任何思考阶段的图片；OR 文档也没有返回它们的方式 | GE§1.3, 实测 2026-11-11 |
 | Google Search 的时间范围与图片搜索 | `googleSearch.timeRangeFilter`、`searchTypes.imageSearch` | 只能经 `openrouter:web_search`（原生映射为 `google_search`），它的参数里没有这两项 | GE§1.8, GE§10, OR§5.1 |
 | 显式缓存 `cachedContents` | 创建命名缓存、自定义 TTL（默认 1 h）、跨请求复用（Gemini 4 本身不支持显式缓存） | 只有 `cache_control` 断点：只用最后一个，第一条 system 不可变，TTL 固定 5 分钟；没有 `cachedContents` API | GE§1.2, GE§9, GE§10, OR§10 |
 

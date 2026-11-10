@@ -22,7 +22,14 @@
 | D14 | 重启恢复：API 能取回结果的就在原消息上更新、不重试；做不到的（OpenRouter 上除 Gemini 4 long decode 外都做不到）允许重试。 |
 | D15 | 回复排版（看过实际消息后定的）：紧凑；不用下划线和斜体；第一行只写模型（不写用户输入的前缀/alias）；用量、费用用末尾小字；推理块显示 token 数而不是字符数；不要 "Answer" 标签。"防伪"只要求结构可无歧义地解析回去——专业的人能准确指出哪部分是模型最终输出——不需要强烈的视觉标记。 |
 | D16 | `$` 后面的正文原样发送：通常不加空格（`c$你好`），加了空格就表示正文开头真的要有空格。 |
-| D17 | 缺口文档（docs/openrouter-gaps.md）只写**真缺口**：官方能做到、OpenRouter 无论怎么配置都做不到的；格式、参数、默认值差异另放 docs/openrouter-fidelity.md。 |
+| D17 | 缺口文档（docs/openrouter-gaps.md）只写**真缺口**：官方能做到、OpenRouter 无论怎么配置都做不到的；格式、参数、默认值差异另放 docs/openrouter-fidelity.md。OpenRouter 不支持的功能记为缺口，不在本地补。 |
+| D18 | 不做独立的 relay 进程（重启时的续流）：重启时除 Gemini 4 long decode 外按重试处理。 |
+| D19 | 一条回复尽量一条消息：图片嵌在富消息里（带尺寸/大小/格式说明），`/raw`、`/info` 也是一条消息；只有超过 Telegram 的客观上限才拆分。 |
+| D20 | 小字里展开显示请求实际的设置（推理强度始终显示，选项/补丁/预设改动的字段逐项描述），让用户确认选项被正确理解。错误只显示会变化的部分。 |
+| D21 | 日志默认永久保存。 |
+| D22 | 只有一个进程处理所有 bot，所以群里不认识的前缀直接报错（每个群只由一个 bot 报）。 |
+| D23 | 上游提供方白名单（配置 `allowed_providers`，按模型厂商）：只允许厂商自己和官方云（如 Gemini ↔ Vertex、GPT ↔ Azure），不允许任意第三方或 OpenRouter 自由路由。 |
+| D24 | 所有人（包括管理员）默认用平台默认服务等级；只有 `[access].priority_users` 里的人可以指定更贵的高优先级等级（priority/fast/ultrafast、Anthropic fast、`:nitro`、tier endpoint），名单内的人默认也不是高优先级。 |
 
 ## 假设（可推翻）
 
@@ -43,7 +50,7 @@
 
 ## 已知限制 / 待办（按优先级）
 
-1. **重启时真正的"续流"**：OpenRouter 无状态，除 Gemini 4 long decode（已实现：checkpoint 落盘，重启后在原消息上接着写）外，重启只能重试；`/generation/content` 只能补回断开前已送达的文本（已用于填充被打断的那条消息）。可选方案：一个很少重启的独立 relay 进程持有上游连接并缓冲 SSE，bot 重启后从 relay 接着读（待作者决定）。
+1. **重启时的续流**：OpenRouter 无状态，除 Gemini 4 long decode（已实现：checkpoint 落盘，重启后在原消息上接着写）外，重启只能重试；`/generation/content` 只能补回断开前已送达的文本（已用于填充被打断的那条消息）。（不做 relay 进程，D18。）
 2. **方舟 provider 未经真实请求验证**（等 `ARK_API_KEY`）：`max_tokens` 的真实上限、`encrypted_content` 回传、`detail:"xhigh"`、错误码。
 3. **OpenAI 走 Responses 方言**（`phase`、加密推理项）——目前都走 Chat Completions；OpenRouter 文档称 CC 缺 `phase` 会导致早停。
 4. **Anthropic 走 Messages 方言**（原生 thinking 签名块、`thinking.display`、引用块、工具变更块）。

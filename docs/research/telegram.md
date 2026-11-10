@@ -106,10 +106,13 @@ defaults from [TD:OptionManager.cpp#L219-L223].
 
 | Limit | Value | appConfig key |
 |---|---|---|
-| Total text | ≤ 32768 "UTF-8 characters" (code points; **UNVERIFIED** unit), **including custom-emoji alt text and formula source** | `rich_message_length_limit` |
-| Blocks | ≤ 500 "including nested blocks, list items, ordered list items, table rows, quotation blocks, and details blocks" | `rich_message_max_blocks` |
+| Total text | ≤ 32768 **Unicode code points** in all text of all blocks (paragraphs, code, table cells, details titles, formula sources, captions), **verified 2026-11-11** (32768 ASCII or CJK or 16385 emoji accepted, 32769 → `RICH_MESSAGE_TEXT_TOO_LONG`) | `rich_message_length_limit` |
+| **Per text string** | **Silently truncated to 70000 UTF-8 bytes** — no error. If the cut falls inside a character the string is stored **empty** (23334 CJK = 70002 B → empty paragraph; an empty code block/cell is then rejected), otherwise the tail is lost (17501 emoji → 17500). Several adjacent text nodes are fine (4×8192 CJK in one paragraph = 98 KB intact; no per-message byte limit). Verified 2026-11-11 by reading messages back | – |
+| Normalization | Stored text: tab, CR, NUL and other C0 controls → space (also in code blocks); U+2028 → line break; U+2029 → space; U+007F, U+0085, zero-width/BOM/RTL marks, combining marks, ZWJ sequences kept. Verified 2026-11-11 | – |
+| Blocks | ≤ 500, counting nested blocks, list items, ordered list items, table rows, quotation blocks and details blocks; **table cells do not count**. Verified 2026-11-11 (501 → `RICH_MESSAGE_BLOCKS_TOO_MANY`) | `rich_message_max_blocks` |
 | Nesting | ≤ 16 levels "of nested formatting and blocks" | `rich_message_max_depth` |
-| Media | ≤ 50 attachments in total | `rich_message_max_media` |
+| Media | ≤ 50 photo/document references per message — the same photo counts each time it appears. Verified 2026-11-11 (51 → `RICH_MESSAGE_MEDIA_TOO_MANY`) | `rich_message_max_media` |
+| Empty content | Rejected (`RICH_MESSAGE_CONTENT_REQUIRED`): empty preformatted, heading, footer, collapsed quote; list without items or item without blocks; quote/details without blocks; table without rows; empty math (`…MATH_SOURCE_REQUIRED`); a message of only a divider (`RICH_MESSAGE_EMPTY`). Accepted: empty paragraph, empty cell, empty inline spans, whitespace-only code. Verified 2026-11-11 | – |
 | Table | ≤ 20 columns (rows count as blocks) | `rich_message_max_table_cols` |
 | Button row | 1–8 buttons (`InputRichBlockButtons`) | – |
 | Map | width+height ≤ 10000, ratio ≤ 20, zoom 0–24 (`InputRichBlockMap`) | – |

@@ -16,7 +16,7 @@ spec   := <模型>[+<选项>...]
 - `author/model$`：任意 OpenRouter 模型 ID，新模型无需改配置。群里只接受目录里存在的 ID（避免误触发）；本地目录里没有时会先立即刷新一次目录再判断，所以刚上线的模型也能马上用。私聊会直接把错误告诉你。
 - `ark:<模型 ID>$`：直连火山方舟（豆包），见下文"火山方舟"。
 - 多个 spec 用逗号分隔，会并行生成多条回答（上限见 `max_parallel_specs`）。多 bot 部署时，每个 spec 由负责该模型的 bot 回答。
-- 第一行没有 `$`、或前缀不认识：群里静默忽略；私聊会提示。
+- 第一行没有 `$`：不触发。前缀看起来像模型名（只含字母、数字和 `._:/-`）但不认识：直接报错（群里只由一个 bot 报）；像 `it costs 5$` 这样带空格的文字不算前缀。
 
 ### 选项
 
@@ -32,8 +32,8 @@ spec   := <模型>[+<选项>...]
 | `max=<n>` | `max_tokens` |
 | `t=` `top_p=` `top_k=` `seed=` | 采样参数 |
 | `v=<…>` | `verbosity` |
-| `tier=<flex\|priority\|…>` | `service_tier`（自动把对应的 tier endpoint 加进固定 provider 列表） |
-| `p=<slug>[\|<slug>…]` | 指定 provider（如 `p=google-vertex`）；`p=any` 交给 OpenRouter 默认路由（允许 fallback） |
+| `tier=<flex\|priority\|…>` | `service_tier`（自动把对应的 tier endpoint 加进固定 provider 列表）。默认大家都用平台默认等级；`flex`（更便宜）谁都能用；`priority`/`fast`/`ultrafast` 等更贵的等级只有 `[access].priority_users` 里的人能指定 |
+| `p=<slug>[\|<slug>…]` | 换成该模型的另一个**官方**提供方，如 Gemini `p=google-vertex`、GPT `p=azure`、Claude `p=amazon-bedrock`（白名单见配置 `allowed_providers`；区域如 `google-vertex/us` 也行）。不允许任意第三方，也没有 `p=any` |
 | `img` / `text` | 输出模态 image+text / 仅 text |
 | `1k` `2k` `4k` / `size=` | 图片尺寸 `image_config.image_size` |
 | `ar=16:9` 及旧写法 `S W H w h` | 图片宽高比 1:1 16:9 9:16 4:3 3:4 |
@@ -128,8 +128,10 @@ Hello!
 +s · in 1,234 (cached 1,000) · out 567 · $0.0123 · 12.3s · via Anthropic   ← 小字：选项、用量、费用
 ```
 
+- 模型生成的图片直接嵌在回答里它出现的位置，图下小字标注尺寸、文件大小和格式；一条回复尽量就是一条消息，只有超过 Telegram 的上限（32768 字、500 块、50 个图片/文件）才拆成多条。
 - **结构无歧义（防伪）**：每条回复消息的第一行是模型名；除此之外 bot 加的所有东西都在折叠块或小字页脚里，而模型输出的 Markdown 永远渲染不出这两种块（`<details>` 等 HTML 一律按字面显示）。所以任何人都能准确指出哪部分是模型的回答。
-- 超过一条富消息的上限（32768 字 / 500 块）会自动拆成多条，后续消息第一行是 `🤖 模型 · part N`。
+- 超过一条富消息的上限会自动拆成多条，后续消息第一行是 `🤖 模型 · part N`。
+- Telegram 会把每段超过 70000 字节的文字静默截断（切在字符中间时整段变空），bot 会把长文字拆成多个文本节点发送来避免；回复发完后还会读回比对，若仍被改动，就在消息里附上原始 Markdown。
 - 某个块（如超过 20 列的表格、嵌套过深的列表）无法用富消息表达时，该块显示为原始 Markdown；整条富消息被 Telegram 拒绝时，模型部分改为原始 Markdown 再发；仍被拒绝才退回纯文本。Telegram 不接受的空结构（例如结尾多出的一个 ```` ``` ````、流式中刚打开的代码块）会被自动处理。
 - `render.markdown = "raw"` 时模型输出始终以原始 Markdown 展示。
 - 失败的尝试会保留在原消息中（附错误），重试在新消息里进行；bot 重启打断的生成也一样（原消息标注"interrupted"）。Gemini 4 的 long decode 例外：从最近的 checkpoint 在原消息里接着写。
@@ -142,8 +144,8 @@ Hello!
 | `/help` `/help options` | 帮助 / 选项列表 |
 | `/models [关键词]` | 当前 bot 负责的 alias；带关键词则搜索 OpenRouter 目录 |
 | `/model <alias 或 ID>` | 模型能力（模态、推理档位、最大输出、价格）及各 endpoint（是否第一方、量化） |
-| 回复 + `/raw` | 该回答的原始 Markdown：短回答直接发在代码块里（推理在折叠块里），长回答发 `.md` 文件；以及原图/原文件 |
-| 回复 + `/info` | 请求详情：每次尝试的请求体（blob 以哈希代替）、应用的补丁来源、上游 ID、用量、错误、OpenRouter 回显的上游请求 |
+| 回复 + `/raw` | 一条消息：该回答的原始 Markdown（短的直接放代码块，推理在折叠块里；长的、或含 Telegram 会改写的字符如制表符时附 `.md` 文件），以及原图/原文件（附件） |
+| 回复 + `/info` | 一条消息：请求摘要，附完整的请求详情 JSON（每次尝试的请求体、补丁来源、上游 ID、用量、错误、上游回显） |
 | 回复 + `/retry` | 重新生成一个失败的回答 |
 | 回复 + `/continue` | 让停在 long decode 预算上的回答（Gemini 4）接着写：新内容在新消息里，并入同一轮对话 |
 | 回复 + `/m spec$正文` | 换模型继续 |
