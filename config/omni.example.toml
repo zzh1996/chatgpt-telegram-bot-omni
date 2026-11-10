@@ -44,7 +44,7 @@ allowed_users = []             # private-chat users; manage with /allow_user
 [providers.openrouter]
 api_key = "${OPENROUTER_API_KEY}"
 # base_url = "https://openrouter.ai/api/v1"
-# Fidelity defaults (see docs/openrouter-gaps.md). Per request: `+p=<slug>` / `+p=any`.
+# Fidelity defaults (see docs/openrouter-fidelity.md). Per request: `+p=<slug>` / `+p=any`.
 pin_first_party = true         # provider.only = [model creator's own endpoint], no fallbacks
 require_parameters = true      # never let OpenRouter silently drop parameters
 echo_upstream_body = true      # log the exact upstream request (also in /info)

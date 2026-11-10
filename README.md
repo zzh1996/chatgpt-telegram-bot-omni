@@ -46,7 +46,8 @@ docker compose logs -f
 - [docs/usage.md](docs/usage.md) — 用户手册（语法、选项、命令、管理）
 - [docs/architecture.md](docs/architecture.md) — 架构、数据模型、可靠性设计
 - [docs/decisions.md](docs/decisions.md) — 设计决策记录、已知限制与待办
-- [docs/openrouter-gaps.md](docs/openrouter-gaps.md) — **通过 OpenRouter 体验到的模型与官方 API 的差异（按厂商）**
+- [docs/openrouter-gaps.md](docs/openrouter-gaps.md) — **官方 API 能做、经 OpenRouter 无论怎么配置都做不到的功能（按厂商，含待实测的疑似项）**
+- [docs/openrouter-fidelity.md](docs/openrouter-fidelity.md) — 经 OpenRouter 时与直连官方的差异：路由、注入的默认值、参数映射、错误归一化、断连计费，以及 bot 的规避措施
 - [docs/research/](docs/research/) — 各家官方 API、OpenRouter、Telegram 的调研笔记（2026-11-11）
 
 ## 开发
