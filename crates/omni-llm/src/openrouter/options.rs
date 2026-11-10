@@ -112,8 +112,8 @@ summary=<s>                 reasoning summary: auto|concise|detailed
 max=<n>                     max output tokens
 t=<x> | temp=<x>            temperature;  top_p=<x>  top_k=<n>  seed=<n>
 v=<x> | verbosity=<x>       verbosity: low|medium|high|xhigh|max
-tier=<x>                    service tier: auto|default|flex|priority|...
-p=<slug>[|<slug>...]        pin provider(s) (p=any: let OpenRouter route, fallbacks allowed)
+tier=<x>                    service tier: flex (cheaper); priority/fast only for users on the priority list
+p=<slug>[|<slug>...]        another official provider of this model, e.g. p=google-vertex, p=azure (whitelist)
 img | text                  output modalities image+text / text only
 ar=<w:h> | 1k | 2k | 4k     image aspect ratio / size (S W H w h = 1:1 16:9 9:16 4:3 3:4)
 pure                        no automatic max-capability presets

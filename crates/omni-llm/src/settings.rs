@@ -17,13 +17,14 @@ pub fn describe(p: &Prepared) -> Vec<String> {
     for a in &p.applied {
         let s = a.source.as_str();
         if (s.starts_with("option:") || s == "json" || s.starts_with("preset:"))
-            && let Some(o) = a.patch.as_object() {
-                for k in o.keys() {
-                    if !touched.contains(k) {
-                        touched.push(k.clone());
-                    }
+            && let Some(o) = a.patch.as_object()
+        {
+            for k in o.keys() {
+                if !touched.contains(k) {
+                    touched.push(k.clone());
                 }
             }
+        }
     }
     let mut out = Vec::new();
     // Reasoning: always.

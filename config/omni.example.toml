@@ -40,6 +40,8 @@ default_model = "gpt"          # used by a bare `$text`
 admins = []                    # your Telegram user id(s); /whoami shows it
 allowed_chats = []             # seeded into the ACL at start; manage at runtime with /allow, /deny
 allowed_users = []             # private-chat users; manage with /allow_user
+priority_users = []            # may request higher-priority (pricier) tiers: +tier=priority, fast modes.
+                               # Nobody (admins included) gets them by default.
 
 [providers.openrouter]
 api_key = "${OPENROUTER_API_KEY}"
@@ -56,6 +58,13 @@ long_decode = ["google/gemini-4*"]
 long_decode_budget = 393216
 # Stable per-user hash sent as `user` (abuse attribution); leave empty to not send it.
 user_id_salt = "${OPENROUTER_USER_SALT:-}"
+# Official providers users may switch to with `+p=<slug>` (per model author;
+# base slugs, regions included). Built-in defaults: openai = openai, azure,
+# amazon-bedrock; anthropic = anthropic, amazon-bedrock, google-vertex, azure,
+# claude-on-aws; google = google-ai-studio, google-vertex; x-ai = xai,
+# amazon-bedrock; open-weight vendors only their own endpoint. Override e.g.:
+# [providers.openrouter.allowed_providers]
+# google = ["google-ai-studio", "google-vertex"]
 # Override the author -> first-party provider mapping:
 # [providers.openrouter.first_party]
 # google = "google-vertex"

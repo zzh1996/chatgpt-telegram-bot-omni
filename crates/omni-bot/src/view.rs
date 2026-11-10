@@ -123,6 +123,10 @@ impl ReplyView {
     /// Push the final state and wait until Telegram shows it. Returns message ids.
     pub async fn finish(self, mut s: RenderState) -> Vec<i32> {
         s.done = true;
+        // Freeze the time shown, so that re-renders (read-back check, retries) are identical.
+        if s.elapsed_override.is_none() {
+            s.elapsed_override = Some(s.started.elapsed());
+        }
         let _ = self.tx.send(Some(s));
         self.task.await.unwrap_or_default()
     }
@@ -310,6 +314,9 @@ async fn verify(
 /// Attach the exact model output as a Markdown file, with a note.
 async fn attach_original(app: &App, turn_id: i64, st: &mut RenderState) -> anyhow::Result<()> {
     let md = compose::raw_markdown(&st.parts);
+    if md.is_empty() {
+        anyhow::bail!("no model output to attach");
+    }
     let blob = app.blobs.put(md.into_bytes(), "text/markdown".into()).await?;
     let filename = format!("answer-{turn_id}.md");
     st.attachments.push(Attachment { key: format!("{}/{filename}", blob.sha256), filename, blob });

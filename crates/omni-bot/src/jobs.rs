@@ -246,7 +246,7 @@ impl Ctx {
             max_tokens_override,
         };
         let blobs = Blobs(self.app.blobs.clone());
-        match self.spec.provider.as_str() {
+        let p = match self.spec.provider.as_str() {
             "ark" => match &self.app.ark {
                 Some(ark) => ark.prepare_chat(&input, &presets, &blobs).await,
                 None => Err(LlmError::request(
@@ -254,7 +254,10 @@ impl Ctx {
                 )),
             },
             _ => self.app.openrouter.prepare_chat(&input, &presets, &blobs).await,
-        }
+        }?;
+        crate::policy::check(&self.app, self.user_id, &self.spec.provider, &self.spec.model, &p.body)
+            .map_err(LlmError::request)?;
+        Ok(p)
     }
 
     fn call_meta(&self, attempt_id: i64) -> crate::ledger::CallMeta {

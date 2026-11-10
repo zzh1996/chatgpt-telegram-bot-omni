@@ -223,6 +223,8 @@ pub struct Metrics {
     pub blocks: usize,
     pub depth: usize,
     pub max_table_cols: usize,
+    /// Photo/document references.
+    pub media: usize,
 }
 
 impl Metrics {
@@ -231,6 +233,7 @@ impl Metrics {
         self.blocks += o.blocks;
         self.depth = self.depth.max(o.depth);
         self.max_table_cols = self.max_table_cols.max(o.max_table_cols);
+        self.media += o.media;
     }
 }
 
@@ -246,6 +249,7 @@ impl RBlock {
             m.blocks += c.blocks;
             m.depth = m.depth.max(1 + c.depth);
             m.max_table_cols = m.max_table_cols.max(c.max_table_cols);
+            m.media += c.media;
         };
         match self {
             RBlock::Paragraph(t)
@@ -256,6 +260,9 @@ impl RBlock {
             | RBlock::Document { caption: t, .. } => {
                 m.chars = t.chars();
                 m.depth = 1 + t.depth();
+                if matches!(self, RBlock::Photo { .. } | RBlock::Document { .. }) {
+                    m.media = 1;
+                }
             }
             RBlock::Pre { text, .. } => m.chars = text.chars().count(),
             RBlock::Math(s) => m.chars = s.chars().count(),
@@ -269,6 +276,7 @@ impl RBlock {
                     m.blocks += im.blocks;
                     m.depth = m.depth.max(1 + im.depth);
                     m.max_table_cols = m.max_table_cols.max(im.max_table_cols);
+                    m.media += im.media;
                 }
             }
             RBlock::Quote { blocks } => child(blocks, &mut m),
@@ -305,11 +313,14 @@ pub struct RichLimits {
     pub max_blocks: usize,
     pub max_depth: usize,
     pub max_table_cols: usize,
+    /// Photo/document references per message (the same photo counts each time).
+    pub max_media: usize,
 }
 
 impl RichLimits {
+    /// Measured against the live API (2026-11-11).
     pub const TELEGRAM: RichLimits =
-        RichLimits { max_chars: 32768, max_blocks: 500, max_depth: 16, max_table_cols: 20 };
+        RichLimits { max_chars: 32768, max_blocks: 500, max_depth: 16, max_table_cols: 20, max_media: 50 };
 }
 
 /// Make blocks acceptable to Telegram, which rejects empty content in most
@@ -657,7 +668,8 @@ pub fn split_blocks(blocks: Vec<RBlock>, limits: RichLimits) -> Vec<Vec<RBlock>>
     let mut msgs: Vec<Vec<RBlock>> = Vec::new();
     let mut cur: Vec<RBlock> = Vec::new();
     let mut cur_m = Metrics::default();
-    let fits = |m: &Metrics| m.chars <= limits.max_chars && m.blocks <= limits.max_blocks;
+    let fits =
+        |m: &Metrics| m.chars <= limits.max_chars && m.blocks <= limits.max_blocks && m.media <= limits.max_media;
     let mut queue: std::collections::VecDeque<RBlock> = blocks.into();
     while let Some(b) = queue.pop_front() {
         let m = b.metrics();
@@ -958,7 +970,7 @@ mod tests {
 
     #[test]
     fn split_respects_limits() {
-        let lim = RichLimits { max_chars: 1000, max_blocks: 20, max_depth: 16, max_table_cols: 20 };
+        let lim = RichLimits { max_chars: 1000, max_blocks: 20, max_depth: 16, max_table_cols: 20, max_media: 50 };
         let mut blocks = Vec::new();
         for i in 0..30 {
             blocks.push(RBlock::Paragraph(RText::plain(format!("paragraph {i} {}", "x".repeat(80)))));
@@ -996,7 +1008,10 @@ mod tests {
         for end in 0..=full.len() {
             if full.is_char_boundary(end) {
                 let b = markdown_to_blocks(&full[..end], 1, RichLimits::TELEGRAM);
-                let _ = split_blocks(b, RichLimits { max_chars: 40, max_blocks: 5, max_depth: 16, max_table_cols: 20 });
+                let _ = split_blocks(
+                    b,
+                    RichLimits { max_chars: 40, max_blocks: 5, max_depth: 16, max_table_cols: 20, max_media: 50 },
+                );
             }
         }
     }
@@ -1032,5 +1047,18 @@ mod normalize_tests {
         assert_eq!(expand_tabs("\tx\n a\tb"), "    x\n a  b");
         let b = sanitize(vec![RBlock::Pre { text: "a\r\n\tb".into(), language: "go".into() }]);
         assert_eq!(b, vec![RBlock::Pre { text: "a\n    b".into(), language: "go".into() }]);
+    }
+}
+
+#[cfg(test)]
+mod media_limit_tests {
+    use super::*;
+
+    #[test]
+    fn at_most_50_media_per_message() {
+        let blocks: Vec<RBlock> =
+            (0..120).map(|i| RBlock::Photo { key: format!("k{i}"), caption: RText::plain("") }).collect();
+        let pages = split_blocks(blocks, RichLimits::TELEGRAM);
+        assert_eq!(pages.iter().map(Vec::len).collect::<Vec<_>>(), vec![50, 50, 20]);
     }
 }

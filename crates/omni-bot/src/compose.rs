@@ -309,11 +309,15 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     {
         if let Some(x) = u.input_tokens {
             let mut s = format!("in {}", fmt_tokens(x));
+            let mut cache = Vec::new();
             if let Some(c) = u.cached_input_tokens.filter(|c| *c > 0) {
-                s.push_str(&format!(" (cached {})", fmt_tokens(c)));
+                cache.push(format!("cached {}", fmt_tokens(c)));
             }
             if let Some(c) = u.cache_write_tokens.filter(|c| *c > 0) {
-                s.push_str(&format!(" (cache write {})", fmt_tokens(c)));
+                cache.push(format!("cache write {}", fmt_tokens(c)));
+            }
+            if !cache.is_empty() {
+                s.push_str(&format!(" ({})", cache.join(", ")));
             }
             f.push(s);
         }
@@ -381,8 +385,19 @@ fn error_extra(details: &Value) -> Option<Value> {
         return Some(details.clone());
     };
     // Fields that are the same for every error (or noise) at the top level.
-    const OUTER_NOISE: &[&str] =
-        &["error", "user_id", "id", "object", "created", "model", "choices", "system_fingerprint"];
+    // (`openrouter_metadata` / `metadata.debug` describe the request, shown by /info.)
+    const OUTER_NOISE: &[&str] = &[
+        "error",
+        "user_id",
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+        "system_fingerprint",
+        "openrouter_metadata",
+    ];
+    const META_NOISE: &[&str] = &["debug", "is_byok"];
     let (err, outer) = match obj.get("error").and_then(Value::as_object) {
         Some(e) => (e, Some(obj)),
         None => (obj, None),
@@ -403,7 +418,7 @@ fn error_extra(details: &Value) -> Option<Value> {
             ("message", _) => {}
             ("code", Value::Number(_)) => {} // the HTTP status, already in the title
             ("metadata", Value::Object(m)) => {
-                for (mk, mv) in m {
+                for (mk, mv) in m.iter().filter(|(k, _)| !META_NOISE.contains(&k.as_str())) {
                     // `raw` is often the upstream error as a JSON string: show it parsed.
                     let mv = match mv.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
                         Some(parsed) if parsed.is_object() || parsed.is_array() => parsed,

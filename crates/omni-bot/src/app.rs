@@ -25,6 +25,8 @@ pub struct App {
     pub openrouter: OpenRouter,
     /// Volcengine Ark, when configured.
     pub ark: Option<omni_llm::ark::Ark>,
+    /// Official providers per model author that users may pick (`+p=`).
+    pub allowed_providers: BTreeMap<String, Vec<String>>,
     /// Bots in config order.
     pub bots: Vec<Arc<BotConn>>,
     /// (bot name, chat id) pairs where the bot is known to be a member.

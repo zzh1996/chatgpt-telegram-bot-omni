@@ -123,6 +123,9 @@ pub struct Access {
     pub allowed_chats: Vec<i64>,
     /// Users allowed to use the bot in private chat at first start.
     pub allowed_users: Vec<i64>,
+    /// Users who may ask for higher-priority (more expensive) service tiers
+    /// (`+tier=priority`, fast modes). Nobody gets them by default.
+    pub priority_users: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -203,6 +206,10 @@ pub struct OpenRouterConfig {
     /// Cap for the automatic max_tokens (0 = no cap).
     #[serde(default = "default_max_tokens_cap")]
     pub max_tokens_cap: u64,
+    /// Official providers users may pick with `+p=<slug>`, per model author
+    /// (base slugs; regions included). Overrides the built-in list per author.
+    #[serde(default)]
+    pub allowed_providers: BTreeMap<String, Vec<String>>,
     /// Models (glob patterns) that support Gemini-style long decode
     /// (continuation hops); `max_tokens` is then a total budget across hops.
     #[serde(default = "default_long_decode")]

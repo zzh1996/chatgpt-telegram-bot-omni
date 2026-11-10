@@ -14,6 +14,7 @@ mod jobs;
 mod ledger;
 mod logging;
 mod media;
+mod policy;
 mod rawlog;
 mod reply;
 mod store;
@@ -158,6 +159,11 @@ async fn run(cfg: Config) -> Result<()> {
         blobs,
         openrouter,
         ark,
+        allowed_providers: {
+            let mut m = policy::default_allowed_providers();
+            m.extend(orc.allowed_providers.clone());
+            m
+        },
         bots: bots.clone(),
         membership: Mutex::new(HashSet::new()),
         aliases: RwLock::new(BTreeMap::new()),
