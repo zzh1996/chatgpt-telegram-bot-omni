@@ -193,7 +193,9 @@ pub fn parse_trigger(text: &str) -> Result<Option<Trigger>, TriggerError> {
         }
         specs.push(SpecToken { model, options, raw: raw_spec.to_string() });
     }
-    Ok(Some(Trigger { specs, text: rest.trim_start().to_string() }))
+    // The text after `$` is sent exactly as typed: `c$hi` sends "hi", while
+    // `c$ hi` sends " hi" (a leading space is deliberate).
+    Ok(Some(Trigger { specs, text: rest.to_string() }))
 }
 
 /// A segment of user-authored history.
@@ -261,9 +263,12 @@ mod tests {
 
     #[test]
     fn simple() {
-        let t = parse_trigger("c$ hello").unwrap().unwrap();
+        let t = parse_trigger("c$hello").unwrap().unwrap();
         assert_eq!(t.specs, vec![spec("c", vec![], "c")]);
         assert_eq!(t.text, "hello");
+        // Whitespace after `$` is part of the message.
+        assert_eq!(parse_trigger("c$ hello").unwrap().unwrap().text, " hello");
+        assert_eq!(parse_trigger("c$\nhello").unwrap().unwrap().text, "\nhello");
     }
 
     #[test]
@@ -296,7 +301,7 @@ mod tests {
 
     #[test]
     fn json_option_with_specials() {
-        let t = parse_trigger(r#"c+{"stop":["$","a,b+c"],"x":{"y":1}}$ go"#).unwrap().unwrap();
+        let t = parse_trigger(r#"c+{"stop":["$","a,b+c"],"x":{"y":1}}$go"#).unwrap().unwrap();
         assert_eq!(t.specs.len(), 1);
         match &t.specs[0].options[0] {
             OptionToken::Json(v) => assert_eq!(v["stop"][0], "$"),

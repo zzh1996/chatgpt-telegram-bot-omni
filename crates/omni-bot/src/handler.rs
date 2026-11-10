@@ -126,7 +126,13 @@ pub async fn resolve_specs(
     let mut out = Vec::new();
     let mut unknown = Vec::new();
     for s in specs {
-        match app.resolve_spec(s, cfg, strict).await? {
+        let mut resolved = app.resolve_spec(s, cfg, strict).await?;
+        if resolved.is_none() && strict && app.plausible_model_id(s) {
+            // Maybe a brand-new model: check a fresh catalog before giving up.
+            app.refresh_catalog_if_older(std::time::Duration::from_secs(20)).await;
+            resolved = app.resolve_spec(s, cfg, strict).await?;
+        }
+        match resolved {
             Some(spec) => {
                 if app.responsible_bot(chat_id, &spec.canonical(), &bot.name).as_deref() == Some(bot.name.as_str()) {
                     out.push(spec);

@@ -48,6 +48,11 @@ pin_first_party = true         # provider.only = [model creator's own endpoint],
 require_parameters = true      # never let OpenRouter silently drop parameters
 echo_upstream_body = true      # log the exact upstream request (also in /info)
 max_tokens_cap = 393216        # cap for the automatic max_tokens (0 = model maximum)
+# Gemini long decode: models answering past the per-request output limit in
+# several continuation hops. Their max_tokens is a total budget across hops;
+# replying /continue to an answer that hit it extends it by the same amount.
+long_decode = ["google/gemini-4*"]
+long_decode_budget = 393216
 # Stable per-user hash sent as `user` (abuse attribution); leave empty to not send it.
 user_id_salt = "${OPENROUTER_USER_SALT:-}"
 # Override the author -> first-party provider mapping:
@@ -203,6 +208,27 @@ spec = "openrouter:qwen/qwen3.7-max"
 [[aliases]]
 name = "qp"
 spec = "openrouter:qwen/qwen3.6-plus"
+
+# ByteDance Doubao (Seed) — on OpenRouter; the flagship doubao-seed-2-1-pro is
+# only available on Volcengine Ark (direct provider: planned).
+[[aliases]]
+name = "dbt"
+spec = "openrouter:bytedance-seed/seed-2-1-turbo"
+[[aliases]]
+name = "db2l"
+spec = "openrouter:bytedance-seed/seed-2.0-lite"
+[[aliases]]
+name = "db2m"
+spec = "openrouter:bytedance-seed/seed-2.0-mini"
+[[aliases]]
+name = "db2c"
+spec = "openrouter:bytedance-seed/seed-2.0-code"
+[[aliases]]
+name = "db16"
+spec = "openrouter:bytedance-seed/seed-1.6"
+[[aliases]]
+name = "db16f"
+spec = "openrouter:bytedance-seed/seed-1.6-flash"
 
 # ------------------------------------------------------------------ presets
 # Extra default request parameters by model pattern (JSON merge patch on the

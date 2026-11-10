@@ -9,15 +9,11 @@ use crate::app::App;
 use crate::tg::bot::BotConn;
 use crate::tg::outbox::{self, Content, Link, SendError, SendReq};
 
-/// Send a short bot-generated notice replying to `reply_to`. The text is shown
-/// as plain text with an underlined bot label (so it can never be mistaken for
-/// model output).
+/// Send a short bot-generated notice replying to `reply_to`, as plain text.
+/// (It cannot be mistaken for model output: model replies always start with
+/// the `🤖 model` header line.)
 pub async fn notice(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, reply_to: i32, text: &str) {
-    let blocks = vec![RBlock::Paragraph(RText::concat(vec![
-        RText::underline(RText::bold(RText::plain("bot"))),
-        RText::plain(" "),
-        RText::plain(text),
-    ]))];
+    let blocks = vec![RBlock::Paragraph(RText::plain(text))];
     send_blocks(app, bot, chat_id, reply_to, blocks).await;
 }
 

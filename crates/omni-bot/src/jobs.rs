@@ -21,7 +21,6 @@ use crate::app::App;
 use crate::compose::Status;
 use crate::conv::{self, AttemptRow, AttemptUpdate, ResolvedSpec, TurnRow, TurnStatus};
 use crate::rawlog::{Blobs, RawLog};
-use crate::store::now_ms;
 use crate::tg::bot::BotConn;
 use crate::tg::outbox::{self, Link};
 use crate::view::{RenderState, ReplyView};

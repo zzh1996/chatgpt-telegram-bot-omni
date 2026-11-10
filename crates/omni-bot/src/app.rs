@@ -152,6 +152,32 @@ impl App {
         Ok(Some(ResolvedSpec { provider, model, label, options, raw: token.raw.clone() }))
     }
 
+    /// Whether `token` looks like a full OpenRouter model id (`author/model`),
+    /// possibly one that is too new for the cached catalog.
+    pub fn plausible_model_id(&self, token: &SpecToken) -> bool {
+        let m = token.model.strip_prefix("openrouter:").unwrap_or(&token.model);
+        let Some((author, model)) = m.split_once('/') else { return false };
+        let ok = |s: &str, extra: &str| {
+            !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c) || extra.contains(c))
+        };
+        ok(author, "") && ok(model, ":") && !self.aliases.read().contains_key(&token.model)
+    }
+
+    /// Refresh the catalog now unless it was refreshed in the last `max_age`
+    /// (concurrent callers share one refresh). For ids missing from the cache.
+    pub async fn refresh_catalog_if_older(&self, max_age: std::time::Duration) {
+        static LOCK: tokio::sync::Mutex<i64> = tokio::sync::Mutex::const_new(0);
+        let mut last = LOCK.lock().await;
+        if now_ms() - *last < max_age.as_millis() as i64 {
+            return;
+        }
+        match self.openrouter.refresh_catalog().await {
+            Ok(n) => tracing::info!(models = n, "refreshed the model catalog for an unknown model id"),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "catalog refresh failed"),
+        }
+        *last = now_ms();
+    }
+
     /// Refresh the model catalog in the background (at most once a minute).
     pub fn refresh_catalog_soon(&self) {
         use std::sync::atomic::{AtomicI64, Ordering};

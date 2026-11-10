@@ -352,6 +352,11 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
         if chat_id > 0 {
             return Some(Kind::Trigger); // let the handler explain what is wrong
         }
+        // Possibly a model newer than the cached catalog: the handler checks it
+        // against a fresh catalog (never blocking this loop).
+        if t.specs.iter().any(|s| app.plausible_model_id(s)) {
+            return Some(Kind::Trigger);
+        }
         return None;
     }
     if chat_id > 0 && m.media.is_none() {

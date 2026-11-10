@@ -58,7 +58,9 @@ pub fn init(level: &str, timezone: &str, log_dir: Option<&Path>) -> Result<LogGu
         .buffered_lines_limit(1 << 16)
         .finish(std::io::stdout());
     guards.push(g);
-    let stdout_layer = fmt::layer().with_timer(Timer { tz: tz.clone() }).with_target(true).with_writer(stdout);
+    let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let stdout_layer =
+        fmt::layer().with_ansi(ansi).with_timer(Timer { tz: tz.clone() }).with_target(true).with_writer(stdout);
     let registry = tracing_subscriber::registry().with(EnvFilter::try_new(&filter)?).with(stdout_layer);
     if let Some(dir) = log_dir {
         std::fs::create_dir_all(dir)?;

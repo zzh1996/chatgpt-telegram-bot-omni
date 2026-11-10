@@ -6,6 +6,7 @@ mod commands;
 mod compose;
 mod config;
 mod conv;
+mod devinject;
 mod handler;
 mod intake;
 mod jobs;
@@ -164,6 +165,9 @@ async fn run(cfg: Config) -> Result<()> {
     handler::recover(app.clone()).await?;
     jobs::recover(app.clone()).await?;
     ledger::spawn_settler(app.clone());
+    if let Some(dir) = &cfg.dev.inject_dir {
+        devinject::spawn(app.clone(), dir.clone());
+    }
 
     // Prefetch endpoint limits of the configured models, so `max_tokens` budgeting never waits.
     {

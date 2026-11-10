@@ -34,6 +34,19 @@ pub struct Config {
     pub retry: RetryConfig,
     #[serde(default)]
     pub log: LogConfig,
+    #[serde(default)]
+    pub dev: DevConfig,
+}
+
+/// Developer/testing aids (all off by default).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DevConfig {
+    /// Watch this directory for `*.json` simulated user messages
+    /// (`{"chat_id":..,"user_id":..,"text":"..","reply_to":null,"bot":"main"}`):
+    /// the bot posts each one visibly as a "simulated message" and handles it
+    /// exactly like a real one. For end-to-end tests without a user account.
+    pub inject_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

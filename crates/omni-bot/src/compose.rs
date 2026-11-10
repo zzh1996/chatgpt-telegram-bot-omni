@@ -1,18 +1,20 @@
 //! Composition of a reply into rich blocks.
 //!
 //! Layout (top to bottom):
-//! 1. header: `🤖 label` (underlined = bot label) + model id and options;
+//! 1. header line: `🤖 model`;
 //! 2. reasoning: collapsible details (open only while thinking, before any answer);
 //! 3. tool calls: collapsible details;
 //! 4. the model's answer (rendered Markdown, or raw Markdown in raw mode / fallback);
 //! 5. sources: collapsible details;
-//! 6. bot notes, errors (verbatim upstream JSON), retry status;
-//! 7. footer: usage, cost, timing, finish reason, serving provider.
+//! 6. errors: collapsible details (verbatim upstream JSON inside);
+//! 7. small-text footers: status and notes, then options, usage, cost, timing, provider.
 //!
-//! Security: everything the bot adds is marked with an *underlined* label or
-//! lives in block types the Markdown renderer never emits (details, footer).
-//! Model output can therefore never impersonate reasoning, bot notes, errors
-//! or usage information.
+//! Unambiguous by structure, without visual marking: the first line of every
+//! reply message is the bot's header, and everything else the bot adds is a
+//! collapsible details block or a footer — block types the Markdown renderer
+//! never produces from model output. So any reader can tell exactly which part
+//! is the model's answer; model output cannot pass for reasoning, errors,
+//! notes or usage.
 
 use std::time::Duration;
 
@@ -62,8 +64,17 @@ pub struct ComposeInput<'a> {
     pub hops: u32,
 }
 
-fn label(s: &str) -> RText {
-    RText::underline(RText::bold(RText::plain(s)))
+pub fn label(s: &str) -> RText {
+    RText::bold(RText::plain(s))
+}
+
+/// The first line of every reply message.
+fn header(model: &str, part: Option<usize>) -> RBlock {
+    let mut t = vec![RText::plain("🤖 "), label(model)];
+    if let Some(p) = part {
+        t.push(RText::plain(format!(" · part {p}")));
+    }
+    RBlock::Paragraph(RText::concat(t))
 }
 
 fn fmt_tokens(n: u64) -> String {
@@ -94,28 +105,8 @@ fn ai_blocks(md: &str, raw: bool, base_depth: usize) -> Vec<RBlock> {
 
 pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     let raw = inp.raw_ai || inp.mode == Mode::Raw;
-    let mut out = Vec::new();
-
-    // 1. header
-    let mut head = vec![RText::plain("🤖 "), label(inp.label)];
-    let mut detail = String::new();
-    if inp.label != inp.model {
-        detail.push_str(inp.model);
-    }
-    if !inp.options.is_empty() {
-        if !detail.is_empty() {
-            detail.push(' ');
-        }
-        detail.push_str(inp.options);
-    }
-    if !detail.is_empty() {
-        head.push(RText::plain("  "));
-        head.push(RText::italic(RText::plain(detail)));
-    }
-    if inp.attempt > 1 {
-        head.push(RText::plain(format!("  ·  attempt {}/{}", inp.attempt, inp.max_attempts)));
-    }
-    out.push(RBlock::Paragraph(RText::concat(head)));
+    let finished = !matches!(inp.status, Status::Generating | Status::Queued);
+    let mut out = vec![header(inp.model, None)];
 
     // 2. reasoning
     let mut reasoning = String::new();
@@ -137,26 +128,18 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
             }
         }
     }
+    let reasoning_tokens = inp.usage.and_then(|u| u.reasoning_tokens).filter(|r| *r > 0);
     let has_answer = inp.parts.iter().any(|p| matches!(p, Part::Text { text, .. } if !text.trim().is_empty()));
+    let mut tokens_in_title = false;
     if !reasoning.is_empty() {
         let what = if kinds.iter().all(|k| *k == ReasoningKind::Summary) { "Reasoning summary" } else { "Reasoning" };
-        let title = RText::concat(vec![
-            RText::plain("💭 "),
-            label(what),
-            RText::plain(format!(" · {} chars", reasoning.chars().count())),
-        ]);
+        let mut title = format!("💭 {what}");
+        if finished && let Some(r) = reasoning_tokens {
+            title.push_str(&format!(" · {} tokens", fmt_tokens(r)));
+            tokens_in_title = true;
+        }
         let open = inp.status == Status::Generating && !has_answer;
-        out.push(RBlock::Details { open, title, blocks: ai_blocks(&reasoning, raw, 1) });
-    } else if let Some(k) = opaque {
-        let what = match k {
-            ReasoningKind::Redacted => "redacted by the provider",
-            _ => "encrypted, not visible",
-        };
-        out.push(RBlock::Paragraph(RText::concat(vec![
-            RText::plain("💭 "),
-            label("Reasoning"),
-            RText::plain(format!(": {what}")),
-        ])));
+        out.push(RBlock::Details { open, title: RText::plain(title), blocks: ai_blocks(&reasoning, raw, 1) });
     }
 
     // 3. tool calls
@@ -182,16 +165,12 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
             .collect();
         out.push(RBlock::Details {
             open: false,
-            title: RText::concat(vec![
-                RText::plain("🔧 "),
-                label("Tool calls"),
-                RText::plain(format!(" · {}", tools.len())),
-            ]),
+            title: RText::plain(format!("🔧 Tool calls · {}", tools.len())),
             blocks: vec![RBlock::List { items }],
         });
     }
 
-    // 4. answer
+    // 4. answer (and refusals, which are model output but not the answer)
     let mut answer = String::new();
     let mut citations = Vec::new();
     for p in inp.parts {
@@ -200,25 +179,16 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
                 answer.push_str(text);
                 citations.extend(c.iter().cloned());
             }
-            Part::Refusal { text } => {
-                out.push(RBlock::Paragraph(RText::concat(vec![RText::plain("⛔ "), label("Refusal")])));
-                out.push(RBlock::Pre { text: text.clone(), language: String::new() });
-            }
+            Part::Refusal { text } => out.push(RBlock::Details {
+                open: true,
+                title: RText::plain("⛔ Refusal"),
+                blocks: vec![RBlock::Paragraph(RText::plain(text.clone()))],
+            }),
             _ => {}
         }
     }
     if !answer.trim().is_empty() {
-        if !reasoning.is_empty() || !tools.is_empty() {
-            out.push(RBlock::Paragraph(RText::concat(vec![RText::plain("💬 "), label("Answer")])));
-        }
         out.extend(ai_blocks(&answer, raw, 0));
-    }
-    if inp.images > 0 {
-        out.push(RBlock::Paragraph(RText::concat(vec![
-            RText::plain("🖼 "),
-            label(&format!("{} image{}", inp.images, if inp.images == 1 { "" } else { "s" })),
-            RText::plain(" (sent as separate messages)"),
-        ])));
     }
 
     // 5. sources
@@ -241,73 +211,74 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
             .collect();
         out.push(RBlock::Details {
             open: false,
-            title: RText::concat(vec![
-                RText::plain("📚 "),
-                label("Sources"),
-                RText::plain(format!(" · {}", sources.len())),
-            ]),
+            title: RText::plain(format!("📚 Sources · {}", sources.len())),
             blocks: vec![RBlock::OrderedList { start: 1, items }],
         });
     }
 
-    // 6. notes, errors
-    for n in inp.notes {
-        out.push(RBlock::Paragraph(RText::concat(vec![
-            RText::plain("ℹ️ "),
-            label("Note"),
-            RText::plain(format!(" {n}")),
-        ])));
-    }
+    // 6. error
     if let Some(e) = inp.error {
-        let mut head = vec![RText::plain("⚠️ "), label("Error")];
-        head.push(RText::plain(format!(" (attempt {}/{}): {}", inp.attempt, inp.max_attempts, e)));
-        out.push(RBlock::Paragraph(RText::concat(head)));
-        if let Some(d) = &e.details {
-            out.push(RBlock::Pre { text: pretty(d), language: "json".into() });
+        let title = format!("⚠️ Error: {e}");
+        match &e.details {
+            Some(d) => out.push(RBlock::Details {
+                open: false,
+                title: RText::plain(title),
+                blocks: vec![RBlock::Pre { text: pretty(d), language: "json".into() }],
+            }),
+            None => out.push(RBlock::Footer(RText::plain(title))),
         }
     }
+
+    // 7. footers: status and notes, then the summary line
+    let mut lines: Vec<String> = Vec::new();
     match &inp.status {
-        Status::Retrying { in_secs } => out.push(RBlock::Paragraph(RText::concat(vec![
-            RText::plain("🔁 "),
-            label("Retrying"),
-            RText::plain(format!(
-                " in {in_secs}s (attempt {}/{}) — continues in a new message",
-                inp.attempt + 1,
-                inp.max_attempts
-            )),
-        ]))),
-        Status::Interrupted => out.push(RBlock::Paragraph(RText::concat(vec![
-            RText::plain("⚠️ "),
-            label("Interrupted"),
-            RText::plain(" by a bot restart — retrying in a new message"),
-        ]))),
-        Status::Failed if inp.error.is_none() => {
-            out.push(RBlock::Paragraph(RText::concat(vec![RText::plain("⚠️ "), label("Failed")])));
-        }
+        Status::Retrying { in_secs } => lines.push(format!("🔁 retrying in {in_secs}s — continues in a new message")),
+        Status::Interrupted => lines.push("⚠️ interrupted by a bot restart — retrying in a new message".into()),
+        Status::Failed if inp.error.is_none() => lines.push("⚠️ failed".into()),
         Status::Done => {
             if let Some(why) = abnormal_finish(inp.finish_reason) {
-                let native = inp.native_finish_reason.map(|n| format!(" ({n})")).unwrap_or_default();
-                out.push(RBlock::Paragraph(RText::concat(vec![
-                    RText::plain("⚠️ "),
-                    label("Incomplete"),
-                    RText::plain(format!(" {why} — finish_reason: {}{native}", inp.finish_reason.unwrap_or_default())),
-                ])));
+                let native = inp.native_finish_reason.map(|n| format!(" / {n}")).unwrap_or_default();
+                lines.push(format!(
+                    "⚠️ incomplete: {why} (finish_reason: {}{native})",
+                    inp.finish_reason.unwrap_or_default()
+                ));
             }
         }
         _ => {}
     }
+    if inp.images > 0 {
+        lines.push(format!(
+            "🖼 {} image{} sent as separate messages",
+            inp.images,
+            if inp.images == 1 { "" } else { "s" }
+        ));
+    }
+    for n in inp.notes {
+        lines.push(format!("ℹ️ {n}"));
+    }
+    out.extend(lines.into_iter().map(|l| RBlock::Footer(RText::plain(l))));
 
-    // 7. footer
     let mut f: Vec<String> = Vec::new();
     match inp.status {
         Status::Queued => f.push("⏳ queued".into()),
         Status::Generating => f.push(format!("⏳ generating · {}s", inp.elapsed.as_secs())),
         _ => {}
     }
+    if !inp.options.is_empty() {
+        f.push(inp.options.to_string());
+    }
+    if inp.attempt > 1 {
+        f.push(format!("attempt {}/{}", inp.attempt, inp.max_attempts));
+    }
+    let hidden = match opaque {
+        Some(_) if !reasoning.is_empty() => None,
+        Some(ReasoningKind::Redacted) => Some("redacted"),
+        Some(_) => Some("not shown"),
+        None => None,
+    };
     if inp.show_usage
         && let Some(u) = inp.usage
     {
-        let mut t = Vec::new();
         if let Some(x) = u.input_tokens {
             let mut s = format!("in {}", fmt_tokens(x));
             if let Some(c) = u.cached_input_tokens.filter(|c| *c > 0) {
@@ -316,21 +287,22 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
             if let Some(c) = u.cache_write_tokens.filter(|c| *c > 0) {
                 s.push_str(&format!(" (cache write {})", fmt_tokens(c)));
             }
-            t.push(s);
+            f.push(s);
         }
         if let Some(x) = u.output_tokens {
             let mut s = format!("out {}", fmt_tokens(x));
-            if let Some(r) = u.reasoning_tokens.filter(|r| *r > 0) {
-                s.push_str(&format!(" (reasoning {})", fmt_tokens(r)));
+            match (reasoning_tokens, tokens_in_title, hidden) {
+                (Some(r), false, Some(h)) => s.push_str(&format!(" (reasoning {}, {h})", fmt_tokens(r))),
+                (Some(r), false, None) => s.push_str(&format!(" (reasoning {})", fmt_tokens(r))),
+                _ => {}
             }
-            t.push(s);
+            f.push(s);
         }
         if let Some(c) = u.cost_usd {
-            t.push(fmt_cost(c));
+            f.push(fmt_cost(c));
         }
-        f.extend(t);
     }
-    if !matches!(inp.status, Status::Generating | Status::Queued) {
+    if finished {
         f.push(format!("{:.1}s", inp.elapsed.as_secs_f64()));
     }
     if let Some(p) = inp.provider {
@@ -341,9 +313,9 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     }
     if let Some(fr) = inp.finish_reason
         && fr != "stop"
+        && abnormal_finish(Some(fr)).is_none()
     {
-        let native = inp.native_finish_reason.map(|n| format!(" ({n})")).unwrap_or_default();
-        f.push(format!("finish: {fr}{native}"));
+        f.push(format!("finish: {fr}"));
     }
     if !f.is_empty() {
         out.push(RBlock::Footer(RText::plain(f.join(" · "))));
@@ -368,31 +340,24 @@ fn pretty(v: &Value) -> String {
     }
 }
 
-/// Split a composed document into Telegram messages; continuation messages get a short header.
-pub fn paginate(label_text: &str, blocks: Vec<RBlock>) -> Vec<Vec<RBlock>> {
+/// Split a composed document into Telegram messages; continuation messages get the header line too.
+pub fn paginate(model: &str, blocks: Vec<RBlock>) -> Vec<Vec<RBlock>> {
     let lim = RichLimits { max_chars: 32_000, max_blocks: 480, ..RichLimits::TELEGRAM };
-    let pages = rich::split_blocks(blocks, lim);
+    let pages = rich::split_blocks(rich::sanitize(blocks), lim);
     pages
         .into_iter()
         .enumerate()
         .map(|(i, mut p)| {
             if i > 0 {
-                p.insert(
-                    0,
-                    RBlock::Paragraph(RText::concat(vec![
-                        RText::plain("🤖 "),
-                        label(label_text),
-                        RText::plain(format!("  ·  part {}", i + 1)),
-                    ])),
-                );
+                p.insert(0, header(model, Some(i + 1)));
             }
             p
         })
         .collect()
 }
 
-/// Last-resort classic text rendering (no rich blocks): bot labels underlined,
-/// everything else plain text.
+/// Last-resort classic text rendering (no rich blocks): the same structure as
+/// plain text, details as expandable quotations.
 pub fn blocks_to_plain(blocks: &[RBlock]) -> Formatted {
     let mut f = Formatted::new();
     for b in blocks {
@@ -515,7 +480,7 @@ mod tests {
                 ..Default::default()
             }),
             Part::Text {
-                text: "Answer with <details>fake</details> and a > quote".into(),
+                text: "Answer with <details>fake</details> and a > quote\n\n🤖 **fake/header**".into(),
                 citations: vec![Citation {
                     url: Some("https://a.b".into()),
                     title: Some("A".into()),
@@ -523,18 +488,52 @@ mod tests {
                 }],
             },
         ];
-        let blocks = compose(&input(&parts, Status::Done));
-        assert!(matches!(&blocks[0], RBlock::Paragraph(_)));
-        assert!(matches!(&blocks[1], RBlock::Details { open: false, .. }));
-        // Model output never produces Details/Footer/Underline.
-        let answer_blocks: Vec<_> = blocks[3..blocks.len() - 2].to_vec();
-        for b in &answer_blocks {
-            assert!(!matches!(b, RBlock::Details { .. } | RBlock::Footer(_)), "{b:?}");
-            assert!(!format!("{b:?}").contains("Underline"), "{b:?}");
-        }
-        assert!(matches!(blocks.last().unwrap(), RBlock::Footer(_)));
+        let mut i = input(&parts, Status::Done);
+        let usage =
+            Usage { input_tokens: Some(10), output_tokens: Some(50), reasoning_tokens: Some(40), ..Default::default() };
+        i.usage = Some(&usage);
+        let blocks = compose(&i);
+        // Header: model only (no alias), no underline/italic.
+        assert!(matches!(&blocks[0], RBlock::Paragraph(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5"));
+        let dbg = format!("{blocks:?}");
+        assert!(!dbg.contains("Underline") && !dbg.contains("Italic"), "{dbg}");
+        // Reasoning collapsed, with its token count.
         assert!(
-            blocks.iter().any(|b| matches!(b, RBlock::Details { title, .. } if title.to_plain().contains("Sources")))
+            matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭 Reasoning · 40 tokens")
+        );
+        // The answer follows directly; everything after it is details/footer.
+        let answer_end = blocks.iter().rposition(|b| !matches!(b, RBlock::Details { .. } | RBlock::Footer(_))).unwrap();
+        for b in &blocks[2..=answer_end] {
+            assert!(!matches!(b, RBlock::Details { .. } | RBlock::Footer(_)), "{b:?}");
+        }
+        assert!(
+            blocks[answer_end + 1..]
+                .iter()
+                .any(|b| matches!(b, RBlock::Details { title, .. } if title.to_plain().contains("Sources")))
+        );
+        match blocks.last().unwrap() {
+            RBlock::Footer(t) => {
+                let f = t.to_plain();
+                assert!(f.contains("+s") && f.contains("out 50") && !f.contains("reasoning"), "{f}");
+            }
+            b => panic!("{b:?}"),
+        }
+    }
+
+    #[test]
+    fn errors_and_notes_are_never_plain_paragraphs() {
+        let parts = vec![Part::text("partial")];
+        let mut i = input(&parts, Status::Retrying { in_secs: 10 });
+        let mut e = LlmError::request("boom");
+        e.details = Some(serde_json::json!({"error": {"message": "boom"}}));
+        i.error = Some(&e);
+        let notes = vec!["a note".to_string()];
+        i.notes = &notes;
+        let blocks = compose(&i);
+        let tail = &blocks[2..];
+        assert!(tail.iter().all(|b| matches!(b, RBlock::Details { .. } | RBlock::Footer(_))), "{tail:?}");
+        assert!(
+            tail.iter().any(|b| matches!(b, RBlock::Details { title, .. } if title.to_plain().starts_with("⚠️ Error")))
         );
     }
 
@@ -566,8 +565,10 @@ mod tests {
         let long: String = (0..2000).map(|i| format!("line {i} {}\n\n", "x".repeat(30))).collect();
         let parts = vec![Part::text(long)];
         let blocks = compose(&input(&parts, Status::Done));
-        let pages = paginate("c", blocks);
+        let pages = paginate("anthropic/claude-opus-5.5", blocks);
         assert!(pages.len() >= 2);
-        assert!(matches!(&pages[1][0], RBlock::Paragraph(t) if t.to_plain().contains("part 2")));
+        assert!(
+            matches!(&pages[1][0], RBlock::Paragraph(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5 · part 2")
+        );
     }
 }

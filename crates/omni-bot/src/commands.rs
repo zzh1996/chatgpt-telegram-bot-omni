@@ -21,13 +21,13 @@ use crate::tg::outbox::{self, Link};
 
 pub const HINT: &str = "Start a conversation with a prefix such as `$hello` (default model) or `alias$question`, or reply to one of my messages to continue. /help for details.";
 
-const HELP: &str = r#"**Start a conversation**: `prefix$ text`
-- `$ text` uses this bot's default model; `alias$ text` uses an alias (see /models); `author/model$ text` uses any OpenRouter model id directly (new models work without any config change).
+const HELP: &str = r#"**Start a conversation**: `prefix$text`
+- `$text` uses this bot's default model; `alias$text` uses an alias (see /models); `author/model$text` uses any OpenRouter model id directly (new models work without any config change). Everything after `$` is sent exactly as typed, including a leading space.
 - Several models at once: `c,g,openai/gpt-6$ compare these`.
 - Options after `+`: `c+s$` web search, `c+e=low$` reasoning effort, `+max=2000`, `+t=0.7`, `+p=any` (let OpenRouter pick the provider), `+pure` (no automatic max-capability presets), `+debug`, or a raw JSON patch `+{"temperature":0.2}`. Full list: /help options.
 - Define a system prompt and fake history with marker lines:
 ```
-c$ ::system
+c$::system
 You are a pirate.
 ::user
 hi
@@ -44,12 +44,12 @@ A line that literally is `::user` can be sent by escaping it as `\::user`.
 
 **Other**: /models [search] · /model `id` · /stats [today|7d|30d|all] · /usage · /whoami · /ping
 
-By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. Everything the bot itself writes is marked with an underlined label."#;
+By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. In a reply, the first line names the model; everything else the bot adds (reasoning, sources, errors, notes, usage) is in collapsible blocks or small text, so the model's answer is always unambiguous."#;
 
 const ADMIN_HELP: &str = r#"**Admin**: /allow [chat_id] · /deny [chat_id] · /allow_user `id` · /deny_user `id` · /ban `id` · /unban `id` · /acl · /quota `user|chat` `id|default` `capacity_usd` `refill_usd_per_day` (or `off`) · /alias `name` `spec` · /unalias `name` · /credits · /stats all"#;
 
 fn label(s: &str) -> RText {
-    RText::underline(RText::bold(RText::plain(s)))
+    RText::bold(RText::plain(s))
 }
 
 fn md(s: &str) -> Vec<RBlock> {

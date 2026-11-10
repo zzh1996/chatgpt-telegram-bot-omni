@@ -12,7 +12,7 @@ use grammers_mtsender::{
     ConnectionParams, InvocationError, RetryContext, RetryPolicy, SenderPool, SenderPoolFatHandle, UpdatesConfiguration,
 };
 use grammers_session::Session as _;
-use grammers_session::types::PeerId;
+use grammers_session::types::{PeerId, PeerInfo, PeerKind, PeerRef};
 use grammers_tl_types as tl;
 use rusqlite::params;
 use tracing::{info, warn};
@@ -108,26 +108,54 @@ impl BotConn {
         self.client.invoke(req).await
     }
 
-    /// Resolve a marked chat id to an input peer, using cached access hashes.
-    pub async fn input_peer(&self, chat_id: i64) -> Result<tl::enums::InputPeer> {
+    /// Resolve a marked chat id to a peer reference, using cached access hashes.
+    /// Supergroups/channels not in the cache (e.g. a fresh session that has not
+    /// seen an update from them yet) are looked up with `channels.getChannels`,
+    /// which bots may call without an access hash for chats they are in.
+    async fn peer_ref(&self, chat_id: i64) -> Result<PeerRef> {
         let id = PeerId::from_bot_api_dialog_id(chat_id).with_context(|| format!("invalid chat id {chat_id}"))?;
-        let r =
-            self.session.peer_ref(id).await.map_err(|e| anyhow::anyhow!("{e}"))?.unwrap_or_else(|| id.to_ambient_ref());
-        Ok((&r).into())
+        if let Some(r) = self.session.peer_ref(id).await.map_err(|e| anyhow::anyhow!("{e}"))? {
+            return Ok(r);
+        }
+        if id.kind() == PeerKind::Channel
+            && let Some(bare) = id.bare_id()
+        {
+            let req = tl::functions::channels::GetChannels {
+                id: vec![tl::types::InputChannel { channel_id: bare, access_hash: 0 }.into()],
+            };
+            match self.invoke(&req).await {
+                Ok(res) => {
+                    let chats = match res {
+                        tl::enums::messages::Chats::Chats(c) => c.chats,
+                        tl::enums::messages::Chats::Slice(c) => c.chats,
+                    };
+                    for ch in chats {
+                        let r = PeerRef::from(&ch);
+                        if r.id == id {
+                            if let Err(e) = self.session.cache_peer(PeerInfo::from(ch)).await {
+                                warn!(bot = %self.name, error = %e, "caching resolved channel failed");
+                            }
+                            info!(bot = %self.name, chat_id, "resolved channel access hash");
+                            return Ok(r);
+                        }
+                    }
+                }
+                Err(e) => warn!(bot = %self.name, chat_id, error = %e, "resolving channel failed"),
+            }
+        }
+        Ok(id.to_ambient_ref())
+    }
+
+    pub async fn input_peer(&self, chat_id: i64) -> Result<tl::enums::InputPeer> {
+        Ok((&self.peer_ref(chat_id).await?).into())
     }
 
     pub async fn input_channel(&self, chat_id: i64) -> Result<tl::enums::InputChannel> {
-        let id = PeerId::from_bot_api_dialog_id(chat_id).with_context(|| format!("invalid chat id {chat_id}"))?;
-        let r =
-            self.session.peer_ref(id).await.map_err(|e| anyhow::anyhow!("{e}"))?.unwrap_or_else(|| id.to_ambient_ref());
-        Ok((&r).into())
+        Ok((&self.peer_ref(chat_id).await?).into())
     }
 
     pub async fn input_user(&self, user_id: i64) -> Result<tl::enums::InputUser> {
-        let id = PeerId::user(user_id).with_context(|| format!("invalid user id {user_id}"))?;
-        let r =
-            self.session.peer_ref(id).await.map_err(|e| anyhow::anyhow!("{e}"))?.unwrap_or_else(|| id.to_ambient_ref());
-        Ok((&r).into())
+        Ok((&self.peer_ref(user_id).await?).into())
     }
 
     /// Fetch messages by id (works for private chats, groups and supergroups).

@@ -157,6 +157,11 @@ async fn sync_loop(
         }
         let Some(state) = rx.borrow_and_update().clone() else { continue };
         let done = state.done;
+        if done && fallback != Fallback::None {
+            // A rejection while streaming may have come from an unfinished construct:
+            // give the final content the full rendering again.
+            fallback = Fallback::None;
+        }
         if let Err(e) =
             apply(&app, &bot, chat_id, reply_to, turn_id, attempt_id, &state, &mut sent, &mut fallback).await
         {
@@ -195,7 +200,7 @@ fn pages_for(state: &RenderState, fallback: Fallback) -> Vec<Content> {
     match fallback {
         Fallback::None | Fallback::RawAi => {
             let blocks = state.compose(fallback == Fallback::RawAi);
-            compose::paginate(&state.label, blocks).into_iter().map(Content::Rich).collect()
+            compose::paginate(&state.model, blocks).into_iter().map(Content::Rich).collect()
         }
         Fallback::PlainText => {
             let f = compose::blocks_to_plain(&state.compose(true));

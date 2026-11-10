@@ -274,13 +274,92 @@ impl RichLimits {
         RichLimits { max_chars: 32768, max_blocks: 500, max_depth: 16, max_table_cols: 20 };
 }
 
+/// Make blocks acceptable to Telegram, which rejects empty content in most
+/// containers (verified against the live API, 2026-11):
+///
+/// | rejected (`RICH_MESSAGE_CONTENT_REQUIRED` etc.) | accepted |
+/// |---|---|
+/// | preformatted with `""` | preformatted with whitespace |
+/// | empty heading, footer, collapsed quote | empty paragraph, empty table cell |
+/// | empty math (block or inline) | empty bold/url/fixed spans |
+/// | list without items, item without blocks | item with an empty paragraph |
+/// | quote / details without blocks, table without rows | details with an empty title |
+///
+/// Empty constructs appear in model output (an unclosed ```` ``` ```` at the
+/// end) and in every streaming snapshot that just opened one. They are kept
+/// visible where Markdown shows something (an empty code box, a bullet, a
+/// quote bar) and dropped where it shows nothing.
+pub fn sanitize(blocks: Vec<RBlock>) -> Vec<RBlock> {
+    blocks.into_iter().filter_map(sanitize_block).collect()
+}
+
+fn non_empty_children(blocks: Vec<RBlock>) -> Vec<RBlock> {
+    let b = sanitize(blocks);
+    if b.is_empty() { vec![RBlock::Paragraph(RText::plain(""))] } else { b }
+}
+
+fn sanitize_text(t: RText) -> RText {
+    match t {
+        RText::Math(m) if m.trim().is_empty() => RText::Plain(m),
+        RText::Bold(x) => RText::Bold(Box::new(sanitize_text(*x))),
+        RText::Italic(x) => RText::Italic(Box::new(sanitize_text(*x))),
+        RText::Underline(x) => RText::Underline(Box::new(sanitize_text(*x))),
+        RText::Strike(x) => RText::Strike(Box::new(sanitize_text(*x))),
+        RText::Fixed(x) => RText::Fixed(Box::new(sanitize_text(*x))),
+        RText::Spoiler(x) => RText::Spoiler(Box::new(sanitize_text(*x))),
+        RText::Url { text, url } => RText::Url { text: Box::new(sanitize_text(*text)), url },
+        RText::Concat(v) => RText::Concat(v.into_iter().map(sanitize_text).collect()),
+        other => other,
+    }
+}
+
+fn sanitize_block(b: RBlock) -> Option<RBlock> {
+    Some(match b {
+        RBlock::Paragraph(t) => RBlock::Paragraph(sanitize_text(t)),
+        RBlock::Heading { level, text } => {
+            let text = sanitize_text(text);
+            if text.is_empty() {
+                return None;
+            }
+            RBlock::Heading { level, text }
+        }
+        RBlock::Footer(t) | RBlock::CollapsedQuote { text: t } if t.is_empty() => return None,
+        RBlock::Footer(t) => RBlock::Footer(sanitize_text(t)),
+        RBlock::CollapsedQuote { text } => RBlock::CollapsedQuote { text: sanitize_text(text) },
+        RBlock::Pre { text, language } if text.is_empty() => RBlock::Pre { text: " ".into(), language },
+        RBlock::Math(m) if m.trim().is_empty() => return None,
+        RBlock::List { items } | RBlock::OrderedList { items, .. } if items.is_empty() => return None,
+        RBlock::List { items } => RBlock::List { items: sanitize_items(items) },
+        RBlock::OrderedList { start, items } => RBlock::OrderedList { start, items: sanitize_items(items) },
+        RBlock::Quote { blocks } => RBlock::Quote { blocks: non_empty_children(blocks) },
+        RBlock::Details { open, title, blocks } => {
+            RBlock::Details { open, title: sanitize_text(title), blocks: non_empty_children(blocks) }
+        }
+        RBlock::Table { rows, .. } if rows.iter().all(|r| r.is_empty()) => return None,
+        RBlock::Table { rows, bordered, striped } => RBlock::Table {
+            rows: rows
+                .into_iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| r.into_iter().map(|c| RCell { text: sanitize_text(c.text), ..c }).collect())
+                .collect(),
+            bordered,
+            striped,
+        },
+        other => other,
+    })
+}
+
+fn sanitize_items(items: Vec<RItem>) -> Vec<RItem> {
+    items.into_iter().map(|it| RItem { blocks: non_empty_children(it.blocks), ..it }).collect()
+}
+
 /// Convert Markdown to rich blocks. `base_depth` is the nesting depth at which
 /// the blocks will be placed (e.g. 1 inside a details block).
 pub fn markdown_to_blocks(src: &str, base_depth: usize, limits: RichLimits) -> Vec<RBlock> {
     let ast = ast::parse(src);
     let mut out = Vec::new();
     for b in &ast {
-        let converted = block(b);
+        let converted = sanitize(block(b));
         let ok = converted.iter().all(|rb| {
             let m = rb.metrics();
             base_depth + m.depth <= limits.max_depth && m.max_table_cols <= limits.max_table_cols
@@ -841,6 +920,27 @@ mod tests {
             if full.is_char_boundary(end) {
                 let b = markdown_to_blocks(&full[..end], 1, RichLimits::TELEGRAM);
                 let _ = split_blocks(b, RichLimits { max_chars: 40, max_blocks: 5, max_depth: 16, max_table_cols: 20 });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn unclosed_fence_and_empty_containers_are_accepted_shapes() {
+        let b = markdown_to_blocks("text\n\n```", 0, RichLimits::TELEGRAM);
+        assert_eq!(b.last(), Some(&RBlock::Pre { text: " ".into(), language: String::new() }));
+        let b = markdown_to_blocks("- \n\n>\n\n## \n\n$$$$", 0, RichLimits::TELEGRAM);
+        for blk in &b {
+            match blk {
+                RBlock::List { items } => assert!(items.iter().all(|i| !i.blocks.is_empty())),
+                RBlock::Quote { blocks } => assert!(!blocks.is_empty()),
+                RBlock::Heading { text, .. } => assert!(!text.is_empty()),
+                RBlock::Math(m) => assert!(!m.trim().is_empty()),
+                _ => {}
             }
         }
     }
