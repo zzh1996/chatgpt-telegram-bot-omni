@@ -46,7 +46,7 @@ pub struct LogGuards(#[allow(dead_code)] Vec<tracing_appender::non_blocking::Wor
 /// streaming code never waits on I/O, and both are **lossless**
 /// (`lossy(false)`): under extreme load the producer is slowed down instead of
 /// silently dropping lines — verbose logs must contain every raw payload.
-pub fn init(level: &str, timezone: &str, log_dir: Option<&Path>) -> Result<LogGuards> {
+pub fn init(level: &str, timezone: &str, log_dir: Option<&Path>, keep_days: usize) -> Result<LogGuards> {
     let tz = jiff::tz::TimeZone::get(timezone).unwrap_or(jiff::tz::TimeZone::UTC);
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| filter_for(level));
     let mut guards = Vec::new();
@@ -61,7 +61,15 @@ pub fn init(level: &str, timezone: &str, log_dir: Option<&Path>) -> Result<LogGu
     let registry = tracing_subscriber::registry().with(EnvFilter::try_new(&filter)?).with(stdout_layer);
     if let Some(dir) = log_dir {
         std::fs::create_dir_all(dir)?;
-        let appender = tracing_appender::rolling::daily(dir, "omni.log");
+        // Files roll over at midnight UTC; the name says so (line timestamps use `timezone`).
+        let mut builder = tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("omni")
+            .filename_suffix("utc.log");
+        if keep_days > 0 {
+            builder = builder.max_log_files(keep_days);
+        }
+        let appender = builder.build(dir)?;
         let (writer, g) = tracing_appender::non_blocking::NonBlockingBuilder::default()
             .lossy(false)
             .buffered_lines_limit(1 << 16)

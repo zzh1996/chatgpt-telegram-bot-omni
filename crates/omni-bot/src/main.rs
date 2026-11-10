@@ -72,7 +72,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let log_dir = cfg.log.file.then(|| cfg.general.data_dir.join("logs"));
-    let _guard = logging::init(&cfg.log.level, &cfg.general.timezone, log_dir.as_deref())?;
+    let _guard = logging::init(&cfg.log.level, &cfg.general.timezone, log_dir.as_deref(), cfg.log.keep_days)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let res = rt.block_on(run(cfg));
     if let Err(e) = &res {

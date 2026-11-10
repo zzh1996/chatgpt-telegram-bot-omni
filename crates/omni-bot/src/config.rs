@@ -320,13 +320,15 @@ pub struct LogConfig {
     /// `verbose` logs every raw upstream payload (blobs stored on disk, referenced by hash);
     /// `normal` logs request lifecycle only. Any tracing filter string is also accepted.
     pub level: String,
-    /// Also write logs to `<data_dir>/logs/omni.log.YYYY-MM-DD`.
+    /// Also write logs to `<data_dir>/logs/omni.YYYY-MM-DD.utc.log` (one file per UTC day).
     pub file: bool,
+    /// Keep this many daily log files (0 = keep all). Verbose logs are large.
+    pub keep_days: usize,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: "verbose".into(), file: true }
+        Self { level: "verbose".into(), file: true, keep_days: 30 }
     }
 }
 
