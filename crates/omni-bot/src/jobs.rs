@@ -246,7 +246,16 @@ impl Ctx {
             known_context: known_context(&self.history, &self.spec.model),
             max_tokens_override,
         };
-        self.app.openrouter.prepare_chat(&input, &presets, &Blobs(self.app.blobs.clone())).await
+        let blobs = Blobs(self.app.blobs.clone());
+        match self.spec.provider.as_str() {
+            "ark" => match &self.app.ark {
+                Some(ark) => ark.prepare_chat(&input, &presets, &blobs).await,
+                None => Err(LlmError::request(
+                    "the Volcengine Ark provider is not configured (set ARK_API_KEY / [providers.ark] api_key)",
+                )),
+            },
+            _ => self.app.openrouter.prepare_chat(&input, &presets, &blobs).await,
+        }
     }
 
     fn call_meta(&self, attempt_id: i64) -> crate::ledger::CallMeta {
@@ -529,7 +538,9 @@ async fn mark_interrupted(ctx: &Ctx, last: &AttemptRow, appending: bool) -> Resu
         out.and_then(|o| serde_json::from_value::<Turn>(o).ok()).map(|t| t.parts).unwrap_or_default();
     // The last seconds of output may not have been persisted: OpenRouter can return
     // what it had delivered before the disconnect (if Input & Output Logging is on).
-    if let Some(gen_id) = upstream.as_deref() {
+    // (The stored id list is comma-separated; the last call is the interrupted one.)
+    let last_id = upstream.as_deref().and_then(|u| u.rsplit(',').next()).filter(|s| !s.is_empty());
+    if let Some(gen_id) = last_id.filter(|_| ctx.spec.provider == "openrouter") {
         if let Some(recovered) = recover_delivered(app, gen_id).await {
             let have: usize = parts.iter().map(|p| if let Part::Text { text, .. } = p { text.len() } else { 0 }).sum();
             let got: usize =
@@ -664,6 +675,8 @@ struct Sink<'a> {
     step: u64,
     /// Generation id already registered as a pending call.
     registered: Option<String>,
+    /// Calls of this provider can be looked up afterwards (OpenRouter `/generation`).
+    lookup_costs: bool,
 }
 
 impl Sink<'_> {
@@ -725,7 +738,9 @@ impl EventSink for Sink<'_> {
                 self.hop_usage = Some(u.clone());
                 return;
             }
-            StreamEvent::Meta { upstream_id: Some(id), .. } if self.registered.as_ref() != Some(id) => {
+            StreamEvent::Meta { upstream_id: Some(id), .. }
+                if self.lookup_costs && self.registered.as_ref() != Some(id) =>
+            {
                 // Billed from now on: make sure the cost is found even if the stream never finishes.
                 self.registered = Some(id.clone());
                 let (db, id, attempt) = (self.app.db.clone(), id.clone(), self.attempt_id);
@@ -783,6 +798,22 @@ impl EventSink for Sink<'_> {
                 .await;
             });
         }
+    }
+}
+
+/// Run one upstream call with the turn's provider.
+async fn stream(
+    app: &App,
+    provider: &str,
+    p: &Prepared,
+    sink: &mut dyn EventSink,
+    observer: &RawLog,
+    cancel: &CancellationToken,
+) -> (Result<Value, LlmError>, omni_llm::CallOutcome) {
+    match (provider, &app.ark) {
+        ("ark", Some(ark)) => ark.stream_chat(p, sink, observer, cancel).await,
+        ("ark", None) => (Err(LlmError::request("the Volcengine Ark provider is not configured")), Default::default()),
+        _ => app.openrouter.stream_chat(p, sink, observer, cancel).await,
     }
 }
 
@@ -861,6 +892,7 @@ async fn run_attempt(
             spent_before: 0,
             step: prepared.max_tokens().unwrap_or(DEFAULT_BUDGET),
             registered: None,
+            lookup_costs: ctx.spec.provider == "openrouter",
         };
         let mut hop_req = prepared.clone();
         match &start {
@@ -898,7 +930,7 @@ async fn run_attempt(
             sink.acc.upstream_id = None;
             let cancel = CancellationToken::new();
             let (result, call) = tokio::select! {
-                r = app.openrouter.stream_chat(&hop_req, &mut sink, &rawlog, &cancel) => r,
+                r = stream(app, &ctx.spec.provider, &hop_req, &mut sink, &rawlog, &cancel) => r,
                 _ = app.shutdown.cancelled() => (Err(LlmError::cancelled()), Default::default()),
             };
             let hop_id = sink.acc.upstream_id.clone().or(call.upstream_id.clone());

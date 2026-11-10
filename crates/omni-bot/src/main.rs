@@ -114,6 +114,20 @@ async fn run(cfg: Config) -> Result<()> {
         echo_upstream_body: orc.echo_upstream_body,
         router_metadata: true,
     })?;
+    let ark = match cfg.providers.ark.as_ref().filter(|a| !a.api_key.trim().is_empty()) {
+        Some(a) => {
+            info!("Volcengine Ark provider enabled");
+            Some(omni_llm::ark::Ark::new(omni_llm::ark::ArkConfig {
+                api_key: a.api_key.trim().to_string(),
+                base_url: a.base_url.clone(),
+                connect_timeout: Duration::from_secs(a.connect_timeout_secs),
+                idle_timeout: Duration::from_secs(a.idle_timeout_secs),
+                max_tokens_cap: a.max_tokens_cap,
+                cny_per_usd: a.cny_per_usd,
+            })?)
+        }
+        None => None,
+    };
     match openrouter.refresh_catalog().await {
         Ok(n) => info!(models = n, "loaded OpenRouter model catalog"),
         Err(e) => warn!(error = %format!("{e:#}"), "could not load the OpenRouter model catalog (will retry)"),
@@ -142,6 +156,7 @@ async fn run(cfg: Config) -> Result<()> {
         db: db.clone(),
         blobs,
         openrouter,
+        ark,
         bots: bots.clone(),
         membership: Mutex::new(HashSet::new()),
         aliases: RwLock::new(BTreeMap::new()),

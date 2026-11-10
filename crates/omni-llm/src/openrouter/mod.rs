@@ -6,14 +6,11 @@ pub mod options;
 
 use std::time::Duration;
 
-use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::error::{ErrorKind, LlmError, Retry};
-use crate::event::StreamEvent;
-use crate::sse::{SseItem, SseParser};
+use crate::error::LlmError;
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared};
 
 use catalog::{Catalog, EndpointInfo, ModelInfo};
@@ -353,152 +350,31 @@ impl OpenRouter {
         observer: &dyn Observer,
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
-        let mut outcome = CallOutcome::default();
-        observer.request(&p.url, &p.body);
         let mut rb = self.auth(self.http.post(&p.url)).json(&p.body);
         if self.cfg.router_metadata {
             rb = rb.header("X-OpenRouter-Metadata", "enabled");
         }
-        let send = rb.send();
-        let resp = tokio::select! {
-            _ = cancel.cancelled() => return (Err(LlmError::cancelled()), outcome),
-            r = tokio::time::timeout(self.cfg.idle_timeout, send) => match r {
-                Err(_) => return (Err(LlmError::new(ErrorKind::Timeout, Retry::Backoff, "no response headers within idle timeout")), outcome),
-                Ok(Err(e)) => return (Err(LlmError::network(format!("request failed: {e}"))), outcome),
-                Ok(Ok(r)) => r,
-            }
+        let crate::chatstream::Streamed { result, parser: mut cp, header_id } = crate::chatstream::run(
+            rb,
+            &p.url,
+            &p.body,
+            self.cfg.idle_timeout,
+            Some("x-generation-id"),
+            chat::error_from_json,
+            sink,
+            observer,
+            cancel,
+        )
+        .await;
+        let outcome = CallOutcome {
+            upstream_id: header_id,
+            continuation: cp.continuation().cloned(),
+            upstream_echo: std::mem::take(&mut cp.upstream_body_echo),
+            router_metadata: cp.router_metadata.take(),
         };
-        let status = resp.status().as_u16();
-        let headers: Vec<(String, String)> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string()))
-            .collect();
-        observer.response_status(status, &headers);
-        let gen_id = resp.headers().get("x-generation-id").and_then(|v| v.to_str().ok()).map(str::to_string);
-        if let Some(g) = &gen_id {
-            outcome.upstream_id = Some(g.clone());
-            sink.event(StreamEvent::Meta { upstream_id: Some(g.clone()), provider: None, model: None });
-        }
-        let retry_after =
-            resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok());
-        if !(200..300).contains(&status) {
-            let text = resp.text().await.unwrap_or_default();
-            observer.body_text(&text);
-            let err = match serde_json::from_str::<Value>(&text) {
-                Ok(v) => {
-                    let e = v.get("error").cloned().unwrap_or(v.clone());
-                    let mut le = chat::error_from_json(&e, Some(status), retry_after, ErrorKind::Http);
-                    le.details = Some(v);
-                    le
-                }
-                Err(_) => {
-                    let mut le = LlmError::new(
-                        ErrorKind::Http,
-                        crate::error::retry_for_status(status, retry_after),
-                        format!("HTTP {status}"),
-                    );
-                    le.status = Some(status);
-                    le.details = Some(Value::String(text));
-                    le
-                }
-            };
-            return (Err(err), outcome);
-        }
-
-        let mut parser = SseParser::new();
-        let mut cp = chat::ChunkParser::default();
-        let mut body = resp.bytes_stream();
-        let mut done = false;
-        let result: Result<(), LlmError> = loop {
-            let next = tokio::select! {
-                _ = cancel.cancelled() => break Err(LlmError::cancelled()),
-                n = tokio::time::timeout(self.cfg.idle_timeout, body.next()) => n,
-            };
-            let chunk = match next {
-                Err(_) => {
-                    let mut e = LlmError::new(
-                        ErrorKind::Timeout,
-                        Retry::Backoff,
-                        format!("stream idle for {}s", self.cfg.idle_timeout.as_secs()),
-                    );
-                    e.partial_output = cp.any_output;
-                    break Err(e);
-                }
-                Ok(None) => break Ok(()),
-                Ok(Some(Err(e))) => {
-                    let mut le = LlmError::network(format!("stream read error: {e}"));
-                    le.partial_output = cp.any_output;
-                    break Err(le);
-                }
-                Ok(Some(Ok(b))) => b,
-            };
-            let mut items = parser.feed(&chunk);
-            if done {
-                items.clear();
-            }
-            match self.handle_items(items, &mut cp, sink, observer, &mut done) {
-                Ok(()) => {}
-                Err(e) => break Err(e),
-            }
-            if done {
-                break Ok(());
-            }
-        };
-        if result.is_ok() && !done {
-            let tail = parser.finish();
-            if let Err(e) = self.handle_items(tail, &mut cp, sink, observer, &mut done) {
-                outcome.upstream_echo = std::mem::take(&mut cp.upstream_body_echo);
-                return (Err(e), outcome);
-            }
-        }
-        outcome.upstream_echo = std::mem::take(&mut cp.upstream_body_echo);
-        outcome.router_metadata = cp.router_metadata.take();
-        outcome.continuation = cp.continuation().cloned();
         match result {
             Err(e) => (Err(e), outcome),
-            Ok(()) => {
-                if !cp.finished && !done {
-                    let mut e = LlmError::network("stream ended without a finish reason or [DONE]");
-                    e.partial_output = cp.any_output;
-                    return (Err(e), outcome);
-                }
-                (Ok(cp.native_payload()), outcome)
-            }
+            Ok(()) => (Ok(cp.native_payload()), outcome),
         }
-    }
-
-    fn handle_items(
-        &self,
-        items: Vec<SseItem>,
-        cp: &mut chat::ChunkParser,
-        sink: &mut dyn EventSink,
-        observer: &dyn Observer,
-        done: &mut bool,
-    ) -> Result<(), LlmError> {
-        for item in items {
-            match item {
-                SseItem::Comment(c) => observer.sse_comment(&c),
-                SseItem::Event(ev) => {
-                    observer.sse_data(&ev.data);
-                    let data = ev.data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data == "[DONE]" {
-                        *done = true;
-                        return Ok(());
-                    }
-                    let v: Value = serde_json::from_str(data).map_err(|e| {
-                        LlmError::new(ErrorKind::Decode, Retry::Backoff, format!("bad JSON chunk: {e}"))
-                            .with_details(Value::String(data.to_string()))
-                    })?;
-                    for e in cp.chunk(&v)? {
-                        sink.event(e);
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }

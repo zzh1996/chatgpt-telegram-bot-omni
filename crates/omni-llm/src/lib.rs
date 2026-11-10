@@ -8,7 +8,9 @@
 //! Direct official APIs (OpenAI Responses, Anthropic Messages, Gemini) can be
 //! added as further [`Provider`] implementations reusing the same events.
 
+pub mod ark;
 pub mod budget;
+pub mod chatstream;
 pub mod error;
 pub mod event;
 pub mod openrouter;

@@ -147,7 +147,11 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
                     ib,
                     "Options",
                     vec![RBlock::Pre {
-                        text: omni_llm::openrouter::options::OPTIONS_HELP.into(),
+                        text: format!(
+                            "{}\n\n{}",
+                            omni_llm::openrouter::options::OPTIONS_HELP,
+                            omni_llm::ark::OPTIONS_HELP
+                        ),
                         language: String::new(),
                     }],
                 )

@@ -23,6 +23,8 @@ pub struct App {
     pub db: Db,
     pub blobs: BlobStore,
     pub openrouter: OpenRouter,
+    /// Volcengine Ark, when configured.
+    pub ark: Option<omni_llm::ark::Ark>,
     /// Bots in config order.
     pub bots: Vec<Arc<BotConn>>,
     /// (bot name, chat id) pairs where the bot is known to be a member.
@@ -37,7 +39,7 @@ pub struct App {
     pub started_at: jiff::Timestamp,
 }
 
-pub const PROVIDERS: &[&str] = &["openrouter"];
+pub const PROVIDERS: &[&str] = &["openrouter", "ark"];
 
 impl App {
     pub fn bot(&self, name: &str) -> Option<&Arc<BotConn>> {
@@ -137,7 +139,11 @@ impl App {
             Some((p, m)) if PROVIDERS.contains(&p) => (p.to_string(), m.to_string()),
             _ => ("openrouter".to_string(), model_token.clone()),
         };
-        if !model.contains('/') {
+        // OpenRouter ids are `author/model`; other providers need their explicit prefix (`ark:…`).
+        if provider == "openrouter" && !model.contains('/') {
+            return Ok(None);
+        }
+        if model.is_empty() {
             return Ok(None);
         }
         // Strict mode never blocks on the network (it runs in the update loop):

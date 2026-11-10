@@ -41,12 +41,46 @@ fn audio_format(mime: &str, filename: Option<&str>) -> String {
     }
 }
 
-/// Convert the conversation to Chat Completions `messages`.
+/// Provider-specific details of an OpenAI-compatible Chat Completions API.
+pub struct Flavor {
+    /// Dialect tag stored with native outputs (replay only within the same dialect and model).
+    pub dialect: &'static str,
+    /// `image_url.detail` sent with images (the highest fidelity the API offers).
+    pub image_detail: &'static str,
+    /// Build the replayed assistant message from a stored native payload.
+    pub replay: fn(&Value) -> Value,
+}
+
+fn openrouter_replay(p: &Value) -> Value {
+    let mut msg = Map::new();
+    msg.insert("role".into(), json!("assistant"));
+    msg.insert("content".into(), p.get("content").cloned().unwrap_or(json!("")));
+    if let Some(rd) = p.get("reasoning_details").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
+        msg.insert("reasoning_details".into(), rd.clone());
+    }
+    Value::Object(msg)
+}
+
+pub const OPENROUTER: Flavor = Flavor { dialect: DIALECT, image_detail: "original", replay: openrouter_replay };
+
+/// Convert the conversation to OpenRouter Chat Completions `messages`.
 pub async fn convert_history(
     history: &[Turn],
     target_model: &str,
     info: Option<&ModelInfo>,
     blobs: &dyn BlobLoader,
+) -> Result<(Vec<Value>, ConvertNotes), LlmError> {
+    convert_history_with(history, target_model, info, blobs, &OPENROUTER).await
+}
+
+/// Convert the conversation to Chat Completions `messages` for `flavor`.
+/// `info` (OpenRouter catalog) enables input-modality checks.
+pub async fn convert_history_with(
+    history: &[Turn],
+    target_model: &str,
+    info: Option<&ModelInfo>,
+    blobs: &dyn BlobLoader,
+    flavor: &Flavor,
 ) -> Result<(Vec<Value>, ConvertNotes), LlmError> {
     let mut notes = ConvertNotes::default();
     let mut out = Vec::with_capacity(history.len());
@@ -58,18 +92,10 @@ pub async fn convert_history(
             Role::Assistant => {
                 // Exact replay when produced by this dialect and the same model.
                 if let Some(n) = &turn.native
-                    && n.dialect == DIALECT
+                    && n.dialect == flavor.dialect
                     && n.model == target_model
                 {
-                    let mut msg = Map::new();
-                    msg.insert("role".into(), json!("assistant"));
-                    let p = &n.payload;
-                    msg.insert("content".into(), p.get("content").cloned().unwrap_or(json!("")));
-                    if let Some(rd) = p.get("reasoning_details").filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-                    {
-                        msg.insert("reasoning_details".into(), rd.clone());
-                    }
-                    out.push(Value::Object(msg));
+                    out.push((flavor.replay)(&n.payload));
                     continue;
                 }
                 out.push(json!({"role": "assistant", "content": turn.answer_text()}));
@@ -93,7 +119,7 @@ pub async fn convert_history(
                                 )));
                             }
                             let bytes = load(blobs, blob).await?;
-                            content.push(json!({"type": "image_url", "image_url": {"url": data_url(&blob.mime, &bytes), "detail": "original"}}));
+                            content.push(json!({"type": "image_url", "image_url": {"url": data_url(&blob.mime, &bytes), "detail": flavor.image_detail}}));
                         }
                         Part::File { blob, filename, .. } => {
                             let bytes = load(blobs, blob).await?;
@@ -124,7 +150,7 @@ pub async fn convert_history(
                                     content.push(json!({"type": "video_url", "video_url": {"url": data_url(&blob.mime, &bytes)}}));
                                 }
                                 MediaClass::Image => {
-                                    content.push(json!({"type": "image_url", "image_url": {"url": data_url(&blob.mime, &bytes), "detail": "original"}}));
+                                    content.push(json!({"type": "image_url", "image_url": {"url": data_url(&blob.mime, &bytes), "detail": flavor.image_detail}}));
                                 }
                                 MediaClass::Text => {
                                     // No native text-document input on Chat Completions: inline verbatim as a separate part.
@@ -189,7 +215,14 @@ pub struct ChunkParser {
     pub router_metadata: Option<Value>,
     /// Latest long-decode continuation item (`id: "gemini-continuation"`).
     continuation: Option<Value>,
+    /// Encrypted original reasoning (Volcengine Ark summary-mode models), kept whole.
+    encrypted_content: Option<String>,
+    /// Maps in-band error objects (default: OpenRouter's classification).
+    pub map_error: Option<ErrorMapper>,
 }
+
+/// Builds an [`LlmError`] from an API error object: `(error, http status, retry-after, kind)`.
+pub type ErrorMapper = fn(&Value, Option<u16>, Option<u64>, ErrorKind) -> LlmError;
 
 impl ChunkParser {
     /// Parse one `data:` JSON chunk. Returns events or an in-band error.
@@ -209,9 +242,10 @@ impl ChunkParser {
         if id.is_some() || provider.is_some() || model.is_some() {
             evs.push(StreamEvent::Meta { upstream_id: id, provider, model });
         }
+        let map_error = self.map_error.unwrap_or(error_from_json);
         if let Some(err) = v.get("error") {
             self.saw_error = true;
-            let mut e = error_from_json(err, None, None, ErrorKind::InBand);
+            let mut e = map_error(err, None, None, ErrorKind::InBand);
             e.partial_output = self.any_output;
             e.details = Some(v.clone());
             return Err(e);
@@ -223,7 +257,7 @@ impl ChunkParser {
             }
             if let Some(err) = choice.get("error") {
                 self.saw_error = true;
-                let mut e = error_from_json(err, None, None, ErrorKind::InBand);
+                let mut e = map_error(err, None, None, ErrorKind::InBand);
                 e.partial_output = self.any_output;
                 e.details = Some(v.clone());
                 return Err(e);
@@ -249,12 +283,17 @@ impl ChunkParser {
                     evs.push(ev);
                 }
             }
-        } else if let Some(r) = d.get("reasoning").and_then(Value::as_str)
+        } else if let Some(r) = d.get("reasoning").or_else(|| d.get("reasoning_content")).and_then(Value::as_str)
             && !r.is_empty()
         {
             self.reasoning_text.push_str(r);
             self.any_output = true;
             evs.push(StreamEvent::Reasoning { kind: ReasoningKind::Text, text: r.to_string(), block: 0 });
+        }
+        if let Some(e) = d.get("encrypted_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            // Sent whole in one dedicated chunk; replace rather than concatenate.
+            self.encrypted_content = Some(e.to_string());
+            evs.push(StreamEvent::OpaqueReasoning { kind: ReasoningKind::Encrypted });
         }
         if let Some(c) = d.get("content") {
             match c {
@@ -418,7 +457,14 @@ impl ChunkParser {
         if !self.refusal.is_empty() {
             m["refusal"] = json!(self.refusal);
         }
+        if let Some(e) = &self.encrypted_content {
+            m["encrypted_content"] = json!(e);
+        }
         m
+    }
+
+    pub fn any_output(&self) -> bool {
+        self.any_output
     }
 }
 

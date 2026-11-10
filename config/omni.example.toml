@@ -209,26 +209,33 @@ spec = "openrouter:qwen/qwen3.7-max"
 name = "qp"
 spec = "openrouter:qwen/qwen3.6-plus"
 
-# ByteDance Doubao (Seed) — on OpenRouter; the flagship doubao-seed-2-1-pro is
-# only available on Volcengine Ark (direct provider: planned).
+# ByteDance Doubao — direct on Volcengine Ark ([providers.ark], needs ARK_API_KEY),
+# like the old bot's prefixes. (The few Seed models on OpenRouter are served by
+# BytePlus; use their ids directly, e.g. `bytedance-seed/seed-2.0-mini$`.)
+[[aliases]]
+name = "db"
+spec = "ark:doubao-seed-2-1-pro-260915"
+[[aliases]]
+name = "dbe"
+spec = "ark:doubao-seed-evolving"
+[[aliases]]
+name = "db21"
+spec = "ark:doubao-seed-2-1-pro-260628"
+[[aliases]]
+name = "dbl"
+spec = "ark:doubao-seed-2-1-lite-260915"
 [[aliases]]
 name = "dbt"
-spec = "openrouter:bytedance-seed/seed-2-1-turbo"
+spec = "ark:doubao-seed-2-1-turbo-260628"
+[[aliases]]
+name = "db2"
+spec = "ark:doubao-seed-2-0-pro-260215"
 [[aliases]]
 name = "db2l"
-spec = "openrouter:bytedance-seed/seed-2.0-lite"
+spec = "ark:doubao-seed-2-0-lite-260428"
 [[aliases]]
 name = "db2m"
-spec = "openrouter:bytedance-seed/seed-2.0-mini"
-[[aliases]]
-name = "db2c"
-spec = "openrouter:bytedance-seed/seed-2.0-code"
-[[aliases]]
-name = "db16"
-spec = "openrouter:bytedance-seed/seed-1.6"
-[[aliases]]
-name = "db16f"
-spec = "openrouter:bytedance-seed/seed-1.6-flash"
+spec = "ark:doubao-seed-2-0-mini-260428"
 
 # ------------------------------------------------------------------ presets
 # Extra default request parameters by model pattern (JSON merge patch on the

@@ -129,6 +129,42 @@ pub struct Access {
 #[serde(deny_unknown_fields, default)]
 pub struct Providers {
     pub openrouter: Option<OpenRouterConfig>,
+    /// Volcengine Ark (火山方舟, Doubao); disabled when `api_key` is empty.
+    pub ark: Option<ArkConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArkConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_ark_base")]
+    pub base_url: String,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// Ark summary-mode models can pause long between chunks (Ark suggests ≥1800 s).
+    #[serde(default = "default_ark_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    /// Cap for the automatic max_tokens (answer only). Ark reserves TPM quota
+    /// by prompt + max_tokens, so very large values throttle concurrency.
+    #[serde(default = "default_ark_max_tokens_cap")]
+    pub max_tokens_cap: u64,
+    /// CNY per USD for cost estimates (Ark prices are in CNY; responses carry no cost).
+    #[serde(default = "default_cny_per_usd")]
+    pub cny_per_usd: f64,
+}
+
+fn default_ark_base() -> String {
+    omni_llm::ark::DEFAULT_BASE_URL.into()
+}
+fn default_ark_idle_timeout() -> u64 {
+    1800
+}
+fn default_ark_max_tokens_cap() -> u64 {
+    65_536
+}
+fn default_cny_per_usd() -> f64 {
+    7.1
 }
 
 #[derive(Debug, Clone, Deserialize)]
