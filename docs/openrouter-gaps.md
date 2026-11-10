@@ -75,6 +75,7 @@
 | 功能 | 官方 API 能做什么 | 为什么 OpenRouter 做不到 | 来源 |
 |---|---|---|---|
 | `web_search` 的部分参数 | `filters.blocked_domains`、`external_web_access`（只用缓存/离线）、`return_token_budget`、图片搜索（`search_content_types` + `image_settings`） | 任何 `web_search`/`web_search_preview` 工具都会被提升为 `openrouter:web_search`，只带 OR 自己的参数：后三者没有，`excluded_domains` 对 OpenAI 原生搜索被静默忽略 | OA§3.1, OA§10.2, OR§5.1–5.2 |
+| `image_generation` 托管工具 | 聊天模型在回答中调用 OpenAI 自己的出图工具（gpt-image 系列），结果为 `image_generation_call` 项 | RSP 实测发送 `{"type":"image_generation"}` 后，返回的是 `openrouter:image_generation` 项：被替换成 OR 自己执行的出图工具，不是 OpenAI 的 | 实测 2026-11-11（`gpt-6-luna`） |
 | `code_interpreter` 的执行输出和生成的文件 | `include: ["code_interpreter_call.outputs"]` 返回执行日志和图片输出；生成的文件（图表等）经 `container_file_citation` + 容器文件接口下载 | 工具本身能透传并执行，但：CC 的流里没有任何 `code_interpreter_call` 项（只有加密推理，index 中间有缺口）；RSP 能看到 `code` 和 `container_id`，带了 `include` 后 `outputs` 仍是 `null`；回答里只有 `sandbox:/mnt/data/…` 链接，没有可下载的途径 | 实测 2026-11-11（`gpt-6-luna`，CC 与 RSP 各一次） |
 
 **疑似缺口（待实测）**
