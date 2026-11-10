@@ -70,16 +70,6 @@ impl BotSession {
         })
     }
 
-    pub fn bot(&self) -> &str {
-        &self.bot
-    }
-
-    /// Whether this session has an authorization key for its home DC (i.e. may be logged in).
-    pub fn has_home_auth_key(&self) -> bool {
-        let dc = *self.home_dc.read();
-        self.dc_options.read().get(&dc).is_some_and(|o| o.auth_key.is_some())
-    }
-
     /// Persist an update-state change inside an existing transaction.
     /// Used by update intake to commit "message recorded" and "pts advanced" atomically.
     pub fn apply_update_state_in(conn: &Connection, bot: &str, update: &UpdateState) -> rusqlite::Result<()> {

@@ -7,6 +7,7 @@
 //!
 //! Direct official APIs (OpenAI Responses, Anthropic Messages, Gemini) can be
 //! added as further [`Provider`] implementations reusing the same events.
+#![allow(clippy::result_large_err)]
 
 pub mod ark;
 pub mod budget;

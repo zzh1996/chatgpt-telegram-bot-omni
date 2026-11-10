@@ -27,8 +27,6 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
-    /// Waiting for the parent turn / queue.
-    Queued,
     Generating,
     Done,
     Failed,
@@ -41,7 +39,6 @@ pub enum Status {
 }
 
 pub struct ComposeInput<'a> {
-    pub label: &'a str,
     pub model: &'a str,
     pub options: &'a str,
     pub parts: &'a [Part],
@@ -107,7 +104,7 @@ fn ai_blocks(md: &str, raw: bool, base_depth: usize) -> Vec<RBlock> {
 
 pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     let raw = inp.raw_ai || inp.mode == Mode::Raw;
-    let finished = !matches!(inp.status, Status::Generating | Status::Queued);
+    let finished = inp.status != Status::Generating;
     let mut out = vec![header(inp.model, None)];
 
     // 2. reasoning
@@ -261,10 +258,8 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     out.extend(lines.into_iter().map(|l| RBlock::Footer(RText::plain(l))));
 
     let mut f: Vec<String> = Vec::new();
-    match inp.status {
-        Status::Queued => f.push("⏳ queued".into()),
-        Status::Generating => f.push(format!("⏳ generating · {}s", inp.elapsed.as_secs())),
-        _ => {}
+    if inp.status == Status::Generating {
+        f.push(format!("⏳ generating · {}s", inp.elapsed.as_secs()))
     }
     if !inp.options.is_empty() {
         f.push(inp.options.to_string());
@@ -453,7 +448,6 @@ mod tests {
 
     fn input<'a>(parts: &'a [Part], status: Status) -> ComposeInput<'a> {
         ComposeInput {
-            label: "c",
             model: "anthropic/claude-opus-5.5",
             options: "+s",
             parts,

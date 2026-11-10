@@ -154,10 +154,6 @@ impl BotConn {
         Ok((&self.peer_ref(chat_id).await?).into())
     }
 
-    pub async fn input_user(&self, user_id: i64) -> Result<tl::enums::InputUser> {
-        Ok((&self.peer_ref(user_id).await?).into())
-    }
-
     /// Fetch messages by id (works for private chats, groups and supergroups).
     pub async fn get_messages(&self, chat_id: i64, ids: &[i32]) -> Result<Vec<tl::enums::Message>> {
         let id: Vec<tl::enums::InputMessage> =

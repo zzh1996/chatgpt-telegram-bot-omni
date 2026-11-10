@@ -78,6 +78,7 @@ pub struct TurnRow {
     pub chat_id: Option<i64>,
     pub user_id: Option<i64>,
     pub inbound_id: Option<i64>,
+    #[allow(dead_code)]
     pub created_at: i64,
 }
 
@@ -230,6 +231,8 @@ pub async fn turn_for_message(db: &Db, bot: &str, chat_id: i64, msg_id: i32) -> 
     .await
 }
 
+/// Map a Telegram message to a turn (tests; production code links via the outbox).
+#[cfg(test)]
 pub async fn link_message(
     db: &Db,
     bot: &str,
@@ -246,19 +249,6 @@ pub async fn link_message(
             params![bot, chat_id, msg_id, turn_id, attempt_id, part],
         )?;
         Ok(())
-    })
-    .await
-}
-
-/// First Telegram message of a turn (for reply targets), any bot.
-pub async fn first_message_of_turn(db: &Db, turn_id: i64) -> Result<Option<(String, i64, i32)>> {
-    db.call(move |c| {
-        Ok(c.query_row(
-            "SELECT bot, chat_id, msg_id FROM tg_messages WHERE turn_id = ?1 ORDER BY msg_id LIMIT 1",
-            params![turn_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?)
     })
     .await
 }
@@ -396,6 +386,7 @@ pub struct Inbound {
     pub chat_id: i64,
     pub msg_id: i32,
     pub sender_id: Option<i64>,
+    #[allow(dead_code)]
     pub date: i64,
     pub text: String,
     pub reply_to_msg_id: Option<i32>,

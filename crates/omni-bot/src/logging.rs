@@ -17,9 +17,6 @@ use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
-/// Target used for raw upstream payload logging.
-pub const RAW: &str = "raw";
-
 struct Timer {
     tz: jiff::tz::TimeZone,
 }

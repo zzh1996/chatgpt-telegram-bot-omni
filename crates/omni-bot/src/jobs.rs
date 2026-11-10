@@ -321,7 +321,6 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
     };
     let max_attempts = app.cfg.retry.max_attempts.max(1);
     let base_state = RenderState {
-        label: spec.label.clone(),
         model: spec.model.clone(),
         options: spec.options_syntax(),
         parts: Vec::new(),
@@ -540,14 +539,13 @@ async fn mark_interrupted(ctx: &Ctx, last: &AttemptRow, appending: bool) -> Resu
     // what it had delivered before the disconnect (if Input & Output Logging is on).
     // (The stored id list is comma-separated; the last call is the interrupted one.)
     let last_id = upstream.as_deref().and_then(|u| u.rsplit(',').next()).filter(|s| !s.is_empty());
-    if let Some(gen_id) = last_id.filter(|_| ctx.spec.provider == "openrouter") {
-        if let Some(recovered) = recover_delivered(app, gen_id).await {
-            let have: usize = parts.iter().map(|p| if let Part::Text { text, .. } = p { text.len() } else { 0 }).sum();
-            let got: usize =
-                recovered.iter().map(|p| if let Part::Text { text, .. } = p { text.len() } else { 0 }).sum();
-            if got > have {
-                parts = recovered;
-            }
+    if let Some(gen_id) = last_id.filter(|_| ctx.spec.provider == "openrouter")
+        && let Some(recovered) = recover_delivered(app, gen_id).await
+    {
+        let have: usize = parts.iter().map(|p| if let Part::Text { text, .. } = p { text.len() } else { 0 }).sum();
+        let got: usize = recovered.iter().map(|p| if let Part::Text { text, .. } = p { text.len() } else { 0 }).sum();
+        if got > have {
+            parts = recovered;
         }
     }
     conv::update_attempt(
@@ -1010,14 +1008,15 @@ async fn run_attempt(
                         break Ok(true);
                     }
                     let resumable = e.is_retryable() && e.kind != omni_llm::ErrorKind::Cancelled;
-                    if resumable && resumes < MAX_RESUMES {
-                        if let Some((item, parts)) = sink.checkpoint.clone() {
-                            resumes += 1;
-                            warn!(error = %e, resume = resumes, "stream dropped; resuming from the latest checkpoint");
-                            sink.acc.restore_parts(parts);
-                            hop_req = prepared.with_continuation(&item);
-                            continue;
-                        }
+                    if resumable
+                        && resumes < MAX_RESUMES
+                        && let Some((item, parts)) = sink.checkpoint.clone()
+                    {
+                        resumes += 1;
+                        warn!(error = %e, resume = resumes, "stream dropped; resuming from the latest checkpoint");
+                        sink.acc.restore_parts(parts);
+                        hop_req = prepared.with_continuation(&item);
+                        continue;
                     }
                     break Err(e);
                 }
@@ -1120,20 +1119,22 @@ async fn run_attempt(
                 .await
                 .ok();
                 // Context overflow with an automatic max_tokens: shrink and retry at once.
-                if !append_mode && e.is_context_overflow() && !acc.has_output() {
-                    if let Some(prev) = prepared.auto_max_tokens {
-                        let msg =
-                            format!("{} {}", e.message, e.details.as_ref().map(|d| d.to_string()).unwrap_or_default());
-                        if let Some(v) = shrink_after_overflow(prev, &msg) {
-                            final_state.error = Some(e.clone());
-                            final_state.status = Status::Retrying { in_secs: 0 };
-                            final_state
-                                .notes
-                                .push(format!("max_tokens {prev} did not fit the context window; retrying with {v}"));
-                            final_state.done = true;
-                            view.finish(final_state).await;
-                            return Outcome::Shrink(v);
-                        }
+                if !append_mode
+                    && e.is_context_overflow()
+                    && !acc.has_output()
+                    && let Some(prev) = prepared.auto_max_tokens
+                {
+                    let msg =
+                        format!("{} {}", e.message, e.details.as_ref().map(|d| d.to_string()).unwrap_or_default());
+                    if let Some(v) = shrink_after_overflow(prev, &msg) {
+                        final_state.error = Some(e.clone());
+                        final_state.status = Status::Retrying { in_secs: 0 };
+                        final_state
+                            .notes
+                            .push(format!("max_tokens {prev} did not fit the context window; retrying with {v}"));
+                        final_state.done = true;
+                        view.finish(final_state).await;
+                        return Outcome::Shrink(v);
                     }
                 }
                 let failed_now = failed_before + 1;

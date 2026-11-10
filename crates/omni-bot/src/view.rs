@@ -23,7 +23,6 @@ use crate::tg::outbox::{self, Content, Link, SendError, SendReq};
 
 #[derive(Debug, Clone)]
 pub struct RenderState {
-    pub label: String,
     pub model: String,
     pub options: String,
     pub parts: Vec<Part>,
@@ -52,7 +51,6 @@ pub struct RenderState {
 impl RenderState {
     fn compose(&self, raw_ai: bool) -> Vec<omni_markdown::rich::RBlock> {
         compose::compose(&ComposeInput {
-            label: &self.label,
             model: &self.model,
             options: &self.options,
             parts: &self.parts,

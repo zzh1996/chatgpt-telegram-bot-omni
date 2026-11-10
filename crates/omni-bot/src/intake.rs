@@ -182,8 +182,7 @@ async fn on_update(app: &Arc<App>, bot: &Arc<BotConn>, update: tl::enums::Update
     let Some(kind) = kind else {
         return Ok(());
     };
-    let mut payload = InboundPayload::default();
-    payload.media = media_of(&m);
+    let mut payload = InboundPayload { media: media_of(&m), ..Default::default() };
     if let Some(Peer::User(u)) = sender_peer {
         payload.sender_name =
             Some(format!("{} {}", u.first_name().unwrap_or(""), u.last_name().unwrap_or("")).trim().to_string());

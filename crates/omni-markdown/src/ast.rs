@@ -229,6 +229,7 @@ fn is_inline_start(e: &Event<'_>) -> bool {
 }
 
 /// Parse blocks until the matching `End(end)` (consumed) or end of input.
+#[allow(clippy::while_let_loop)]
 fn parse_blocks(ev: &mut Events<'_>, end: Option<TagEnd>) -> Vec<Block> {
     let mut blocks = Vec::new();
     loop {
@@ -393,6 +394,7 @@ fn parse_inline_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> (Inline, usi
     (inl, src_end)
 }
 
+#[allow(clippy::while_let_loop)]
 fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block> {
     match tag {
         Tag::Paragraph => {

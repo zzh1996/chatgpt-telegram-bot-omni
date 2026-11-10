@@ -1,4 +1,5 @@
 //! omni: multi-bot, multi-provider Telegram LLM bot (MTProto).
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 mod access;
 mod app;

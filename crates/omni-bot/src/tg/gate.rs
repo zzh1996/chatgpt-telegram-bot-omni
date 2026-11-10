@@ -75,12 +75,6 @@ impl ChatGate {
         }
         GatePermit { _guard: guard, state: self.state.clone(), interval: self.interval }
     }
-
-    /// Time until an operation could start (zero if free now and not locked).
-    pub fn ready_in(&self) -> Duration {
-        let s = self.state.lock();
-        s.next_allowed.saturating_duration_since(Instant::now())
-    }
 }
 
 /// All gates of one bot, keyed by chat id.

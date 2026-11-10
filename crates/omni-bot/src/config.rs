@@ -241,7 +241,9 @@ pub struct AliasConfig {
     pub name: String,
     /// A spec in trigger syntax without the `$`, e.g. `openrouter:anthropic/claude-opus-5-5+search`.
     pub spec: String,
+    /// Free-form documentation in the config file (not used by the bot).
     #[serde(default)]
+    #[allow(dead_code)]
     pub note: Option<String>,
 }
 
@@ -254,7 +256,9 @@ pub struct PresetConfig {
     /// JSON merge patch applied to the request body (provider dialect).
     #[serde(default)]
     pub body: Option<toml::Value>,
+    /// Free-form documentation in the config file (not used by the bot).
     #[serde(default)]
+    #[allow(dead_code)]
     pub note: Option<String>,
 }
 
