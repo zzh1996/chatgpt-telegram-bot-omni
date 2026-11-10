@@ -11,7 +11,7 @@ max_file_mb = 50               # max Telegram file size forwarded to a model
 [log]
 level = "verbose"              # verbose (raw upstream payloads) | normal | quiet | any tracing filter
 file = true                    # also write data/logs/omni.YYYY-MM-DD.utc.log (rolls over at 00:00 UTC)
-keep_days = 30                 # daily log files to keep (0 = all); verbose logs are large
+keep_days = 0                  # daily log files to keep (0 = keep all)
 
 [telegram]
 # From https://my.telegram.org/apps

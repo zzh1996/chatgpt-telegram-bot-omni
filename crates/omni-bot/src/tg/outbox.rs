@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::bot::BotConn;
 use super::convert::{formatted_to_tl, sent_message_id};
-use super::rich::input_rich_message;
+use super::rich::{RichMedia, input_rich_message};
 use crate::store::{Db, now_ms};
 
 /// What a Telegram message should display.
@@ -123,6 +123,8 @@ pub struct SendReq<'a> {
     pub reply_to: Option<i32>,
     pub content: &'a Content,
     pub link: Link,
+    /// Uploaded media referenced by `Photo`/`Document` blocks of rich content.
+    pub media: Option<&'a RichMedia>,
 }
 
 /// Ensure the message for `link` exists in Telegram; returns its id.
@@ -156,7 +158,9 @@ pub async fn send(db: &Db, bot: &BotConn, req: SendReq<'_>) -> Result<i32, SendE
             })
         });
         let (message, entities, rich_message) = match req.content {
-            Content::Rich(blocks) => (String::new(), None, Some(input_rich_message(blocks))),
+            Content::Rich(blocks) => {
+                (String::new(), None, Some(input_rich_message(blocks, req.media.unwrap_or(&RichMedia::default()))))
+            }
             Content::Text(f) => {
                 let (t, e) = formatted_to_tl(f);
                 (t, if e.is_empty() { None } else { Some(e) }, None)
@@ -228,7 +232,14 @@ pub async fn send(db: &Db, bot: &BotConn, req: SendReq<'_>) -> Result<i32, SendE
 }
 
 /// Edit a message's content. `MESSAGE_NOT_MODIFIED` counts as success.
-pub async fn edit(db: &Db, bot: &BotConn, chat_id: i64, msg_id: i32, content: &Content) -> Result<(), SendError> {
+pub async fn edit(
+    db: &Db,
+    bot: &BotConn,
+    chat_id: i64,
+    msg_id: i32,
+    content: &Content,
+    media: Option<&RichMedia>,
+) -> Result<(), SendError> {
     let peer = bot.input_peer(chat_id).await.map_err(SendError::Other)?;
     let gate = bot.gates.get(chat_id);
     let mut tries = 0u32;
@@ -236,7 +247,9 @@ pub async fn edit(db: &Db, bot: &BotConn, chat_id: i64, msg_id: i32, content: &C
         tries += 1;
         let permit = gate.acquire().await;
         let (message, entities, rich_message) = match content {
-            Content::Rich(blocks) => (Some(String::new()), None, Some(input_rich_message(blocks))),
+            Content::Rich(blocks) => {
+                (Some(String::new()), None, Some(input_rich_message(blocks, media.unwrap_or(&RichMedia::default()))))
+            }
             Content::Text(f) => {
                 let (t, e) = formatted_to_tl(f);
                 (Some(t), Some(e), None)
@@ -409,7 +422,7 @@ pub async fn send_file(
     link: Link,
 ) -> Result<i32, SendError> {
     let dummy = Content::Text(Formatted::plain(caption));
-    let req = SendReq { chat_id, reply_to, content: &dummy, link };
+    let req = SendReq { chat_id, reply_to, content: &dummy, link, media: None };
     let (random_id, existing) = reserve(db, &bot.name, &req).await.map_err(SendError::Other)?;
     if let Some(id) = existing {
         return Ok(id);

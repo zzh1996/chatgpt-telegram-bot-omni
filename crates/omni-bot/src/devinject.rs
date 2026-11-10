@@ -54,6 +54,9 @@ struct Injected {
     mime: Option<String>,
     #[serde(default)]
     as_photo: bool,
+    /// Probe: keep the sent messages (to read them back) instead of deleting them.
+    #[serde(default)]
+    keep: bool,
 }
 
 pub fn spawn(app: Arc<App>, dir: PathBuf) {
@@ -101,18 +104,89 @@ async fn inject(app: &Arc<App>, path: &Path) -> Result<i32> {
         std::fs::create_dir_all(&out_dir)?;
         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let mut report = String::new();
+        let mut media = crate::tg::rich::RichMedia::default();
         for (i, (label, blocks)) in req.probe.iter().enumerate() {
+            // Media keys are blob hashes (photos) or `hash/filename` (documents) of existing blobs.
+            let mut sources = Vec::new();
+            for key in omni_markdown::rich::media_keys(blocks) {
+                let (sha, name) = match key.split_once('/') {
+                    Some((h, n)) => (h.to_string(), Some(n.to_string())),
+                    None => (key.clone(), None),
+                };
+                let sha2 = sha.clone();
+                let meta: Option<(i64, Option<String>)> = app
+                    .db
+                    .call(move |c| {
+                        Ok(rusqlite::OptionalExtension::optional(c.query_row(
+                            "SELECT size, mime FROM blobs WHERE sha256 = ?1",
+                            params![sha2],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        ))?)
+                    })
+                    .await?;
+                let Some((size, mime)) = meta else { anyhow::bail!("no blob {sha}") };
+                let blob = omni_core::BlobRef { sha256: sha, size: size as u64, mime: mime.unwrap_or_default() };
+                sources.push(crate::tg::upload::Source {
+                    key: key.clone(),
+                    blob,
+                    filename: name.clone().unwrap_or_else(|| "image.jpg".into()),
+                    want: if name.is_some() {
+                        crate::tg::upload::Want::Document
+                    } else {
+                        crate::tg::upload::Want::Photo
+                    },
+                });
+            }
+            crate::tg::upload::ensure(app, &bot, req.chat_id, &sources, &mut media).await?;
             let content = Content::Rich(blocks.clone());
             let h = Sha256::digest(format!("{name}/{i}").as_bytes());
             let tag = i64::from_be_bytes(h[..8].try_into().unwrap()) & 0x3fff_ffff_ffff_ffff;
             let link = Link { turn_id: -2, attempt_id: None, part_index: tag };
-            let res =
-                outbox::send(&app.db, &bot, SendReq { chat_id: req.chat_id, reply_to: None, content: &content, link })
-                    .await;
+            let res = outbox::send(
+                &app.db,
+                &bot,
+                SendReq { chat_id: req.chat_id, reply_to: None, content: &content, link, media: Some(&media) },
+            )
+            .await;
             match res {
                 Ok(id) => {
-                    report.push_str(&format!("OK   {label}\n"));
-                    let _ = outbox::delete(&app.db, &bot, req.chat_id, &[id]).await;
+                    // Read it back and compare the stored text with what was sent.
+                    let verdict = match bot.get_messages(req.chat_id, &[id]).await {
+                        Ok(msgs) => match msgs.first() {
+                            Some(grammers_tl_types::enums::Message::Message(m)) => match &m.rich_message {
+                                Some(grammers_tl_types::enums::RichMessage::Message(rm)) => {
+                                    let got = crate::tg::rich::received_text(&rm.blocks);
+                                    let want = crate::tg::rich::expected_text(blocks);
+                                    let part = if rm.part { " part=true" } else { "" };
+                                    if got == want {
+                                        format!("intact ({} chars){part}", want.chars().count())
+                                    } else {
+                                        let at = got.chars().zip(want.chars()).take_while(|(a, b)| a == b).count();
+                                        let around = |s: &str| {
+                                            s.chars().skip(at.saturating_sub(10)).take(30).collect::<String>()
+                                        };
+                                        format!(
+                                            "CHANGED{part}: sent {} chars, stored {} chars, first difference at char {at}: sent {:?} stored {:?}",
+                                            want.chars().count(),
+                                            got.chars().count(),
+                                            around(&want),
+                                            around(&got)
+                                        )
+                                    }
+                                }
+                                None => format!(
+                                    "CHANGED: no rich message stored (text {:?})",
+                                    m.message.chars().take(40).collect::<String>()
+                                ),
+                            },
+                            other => format!("CHANGED: unexpected {other:?}"),
+                        },
+                        Err(e) => format!("read-back failed: {e}"),
+                    };
+                    report.push_str(&format!("OK   {label} msg={id} · {verdict}\n"));
+                    if !req.keep {
+                        let _ = outbox::delete(&app.db, &bot, req.chat_id, &[id]).await;
+                    }
                 }
                 Err(e) => report.push_str(&format!("FAIL {label}: {e}\n")),
             }
@@ -145,7 +219,7 @@ async fn inject(app: &Arc<App>, path: &Path) -> Result<i32> {
         None => outbox::send(
             &app.db,
             &bot,
-            SendReq { chat_id: req.chat_id, reply_to: req.reply_to, content: &content, link },
+            SendReq { chat_id: req.chat_id, reply_to: req.reply_to, content: &content, link, media: None },
         )
         .await
         .map_err(|e| anyhow!("send: {e}"))?,

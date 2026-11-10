@@ -322,13 +322,13 @@ pub struct LogConfig {
     pub level: String,
     /// Also write logs to `<data_dir>/logs/omni.YYYY-MM-DD.utc.log` (one file per UTC day).
     pub file: bool,
-    /// Keep this many daily log files (0 = keep all). Verbose logs are large.
+    /// Keep this many daily log files (0 = keep all, the default).
     pub keep_days: usize,
 }
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: "verbose".into(), file: true, keep_days: 30 }
+        Self { level: "verbose".into(), file: true, keep_days: 0 }
     }
 }
 

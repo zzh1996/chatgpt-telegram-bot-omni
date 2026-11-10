@@ -178,6 +178,42 @@ pub enum RBlock {
         title: RText,
         blocks: Vec<RBlock>,
     },
+    /// An inline image (`pageBlockPhoto`). `key` names media the sender
+    /// uploads (e.g. a blob hash); never produced from Markdown.
+    Photo {
+        key: String,
+        caption: RText,
+    },
+    /// An attached file (`pageBlockDocument`). Never produced from Markdown.
+    Document {
+        key: String,
+        caption: RText,
+    },
+}
+
+impl RBlock {
+    /// Media keys referenced by this block (photos and documents), recursively.
+    pub fn media_keys(&self, out: &mut Vec<String>) {
+        match self {
+            RBlock::Photo { key, .. } | RBlock::Document { key, .. } => {
+                if !out.contains(key) {
+                    out.push(key.clone());
+                }
+            }
+            RBlock::List { items } | RBlock::OrderedList { items, .. } => {
+                items.iter().flat_map(|i| &i.blocks).for_each(|b| b.media_keys(out))
+            }
+            RBlock::Quote { blocks } | RBlock::Details { blocks, .. } => blocks.iter().for_each(|b| b.media_keys(out)),
+            _ => {}
+        }
+    }
+}
+
+/// Media keys referenced by `blocks`, in order of first appearance.
+pub fn media_keys(blocks: &[RBlock]) -> Vec<String> {
+    let mut out = Vec::new();
+    blocks.iter().for_each(|b| b.media_keys(&mut out));
+    out
 }
 
 /// Size metrics of blocks against rich-message limits.
@@ -215,7 +251,9 @@ impl RBlock {
             RBlock::Paragraph(t)
             | RBlock::Footer(t)
             | RBlock::Heading { text: t, .. }
-            | RBlock::CollapsedQuote { text: t } => {
+            | RBlock::CollapsedQuote { text: t }
+            | RBlock::Photo { caption: t, .. }
+            | RBlock::Document { caption: t, .. } => {
                 m.chars = t.chars();
                 m.depth = 1 + t.depth();
             }
@@ -298,9 +336,16 @@ fn non_empty_children(blocks: Vec<RBlock>) -> Vec<RBlock> {
     if b.is_empty() { vec![RBlock::Paragraph(RText::plain(""))] } else { b }
 }
 
+/// Strings Telegram cannot store whole (it truncates every text string to
+/// 70000 UTF-8 bytes); text nodes are split by the sender, but formula
+/// sources and URLs are single strings, so long ones become plain text.
+pub const STRING_MAX_BYTES: usize = 65_000;
+
 fn sanitize_text(t: RText) -> RText {
     match t {
         RText::Math(m) if m.trim().is_empty() => RText::Plain(m),
+        RText::Math(m) if m.len() > STRING_MAX_BYTES => RText::Plain(m),
+        RText::Url { text, url } if url.len() > STRING_MAX_BYTES => sanitize_text(*text),
         RText::Bold(x) => RText::Bold(Box::new(sanitize_text(*x))),
         RText::Italic(x) => RText::Italic(Box::new(sanitize_text(*x))),
         RText::Underline(x) => RText::Underline(Box::new(sanitize_text(*x))),
@@ -327,7 +372,13 @@ fn sanitize_block(b: RBlock) -> Option<RBlock> {
         RBlock::Footer(t) => RBlock::Footer(sanitize_text(t)),
         RBlock::CollapsedQuote { text } => RBlock::CollapsedQuote { text: sanitize_text(text) },
         RBlock::Pre { text, language } if text.is_empty() => RBlock::Pre { text: " ".into(), language },
+        // Telegram turns tabs and carriage returns into single spaces: expand tabs to
+        // their columns (keeps indentation readable) and normalize line breaks.
+        RBlock::Pre { text, language } if text.contains(['\t', '\r']) => {
+            RBlock::Pre { text: expand_tabs(&text.replace("\r\n", "\n").replace('\r', "\n")), language }
+        }
         RBlock::Math(m) if m.trim().is_empty() => return None,
+        RBlock::Math(m) if m.len() > STRING_MAX_BYTES => RBlock::Pre { text: m, language: "latex".into() },
         RBlock::List { items } | RBlock::OrderedList { items, .. } if items.is_empty() => return None,
         RBlock::List { items } => RBlock::List { items: sanitize_items(items) },
         RBlock::OrderedList { start, items } => RBlock::OrderedList { start, items: sanitize_items(items) },
@@ -335,6 +386,8 @@ fn sanitize_block(b: RBlock) -> Option<RBlock> {
         RBlock::Details { open, title, blocks } => {
             RBlock::Details { open, title: sanitize_text(title), blocks: non_empty_children(blocks) }
         }
+        RBlock::Photo { key, caption } => RBlock::Photo { key, caption: sanitize_text(caption) },
+        RBlock::Document { key, caption } => RBlock::Document { key, caption: sanitize_text(caption) },
         RBlock::Table { rows, .. } if rows.iter().all(|r| r.is_empty()) => return None,
         RBlock::Table { rows, bordered, striped } => RBlock::Table {
             rows: rows
@@ -347,6 +400,30 @@ fn sanitize_block(b: RBlock) -> Option<RBlock> {
         },
         other => other,
     })
+}
+
+/// Expand tabs to spaces at 4-column tab stops (per line).
+pub fn expand_tabs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for c in s.chars() {
+        match c {
+            '\t' => {
+                let n = 4 - col % 4;
+                out.extend(std::iter::repeat_n(' ', n));
+                col += n;
+            }
+            '\n' => {
+                out.push(c);
+                col = 0;
+            }
+            _ => {
+                out.push(c);
+                col += 1;
+            }
+        }
+    }
+    out
 }
 
 fn sanitize_items(items: Vec<RItem>) -> Vec<RItem> {
@@ -729,7 +806,7 @@ fn split_block(b: RBlock, chars: usize, blocks: usize) -> Option<(RBlock, RBlock
             let (a, rest) = split_text_at(&plain, chars)?;
             Some((RBlock::Footer(RText::plain(a)), RBlock::Footer(RText::plain(rest))))
         }
-        RBlock::Math(_) | RBlock::Divider => None,
+        RBlock::Math(_) | RBlock::Divider | RBlock::Photo { .. } | RBlock::Document { .. } => None,
     }
 }
 
@@ -943,5 +1020,17 @@ mod sanitize_tests {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    #[test]
+    fn tabs_expand_to_columns() {
+        assert_eq!(expand_tabs("\tx\n a\tb"), "    x\n a  b");
+        let b = sanitize(vec![RBlock::Pre { text: "a\r\n\tb".into(), language: "go".into() }]);
+        assert_eq!(b, vec![RBlock::Pre { text: "a\n    b".into(), language: "go".into() }]);
     }
 }

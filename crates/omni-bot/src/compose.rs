@@ -56,11 +56,35 @@ pub struct ComposeInput<'a> {
     pub mode: Mode,
     /// Show AI-generated content as raw Markdown (fallback after Telegram rejected the rendering).
     pub raw_ai: bool,
-    pub images: usize,
     /// Completed long-decode continuation hops (0 = single request).
     pub hops: u32,
     /// This attempt continues a finished answer (`/continue`).
     pub continuation: bool,
+    /// Files attached by the bot (media keys), e.g. the original Markdown when
+    /// Telegram altered the rendered text.
+    pub attachments: &'a [String],
+    /// What the request actually asks for (effort, user options expanded), from
+    /// the request body; empty when no request was built.
+    pub settings: &'a [String],
+}
+
+/// The model output of `parts` as Markdown, exactly (reasoning in HTML comments).
+pub fn raw_markdown(parts: &[Part]) -> String {
+    let mut md = String::new();
+    for p in parts {
+        match p {
+            Part::Reasoning(r) => {
+                if let Some(text) = &r.text {
+                    let kind = if r.kind == ReasoningKind::Summary { "reasoning summary" } else { "reasoning" };
+                    md.push_str(&format!("<!-- {kind} -->\n{text}\n<!-- end {kind} -->\n\n"));
+                }
+            }
+            Part::Text { text, .. } => md.push_str(text),
+            Part::Refusal { text } => md.push_str(&format!("<!-- refusal -->\n{text}\n")),
+            _ => {}
+        }
+    }
+    md
 }
 
 pub fn label(s: &str) -> RText {
@@ -169,7 +193,8 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         });
     }
 
-    // 4. answer (and refusals, which are model output but not the answer)
+    // 4. answer, with generated images in the place the model put them
+    //    (and refusals, which are model output but not the answer)
     let mut answer = String::new();
     let mut citations = Vec::new();
     for p in inp.parts {
@@ -177,6 +202,13 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
             Part::Text { text, citations: c } => {
                 answer.push_str(text);
                 citations.extend(c.iter().cloned());
+            }
+            Part::Image { blob, generated: true, dims, .. } => {
+                if !answer.trim().is_empty() {
+                    out.extend(ai_blocks(&answer, raw, 0));
+                }
+                answer.clear();
+                out.push(RBlock::Photo { key: blob.sha256.clone(), caption: RText::plain(image_caption(blob, *dims)) });
             }
             Part::Refusal { text } => out.push(RBlock::Details {
                 open: true,
@@ -215,14 +247,15 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         });
     }
 
-    // 6. error
+    // 6. error: the message in the title; only the parts of the error object
+    //    that carry information beyond it (metadata, upstream raw error…) inside.
     if let Some(e) = inp.error {
         let title = format!("⚠️ Error: {e}");
-        match &e.details {
+        match e.details.as_ref().and_then(error_extra) {
             Some(d) => out.push(RBlock::Details {
                 open: false,
                 title: RText::plain(title),
-                blocks: vec![RBlock::Pre { text: pretty(d), language: "json".into() }],
+                blocks: vec![RBlock::Pre { text: pretty(&d), language: "json".into() }],
             }),
             None => out.push(RBlock::Footer(RText::plain(title))),
         }
@@ -245,23 +278,19 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         }
         _ => {}
     }
-    if inp.images > 0 {
-        lines.push(format!(
-            "🖼 {} image{} sent as separate messages",
-            inp.images,
-            if inp.images == 1 { "" } else { "s" }
-        ));
-    }
     for n in inp.notes {
         lines.push(format!("ℹ️ {n}"));
     }
     out.extend(lines.into_iter().map(|l| RBlock::Footer(RText::plain(l))));
+    out.extend(inp.attachments.iter().map(|k| RBlock::Document { key: k.clone(), caption: RText::plain("") }));
 
     let mut f: Vec<String> = Vec::new();
     if inp.status == Status::Generating {
         f.push(format!("⏳ generating · {}s", inp.elapsed.as_secs()))
     }
-    if !inp.options.is_empty() {
+    if !inp.settings.is_empty() {
+        f.extend(inp.settings.iter().cloned());
+    } else if !inp.options.is_empty() {
         f.push(inp.options.to_string());
     }
     if inp.continuation {
@@ -322,6 +351,76 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     out
 }
 
+/// `1024×1024 · 623.9 KB · JPEG` (dimensions when known, file size, format).
+pub fn image_caption(blob: &omni_core::BlobRef, dims: Option<(u32, u32)>) -> String {
+    let mut p = Vec::new();
+    if let Some((w, h)) = dims {
+        p.push(format!("{w}×{h}"));
+    }
+    p.push(fmt_bytes(blob.size));
+    if let Some(f) = blob.mime.strip_prefix("image/") {
+        p.push(f.to_ascii_uppercase());
+    }
+    p.join(" · ")
+}
+
+pub fn fmt_bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1u64 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.1} KB", n as f64 / (1u64 << 10) as f64),
+        n => format!("{n} B"),
+    }
+}
+
+/// What an error object says beyond its message and status. Known shapes
+/// (`{"error": {message, code, metadata}, "user_id"}` from OpenRouter, Ark's
+/// `{code, message, param, type}`, in-band stream chunks) are reduced to the
+/// parts that vary; anything unrecognized is shown whole.
+fn error_extra(details: &Value) -> Option<Value> {
+    let Some(obj) = details.as_object() else {
+        return Some(details.clone());
+    };
+    // Fields that are the same for every error (or noise) at the top level.
+    const OUTER_NOISE: &[&str] =
+        &["error", "user_id", "id", "object", "created", "model", "choices", "system_fingerprint"];
+    let (err, outer) = match obj.get("error").and_then(Value::as_object) {
+        Some(e) => (e, Some(obj)),
+        None => (obj, None),
+    };
+    if !err.contains_key("message") {
+        return Some(details.clone());
+    }
+    let mut extra = serde_json::Map::new();
+    if let Some(o) = outer {
+        for (k, v) in o {
+            if !OUTER_NOISE.contains(&k.as_str()) {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for (k, v) in err {
+        match (k.as_str(), v) {
+            ("message", _) => {}
+            ("code", Value::Number(_)) => {} // the HTTP status, already in the title
+            ("metadata", Value::Object(m)) => {
+                for (mk, mv) in m {
+                    // `raw` is often the upstream error as a JSON string: show it parsed.
+                    let mv = match mv.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                        Some(parsed) if parsed.is_object() || parsed.is_array() => parsed,
+                        _ => mv.clone(),
+                    };
+                    extra.insert(mk.clone(), mv);
+                }
+            }
+            (_, Value::Null) => {}
+            _ => {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    (!extra.is_empty()).then_some(Value::Object(extra))
+}
+
 /// Why a successfully streamed answer may be incomplete, from its finish reason.
 fn abnormal_finish(fr: Option<&str>) -> Option<&'static str> {
     match fr? {
@@ -339,10 +438,16 @@ fn pretty(v: &Value) -> String {
     }
 }
 
-/// Split a composed document into Telegram messages; continuation messages get the header line too.
+/// Telegram's rich-message limits (32768 characters of text in all blocks,
+/// 500 blocks counting nested blocks, list items and table rows — measured
+/// against the live API, 2026-11-11), minus room for the header line that
+/// continuation pages get.
+pub const PAGE_LIMITS: RichLimits = RichLimits { max_chars: 32_768 - 128, max_blocks: 500 - 1, ..RichLimits::TELEGRAM };
+
+/// Split a composed document into as few Telegram messages as the limits
+/// allow; continuation messages get the header line too.
 pub fn paginate(model: &str, blocks: Vec<RBlock>) -> Vec<Vec<RBlock>> {
-    let lim = RichLimits { max_chars: 32_000, max_blocks: 480, ..RichLimits::TELEGRAM };
-    let pages = rich::split_blocks(rich::sanitize(blocks), lim);
+    let pages = rich::split_blocks(rich::sanitize(blocks), PAGE_LIMITS);
     pages
         .into_iter()
         .enumerate()
@@ -428,6 +533,14 @@ fn write_block(f: &mut Formatted, b: &RBlock, depth: usize) {
                 f.push_char('\n');
             }
         }
+        RBlock::Photo { caption, .. } => {
+            f.push_str("🖼 [image] ");
+            write_text(f, caption);
+        }
+        RBlock::Document { caption, .. } => {
+            f.push_str("📎 [file] ");
+            write_text(f, caption);
+        }
         RBlock::Details { title, blocks, .. } => {
             write_text(f, title);
             f.push_char('\n');
@@ -464,9 +577,10 @@ mod tests {
             show_usage: true,
             mode: Mode::Clean,
             raw_ai: false,
-            images: 0,
             hops: 0,
             continuation: false,
+            attachments: &[],
+            settings: &[],
         }
     }
 
@@ -531,9 +645,35 @@ mod tests {
         let blocks = compose(&i);
         let tail = &blocks[2..];
         assert!(tail.iter().all(|b| matches!(b, RBlock::Details { .. } | RBlock::Footer(_))), "{tail:?}");
+        // Nothing beyond the message: a small-text line.
+        assert!(tail.iter().any(|b| matches!(b, RBlock::Footer(t) if t.to_plain().starts_with("⚠️ Error"))));
+        // With upstream details: collapsible, details inside.
+        let mut e2 = LlmError::request("boom");
+        e2.details = Some(serde_json::json!({"error": {"message": "boom", "metadata": {"provider_name": "X"}}}));
+        i.error = Some(&e2);
+        let blocks = compose(&i);
         assert!(
-            tail.iter().any(|b| matches!(b, RBlock::Details { title, .. } if title.to_plain().starts_with("⚠️ Error")))
+            blocks[2..]
+                .iter()
+                .any(|b| matches!(b, RBlock::Details { title, .. } if title.to_plain().starts_with("⚠️ Error")))
         );
+    }
+
+    #[test]
+    fn error_details_keep_only_what_varies() {
+        let or = serde_json::json!({"error": {"message": "bad temp", "code": 400}, "user_id": "user_x"});
+        assert_eq!(error_extra(&or), None);
+        let or2 = serde_json::json!({"error": {"message": "upstream", "code": 502, "metadata": {"provider_name": "Google", "raw": "{\"error\":{\"status\":\"UNAVAILABLE\"}}"}}, "user_id": "u"});
+        assert_eq!(
+            error_extra(&or2),
+            Some(serde_json::json!({"provider_name": "Google", "raw": {"error": {"status": "UNAVAILABLE"}}}))
+        );
+        let ark = serde_json::json!({"code": "QuotaExceeded", "message": "m", "param": "", "type": "TooManyRequests"});
+        assert_eq!(
+            error_extra(&ark),
+            Some(serde_json::json!({"code": "QuotaExceeded", "param": "", "type": "TooManyRequests"}))
+        );
+        assert_eq!(error_extra(&serde_json::json!("plain text")), Some(serde_json::json!("plain text")));
     }
 
     #[test]

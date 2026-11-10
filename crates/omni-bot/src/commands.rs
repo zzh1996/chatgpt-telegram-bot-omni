@@ -17,7 +17,7 @@ use crate::jobs;
 use crate::reply;
 use crate::store::now_ms;
 use crate::tg::bot::BotConn;
-use crate::tg::outbox::{self, Link};
+use crate::tg::upload::{Source, Want};
 
 pub const HINT: &str = "Start a conversation with a prefix such as `$hello` (default model) or `alias$question`, or reply to one of my messages to continue. /help for details.";
 
@@ -366,6 +366,8 @@ async fn target_turn(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result
 /// Raw answers up to this size are sent inline (code block with a copy button), longer ones as a file.
 const RAW_INLINE_MAX: usize = 2000;
 
+/// `/raw`: one message with the original Markdown (inline when short, else
+/// an attached `.md`) and every original image/file of the answer attached.
 async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
     let mut md = String::new();
@@ -394,8 +396,15 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
             _ => {}
         }
     }
-    if answer.chars().count() <= RAW_INLINE_MAX && reasoning.chars().count() <= 28_000 {
-        let mut blocks = Vec::new();
+    let mut blocks = Vec::new();
+    let mut sources = Vec::new();
+    // Telegram turns tabs, CRs and other control characters into spaces: then only a file is exact.
+    let altered = |s: &str| s.chars().any(|c| (c as u32) < 0x20 && c != '\n' || matches!(c, '\u{2028}' | '\u{2029}'));
+    let inline = answer.chars().count() <= RAW_INLINE_MAX
+        && reasoning.chars().count() <= 28_000
+        && !altered(&answer)
+        && !altered(&reasoning);
+    if inline {
         if !reasoning.is_empty() {
             blocks.push(RBlock::Details {
                 open: false,
@@ -403,49 +412,33 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
                 blocks: vec![RBlock::Pre { text: reasoning, language: "markdown".into() }],
             });
         }
-        blocks.push(RBlock::Pre { text: answer, language: "markdown".into() });
-        reply::send_blocks(app, bot, ib.chat_id, ib.msg_id, blocks).await;
+        if !answer.is_empty() {
+            blocks.push(RBlock::Pre { text: answer, language: "markdown".into() });
+        }
     } else {
         let name = format!("answer-{}.md", t.id);
-        let link = Link { turn_id: -(ib.msg_id as i64), attempt_id: None, part_index: 9000 };
-        if let Err(e) = outbox::send_file(
-            &app.db,
-            bot,
-            ib.chat_id,
-            Some(ib.msg_id),
-            md.into_bytes(),
-            &name,
-            "text/markdown",
-            false,
-            "",
-            link,
-        )
-        .await
-        {
-            say(app, bot, ib, &format!("⚠️ {e}")).await;
-        }
+        let blob = app.blobs.put(md.into_bytes(), "text/markdown".into()).await?;
+        let key = format!("{}/{name}", blob.sha256);
+        blocks.push(RBlock::Document { key: key.clone(), caption: RText::plain("") });
+        sources.push(Source { key, blob, filename: name, want: Want::Document });
     }
     let mut i = 0;
     for p in &t.turn.parts {
-        if let Part::Image { blob, .. } | Part::File { blob, .. } = p {
+        if let Part::Image { blob, filename, .. } | Part::File { blob, filename, .. } = p {
             i += 1;
-            let bytes = app.blobs.get(blob).await?;
             let ext = blob.mime.rsplit('/').next().unwrap_or("bin");
-            let link = Link { turn_id: -(ib.msg_id as i64), attempt_id: None, part_index: 9000 + i };
-            let _ = outbox::send_file(
-                &app.db,
-                bot,
-                ib.chat_id,
-                Some(ib.msg_id),
-                bytes,
-                &format!("file-{}-{i}.{ext}", t.id),
-                &blob.mime,
-                false,
-                "",
-                link,
-            )
-            .await;
+            let name = filename.clone().unwrap_or_else(|| format!("file-{}-{i}.{ext}", t.id));
+            let key = format!("{}/{name}", blob.sha256);
+            blocks.push(RBlock::Document { key: key.clone(), caption: RText::plain("") });
+            sources.push(Source { key, blob: blob.clone(), filename: name, want: Want::Document });
         }
+    }
+    if blocks.is_empty() {
+        say(app, bot, ib, "this answer is empty").await;
+        return Ok(());
+    }
+    if let Err(e) = reply::send_blocks_with_media(app, bot, ib.chat_id, ib.msg_id, blocks, &sources).await {
+        say(app, bot, ib, &format!("⚠️ {e:#}")).await;
     }
     Ok(())
 }
@@ -475,24 +468,15 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
             up.unwrap_or_default()
         ))));
     }
-    send(app, bot, ib, "Request details", blocks).await;
-    let link = Link { turn_id: -(ib.msg_id as i64), attempt_id: None, part_index: 9500 };
-    let body = serde_json::to_vec_pretty(&dump)?;
-    if let Err(e) = outbox::send_file(
-        &app.db,
-        bot,
-        ib.chat_id,
-        Some(ib.msg_id),
-        body,
-        &format!("request-{}.json", t.id),
-        "application/json",
-        false,
-        "",
-        link,
-    )
-    .await
-    {
-        say(app, bot, ib, &format!("⚠️ {e}")).await;
+    // One message: the summary and the full request/response dump attached.
+    let name = format!("request-{}.json", t.id);
+    let blob = app.blobs.put(serde_json::to_vec_pretty(&dump)?, "application/json".into()).await?;
+    let key = format!("{}/{name}", blob.sha256);
+    blocks.insert(0, RBlock::Paragraph(RText::concat(vec![RText::plain("🤖 "), label("Request details")])));
+    blocks.push(RBlock::Document { key: key.clone(), caption: RText::plain("") });
+    let sources = [Source { key, blob, filename: name, want: Want::Document }];
+    if let Err(e) = reply::send_blocks_with_media(app, bot, ib.chat_id, ib.msg_id, blocks, &sources).await {
+        say(app, bot, ib, &format!("⚠️ {e:#}")).await;
     }
     Ok(())
 }

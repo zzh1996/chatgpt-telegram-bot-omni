@@ -356,12 +356,24 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
         if t.specs.iter().any(|s| app.plausible_model_id(s)) {
             return Some(Kind::Trigger);
         }
+        // A prefix nobody knows: the primary bot reports it (all our bots are in
+        // this process, so "maybe another bot handles it" cannot happen).
+        if t.specs.iter().all(looks_like_spec) && app.primary_bot(chat_id, &bot.name) == bot.name {
+            return Some(Kind::Trigger);
+        }
         return None;
     }
     if chat_id > 0 && m.media.is_none() {
         return Some(Kind::Hint);
     }
     None
+}
+
+/// Whether a parsed spec is plausibly meant as a model prefix (`c`, `5`,
+/// `openai/gpt-6`, `ark:x`), rather than prose that happens to contain `$`
+/// (`it costs 5$`).
+fn looks_like_spec(s: &omni_core::trigger::SpecToken) -> bool {
+    !s.model.is_empty() && s.model.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
 }
 
 pub fn reply_target(m: &tl::types::Message) -> Option<i32> {

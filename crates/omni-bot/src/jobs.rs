@@ -22,7 +22,6 @@ use crate::compose::Status;
 use crate::conv::{self, AttemptRow, AttemptUpdate, ResolvedSpec, TurnRow, TurnStatus};
 use crate::rawlog::{Blobs, RawLog};
 use crate::tg::bot::BotConn;
-use crate::tg::outbox::{self, Link};
 use crate::view::{RenderState, ReplyView};
 
 /// Maximum continuation hops per attempt (each hop is ≤ the per-request output limit).
@@ -335,9 +334,10 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         notes: Vec::new(),
         started: Instant::now(),
         elapsed_override: None,
-        images: 0,
         hops: 0,
         continuation: false,
+        attachments: Vec::new(),
+        settings: Vec::new(),
         show_usage: true,
         mode: app.cfg.render.markdown,
         done: false,
@@ -685,7 +685,6 @@ impl Sink<'_> {
         s.provider = self.acc.provider.clone();
         s.finish_reason = self.acc.finish_reason.clone();
         s.native_finish_reason = self.acc.native_finish_reason.clone();
-        s.images = s.parts.iter().filter(|p| matches!(p, Part::Image { generated: true, .. })).count();
         s.hops = self.hops;
         for n in &self.acc.notices {
             if !s.notes.contains(n) {
@@ -768,7 +767,7 @@ impl EventSink for Sink<'_> {
         if is_image {
             for (data, mime) in self.acc.take_pending_images() {
                 match self.app.blobs.put_sync(&data, &mime) {
-                    Ok(b) => self.acc.attach_image(b),
+                    Ok(b) => self.acc.attach_image(b, image_dims(&data)),
                     Err(e) => warn!(error = %e, "failed to store generated image"),
                 }
             }
@@ -797,6 +796,11 @@ impl EventSink for Sink<'_> {
             });
         }
     }
+}
+
+/// Pixel dimensions from the image header (no decoding).
+fn image_dims(data: &[u8]) -> Option<(u32, u32)> {
+    imagesize::blob_size(data).ok().map(|s| (s.width as u32, s.height as u32))
 }
 
 /// Run one upstream call with the turn's provider.
@@ -869,6 +873,7 @@ async fn run_attempt(
             (None, ctx.reply_to)
         };
         state.continuation = append_mode;
+        state.settings = omni_llm::settings::describe(prepared);
         let first_delay = Duration::from_secs_f64(app.cfg.render.first_flush_delay_secs);
         let view =
             ReplyView::start(app.clone(), ctx.bot.clone(), ctx.chat_id, reply_to, ctx.turn_id, attempt.id, first_delay);
@@ -1025,8 +1030,9 @@ async fn run_attempt(
 
         // Store generated images (if any are still pending).
         for (data, mime) in sink.acc.take_pending_images() {
+            let dims = image_dims(&data);
             if let Ok(b) = app.blobs.put(data, mime).await {
-                sink.acc.attach_image(b);
+                sink.acc.attach_image(b, dims);
             }
         }
         let usage = sink.total_usage();
@@ -1087,17 +1093,7 @@ async fn run_attempt(
                 .ok();
                 final_state.status = Status::Done;
                 final_state.done = true;
-                let ids = view.finish(final_state).await;
-                send_images(
-                    app,
-                    &ctx.bot,
-                    ctx.chat_id,
-                    ids.first().copied().or(reply_to),
-                    ctx.turn_id,
-                    attempt.id,
-                    &acc.turn(),
-                )
-                .await;
+                view.finish(final_state).await;
                 info!(cost = ?usage.as_ref().and_then(|u| u.cost_usd), hops, "attempt succeeded");
                 Outcome::Done
             }
@@ -1220,39 +1216,6 @@ async fn fail_without_attempt(ctx: &Ctx, err: LlmError) -> Result<()> {
     view.finish(st).await;
     conv::set_turn_status(&app.db, ctx.turn_id, TurnStatus::Failed).await?;
     Ok(())
-}
-
-async fn send_images(
-    app: &Arc<App>,
-    bot: &Arc<BotConn>,
-    chat_id: i64,
-    reply_to: Option<i32>,
-    turn_id: i64,
-    attempt_id: i64,
-    turn: &Turn,
-) {
-    let mut idx = 0i64;
-    for p in &turn.parts {
-        if let Part::Image { blob, generated: true, .. } = p {
-            idx += 1;
-            let Ok(bytes) = app.blobs.get(blob).await else { continue };
-            let ext = blob.mime.rsplit('/').next().unwrap_or("png");
-            let name = format!("image-{turn_id}-{idx}.{ext}");
-            let link = Link { turn_id, attempt_id: Some(attempt_id), part_index: 1000 + idx };
-            let res =
-                outbox::send_file(&app.db, bot, chat_id, reply_to, bytes.clone(), &name, &blob.mime, true, "", link)
-                    .await;
-            if let Err(e) = res {
-                warn!(error = %e, "sending image as photo failed; sending as file");
-                let link = Link { turn_id, attempt_id: Some(attempt_id), part_index: 2000 + idx };
-                if let Err(e) =
-                    outbox::send_file(&app.db, bot, chat_id, reply_to, bytes, &name, &blob.mime, false, "", link).await
-                {
-                    warn!(error = %e, "sending image failed");
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

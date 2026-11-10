@@ -141,12 +141,28 @@ pub async fn convert_history_with(
                                     }}));
                                 }
                                 MediaClass::Audio => {
+                                    if let Some(i) = info
+                                        && !i.accepts("audio")
+                                    {
+                                        return Err(LlmError::request(format!(
+                                            "{target_model} does not accept audio input (input modalities: {})",
+                                            i.architecture.input_modalities.join(", ")
+                                        )));
+                                    }
                                     content.push(json!({"type": "input_audio", "input_audio": {
                                         "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
                                         "format": audio_format(&blob.mime, filename.as_deref()),
                                     }}));
                                 }
                                 MediaClass::Video => {
+                                    if let Some(i) = info
+                                        && !i.accepts("video")
+                                    {
+                                        return Err(LlmError::request(format!(
+                                            "{target_model} does not accept video input (input modalities: {})",
+                                            i.architecture.input_modalities.join(", ")
+                                        )));
+                                    }
                                     content.push(json!({"type": "video_url", "video_url": {"url": data_url(&blob.mime, &bytes)}}));
                                 }
                                 MediaClass::Image => {

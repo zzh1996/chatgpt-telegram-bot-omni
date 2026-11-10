@@ -15,6 +15,7 @@ pub mod chatstream;
 pub mod error;
 pub mod event;
 pub mod openrouter;
+pub mod settings;
 pub mod sse;
 
 use std::future::Future;

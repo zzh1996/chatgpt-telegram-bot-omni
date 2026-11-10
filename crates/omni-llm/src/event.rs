@@ -178,8 +178,8 @@ impl Accumulator {
         std::mem::take(&mut self.pending_images)
     }
 
-    pub fn attach_image(&mut self, blob: BlobRef) {
-        self.parts.push(Part::Image { blob, filename: None, generated: true });
+    pub fn attach_image(&mut self, blob: BlobRef, dims: Option<(u32, u32)>) {
+        self.parts.push(Part::Image { blob, filename: None, generated: true, dims });
     }
 
     pub fn parts(&self) -> &[Part] {

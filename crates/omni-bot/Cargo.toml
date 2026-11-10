@@ -38,6 +38,7 @@ grammers-client = { workspace = true }
 grammers-mtsender = { workspace = true }
 grammers-session = { workspace = true }
 grammers-tl-types = { workspace = true }
+imagesize = "0.15"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

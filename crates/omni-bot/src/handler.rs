@@ -125,6 +125,7 @@ pub async fn resolve_specs(
     let strict = chat_id < 0;
     let mut out = Vec::new();
     let mut unknown = Vec::new();
+    let mut unserved = Vec::new();
     for s in specs {
         let mut resolved = app.resolve_spec(s, cfg, strict).await?;
         if resolved.is_none() && strict && app.plausible_model_id(s) {
@@ -133,21 +134,31 @@ pub async fn resolve_specs(
             resolved = app.resolve_spec(s, cfg, strict).await?;
         }
         match resolved {
-            Some(spec) => {
-                if app.responsible_bot(chat_id, &spec.canonical(), &bot.name).as_deref() == Some(bot.name.as_str()) {
-                    out.push(spec);
-                } else if chat_id > 0 {
-                    return Err(format!("this bot does not serve `{}` (see /models)", spec.model));
-                }
-            }
+            Some(spec) => match app.responsible_bot(chat_id, &spec.canonical(), &bot.name) {
+                Some(b) if b == bot.name => out.push(spec),
+                Some(_) => {} // another of our bots answers this one
+                None => unserved.push(spec.model.clone()),
+            },
             None => unknown.push(if s.raw.is_empty() { "$".to_string() } else { s.raw.clone() }),
         }
     }
-    if !unknown.is_empty() && chat_id > 0 {
+    // All bots run in this process, so a prefix none of them knows is an error
+    // (reported once per chat, by its primary bot).
+    let reporter = chat_id > 0 || app.primary_bot(chat_id, &bot.name) == bot.name;
+    if !unknown.is_empty() {
+        if !reporter {
+            return Ok(Vec::new());
+        }
         return Err(format!(
             "unknown model or alias: {}. Use an alias from /models or a full OpenRouter model id like `openai/gpt-6$`",
             unknown.join(", ")
         ));
+    }
+    if !unserved.is_empty() {
+        if !reporter {
+            return Ok(Vec::new());
+        }
+        return Err(format!("no bot serves {} in this chat (see /models)", unserved.join(", ")));
     }
     Ok(out)
 }
@@ -191,9 +202,9 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Vec<Part>
             .await
             .with_context(|| format!("download {}", r.describe()))?;
         parts.push(match r.kind {
-            media::MediaKind::Photo => Part::Image { blob, filename: None, generated: false },
+            media::MediaKind::Photo => Part::Image { blob, filename: None, generated: false, dims: None },
             media::MediaKind::Document if r.mime.starts_with("image/") => {
-                Part::Image { blob, filename: r.filename.clone(), generated: false }
+                Part::Image { blob, filename: r.filename.clone(), generated: false, dims: None }
             }
             media::MediaKind::Document => Part::File { blob, filename: r.filename.clone(), generated: false },
         });
@@ -426,8 +437,12 @@ mod tests {
 
     #[test]
     fn history_turns_and_media_placement() {
-        let img =
-            Part::Image { blob: omni_core::BlobRef::for_bytes(b"x", "image/jpeg"), filename: None, generated: false };
+        let img = Part::Image {
+            blob: omni_core::BlobRef::for_bytes(b"x", "image/jpeg"),
+            filename: None,
+            generated: false,
+            dims: None,
+        };
         let t = user_turns("::system\nbe brief\n::user\nwhat is this?\n::assistant\nIt is", vec![img.clone()]).unwrap();
         assert_eq!(t.len(), 3);
         assert_eq!(t[0].role, Role::System);

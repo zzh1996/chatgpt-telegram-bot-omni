@@ -118,6 +118,9 @@ pub enum Part {
         /// True if produced by the model (or a server tool) rather than the user.
         #[serde(default)]
         generated: bool,
+        /// Pixel dimensions (width, height), when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dims: Option<(u32, u32)>,
     },
     /// Any other file: PDF, audio, video, text/code documents, ...
     /// Mapping to the provider's input type (native document, inline data,

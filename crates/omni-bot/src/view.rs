@@ -20,6 +20,8 @@ use crate::compose::{self, ComposeInput, Status};
 use crate::conv;
 use crate::tg::bot::BotConn;
 use crate::tg::outbox::{self, Content, Link, SendError, SendReq};
+use crate::tg::rich::RichMedia;
+use crate::tg::upload::{self, Source, Want};
 
 #[derive(Debug, Clone)]
 pub struct RenderState {
@@ -37,11 +39,14 @@ pub struct RenderState {
     pub notes: Vec<String>,
     pub started: Instant,
     pub elapsed_override: Option<Duration>,
-    pub images: usize,
     /// Completed long-decode continuation hops.
     pub hops: u32,
     /// This attempt continues a finished answer (`/continue`).
     pub continuation: bool,
+    /// Files the bot attached to the reply (see [`Attachment`]).
+    pub attachments: Vec<Attachment>,
+    /// Effective request settings, described (see `omni_llm::settings`).
+    pub settings: Vec<String>,
     pub show_usage: bool,
     pub mode: Mode,
     /// Final state: sync it and stop.
@@ -67,11 +72,20 @@ impl RenderState {
             show_usage: self.show_usage,
             mode: self.mode,
             raw_ai,
-            images: self.images,
             hops: self.hops,
             continuation: self.continuation,
+            attachments: &self.attachments.iter().map(|a| a.key.clone()).collect::<Vec<_>>(),
+            settings: &self.settings,
         })
     }
+}
+
+/// A file the bot attaches to a reply.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub key: String,
+    pub filename: String,
+    pub blob: omni_core::BlobRef,
 }
 
 pub struct ReplyView {
@@ -133,6 +147,7 @@ async fn sync_loop(
         .map(|(_, id, h)| (id, h))
         .collect();
     let mut fallback = Fallback::None;
+    let mut media = RichMedia::default();
     let mut first = sent.is_empty();
     let tick = Duration::from_secs(30);
     loop {
@@ -164,7 +179,8 @@ async fn sync_loop(
             fallback = Fallback::None;
         }
         if let Err(e) =
-            apply(&app, &bot, chat_id, reply_to, turn_id, attempt_id, &state, &mut sent, &mut fallback).await
+            apply(&app, &bot, chat_id, reply_to, turn_id, attempt_id, &state, &mut sent, &mut fallback, &mut media)
+                .await
         {
             warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "failed to update reply messages");
             if done {
@@ -175,8 +191,19 @@ async fn sync_loop(
                         _ = tokio::time::sleep(wait) => {}
                         _ = app.shutdown.cancelled() => return sent.into_iter().map(|(id, _)| id).collect(),
                     }
-                    match apply(&app, &bot, chat_id, reply_to, turn_id, attempt_id, &state, &mut sent, &mut fallback)
-                        .await
+                    match apply(
+                        &app,
+                        &bot,
+                        chat_id,
+                        reply_to,
+                        turn_id,
+                        attempt_id,
+                        &state,
+                        &mut sent,
+                        &mut fallback,
+                        &mut media,
+                    )
+                    .await
                     {
                         Ok(()) => break,
                         Err(e) => {
@@ -191,10 +218,103 @@ async fn sync_loop(
             continue;
         }
         if done {
+            // Telegram has stored messages differently from what was sent before
+            // (silent truncation): read the final messages back, and if the text
+            // was altered after all, attach the exact original so nothing is lost.
+            if fallback != Fallback::PlainText
+                && let Some(problem) = verify(&bot, chat_id, &sent, &state, fallback).await
+            {
+                warn!(bot = %bot.name, chat = chat_id, turn = turn_id, %problem, "Telegram altered the stored reply text");
+                let mut st = state.clone();
+                match attach_original(&app, turn_id, &mut st).await {
+                    Ok(()) => {
+                        if let Err(e) = apply(
+                            &app,
+                            &bot,
+                            chat_id,
+                            reply_to,
+                            turn_id,
+                            attempt_id,
+                            &st,
+                            &mut sent,
+                            &mut fallback,
+                            &mut media,
+                        )
+                        .await
+                        {
+                            warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "attaching the original failed");
+                        }
+                    }
+                    Err(e) => warn!(error = %format!("{e:#}"), "cannot store the original Markdown"),
+                }
+            }
             break;
         }
     }
     sent.into_iter().map(|(id, _)| id).collect()
+}
+
+/// Telegram's own normalization of rich-message text (measured 2026-11-11):
+/// control characters (tab, CR, NUL, …) become spaces, U+2028 a line break and
+/// U+2029 a space. Differences beyond this are information loss.
+fn telegram_normalized(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\u{1}' => c, // '\u{1}' is our block separator
+            '\u{2028}' => '\n',
+            '\u{2029}' => ' ',
+            c if (c as u32) < 0x20 => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+/// Compare what Telegram stored with what was sent. `None` if identical.
+async fn verify(
+    bot: &BotConn,
+    chat_id: i64,
+    sent: &[(i32, Option<String>)],
+    state: &RenderState,
+    fallback: Fallback,
+) -> Option<String> {
+    let pages = pages_for(state, fallback);
+    let ids: Vec<i32> = sent.iter().map(|(id, _)| *id).collect();
+    let msgs = match bot.get_messages(chat_id, &ids).await {
+        Ok(m) => m,
+        Err(e) => {
+            debug!(error = %e, "read-back of reply messages failed");
+            return None;
+        }
+    };
+    for (i, content) in pages.iter().enumerate() {
+        let Content::Rich(blocks) = content else { continue };
+        let Some(grammers_tl_types::enums::Message::Message(m)) = msgs.get(i) else { continue };
+        let Some(grammers_tl_types::enums::RichMessage::Message(rm)) = &m.rich_message else {
+            return Some(format!("message {} has no rich content", m.id));
+        };
+        let want = telegram_normalized(&crate::tg::rich::expected_text(blocks));
+        let got = telegram_normalized(&crate::tg::rich::received_text(&rm.blocks));
+        if want != got {
+            let at = want.chars().zip(got.chars()).take_while(|(a, b)| a == b).count();
+            return Some(format!(
+                "message {}: sent {} chars, stored {} (first difference at char {at})",
+                m.id,
+                want.chars().count(),
+                got.chars().count()
+            ));
+        }
+    }
+    None
+}
+
+/// Attach the exact model output as a Markdown file, with a note.
+async fn attach_original(app: &App, turn_id: i64, st: &mut RenderState) -> anyhow::Result<()> {
+    let md = compose::raw_markdown(&st.parts);
+    let blob = app.blobs.put(md.into_bytes(), "text/markdown".into()).await?;
+    let filename = format!("answer-{turn_id}.md");
+    st.attachments.push(Attachment { key: format!("{}/{filename}", blob.sha256), filename, blob });
+    st.notes.push("Telegram altered the stored text of this reply; the exact original is attached".into());
+    Ok(())
 }
 
 fn pages_for(state: &RenderState, fallback: Fallback) -> Vec<Content> {
@@ -224,16 +344,23 @@ async fn apply(
     state: &RenderState,
     sent: &mut Vec<(i32, Option<String>)>,
     fallback: &mut Fallback,
+    media: &mut RichMedia,
 ) -> Result<(), String> {
+    let mut media_refreshed = false;
     'retry: loop {
         let pages = pages_for(state, *fallback);
+        // Upload the images these pages show (cached: never uploaded twice).
+        let sources = media_sources(state, &pages);
+        if !sources.is_empty() {
+            upload::ensure(app, bot, chat_id, &sources, media).await.map_err(|e| format!("uploading media: {e:#}"))?;
+        }
         for (i, content) in pages.iter().enumerate() {
             let hash = content.hash();
             let res = if i < sent.len() {
                 if sent[i].1.as_deref() == Some(hash.as_str()) {
                     continue;
                 }
-                outbox::edit(&app.db, bot, chat_id, sent[i].0, content).await.map(|_| sent[i].0)
+                outbox::edit(&app.db, bot, chat_id, sent[i].0, content, Some(media)).await.map(|_| sent[i].0)
             } else {
                 let rt = if i == 0 { reply_to } else { Some(sent[i - 1].0) };
                 outbox::send(
@@ -244,6 +371,7 @@ async fn apply(
                         reply_to: rt,
                         content,
                         link: Link { turn_id, attempt_id: Some(attempt_id), part_index: i as i64 },
+                        media: Some(media),
                     },
                 )
                 .await
@@ -255,6 +383,14 @@ async fn apply(
                     } else {
                         sent.push((id, Some(hash)));
                     }
+                }
+                Err(SendError::Rejected(e)) if !media_refreshed && is_media_error(&e) && !media.items.is_empty() => {
+                    // A cached upload went stale (file reference): upload again once.
+                    warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "media rejected; uploading again");
+                    media_refreshed = true;
+                    let keys: Vec<String> = media.items.keys().cloned().collect();
+                    upload::forget(&app.db, &bot.name, &keys, media).await.map_err(|e| format!("{e:#}"))?;
+                    continue 'retry;
                 }
                 Err(SendError::Rejected(e)) => {
                     let next = match *fallback {
@@ -269,6 +405,11 @@ async fn apply(
                 Err(SendError::Other(e)) => return Err(format!("{e:#}")),
             }
         }
+        if state.done && *fallback == Fallback::PlainText {
+            // Plain text cannot hold images: only now are they sent as separate messages.
+            let first = sent.first().map(|(id, _)| *id).or(reply_to);
+            send_images_separately(app, bot, chat_id, first, turn_id, attempt_id, &state.parts).await;
+        }
         if state.done && sent.len() > pages.len() {
             let extra: Vec<i32> = sent[pages.len()..].iter().map(|(id, _)| *id).collect();
             debug!(?extra, "deleting surplus messages");
@@ -278,5 +419,84 @@ async fn apply(
             sent.truncate(pages.len());
         }
         return Ok(());
+    }
+}
+
+fn is_media_error(e: &grammers_mtsender::RpcError) -> bool {
+    ["FILE_REFERENCE", "MEDIA_", "PHOTO_", "DOCUMENT_"].iter().any(|p| e.name.starts_with(p))
+}
+
+/// The generated images referenced by `pages`, as upload sources.
+fn media_sources(state: &RenderState, pages: &[Content]) -> Vec<Source> {
+    let mut keys = Vec::new();
+    for p in pages {
+        if let Content::Rich(blocks) = p {
+            for k in omni_markdown::rich::media_keys(blocks) {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+    }
+    let mut out: Vec<Source> = state
+        .attachments
+        .iter()
+        .filter(|a| keys.contains(&a.key))
+        .map(|a| Source {
+            key: a.key.clone(),
+            blob: a.blob.clone(),
+            filename: a.filename.clone(),
+            want: Want::Document,
+        })
+        .collect();
+    let mut n = 0;
+    for p in &state.parts {
+        if let Part::Image { blob, generated: true, .. } = p {
+            n += 1;
+            if keys.contains(&blob.sha256) && !out.iter().any(|s: &Source| s.key == blob.sha256) {
+                let ext = blob.mime.rsplit('/').next().unwrap_or("png");
+                out.push(Source {
+                    key: blob.sha256.clone(),
+                    blob: blob.clone(),
+                    filename: format!("image-{n}.{ext}"),
+                    want: Want::Photo,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Last resort (plain-text rendering): generated images as their own messages.
+async fn send_images_separately(
+    app: &App,
+    bot: &BotConn,
+    chat_id: i64,
+    reply_to: Option<i32>,
+    turn_id: i64,
+    attempt_id: i64,
+    parts: &[Part],
+) {
+    let mut idx = 0i64;
+    for p in parts {
+        if let Part::Image { blob, generated: true, .. } = p {
+            idx += 1;
+            let Ok(bytes) = app.blobs.get(blob).await else { continue };
+            let ext = blob.mime.rsplit('/').next().unwrap_or("png");
+            let name = format!("image-{turn_id}-{idx}.{ext}");
+            let link = Link { turn_id, attempt_id: Some(attempt_id), part_index: 1000 + idx };
+            let res =
+                outbox::send_file(&app.db, bot, chat_id, reply_to, bytes.clone(), &name, &blob.mime, true, "", link)
+                    .await;
+            if let Err(e) = res {
+                warn!(error = %e, "sending image as photo failed; sending as file");
+                let link = Link { turn_id, attempt_id: Some(attempt_id), part_index: 2000 + idx };
+                if let Err(e) =
+                    outbox::send_file(&app.db, bot, chat_id, reply_to, bytes, &name, &blob.mime, false, "", link).await
+                {
+                    warn!(error = %e, "sending image failed");
+                }
+            }
+        }
     }
 }

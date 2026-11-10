@@ -5,3 +5,4 @@ pub mod convert;
 pub mod gate;
 pub mod outbox;
 pub mod rich;
+pub mod upload;

@@ -275,4 +275,18 @@ CREATE TABLE pending_costs (
     next_at INTEGER NOT NULL
 );
 "#,
+    // ---- v4: media uploaded for rich messages (photos/documents embedded in replies)
+    r#"
+CREATE TABLE tg_uploads (
+    bot TEXT NOT NULL,
+    key TEXT NOT NULL,                 -- media key (blob sha256, + "/filename" for documents)
+    kind TEXT NOT NULL,                -- photo | document (what Telegram accepted)
+    want TEXT NOT NULL,                -- photo | document (what was asked for)
+    media_id INTEGER NOT NULL,
+    access_hash INTEGER NOT NULL,
+    file_reference BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, key, want)
+);
+"#,
 ];
