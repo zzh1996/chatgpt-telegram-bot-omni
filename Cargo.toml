@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/omni-core", "crates/omni-markdown", "crates/omni-llm", "crates/omni-bot"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+omni-core = { path = "crates/omni-core" }
+omni-markdown = { path = "crates/omni-markdown" }
+omni-llm = { path = "crates/omni-llm" }
+
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+bytes = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "http2", "query", "multipart"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time", "local-time"] }
+tracing-appender = "0.2"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+rand = "0.10"
+clap = { version = "4.6", features = ["derive", "env"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+jiff = { version = "0.2", features = ["serde"] }
+rusqlite = { version = "0.41", features = ["bundled", "serde_json"] }
+regex = "1"
+url = "2"
+mime_guess = "2"
+parking_lot = "0.13"
+async-trait = "0.1"
+grammers-client = { version = "0.12", default-features = false, features = ["fs"] }
+grammers-mtsender = "0.12"
+grammers-session = { version = "0.12", default-features = false, features = ["serde"] }
+grammers-tl-types = { version = "0.12", features = ["tl-mtproto"] }
+pretty_assertions = "1"
+proptest = "1"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

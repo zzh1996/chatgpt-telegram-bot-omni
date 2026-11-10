@@ -1,0 +1,19 @@
+services:
+  omni:
+    build: .
+    image: omni-bot:latest
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      - OMNI_CONFIG=/app/config/omni.toml
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    # Give in-flight requests a moment to persist their state on shutdown.
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"

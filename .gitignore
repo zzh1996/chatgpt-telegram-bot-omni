@@ -1,0 +1,9 @@
+/target
+/data
+/config/omni.toml
+/.env
+*.session
+*.log
+.DS_Store
+*.swp
+*.swo

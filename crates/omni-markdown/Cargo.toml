@@ -1,0 +1,15 @@
+[package]
+name = "omni-markdown"
+description = "Markdown -> Telegram formatted text (entities) and rich-message blocks, with limit-aware splitting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+unicode-width = "0.2"
+serde = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+proptest = { workspace = true }

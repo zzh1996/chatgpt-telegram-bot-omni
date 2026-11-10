@@ -1,0 +1,26 @@
+[package]
+name = "omni-llm"
+description = "LLM provider abstraction, OpenRouter adapter, SSE streaming, error classification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+omni-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

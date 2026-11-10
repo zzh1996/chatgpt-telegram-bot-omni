@@ -1,0 +1,223 @@
+# omni configuration. Copy to config/omni.toml and adjust.
+# Secrets come from the environment (see .env.example): `${VAR}` is replaced by
+# the variable's value, `${VAR:-default}` provides a default.
+
+[general]
+data_dir = "data"              # database, blobs, logs (mounted as a volume in Docker)
+timezone = "Asia/Shanghai"     # displayed times and daily stats boundaries
+max_parallel_specs = 20        # max models in one `a,b,c$` trigger
+max_file_mb = 50               # max Telegram file size forwarded to a model
+
+[log]
+level = "verbose"              # verbose (raw upstream payloads) | normal | quiet | any tracing filter
+file = true                    # also write data/logs/omni.log.YYYY-MM-DD
+
+[telegram]
+# From https://my.telegram.org/apps
+api_id = "${TELEGRAM_API_ID}"
+api_hash = "${TELEGRAM_API_HASH}"
+
+# Several bots can run in one process (separate rate limits, isolation).
+# For each request, the first bot in this list that is a member of the chat and
+# whose `models` patterns match the model handles it: put specific bots first,
+# catch-alls last. Patterns match canonical ids like `openrouter:anthropic/claude-opus-5.5`.
+[[bots]]
+name = "main"                  # stable internal name (database key) — do not rename casually
+token = "${TELEGRAM_BOT_TOKEN}"
+models = ["*"]
+default_model = "gpt"          # used by a bare `$text`
+# chats = [-1001234567890]     # optional: restrict this bot to these chats
+
+# Example: a dedicated Claude bot in the same groups.
+# [[bots]]
+# name = "claude"
+# token = "${TELEGRAM_BOT_TOKEN_CLAUDE}"
+# models = ["openrouter:anthropic/*"]
+# default_model = "c"
+
+[access]
+admins = []                    # your Telegram user id(s); /whoami shows it
+allowed_chats = []             # seeded into the ACL at start; manage at runtime with /allow, /deny
+allowed_users = []             # private-chat users; manage with /allow_user
+
+[providers.openrouter]
+api_key = "${OPENROUTER_API_KEY}"
+# base_url = "https://openrouter.ai/api/v1"
+# Fidelity defaults (see docs/openrouter-gaps.md). Per request: `+p=<slug>` / `+p=any`.
+pin_first_party = true         # provider.only = [model creator's own endpoint], no fallbacks
+require_parameters = true      # never let OpenRouter silently drop parameters
+echo_upstream_body = true      # log the exact upstream request (also in /info)
+max_tokens_cap = 393216        # cap for the automatic max_tokens (0 = model maximum)
+# Stable per-user hash sent as `user` (abuse attribution); leave empty to not send it.
+user_id_salt = "${OPENROUTER_USER_SALT:-}"
+# Override the author -> first-party provider mapping:
+# [providers.openrouter.first_party]
+# google = "google-vertex"
+
+[render]
+markdown = "clean"             # clean | raw (raw = the model's exact Markdown source)
+min_edit_interval_secs = 3.0   # per bot and group chat (private chats: 1s)
+first_flush_delay_secs = 1.0
+max_messages_per_reply = 30
+show_usage = "always"          # always | never | USD threshold such as "0.05"
+
+[retry]
+max_attempts = 4               # including the first; only retryable errors are retried
+base_delay_secs = 10
+max_delay_secs = 120
+
+# ------------------------------------------------------------------ aliases
+# Any OpenRouter model id also works directly as a prefix (`openai/gpt-6$ hi`),
+# so new models need no config change. Aliases are shortcuts (the old prefixes).
+# Runtime aliases can be added by admins with /alias.
+
+# OpenAI
+[[aliases]]
+name = "gpt"
+spec = "openrouter:openai/gpt-6.1-sol"
+[[aliases]]
+name = "61s"
+spec = "openrouter:openai/gpt-6.1-sol"
+[[aliases]]
+name = "61t"
+spec = "openrouter:openai/gpt-6.1-terra"
+[[aliases]]
+name = "6"
+spec = "openrouter:openai/gpt-6-astra"
+[[aliases]]
+name = "6s"
+spec = "openrouter:openai/gpt-6-sol"
+[[aliases]]
+name = "6l"
+spec = "openrouter:openai/gpt-6-luna"
+[[aliases]]
+name = "56"
+spec = "openrouter:openai/gpt-5.6-sol"
+[[aliases]]
+name = "56t"
+spec = "openrouter:openai/gpt-5.6-terra"
+[[aliases]]
+name = "56l"
+spec = "openrouter:openai/gpt-5.6-luna"
+[[aliases]]
+name = "55"
+spec = "openrouter:openai/gpt-5.5"
+[[aliases]]
+name = "54"
+spec = "openrouter:openai/gpt-5.4"
+[[aliases]]
+name = "chat"
+spec = "openrouter:openai/gpt-chat-latest"
+
+# Anthropic
+[[aliases]]
+name = "c"
+spec = "openrouter:anthropic/claude-opus-5.5"
+[[aliases]]
+name = "c5"
+spec = "openrouter:anthropic/claude-opus-5"
+[[aliases]]
+name = "cf"
+spec = "openrouter:anthropic/claude-fable-5.2"
+[[aliases]]
+name = "cf51"
+spec = "openrouter:anthropic/claude-fable-5.1"
+[[aliases]]
+name = "cs"
+spec = "openrouter:anthropic/claude-sonnet-5.5"
+[[aliases]]
+name = "ch"
+spec = "openrouter:anthropic/claude-haiku-5.5"
+[[aliases]]
+name = "c48"
+spec = "openrouter:anthropic/claude-opus-4.8"
+[[aliases]]
+name = "c46s"
+spec = "openrouter:anthropic/claude-sonnet-4.6"
+
+# Google
+[[aliases]]
+name = "g"
+spec = "openrouter:google/gemini-4-carbon"
+[[aliases]]
+name = "g4"
+spec = "openrouter:google/gemini-4-argon"
+[[aliases]]
+name = "g31"
+spec = "openrouter:google/gemini-3.1-pro-preview"
+[[aliases]]
+name = "gf"
+spec = "openrouter:google/gemini-3.8-flash"
+[[aliases]]
+name = "gi"
+spec = "openrouter:google/gemini-nano-banana-2.1"
+[[aliases]]
+name = "gi31"
+spec = "openrouter:google/gemini-3.1-flash-image"
+[[aliases]]
+name = "gi3"
+spec = "openrouter:google/gemini-3-pro-image"
+
+# xAI
+[[aliases]]
+name = "x"
+spec = "openrouter:x-ai/grok-4.7"
+[[aliases]]
+name = "x46"
+spec = "openrouter:x-ai/grok-4.6"
+[[aliases]]
+name = "x43"
+spec = "openrouter:x-ai/grok-4.3"
+
+# DeepSeek (the dated slugs are the ones served by DeepSeek itself)
+[[aliases]]
+name = "d"
+spec = "openrouter:deepseek/deepseek-v4-pro-0813"
+[[aliases]]
+name = "df"
+spec = "openrouter:deepseek/deepseek-v4.1-flash-1017"
+
+# Zhipu GLM
+[[aliases]]
+name = "z"
+spec = "openrouter:z-ai/glm-5.3"
+[[aliases]]
+name = "zf"
+spec = "openrouter:z-ai/glm-5.3-flash"
+
+# Moonshot Kimi
+[[aliases]]
+name = "k"
+spec = "openrouter:moonshotai/kimi-k3"
+[[aliases]]
+name = "k26"
+spec = "openrouter:moonshotai/kimi-k2.6"
+
+# Alibaba Qwen
+[[aliases]]
+name = "q"
+spec = "openrouter:qwen/qwen3.8-max-0902"
+[[aliases]]
+name = "q37"
+spec = "openrouter:qwen/qwen3.7-max"
+[[aliases]]
+name = "qp"
+spec = "openrouter:qwen/qwen3.6-plus"
+
+# ------------------------------------------------------------------ presets
+# Extra default request parameters by model pattern (JSON merge patch on the
+# OpenRouter request body), applied after the automatic max-capability presets
+# (highest supported reasoning effort, max output tokens, detailed summaries for
+# OpenAI, image output for image models) and before user options.
+# Every applied patch is listed by /info. `+pure` skips automatic presets.
+
+# Image models: request the largest image size by default.
+[[presets]]
+match = "openrouter:google/gemini-*image*"
+note = "largest image size"
+body = { image_config = { image_size = "4K" } }
+
+[[presets]]
+match = "openrouter:google/gemini-nano-banana*"
+note = "largest image size"
+body = { image_config = { image_size = "4K" } }
