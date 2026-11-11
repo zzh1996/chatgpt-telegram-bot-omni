@@ -108,16 +108,18 @@ delays_secs = [2, 10, 30, 60]  # wait before retry 1, 2, 3, …; the last value 
 # empty name is the prefix `$text`. /models lists them in this order. Where a
 # provider has `allow_unlisted_models = true`, the id of any model the bot has works
 # as a prefix too (`openai/gpt-6.1-sol$`). Administrators can add prefixes per bot
-# with /alias. Kept: the two latest generations each vendor still serves.
+# with /alias. The list was chosen by the owner from the old bot's prefixes (2026-11-12).
 
-# OpenAI: GPT-6 and GPT-5 (old `dev` branch; `$` is its bare prefix, ChatGPT's current
-# Instant model)
+# OpenAI (old `dev` branch; `$` is its bare prefix, ChatGPT's current Instant model)
 [[aliases]]
 name = ""
 spec = "openrouter:openai/gpt-chat-latest"
 [[aliases]]
 name = "61s"
 spec = "openrouter:openai/gpt-6.1-sol"
+[[aliases]]
+name = "61t"
+spec = "openrouter:openai/gpt-6.1-terra"
 [[aliases]]
 name = "6"
 spec = "openrouter:openai/gpt-6-astra"
@@ -148,27 +150,8 @@ spec = "openrouter:openai/gpt-5.4-mini"
 [[aliases]]
 name = "54n"
 spec = "openrouter:openai/gpt-5.4-nano"
-[[aliases]]
-name = "52pro"
-spec = "openrouter:openai/gpt-5.2-pro"
-[[aliases]]
-name = "52"
-spec = "openrouter:openai/gpt-5.2"
-[[aliases]]
-name = "51"
-spec = "openrouter:openai/gpt-5.1"
-[[aliases]]
-name = "5"
-spec = "openrouter:openai/gpt-5"
-[[aliases]]
-name = "5m"
-spec = "openrouter:openai/gpt-5-mini"
-[[aliases]]
-name = "5n"
-spec = "openrouter:openai/gpt-5-nano"
 
-# Anthropic: Claude 5 and Claude 4 (old `claude` branch). Every model thinks at the
-# highest effort by default, so the old `…t` prefixes equal the plain ones.
+# Anthropic (old `claude` branch)
 [[aliases]]
 name = "c"
 spec = "openrouter:anthropic/claude-opus-5.5"
@@ -193,32 +176,8 @@ spec = "openrouter:anthropic/claude-sonnet-5"
 [[aliases]]
 name = "ch"
 spec = "openrouter:anthropic/claude-haiku-5.5"
-[[aliases]]
-name = "c48"
-spec = "openrouter:anthropic/claude-opus-4.8"
-[[aliases]]
-name = "c47"
-spec = "openrouter:anthropic/claude-opus-4.7"
-[[aliases]]
-name = "c46"
-spec = "openrouter:anthropic/claude-opus-4.6"
-[[aliases]]
-name = "c45"
-spec = "openrouter:anthropic/claude-opus-4.5"
-[[aliases]]
-name = "c45s"
-spec = "openrouter:anthropic/claude-sonnet-4.5"
-[[aliases]]
-name = "c46s"
-spec = "openrouter:anthropic/claude-sonnet-4.6"
-[[aliases]]
-name = "c45t"
-spec = "openrouter:anthropic/claude-opus-4.5"
-[[aliases]]
-name = "c45st"
-spec = "openrouter:anthropic/claude-sonnet-4.5"
 
-# Google: Gemini 4 and Gemini 3 (old `gemini` branch)
+# Google (old `gemini` branch)
 [[aliases]]
 name = "g"
 spec = "openrouter:google/gemini-4-carbon"
@@ -244,19 +203,10 @@ spec = "openrouter:google/gemini-3.6-flash"
 name = "g35f"
 spec = "openrouter:google/gemini-3.5-flash"
 [[aliases]]
-name = "g3f"
-spec = "openrouter:google/gemini-3-flash-preview"
-[[aliases]]
 name = "gi"
 spec = "openrouter:google/gemini-nano-banana-2.1"
-[[aliases]]
-name = "gi31"
-spec = "openrouter:google/gemini-3.1-flash-image-preview"
-[[aliases]]
-name = "gi3"
-spec = "openrouter:google/gemini-3-pro-image-preview"
 
-# xAI: Grok 4, the only generation xAI still serves (old `grok` branch)
+# xAI (old `grok` branch)
 [[aliases]]
 name = "x"
 spec = "openrouter:x-ai/grok-4.7"
@@ -266,15 +216,9 @@ spec = "openrouter:x-ai/grok-4.6"
 [[aliases]]
 name = "x45"
 spec = "openrouter:x-ai/grok-4.5"
-[[aliases]]
-name = "x43"
-spec = "openrouter:x-ai/grok-4.3"
-[[aliases]]
-name = "x42"
-spec = "openrouter:x-ai/grok-4.20"
 
-# DeepSeek: V4, the only generation DeepSeek still serves (old `deepseek` branch; its
-# `deepseek-v4-pro` and `deepseek-flash` are these dated releases)
+# DeepSeek (old `deepseek` branch; its `deepseek-v4-pro` and `deepseek-flash` are these
+# dated releases)
 [[aliases]]
 name = "d"
 spec = "openrouter:deepseek/deepseek-v4-pro-0813"
@@ -282,33 +226,15 @@ spec = "openrouter:deepseek/deepseek-v4-pro-0813"
 name = "df"
 spec = "openrouter:deepseek/deepseek-v4.1-flash-1017"
 
-# Zhipu: GLM-5 and GLM-4 (old `glm` branch)
+# Zhipu GLM (old `glm` branch)
 [[aliases]]
 name = "z"
 spec = "openrouter:z-ai/glm-5.3"
 [[aliases]]
 name = "zf"
 spec = "openrouter:z-ai/glm-5.3-flash"
-[[aliases]]
-name = "z52"
-spec = "openrouter:z-ai/glm-5.2"
-[[aliases]]
-name = "z51"
-spec = "openrouter:z-ai/glm-5.1"
-[[aliases]]
-name = "z5"
-spec = "openrouter:z-ai/glm-5"
-[[aliases]]
-name = "z47"
-spec = "openrouter:z-ai/glm-4.7"
-[[aliases]]
-name = "z46"
-spec = "openrouter:z-ai/glm-4.6"
-[[aliases]]
-name = "z45"
-spec = "openrouter:z-ai/glm-4.5"
 
-# Moonshot: Kimi K3 and K2 (old `moonshot` branch)
+# Moonshot Kimi (old `moonshot` branch)
 [[aliases]]
 name = "k"
 spec = "openrouter:moonshotai/kimi-k3"
@@ -316,48 +242,22 @@ spec = "openrouter:moonshotai/kimi-k3"
 name = "k26"
 spec = "openrouter:moonshotai/kimi-k2.6"
 
-# Alibaba: Qwen3.x, the only generation Alibaba still serves (old `qwen` branch; its
-# `qwen3.8-max` is this dated release)
+# Alibaba Qwen (old `qwen` branch; its `qwen3.8-max` is this dated release)
 [[aliases]]
 name = "q"
 spec = "openrouter:qwen/qwen3.8-max-0902"
 [[aliases]]
 name = "q37"
 spec = "openrouter:qwen/qwen3.7-max"
-[[aliases]]
-name = "qp"
-spec = "openrouter:qwen/qwen3.6-plus"
-[[aliases]]
-name = "qf"
-spec = "openrouter:qwen/qwen3.6-flash"
-[[aliases]]
-name = "q35"
-spec = "openrouter:qwen/qwen3.5-397b-a17b"
 
-# ByteDance: Doubao Seed 2.1 and 2.0, directly on Volcengine Ark (old `doubao` branch;
-# needs [providers.ark]). The 2.0 lite/mini 260215 builds reached end of service on
-# 2026-10-22; Ark moved them to 260428.
+# ByteDance Doubao, directly on Volcengine Ark (old `doubao` branch; needs
+# [providers.ark])
 [[aliases]]
 name = "dbe"
 spec = "ark:doubao-seed-evolving"
 [[aliases]]
 name = "db"
 spec = "ark:doubao-seed-2-1-pro-260915"
-[[aliases]]
-name = "db21"
-spec = "ark:doubao-seed-2-1-pro-260628"
-[[aliases]]
-name = "dbt"
-spec = "ark:doubao-seed-2-1-turbo-260628"
-[[aliases]]
-name = "db2"
-spec = "ark:doubao-seed-2-0-pro-260215"
-[[aliases]]
-name = "db2l"
-spec = "ark:doubao-seed-2-0-lite-260428"
-[[aliases]]
-name = "db2m"
-spec = "ark:doubao-seed-2-0-mini-260428"
 
 # ------------------------------------------------------------------ presets
 # Default options for matching models, in the same syntax as after a prefix

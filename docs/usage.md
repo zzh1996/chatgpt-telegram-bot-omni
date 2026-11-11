@@ -56,7 +56,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 ### 火山方舟（豆包，`ark:`）
 
-示例配置里的 `db$`、`dbe$`、`db21$`、`dbt$`、`db2$`、`db2l$`、`db2m$` 直连方舟 Chat API（需要 `ARK_API_KEY`；没有 key 时方舟和它的模型都不存在）。直接写 `ark:<模型 ID>$` 需要 `[providers.ark].allow_unlisted_models = true`。选项与上面相同，方舟支持 `s`（豆包搜索，需先在方舟控制台开通）、`e=<high|medium|low>`、`e=none` 或 `e=minimal`（都是关闭思考）、`tier=flex`/`tier=fast`（`fast` 只给 `priority_users`）；`p=` 和其它选项报错。
+示例配置里的 `db$`、`dbe$` 直连方舟 Chat API（需要 `ARK_API_KEY`；没有 key 时方舟和它的模型都不存在）。直接写 `ark:<模型 ID>$` 需要 `[providers.ark].allow_unlisted_models = true`。选项与上面相同，方舟支持 `s`（豆包搜索，需先在方舟控制台开通）、`e=<high|medium|low>`、`e=none` 或 `e=minimal`（都是关闭思考）、`tier=flex`/`tier=fast`（`fast` 只给 `priority_users`）；`p=` 和其它选项报错。
 
 方舟默认 `max_tokens` 只有 4096 且会静默截断，所以 bot 总是显式发送：模型最大回答长度（受上下文限制），上限 65536（`[providers.ark].max_tokens_cap`；方舟按"输入 + max_tokens"预扣 TPM，设得过大会更快触发 429）。方舟响应不带费用，统计里的费用按价目表（人民币，最低档位）估算，汇率见 `cny_per_usd`。
 
@@ -176,13 +176,13 @@ bot 每次启动都会注册命令菜单：所有聊天、所有语言共用一�
 
 每个 bot 各自独立；在一个 bot 下，群和私聊都是平等的"聊天"，在一个聊天里设置或统计的东西不会影响别的聊天。
 
-- 没被允许的聊天里只回答 `/ping`，其它一律不理（查询类命令、管理命令也不例外）。
+- 没被允许的聊天里只回答 `/ping` 和管理员的 `/allow`，其它一律不理（查询类命令、其它管理命令也不例外）。
 - 被允许的聊天里：
   - 只显示信息的命令（`/help` `/models` `/model` `/stats` `/usage` `/ping`，回复类的 `/raw` `/info` `/dump`）对所有人回答，被封的人也一样（能看自己的限额和统计）。
   - 花钱的请求（新对话、回复继续对话、`/m`、`/retry`、`/continue`、🔁 Retry 按钮）：发的人在这里被封时，bot 回复"你在这个聊天被封禁了"（按钮则弹出提示）；限额用完时，回复里写明哪个限额用完、多久后恢复。
-- 允许一个聊天：管理员在自己的私聊里发 `/allow <chat_id>`（群 id 在群里发 `/ping` 看；私聊的 id 就是对方的 user id）；`/deny` 撤销（在群里发 `/deny` 撤销本群）。允许之后聊天里的所有人都能用。
+- 允许一个聊天：管理员在群里发 `/allow`（允许本群，群还没被允许时也可以），或在自己的私聊里发 `/allow <chat_id>`（私聊的 id 就是对方的 user id）；`/deny` 撤销。允许之后聊天里的所有人都能用。
 - 封禁只存在于某个群里，别的聊天不受影响；被封的人已经在生成的回答照常写完。没有整个 bot 范围的封禁。
-- 管理员没有特权：他们的私聊在首次启动时被允许一次，之后可以 `/deny` 自己的私聊，也可以在群里封自己（被封的管理员在那个群里仍能用管理命令，比如解封自己）。注意：管理员的私聊被移出白名单后，那里也只回答 `/ping`，管理命令就用不了了；恢复只能在服务器上直接改数据库：`sqlite3 data/omni.sqlite3 "INSERT INTO access_rules(bot, chat_id, user_id, status, set_at) VALUES ('main', <user_id>, 0, 'allow', 0)"`。管理员和其他人一样受花费限额限制。
+- 管理员没有特权：他们的私聊在首次启动时被允许一次，之后可以 `/deny` 自己的私聊，也可以在群里封自己（被封的管理员在那个群里仍能用管理命令，比如解封自己）。私聊被移出白名单后，在那里再发 `/allow` 就能恢复。管理员和其他人一样受花费限额限制。
 - 其他 bot 和以群/频道身份匿名发出的消息一律忽略。
 - 配置里的 `[access].allowed_chats`（群 id 和私聊都可以写，私聊的 id 就是对方的 user id）：每个 id 加进配置后，在下一次启动时为每个 bot 允许一次；之后以命令为准，从配置里删掉不会撤销（用 `/deny`）。
 
@@ -192,7 +192,7 @@ bot 每次启动都会注册命令菜单：所有聊天、所有语言共用一�
 
 | 命令 | 说明 |
 |---|---|
-| `/allow` / `/deny` | 私聊：`/allow <chat_id>` / `/deny <chat_id>`，允许/撤销任意群或私聊。群里：`/deny` 撤销本群（没允许的群里只回答 `/ping`，所以允许群要在私聊里做） |
+| `/allow` / `/deny` | 群里：允许/撤销本群（`/allow` 在没被允许的群里也有效）。私聊：`/allow <chat_id>` / `/deny <chat_id>`，允许/撤销任意群或私聊 |
 | `/ban` / `/unban` | 群里：`/ban <user_id>`，或回复某人的消息发 `/ban`，在本群封禁；`/unban` 同理。私聊：`/ban <user_id> <group_id>` / `/unban <user_id> <group_id>`。管理员也可以被封（包括封自己） |
 | `/acl` | 群里：本群是否被允许、本群的封禁；私聊：所有聊天的 |
 | `/prefix <chat_id>` / `/unprefix <chat_id> <名字>` | （私聊）看某个聊天的前缀 / 删除其中一个；群里管理员可以用 `/unprefix 名字` 删任何人的 |

@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn chat_kinds() {
-        assert_eq!(chat_kind(71863318), ChatKind::Private);
+        assert_eq!(chat_kind(12345678), ChatKind::Private);
         assert_eq!(chat_kind(-123456), ChatKind::Group);
         assert_eq!(chat_kind(-1001234567890), ChatKind::Channel);
         assert_eq!(marked_peer_id(&tl::types::PeerChannel { channel_id: 1234567890 }.into()), -1001234567890);

@@ -47,7 +47,8 @@ pub fn direct_ids(app: &App) -> Option<String> {
 
 /// Commands that start requests that cost money. Every other non-admin command
 /// only shows information: answered for everyone in an allowed chat, people
-/// banned there included. Where the chat is not allowed only /ping is answered.
+/// banned there included. Where the chat is not allowed only /ping and an
+/// administrator's /allow are answered.
 const PAID_COMMANDS: &[&str] = &["m", "retry", "continue"];
 
 /// The answer to a paid request from someone banned in the chat.
@@ -80,7 +81,7 @@ Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::u
 
 **Other**: /models [search] · /model `prefix` · /stats [today|7d|30d|all] this chat's usage (calendar days in the bot's time zone, today since 00:00, default 30d; in a group also one member: `/stats user_id`, or reply /stats to their message) · /usage · /ping (ids and access here)
 
-Where the bot is not allowed, only /ping is answered. Where it is, commands that only show information work for everyone, also for people banned there; requests that cost money tell banned people that they are banned.
+Where the bot is not allowed, only /ping (and an admin's /allow) is answered. Where it is, commands that only show information work for everyone, also for people banned there; requests that cost money tell banned people that they are banned.
 
 By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. In a reply, the first line names the model; everything else the bot adds (reasoning, sources, errors, notes, usage) is in collapsible blocks or small text, so the model's answer is always unambiguous."#;
 
@@ -93,7 +94,7 @@ const GROUP_ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", 
 
 const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [period] (every chat: rankings by model, chat, user and chat · user; one of them, longer: /stats `model|chat|user|chat-user` [period]) · /stats `chat_id` [`user_id`] [period] · /prefix `chat_id` (a chat's own prefixes) · /unprefix `chat_id` `name` · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
 
-const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person) · /unprefix `name` (anyone's). Everything else in private chat."#;
+const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow (also where the group is not allowed yet) · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person) · /unprefix `name` (anyone's). Everything else in private chat."#;
 
 fn label(s: &str) -> RText {
     RText::bold(RText::plain(s))
@@ -163,8 +164,10 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         .await;
         return Ok(());
     }
-    // Where the chat is not allowed, only /ping is answered (owner's rule).
-    if access == Access::NotAllowed {
+    // Where the chat is not allowed, only /ping is answered, and an
+    // administrator's /allow (owner's rule): in a group it allows that group,
+    // in their private chat any chat, their own included.
+    if access == Access::NotAllowed && !(admin && name == "allow") {
         return Ok(());
     }
     if ADMIN_COMMANDS.contains(&name) {

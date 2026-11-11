@@ -5,7 +5,8 @@
 //! spend limit, its members' limits. Nothing set or counted in one chat ever
 //! affects another.
 //!
-//! Where a chat is not allowed, only /ping is answered. In an allowed chat,
+//! Where a chat is not allowed, only /ping and an administrator's /allow are
+//! answered. In an allowed chat,
 //! queries (commands that only show information) are answered for everyone,
 //! people banned there included, and paid requests for everyone not banned
 //! there (banned people are told). Nobody is special: the administrators'
@@ -28,7 +29,7 @@ pub enum Access {
     Allowed,
     /// The chat is allowed, but the person is banned there: told so.
     Banned,
-    /// The chat is not allowed: only /ping is answered.
+    /// The chat is not allowed: only /ping (and an administrator's /allow) is answered.
     NotAllowed,
 }
 
