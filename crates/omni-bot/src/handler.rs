@@ -63,19 +63,22 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
             return Ok(());
         }
         let kind = kind_of(&app, &bot, &ib).await;
-        // Commands handle their own permission checks (e.g. /whoami, /ping work for everyone).
+        // Commands decide themselves (queries are answered everywhere).
         if let Some(Kind::Command(name)) = &kind {
             let args = parse_command(&ib.text, &bot.username).map(|(_, a, _)| a.to_string()).unwrap_or_default();
             return crate::commands::run(&app, &bot, &ib, name, &args).await;
         }
+        // Conversations are paid requests.
         match access::check(&app, &bot.name, ib.chat_id, user).await? {
             Access::Allowed => {}
-            Access::Denied(msg) => {
-                reply::notice(&app, &bot, ib.chat_id, ib.msg_id, &format!("⛔ {msg}")).await;
+            Access::Banned => {
+                if matches!(kind, Some(Kind::Trigger | Kind::Reply)) {
+                    reply::notice(&app, &bot, ib.chat_id, ib.msg_id, crate::commands::BANNED).await;
+                }
                 return Ok(());
             }
-            Access::Silent => {
-                info!("ignored (not allowed)");
+            Access::NotAllowed => {
+                info!("ignored (chat not allowed)");
                 return Ok(());
             }
         }

@@ -88,7 +88,10 @@ async fn run(cfg: Config) -> Result<()> {
     let db = Db::open(&cfg.general.data_dir.join("omni.sqlite3"))?;
     let blobs = BlobStore::new(cfg.general.data_dir.join("blobs"), db.clone())?;
     let bot_names: Vec<String> = cfg.bots.iter().map(|b| b.name.clone()).collect();
-    access::seed(&db, &bot_names, &cfg.access.allowed_chats).await?;
+    // The administrators' private chats are allowed like the configured chats:
+    // once, so that they can remove them again.
+    let seeded: Vec<i64> = cfg.access.allowed_chats.iter().chain(&cfg.access.admins).copied().collect();
+    access::seed(&db, &bot_names, &seeded).await?;
 
     let orc = cfg.providers.openrouter.clone().context("[providers.openrouter] is required")?;
     let openrouter = OpenRouter::new(OpenRouterConfig {
@@ -290,8 +293,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("continue", "Reply: keep writing an answer that hit its long-decode budget"),
         ("stats", "Usage statistics"),
         ("usage", "Your (and this group's) spend limits"),
-        ("whoami", "Show your user id and this chat's id"),
-        ("ping", "Check the bot, show this chat's id"),
+        ("ping", "Check the bot: your and this chat's ids, access here"),
     ];
     let admin = [
         ("allow", "Admin: allow a chat (group or private chat)"),

@@ -35,7 +35,6 @@ pub const COMMANDS: &[&str] = &[
     "start",
     "help",
     "ping",
-    "whoami",
     "models",
     "model",
     "raw",

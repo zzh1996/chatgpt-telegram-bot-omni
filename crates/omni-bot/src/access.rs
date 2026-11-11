@@ -5,11 +5,13 @@
 //! spend limit, its members' limits. Nothing set or counted in one chat ever
 //! affects another.
 //!
-//! A chat is usable once allowed (then by everyone in it, administrators
-//! included); the administrators' own private chats always are. A banned
-//! person is ignored in that chat. Administrators manage this with commands:
-//! in their private chat for every chat of the bot, inside a group for that
-//! group only (see `commands`).
+//! Queries (commands that only show information) are answered for anyone,
+//! anywhere. Paid requests need an allowed chat (otherwise they are ignored
+//! without a word) and a sender who is not banned there (otherwise they are
+//! told). Nobody is special: the administrators' private chats are allowed once
+//! at the first start, and they can remove them or ban themselves like anyone.
+//! Administrators manage this with commands: in their private chat for every
+//! chat of the bot, inside a group for that group only (see `commands`).
 
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
@@ -17,13 +19,16 @@ use rusqlite::{OptionalExtension, params};
 use crate::app::App;
 use crate::store::{Db, now_ms};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a person may do in a chat. Queries (information that costs nothing)
+/// are always answered; this decides paid requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
+    /// The chat is allowed and the person is not banned there.
     Allowed,
-    /// Tell the user why (private chats).
-    Denied(String),
-    /// Ignore silently (groups that are not allowed, banned users).
-    Silent,
+    /// The chat is allowed, but the person is banned there: told so.
+    Banned,
+    /// The chat is not allowed: paid requests are ignored without a word.
+    NotAllowed,
 }
 
 /// Allow the configured chats (groups and private chats) for every bot, once
@@ -162,30 +167,22 @@ pub async fn rules(db: &Db, bot: &str, only_chat: Option<i64>) -> Result<Vec<Rul
     .await
 }
 
-/// Whether `user_id` may use `bot` in `chat_id` (conversations and user commands).
+/// Whether `user_id` may make paid requests to `bot` in `chat_id`. Nobody is
+/// special: administrators can remove their own private chat from the allow
+/// list or ban themselves like anyone else.
 pub async fn check(app: &App, bot: &str, chat_id: i64, user_id: i64) -> Result<Access> {
-    let banned = banned(&app.db, bot, chat_id, user_id).await?;
     let place = place_allowed(&app.db, bot, chat_id).await?;
-    Ok(decide(chat_id, user_id, app.is_admin(user_id), place, banned))
+    let banned = banned(&app.db, bot, chat_id, user_id).await?;
+    Ok(decide(place, banned))
 }
 
-/// [`check`] given the rules: whether the place is allowed, whether the user is banned there.
-pub fn decide(chat_id: i64, user_id: i64, admin: bool, place_allowed: bool, banned: bool) -> Access {
-    if banned && !admin {
-        return Access::Silent;
+/// [`check`] given the rules: whether the chat is allowed, whether the person is banned there.
+pub fn decide(chat_allowed: bool, banned: bool) -> Access {
+    match (chat_allowed, banned) {
+        (false, _) => Access::NotAllowed,
+        (true, true) => Access::Banned,
+        (true, false) => Access::Allowed,
     }
-    if chat_id > 0 {
-        // Private chat (its id is the user's): administrators, and users allowed there.
-        return if admin || place_allowed {
-            Access::Allowed
-        } else {
-            Access::Denied(format!(
-                "This chat is not allowed to use this bot. Ask an administrator to run /allow {user_id} in their private chat with it"
-            ))
-        };
-    }
-    // A group: only if allowed, for everyone in it.
-    if place_allowed { Access::Allowed } else { Access::Silent }
 }
 
 // ------------------------------------------------------------------ quotas
@@ -441,19 +438,10 @@ mod tests {
     }
 
     #[test]
-    fn everything_is_explicitly_authorized_chat_by_chat() {
-        let (group, user, admin) = (-100, 7, 1);
-        // Groups: only allowed ones, for everyone (administrators included).
-        assert_eq!(decide(group, user, false, true, false), Access::Allowed);
-        assert_eq!(decide(group, admin, true, true, false), Access::Allowed);
-        assert_eq!(decide(group, admin, true, false, false), Access::Silent);
-        assert_eq!(decide(group, user, false, false, false), Access::Silent);
-        // Private chats: administrators, and chats allowed like any other.
-        assert_eq!(decide(admin, admin, true, false, false), Access::Allowed);
-        assert_eq!(decide(user, user, false, true, false), Access::Allowed);
-        assert!(matches!(decide(user, user, false, false, false), Access::Denied(_)));
-        // A ban silences in its chat, except administrators.
-        assert_eq!(decide(group, user, false, true, true), Access::Silent);
-        assert_eq!(decide(group, admin, true, true, true), Access::Allowed);
+    fn paid_requests_need_an_allowed_chat_and_no_ban() {
+        assert_eq!(decide(true, false), Access::Allowed);
+        assert_eq!(decide(true, true), Access::Banned);
+        assert_eq!(decide(false, false), Access::NotAllowed);
+        assert_eq!(decide(false, true), Access::NotAllowed);
     }
 }

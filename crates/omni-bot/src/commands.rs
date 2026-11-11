@@ -45,6 +45,13 @@ pub fn direct_ids(app: &App) -> Option<String> {
     (!forms.is_empty()).then(|| forms.join(" or "))
 }
 
+/// Commands that start requests that cost money; every other non-admin command
+/// only shows information and is answered for anyone, anywhere.
+const PAID_COMMANDS: &[&str] = &["m", "retry", "continue"];
+
+/// The answer to a paid request from someone banned in the chat.
+pub const BANNED: &str = "⛔ You are banned from using this bot in this chat.";
+
 const HINT: &str = "Start a conversation with `prefix$question` (the prefixes are listed by /models), or reply to one of my messages to continue. /help for details.";
 
 const HELP: &str = r#"**Start a conversation**: `prefix$text`
@@ -68,7 +75,9 @@ Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::u
 
 **Commands (reply to a bot message)**: /m `prefix$text` continue with another model · /raw original Markdown and files · /dump the whole conversation up to that message as a JSON file · /info request details · /retry regenerate a failed answer · /continue keep writing an answer that stopped at the long-decode budget.
 
-**Other**: /models [search] · /model `prefix` · /stats [today|7d|30d|all] this chat's usage (calendar days in the bot's time zone, today since 00:00, default 30d; in a group also one member: `/stats user_id`, or reply /stats to their message) · /usage · /whoami · /ping
+**Other**: /models [search] · /model `prefix` · /stats [today|7d|30d|all] this chat's usage (calendar days in the bot's time zone, today since 00:00, default 30d; in a group also one member: `/stats user_id`, or reply /stats to their message) · /usage · /ping (ids and access here)
+
+Commands that only show information work everywhere. Requests that cost money need an allowed chat; someone banned in it is told so.
 
 By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. In a reply, the first line names the model; everything else the bot adds (reasoning, sources, errors, notes, usage) is in collapsible blocks or small text, so the model's answer is always unambiguous."#;
 
@@ -126,60 +135,38 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     let user = ib.sender_id.unwrap_or(0);
     let admin = app.is_admin(user);
     let access = access::check(app, &bot.name, ib.chat_id, user).await?;
-    let allowed = access == Access::Allowed;
-    // `/ping` and `/whoami` work for everyone everywhere: they show the ids an
-    // administrator needs to allow a chat or user.
-    match name {
-        "ping" => {
-            let a = match &access {
-                Access::Allowed => "allowed",
-                Access::Denied(_) | Access::Silent => "not allowed",
-            };
-            let up = jiff::Timestamp::now().duration_since(app.started_at);
-            say(
-                app,
-                bot,
-                ib,
-                &format!(
-                    "pong · chat_id={} · user_id={} · {a} · bot={} · up {}s",
-                    ib.chat_id,
-                    user,
-                    bot.name,
-                    up.as_secs()
-                ),
-            )
-            .await;
-            return Ok(());
-        }
-        "whoami" => {
-            say(
-                app,
-                bot,
-                ib,
-                &format!(
-                    "user_id={user}{}{} · chat_id={}",
-                    ib.payload.sender_username.as_ref().map(|u| format!(" (@{u})")).unwrap_or_default(),
-                    if admin { " · admin" } else { "" },
-                    ib.chat_id
-                ),
-            )
-            .await;
-            return Ok(());
-        }
-        _ => {}
-    }
-    let is_admin_command = ADMIN_COMMANDS.contains(&name);
-    // Everything else only where the bot may be used, except that administrators
-    // may run admin commands anywhere (e.g. `/allow` inside a group to authorize it).
-    if !(allowed || admin && is_admin_command) {
-        if let Access::Denied(msg) = access {
-            say(app, bot, ib, &format!("⛔ {msg}")).await;
-        }
+    if name == "ping" {
+        // Everything an administrator needs to allow a chat or ban someone.
+        let here = match access {
+            Access::Allowed => "this chat is allowed",
+            Access::Banned => "this chat is allowed, you are banned here",
+            Access::NotAllowed => "this chat is not allowed",
+        };
+        let up = jiff::Timestamp::now().duration_since(app.started_at);
+        say(
+            app,
+            bot,
+            ib,
+            &format!(
+                "pong · chat_id={} · user_id={}{}{} · {here} · bot={} · up {}s",
+                ib.chat_id,
+                user,
+                ib.payload.sender_username.as_ref().map(|u| format!(" (@{u})")).unwrap_or_default(),
+                if admin { " · admin" } else { "" },
+                bot.name,
+                up.as_secs()
+            ),
+        )
+        .await;
         return Ok(());
     }
-    if is_admin_command {
+    if ADMIN_COMMANDS.contains(&name) {
+        // Administrators may manage from anywhere (e.g. `/allow` inside a group to
+        // authorize it), scoped to the group when sent in one.
         if !admin {
-            say(app, bot, ib, "⛔ admin only").await;
+            if access != Access::NotAllowed {
+                say(app, bot, ib, "⛔ admin only").await;
+            }
         } else if ib.chat_id < 0 && !GROUP_ADMIN_COMMANDS.contains(&name) {
             say(
                 app,
@@ -192,6 +179,17 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
             admin_command(app, bot, ib, name, args, user).await?;
         }
         return Ok(());
+    }
+    // Paid requests: only in allowed chats (else not a word), not when banned there.
+    if PAID_COMMANDS.contains(&name) {
+        match access {
+            Access::Allowed => {}
+            Access::Banned => {
+                say(app, bot, ib, BANNED).await;
+                return Ok(());
+            }
+            Access::NotAllowed => return Ok(()),
+        }
     }
     match name {
         "start" | "help" => {
@@ -316,10 +314,6 @@ async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &
                 }
             };
             let ban = name == "ban";
-            if ban && app.is_admin(user) {
-                say(app, bot, ib, "administrators cannot be banned").await;
-                return Ok(());
-            }
             let changed = access::set_ban(&app.db, &bot.name, place, user, ban, by).await?;
             let scope = if group { "in this group".to_string() } else { format!("in group {place}") };
             let text = match (ban, changed) {
@@ -835,9 +829,17 @@ pub async fn on_callback(app: &Arc<App>, bot: &Arc<BotConn>, q: tl::types::Updat
         answer(Some("This button does not belong to this message.")).await;
         return Ok(());
     }
-    if !matches!(access::check(app, &bot.name, chat_id, q.user_id).await?, Access::Allowed) {
-        answer(Some("You are not allowed to use this bot here.")).await;
-        return Ok(());
+    // A retry is a paid request.
+    match access::check(app, &bot.name, chat_id, q.user_id).await? {
+        Access::Allowed => {}
+        Access::Banned => {
+            answer(Some("You are banned from using this bot in this chat.")).await;
+            return Ok(());
+        }
+        Access::NotAllowed => {
+            answer(None).await;
+            return Ok(());
+        }
     }
     let t = conv::get_turn(&app.db, turn_id).await?;
     if t.status != TurnStatus::Failed {
