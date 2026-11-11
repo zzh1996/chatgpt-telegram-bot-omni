@@ -97,6 +97,8 @@ allow_unlisted_models = false  # only the `db…` prefixes below; true: any `ark
 [render]
 markdown = "clean"             # clean | raw (raw = the model's exact Markdown source)
 first_flush_delay_secs = 1.0   # wait before a new reply's first message, to batch the first tokens
+reasoning_open = false         # keep the reasoning fold open while the model thinks (every edit would
+                               # re-open it for readers who closed it)
 show_usage = "always"          # always | never | USD threshold such as "0.05"
 
 [retry]

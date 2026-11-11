@@ -308,6 +308,10 @@ pub struct RenderConfig {
     pub markdown: omni_markdown::Mode,
     /// Delay before the first flush of a new reply (seconds), to batch the first tokens.
     pub first_flush_delay_secs: f64,
+    /// Keep the reasoning fold of a reply open while the model is still
+    /// thinking. Off by default: every streaming edit sends the fold's state
+    /// again, which would re-open it for anyone who closed it.
+    pub reasoning_open: bool,
     /// Show usage/cost footer: `always`, `never`, or a USD threshold like `0.05`.
     pub show_usage: String,
 }
@@ -317,6 +321,7 @@ impl Default for RenderConfig {
         Self {
             markdown: omni_markdown::Mode::Clean,
             first_flush_delay_secs: 1.0,
+            reasoning_open: false,
             show_usage: "always".into(),
         }
     }

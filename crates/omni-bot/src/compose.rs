@@ -65,6 +65,8 @@ pub struct ComposeInput<'a> {
     pub notes: &'a [String],
     pub elapsed: Duration,
     pub show_usage: bool,
+    /// Open the reasoning fold while the model is thinking (`render.reasoning_open`).
+    pub reasoning_open: bool,
     pub mode: Mode,
     /// Show AI-generated content as raw Markdown (fallback after Telegram rejected the rendering).
     pub raw_ai: bool,
@@ -206,7 +208,9 @@ fn flush_answer(out: &mut Vec<RBlock>, answer: &mut String, citations: &mut Vec<
 /// kind are joined into a block; nothing is moved past anything else. Sources
 /// follow the answer text they belong to. `depth`: nesting of the output
 /// (0 at the top of the message, 1 inside an earlier attempt's block).
-fn output_blocks(parts: &[Part], raw: bool, depth: usize, generating: bool) -> Vec<RBlock> {
+/// `open_thinking`: open the reasoning fold that nothing follows yet (the model
+/// is still thinking and `render.reasoning_open` is on).
+fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -> Vec<RBlock> {
     let mut out = Vec::new();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
@@ -231,7 +235,7 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, generating: bool) -> V
                 if !text.is_empty() {
                     flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
                     // Open only while the model is thinking: nothing has come after it yet.
-                    let open = generating && !parts[i..].iter().any(visible);
+                    let open = open_thinking && !parts[i..].iter().any(visible);
                     out.push(RBlock::Details {
                         open,
                         title: RText::sub(RText::plain("💭")),
@@ -348,7 +352,7 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         out.push(prior_block(a, raw, inp.show_usage));
     }
     // 3. this attempt's output, in the order it was produced.
-    out.extend(output_blocks(inp.parts, raw, 0, inp.status == Status::Generating));
+    out.extend(output_blocks(inp.parts, raw, 0, inp.reasoning_open && inp.status == Status::Generating));
 
     // 6. error: the message in the title; the complete error object inside.
     if let Some(e) = inp.error {
@@ -631,6 +635,7 @@ mod tests {
             notes: &[],
             elapsed: Duration::from_secs(3),
             show_usage: true,
+            reasoning_open: true,
             mode: Mode::Clean,
             raw_ai: false,
             hops: 0,
@@ -831,6 +836,10 @@ mod tests {
         })];
         let blocks = compose(&input(&parts, Status::Generating));
         assert!(matches!(&blocks[1], RBlock::Details { open: true, .. }));
+        // Off (the default): always folded, even while thinking.
+        let mut i = input(&parts, Status::Generating);
+        i.reasoning_open = false;
+        assert!(matches!(&compose(&i)[1], RBlock::Details { open: false, .. }));
     }
 
     #[test]

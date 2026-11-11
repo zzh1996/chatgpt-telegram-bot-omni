@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/omni-core", "crates/omni-markdown", "crates/omni-llm", "crates/omni-bot"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -52,3 +53,8 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 4
+
+# pulldown-cmark 0.13.6 with CJK-friendly emphasis (`**注意：**内容`), see
+# vendor/pulldown-cmark/src/firstpass.rs ("omni patch").
+[patch.crates-io]
+pulldown-cmark = { path = "vendor/pulldown-cmark" }

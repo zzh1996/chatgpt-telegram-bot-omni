@@ -24,7 +24,7 @@ view：RenderState → compose（富消息块）→ paginate → outbox（幂等
 | crate | 职责 | 依赖 |
 |---|---|---|
 | `omni-core` | 对话内容模型（`Turn`/`Part`/`Reasoning`/`Citation`/`NativeOutput`）、blob 引用、触发语法与 `::role` 解析、用量、JSON 工具（merge patch、blob 脱敏） | 纯逻辑 |
-| `omni-markdown` | Markdown → 自有 AST（带源码范围）→ 富消息块 `RBlock`/`RText`（镜像 TL PageBlock）或经典 entities；限额统计与切分 | pulldown-cmark |
+| `omni-markdown` | Markdown → 自有 AST（带源码范围）→ 富消息块 `RBlock`/`RText`（镜像 TL PageBlock）或经典 entities；限额统计与切分 | pulldown-cmark（`vendor/` 里打了 CJK 友好强调补丁的副本） |
 | `omni-llm` | Provider 抽象（`CallInput`→`Prepared`→流事件）、SSE 解析、错误分类、OpenRouter（目录、Chat Completions / Responses / Messages 三种接口、选项/预设解析）、火山方舟直连 | reqwest |
 | `omni-bot` | 二进制 `omni`：配置、日志、SQLite、grammers Session、Telegram 收发、多 bot（各自独立）、任务、渲染、命令、权限、限额 | grammers、rusqlite |
 
