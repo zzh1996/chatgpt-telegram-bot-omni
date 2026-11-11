@@ -1,8 +1,10 @@
 //! Composition of a reply into rich blocks.
 //!
 //! Layout (top to bottom):
-//! 1. header line: `🤖 model`;
-//! 2. reasoning: collapsible details (open only while thinking, before any answer);
+//! 1. header line: `🤖 **model**` in small text (the owner's choice: the answer
+//!    takes the space);
+//! 2. reasoning: collapsible details titled with a small 💭 only (open only
+//!    while thinking, before any answer);
 //! 3. tool calls: collapsible details;
 //! 4. the model's answer (rendered Markdown, or raw Markdown in raw mode / fallback);
 //! 5. sources: collapsible details;
@@ -10,9 +12,9 @@
 //! 7. small-text footers: status and notes, then options, usage, cost, timing, provider.
 //!
 //! Unambiguous by structure, without visual marking: the first line of every
-//! reply message is the bot's header, and everything else the bot adds is a
-//! collapsible details block or a footer — block types the Markdown renderer
-//! never produces from model output. So any reader can tell exactly which part
+//! reply message is the bot's header (a small-text block), and everything else
+//! the bot adds is a collapsible details block or small text — block types the
+//! Markdown renderer never produces from model output. So any reader can tell exactly which part
 //! is the model's answer; model output cannot pass for reasoning, errors,
 //! notes or usage.
 
@@ -103,13 +105,13 @@ pub fn label(s: &str) -> RText {
     RText::bold(RText::plain(s))
 }
 
-/// The first line of every reply message.
+/// The first line of every reply message, in small text.
 fn header(model: &str, part: Option<usize>) -> RBlock {
     let mut t = vec![RText::plain("🤖 "), label(model)];
     if let Some(p) = part {
         t.push(RText::plain(format!(" · part {p}")));
     }
-    RBlock::Paragraph(RText::concat(t))
+    RBlock::Footer(RText::concat(t))
 }
 
 fn fmt_tokens(n: u64) -> String {
@@ -213,7 +215,6 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, generating: bool) -> V
         match &parts[i] {
             Part::Reasoning(_) => {
                 let mut text = String::new();
-                let mut kinds = Vec::new();
                 while let Some(Part::Reasoning(r)) = parts.get(i) {
                     match &r.text {
                         Some(t) if !t.is_empty() => {
@@ -221,9 +222,6 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, generating: bool) -> V
                                 text.push_str("\n\n");
                             }
                             text.push_str(t);
-                            if !kinds.contains(&r.kind) {
-                                kinds.push(r.kind);
-                            }
                         }
                         // Reasoning that was not returned (encrypted, redacted): nothing to show.
                         _ => {}
@@ -232,13 +230,11 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, generating: bool) -> V
                 }
                 if !text.is_empty() {
                     flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
-                    let what =
-                        if kinds.iter().all(|k| *k == ReasoningKind::Summary) { "Reasoning summary" } else { "Reasoning" };
                     // Open only while the model is thinking: nothing has come after it yet.
                     let open = generating && !parts[i..].iter().any(visible);
                     out.push(RBlock::Details {
                         open,
-                        title: RText::plain(format!("💭 {what}")),
+                        title: RText::sub(RText::plain("💭")),
                         blocks: ai_blocks(&text, raw, depth + 1),
                     });
                 }
@@ -667,12 +663,12 @@ mod tests {
             Usage { input_tokens: Some(10), output_tokens: Some(50), reasoning_tokens: Some(40), ..Default::default() };
         i.usage = Some(&usage);
         let blocks = compose(&i);
-        // Header: model only (no alias), no underline/italic.
-        assert!(matches!(&blocks[0], RBlock::Paragraph(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5"));
+        // Header: model only (no alias), small text, no underline/italic.
+        assert!(matches!(&blocks[0], RBlock::Footer(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5"));
         let dbg = format!("{blocks:?}");
         assert!(!dbg.contains("Underline") && !dbg.contains("Italic"), "{dbg}");
         // Reasoning collapsed; its token count (a total for the whole reply) is in the footer.
-        assert!(matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭 Reasoning"));
+        assert!(matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭"));
         // The answer follows directly; everything after it is details/footer.
         let answer_end = blocks.iter().rposition(|b| !matches!(b, RBlock::Details { .. } | RBlock::Footer(_))).unwrap();
         for b in &blocks[2..=answer_end] {
@@ -745,8 +741,8 @@ mod tests {
                 format!("{}{}", title.to_plain().split(' ').next().unwrap_or(""), if *open { "+" } else { "" })
             }
             RBlock::Photo { .. } => "photo".into(),
+            RBlock::Footer(t) if t.to_plain().starts_with("🤖") => "header".into(),
             RBlock::Footer(_) => "footer".into(),
-            RBlock::Paragraph(t) if t.to_plain().starts_with("🤖") => "header".into(),
             RBlock::Paragraph(t) => format!("p:{}", t.to_plain()),
             other => format!("{other:?}").chars().take(12).collect(),
         }
@@ -857,7 +853,7 @@ mod tests {
         let pages = paginate("anthropic/claude-opus-5.5", blocks);
         assert!(pages.len() >= 2);
         assert!(
-            matches!(&pages[1][0], RBlock::Paragraph(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5 · part 2")
+            matches!(&pages[1][0], RBlock::Footer(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5 · part 2")
         );
     }
 }

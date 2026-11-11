@@ -88,7 +88,7 @@ const ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota
 /// never anything about other chats.
 const GROUP_ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota"];
 
-const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [`chat_id`] [`user_id`] [period] (default: every chat) · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
+const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [period] (every chat: rankings by model, chat, user and chat · user; one of them, longer: /stats `model|chat|user|chat-user` [period]) · /stats `chat_id` [`user_id`] [period] · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
 
 const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person). Everything else in private chat."#;
 
@@ -231,6 +231,69 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         _ => {}
     }
     Ok(())
+}
+
+/// `/credits`: the OpenRouter key's limit and spending, readable, with the full
+/// response folded underneath (without the key's masked label).
+fn credits_blocks(v: &serde_json::Value) -> Result<Vec<RBlock>> {
+    let d = v.get("data").unwrap_or(v);
+    let num = |k: &str| d.get(k).and_then(serde_json::Value::as_f64);
+    let usd = |x: Option<f64>| x.map(fmt_cost).unwrap_or_else(|| "-".into());
+    let mut lines = Vec::new();
+    match num("limit") {
+        Some(limit) => {
+            let reset = d.get("limit_reset").and_then(|x| x.as_str()).map(|r| format!(" · resets {r}")).unwrap_or_default();
+            lines.push(format!(
+                "limit {} · used {} · remaining {}{reset}",
+                usd(Some(limit)),
+                usd(num("usage")),
+                usd(num("limit_remaining"))
+            ));
+        }
+        None => lines.push(format!("no limit · used {}", usd(num("usage")))),
+    }
+    lines.push(format!(
+        "spent today {} · this week {} · this month {} (UTC)",
+        usd(num("usage_daily")),
+        usd(num("usage_weekly")),
+        usd(num("usage_monthly"))
+    ));
+    if num("byok_usage").is_some_and(|b| b > 0.0) {
+        let counted = d.get("include_byok_in_limit").and_then(|x| x.as_bool()) == Some(true);
+        lines.push(format!(
+            "with your own provider keys (BYOK): today {} · this week {} · this month {} ({} the limit)",
+            usd(num("byok_usage_daily")),
+            usd(num("byok_usage_weekly")),
+            usd(num("byok_usage_monthly")),
+            if counted { "counted in" } else { "not counted in" }
+        ));
+    }
+    if let Some(f) = d.get("free_model_daily_requests")
+        && let (Some(used), Some(limit)) = (f.get("used").and_then(|x| x.as_i64()), f.get("limit").and_then(|x| x.as_i64()))
+    {
+        lines.push(format!("free models: {used} of {limit} requests today"));
+    }
+    lines.push(match d.get("expires_at").and_then(|x| x.as_str()) {
+        Some(e) => format!("the key expires {e}"),
+        None => "the key does not expire".into(),
+    });
+    if d.get("is_free_tier").and_then(|x| x.as_bool()) == Some(true) {
+        lines.push("free tier account".into());
+    }
+    let items =
+        lines.into_iter().map(|l| RItem { checkbox: None, blocks: vec![RBlock::Paragraph(RText::plain(l))] }).collect();
+    let mut raw = d.clone();
+    if let Some(o) = raw.as_object_mut() {
+        o.remove("label");
+    }
+    Ok(vec![
+        RBlock::List { items },
+        RBlock::Details {
+            open: false,
+            title: RText::plain("full response"),
+            blocks: vec![RBlock::Pre { text: serde_json::to_string_pretty(&raw)?, language: "json".into() }],
+        },
+    ])
 }
 
 /// How a chat id reads: a group, or a user's private chat.
@@ -408,16 +471,7 @@ async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &
             say(app, bot, ib, &text).await;
         }
         "credits" => match app.openrouter.key_info().await {
-            Ok(v) => {
-                send(
-                    app,
-                    bot,
-                    ib,
-                    "OpenRouter key",
-                    vec![RBlock::Pre { text: serde_json::to_string_pretty(&v)?, language: "json".into() }],
-                )
-                .await
-            }
+            Ok(v) => send(app, bot, ib, "OpenRouter key", credits_blocks(&v)?).await,
             Err(e) => say(app, bot, ib, &format!("⚠️ {e:#}")).await,
         },
         _ => {}
@@ -937,10 +991,113 @@ fn period_start(app: &App, p: &str) -> (i64, String) {
     }
 }
 
+/// A ranking dimension of `/stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dim {
+    Model,
+    Chat,
+    User,
+    ChatUser,
+}
+
+impl Dim {
+    fn parse(w: &str) -> Option<Dim> {
+        Some(match w {
+            "model" => Dim::Model,
+            "chat" => Dim::Chat,
+            "user" => Dim::User,
+            "chat-user" => Dim::ChatUser,
+            _ => return None,
+        })
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Dim::Model => "model",
+            Dim::Chat => "chat",
+            Dim::User => "user",
+            Dim::ChatUser => "chat · user",
+        }
+    }
+
+    /// (label expression, GROUP BY expression) over `usage_ledger l`.
+    fn sql(self) -> (String, &'static str) {
+        let name = |id: &str| {
+            format!(
+                "COALESCE((SELECT NULLIF(TRIM(COALESCE(u.first_name,'') || ' ' || COALESCE(u.last_name,'')), '') \
+                 FROM users u WHERE u.user_id = {id}), '?')"
+            )
+        };
+        let chat = format!(
+            "CASE WHEN l.chat_id > 0 THEN 'private · ' || {} ELSE COALESCE((SELECT c.title FROM chats c WHERE c.chat_id = l.chat_id), '?') END \
+             || ' (' || l.chat_id || ')'",
+            name("l.chat_id")
+        );
+        let user = format!("{} || ' (' || l.user_id || ')'", name("l.user_id"));
+        match self {
+            Dim::Model => ("l.model".into(), "l.model"),
+            Dim::Chat => (chat, "l.chat_id"),
+            Dim::User => (user, "l.user_id"),
+            Dim::ChatUser => (format!("{chat} || ' · ' || {user}"), "l.chat_id, l.user_id"),
+        }
+    }
+}
+
+/// One ranking row: label, calls, input tokens, output tokens, cost.
+type RankRow = (String, i64, i64, i64, f64);
+
+/// Usage of a bot since `since` (optionally in one chat / of one person),
+/// ranked by cost along `dim`, at most `limit` rows.
+async fn rank(
+    app: &App,
+    bot: &str,
+    since: i64,
+    chat: Option<i64>,
+    user: Option<i64>,
+    dim: Dim,
+    limit: usize,
+) -> Result<Vec<RankRow>> {
+    let (label, group) = dim.sql();
+    let sql = format!(
+        "SELECT {label}, COUNT(*), COALESCE(SUM(l.input_tokens),0), COALESCE(SUM(l.output_tokens),0), COALESCE(SUM(l.cost_usd),0)
+         FROM usage_ledger l WHERE l.bot = ?1 AND l.ts >= ?2 AND (?3 IS NULL OR l.chat_id = ?3) AND (?4 IS NULL OR l.user_id = ?4)
+         GROUP BY {group} ORDER BY 5 DESC LIMIT {limit}"
+    );
+    let bot = bot.to_string();
+    app.db
+        .call(move |c| {
+            let mut s = c.prepare(&sql)?;
+            let v = s
+                .query_map(params![bot, since, chat, user], |r| {
+                    Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await
+}
+
+/// Total calls and cost of a bot since `since` (optionally in one chat / of one person).
+async fn usage_total(app: &App, bot: &str, since: i64, chat: Option<i64>, user: Option<i64>) -> Result<(i64, f64)> {
+    let bot = bot.to_string();
+    app.db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM usage_ledger
+                 WHERE bot = ?1 AND ts >= ?2 AND (?3 IS NULL OR chat_id = ?3) AND (?4 IS NULL OR user_id = ?4)",
+                params![bot, since, chat, user],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .await
+}
+
 /// `/stats [period]`, along the tree bot → chat → person: in a chat, that chat
 /// (in a group also one member: `/stats <user_id>` or as a reply); in an
-/// administrator's private chat the whole bot, `<chat_id>` one chat, or
-/// `<chat_id> <user_id>` one person in it. Always this bot's usage only.
+/// administrator's private chat the whole bot ranked by model, chat, person and
+/// (chat, person) — or one ranking with `model|chat|user|chat-user` —,
+/// `<chat_id>` one chat, or `<chat_id> <user_id>` one person in it. Always this
+/// bot's usage only.
 async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str, admin: bool) -> Result<()> {
     let mut words = args.split_whitespace().collect::<Vec<_>>();
     let chat = ib.chat_id;
@@ -948,7 +1105,9 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
         let i = words.iter().position(|w| w.parse::<i64>().is_ok())?;
         words.remove(i).parse().ok()
     };
-    // Scope: (chat filter, user filter, description).
+    // Scope (chat filter, user filter, description) and the rankings to show.
+    let mut dims = vec![Dim::Model];
+    let mut limit = 30;
     let (chat_f, user_f, scope_desc): (Option<i64>, Option<i64>, String) = if chat < 0 {
         let member = match take_id(&mut words) {
             Some(u) => Some(u),
@@ -957,67 +1116,58 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
         };
         match member {
             Some(u) => (Some(chat), Some(u), format!("user {u} in this group")),
-            None => (Some(chat), None, "this group".into()),
+            None => {
+                dims.push(Dim::User);
+                (Some(chat), None, "this group".into())
+            }
         }
     } else if admin {
-        // An administrator's private chat, along the tree: the whole bot, one chat
-        // (a private chat's id is its user's), or one person in one chat.
+        // An administrator's private chat: the whole bot (rankings), one chat (a
+        // private chat's id is its user's), or one person in one chat.
         let mut ids = Vec::new();
         while let Some(id) = take_id(&mut words) {
             ids.push(id);
         }
+        let dim = words.iter().position(|w| Dim::parse(w).is_some()).map(|i| Dim::parse(words.remove(i)).unwrap());
         match ids[..] {
-            [] => (None, None, "every chat".into()),
-            [c] => (Some(c), None, place_label(c)),
+            [] => {
+                match dim {
+                    Some(d) => {
+                        dims = vec![d];
+                        limit = 50;
+                    }
+                    None => {
+                        dims = vec![Dim::Model, Dim::Chat, Dim::User, Dim::ChatUser];
+                        limit = 10;
+                    }
+                }
+                (None, None, "every chat".into())
+            }
+            [c] => {
+                dims.push(Dim::User);
+                (Some(c), None, place_label(c))
+            }
             [c, u, ..] => (Some(c), Some(u), format!("user {u} in {}", place_label(c))),
         }
     } else {
         (Some(chat), None, "this chat".into())
     };
     let (since, period) = period_start(app, words.first().copied().unwrap_or("30d"));
-    let bot_name = bot.name.clone();
-    let per_chat = chat_f.is_none();
-    let (by_model, by_who) = app
-        .db
-        .call(move |c| {
-            let filter = "bot = ?2 AND ts >= ?1 AND (?3 IS NULL OR chat_id = ?3) AND (?4 IS NULL OR user_id = ?4)";
-            let q = |group: &str| {
-                format!(
-                    "SELECT {group}, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0)
-                     FROM usage_ledger WHERE {filter} GROUP BY 1 ORDER BY 5 DESC LIMIT 30"
-                )
-            };
-            let run = |sql: String| -> rusqlite::Result<Vec<(String, i64, i64, i64, f64)>> {
-                let mut s = c.prepare(&sql)?;
-                s.query_map(params![since, bot_name, chat_f, user_f], |r| {
-                    Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })?
-                .collect()
-            };
-            let by_model = run(q("model"))?;
-            let who = if per_chat {
-                "COALESCE((SELECT title FROM chats WHERE chats.chat_id = usage_ledger.chat_id), CAST(chat_id AS TEXT))"
-            } else {
-                "COALESCE((SELECT TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) FROM users WHERE users.user_id = usage_ledger.user_id), CAST(user_id AS TEXT))"
-            };
-            let by_who = run(q(who))?;
-            Ok((by_model, by_who))
-        })
-        .await?;
-    let fmt = |rows: Vec<(String, i64, i64, i64, f64)>| -> Vec<Vec<String>> {
-        rows.into_iter()
-            .map(|(k, n, i, o, c)| vec![k, n.to_string(), i.to_string(), o.to_string(), fmt_cost(c)])
-            .collect()
-    };
-    let total = by_model.iter().fold(0.0, |a, r| a + r.4);
-    let who_header = if per_chat { "chat" } else { "user" };
-    let mut blocks = vec![RBlock::Paragraph(RText::plain(format!("{scope_desc} · {period} · total {}", fmt_cost(total))))];
-    if by_model.is_empty() {
+    let (calls, total) = usage_total(app, &bot.name, since, chat_f, user_f).await?;
+    let mut blocks = vec![RBlock::Paragraph(RText::plain(format!(
+        "{scope_desc} · {period} · {calls} calls · total {}",
+        fmt_cost(total)
+    )))];
+    if calls == 0 {
         blocks.push(RBlock::Paragraph(RText::plain("No usage in this period.")));
     } else {
-        blocks.push(table(&["model", "calls", "in", "out", "cost"], fmt(by_model)));
-        if user_f.is_none() || per_chat {
-            blocks.push(table(&[who_header, "calls", "in", "out", "cost"], fmt(by_who)));
+        for d in dims {
+            let rows = rank(app, &bot.name, since, chat_f, user_f, d, limit).await?;
+            let rows = rows
+                .into_iter()
+                .map(|(k, n, i, o, c)| vec![k, n.to_string(), i.to_string(), o.to_string(), fmt_cost(c)])
+                .collect();
+            blocks.push(table(&[d.header(), "calls", "in", "out", "cost"], rows));
         }
     }
     send(app, bot, ib, "Usage stats", blocks).await;
