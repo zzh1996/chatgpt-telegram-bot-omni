@@ -255,6 +255,21 @@ pub async fn turn_for_message(db: &Db, bot: &str, chat_id: i64, msg_id: i32) -> 
     .await
 }
 
+/// Whether `bot` sent this message (an answer, command output or notice).
+pub async fn sent_by(db: &Db, bot: &str, chat_id: i64, msg_id: i32) -> Result<bool> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        Ok(c.query_row(
+            "SELECT 1 FROM outbox WHERE bot = ?1 AND chat_id = ?2 AND msg_id = ?3 LIMIT 1",
+            params![bot, chat_id, msg_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+    })
+    .await
+}
+
 /// Map a Telegram message to a turn (tests; production code links via the outbox).
 #[cfg(test)]
 pub async fn link_message(

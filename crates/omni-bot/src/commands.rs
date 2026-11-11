@@ -54,7 +54,7 @@ const PAID_COMMANDS: &[&str] = &["m", "retry", "continue"];
 /// The answer to a paid request from someone banned in the chat.
 pub const BANNED: &str = "⛔ You are banned from using this bot in this chat.";
 
-const HINT: &str = "Start a conversation with `prefix$question` (the prefixes are listed by /models), or reply to one of my messages to continue. /help for details.";
+const HINT: &str = "Start a conversation with `prefix$question` (the prefixes are listed by /models), or reply to one of my answers to continue. /help for details.";
 
 const HELP: &str = r#"**Start a conversation**: `prefix$text`
 - PREFIXES Everything after `$` is sent exactly as typed, including a leading space.
@@ -618,10 +618,22 @@ async fn target_turn(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result
         return Ok(None);
     };
     let Some((turn_id, _)) = conv::turn_for_message(&app.db, &bot.name, ib.chat_id, rt).await? else {
-        say(app, bot, ib, "that message is not one of my answers").await;
+        let text = if conv::sent_by(&app.db, &bot.name, ib.chat_id, rt).await? {
+            "that message is not a model's answer: reply to an answer with this command"
+        } else {
+            "that message is not one of my answers"
+        };
+        say(app, bot, ib, text).await;
         return Ok(None);
     };
     Ok(Some(conv::get_turn(&app.db, turn_id).await?))
+}
+
+/// The answer is still being generated (`/raw`, `/dump`… need it finished).
+const STILL_GENERATING: &str = "this answer is still being generated; try again when it is finished";
+
+fn generating(t: &conv::TurnRow) -> bool {
+    matches!(t.status, TurnStatus::Pending | TurnStatus::Running)
 }
 
 /// Raw answers up to this size are sent inline (code block with a copy button), longer ones as a file.
@@ -631,6 +643,15 @@ const RAW_INLINE_MAX: usize = 2000;
 /// an attached `.md`) and every original image/file of the answer attached.
 async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    if generating(&t) {
+        say(app, bot, ib, STILL_GENERATING).await;
+        return Ok(());
+    }
+    if t.status == TurnStatus::Failed {
+        let msg = "this answer failed, so it has no final text; /info has every attempt's output and error";
+        say(app, bot, ib, msg).await;
+        return Ok(());
+    }
     let parts = &t.turn.parts;
     // Telegram turns tabs, CRs and other control characters into spaces: then only a file is exact.
     let altered = |s: &str| s.chars().any(|c| (c as u32) < 0x20 && c != '\n' || matches!(c, '\u{2028}' | '\u{2029}'));
@@ -727,6 +748,10 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
 async fn cmd_dump(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     use base64::Engine;
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    if generating(&t) {
+        say(app, bot, ib, STILL_GENERATING).await;
+        return Ok(());
+    }
     let chain = conv::history(&app.db, t.id).await?;
     let iso = |ms: i64| jiff::Timestamp::from_millisecond(ms).map(|t| t.to_string()).unwrap_or_default();
     let mut turns = Vec::new();
@@ -942,6 +967,10 @@ async fn cmd_prefix(
     let (spec, turns) = if rest.is_empty() {
         // From the conversation up to the replied answer.
         let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+        if generating(&t) {
+            say(app, bot, ib, &format!("⚠️ {STILL_GENERATING}")).await;
+            return Ok(());
+        }
         if t.turn.role != omni_core::content::Role::Assistant || t.status != TurnStatus::Done {
             say(app, bot, ib, "⚠️ reply to an answer that finished normally").await;
             return Ok(());
@@ -1093,6 +1122,10 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
 
 async fn cmd_retry(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    if generating(&t) {
+        say(app, bot, ib, STILL_GENERATING).await;
+        return Ok(());
+    }
     if t.status != TurnStatus::Failed {
         say(app, bot, ib, "only failed answers can be retried; to regenerate, reply to the previous message again")
             .await;
@@ -1172,6 +1205,14 @@ async fn retry_turn(app: &Arc<App>, id: i64) -> Result<bool> {
 
 async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    if generating(&t) {
+        say(app, bot, ib, STILL_GENERATING).await;
+        return Ok(());
+    }
+    if t.status == TurnStatus::Failed {
+        say(app, bot, ib, "this answer failed; /retry it instead").await;
+        return Ok(());
+    }
     if t.status != TurnStatus::Done || !jobs::can_continue(app, t.id).await? {
         say(
             app,
@@ -1192,6 +1233,10 @@ async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Resul
 async fn cmd_m(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str) -> Result<()> {
     if ib.reply_to_msg_id.is_none() {
         say(app, bot, ib, &with_marker("reply to one of my messages: /m prefix$text", app.marker())).await;
+        return Ok(());
+    }
+    // It must reply to an answer (says so otherwise).
+    if target_turn(app, bot, ib).await?.is_none() {
         return Ok(());
     }
     let t = match trigger::parse_trigger(args, app.marker()) {

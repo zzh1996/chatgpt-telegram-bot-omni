@@ -324,11 +324,15 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
         // Every bot answers commands addressed to it or to everyone, like an
         // independent instance; `/m`, `/raw`, `/dump`, `/retry`, `/continue`,
         // `/info`, `/prefix` in replies only the bot that owns the replied message.
+        // (any message of it, so that it can tell when that is not an answer; in a
+        // private chat the bot is the only one to answer).
         if matches!(name.as_str(), "m" | "raw" | "dump" | "retry" | "continue" | "info" | "prefix")
             && !addressed
+            && chat_id < 0
             && let Some(rt) = reply_target(m)
+            && !crate::conv::sent_by(&app.db, &bot.name, chat_id, rt).await.unwrap_or(false)
         {
-            crate::conv::turn_for_message(&app.db, &bot.name, chat_id, rt).await.ok().flatten()?;
+            return None;
         }
         return Some(Kind::Command(name));
     }

@@ -351,7 +351,13 @@ pub async fn continue_conversation(
         return Ok(());
     }
     let turns = vec![Turn { role: Role::User, origin: Origin::Live, parts, native: None }];
-    create_and_start(app, bot, ib, Some(turn_id), turns, specs).await
+    create_and_start(app, bot, ib, Some(turn_id), turns, specs).await?;
+    // It continues from an answer that is not finished: it waits for it (jobs).
+    if matches!(parent.status, TurnStatus::Pending | TurnStatus::Running) {
+        let msg = "⏳ queued: the answer this continues is still being generated; this one starts when it is finished";
+        reply::notice(app, bot, ib.chat_id, ib.msg_id, msg).await;
+    }
+    Ok(())
 }
 
 async fn create_and_start(
