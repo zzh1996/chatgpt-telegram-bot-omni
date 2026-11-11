@@ -1,0 +1,159 @@
+{
+ "case": "cc_audio_to_text_model",
+ "endpoint": "chat",
+ "model": "deepseek/deepseek-v4-pro-0813",
+ "recorded": "2026-11-11",
+ "status": 404,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "client"
+ },
+ "body": {
+  "error": {
+   "message": "No endpoints found that support input audio",
+   "code": 404,
+   "metadata": {
+    "routing_funnel": [
+     {
+      "step": "Initial Endpoints",
+      "endpoint_count": 24
+     }
+    ],
+    "failed_routing_step": "Filter by Input Audio Support"
+   }
+  },
+  "openrouter_metadata": {
+   "requested": "deepseek/deepseek-v4-pro-0813",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=24",
+   "attempt": 0,
+   "is_byok": false,
+   "endpoints": {
+    "total": 24,
+    "available": [
+     {
+      "provider": "Relace",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Wafer",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Wafer",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "StreamLake",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Novita",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "GMICloud",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Alibaba",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "DeepInfra",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "CoreWeave",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "BaseTen",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Alibaba",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "AtlasCloud",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Nebius",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Baidu",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Parasail",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Together",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "DigitalOcean",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "SiliconFlow",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Cloudflare",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "DeepSeek",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Sail Research",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Sail Research",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Venice",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     },
+     {
+      "provider": "Parasail",
+      "model": "deepseek/deepseek-v4-pro-20260813",
+      "selected": false
+     }
+    ]
+   }
+  }
+ }
+}

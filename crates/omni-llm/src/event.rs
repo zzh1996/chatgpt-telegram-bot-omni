@@ -27,8 +27,14 @@ pub enum StreamEvent {
     Refusal(String),
     /// Token usage / cost (may arrive more than once; the last one wins).
     Usage(Usage),
+    /// Usage known so far, for display only (e.g. input tokens at the start of a
+    /// stream). Never billed: the call's final [`StreamEvent::Usage`] replaces it.
+    LiveUsage(Usage),
     /// The upstream finished. `reason` is normalized, `native` is the raw upstream reason.
     Finish { reason: Option<String>, native: Option<String> },
+    /// The provider's own account of why the output stopped, verbatim (e.g.
+    /// Anthropic `stop_details` of a refusal, Responses `incomplete_details`).
+    FinishDetails(Value),
     /// A notice from the adapter/router that the user should see (e.g. a
     /// router-side transformation was detected). Shown in the bot info area.
     Notice(String),
@@ -47,16 +53,86 @@ pub struct Accumulator {
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
     pub native_finish_reason: Option<String>,
+    /// See [`StreamEvent::FinishDetails`].
+    pub finish_details: Option<Value>,
     pub notices: Vec<String>,
     /// Native replay payload, maintained by the adapter.
     pub native: Option<NativeOutput>,
     pending_images: Vec<(Vec<u8>, String)>,
     last_reasoning_block: Option<usize>,
+    /// Parts changed since the last [`Accumulator::sync_parts`].
+    changes: Option<PartsChange>,
+}
+
+/// Which parts changed since a mirror of [`Accumulator::parts`] was last synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartsChange {
+    /// Parts before this index are unchanged.
+    from: usize,
+    /// The only change is text appended to part `from`, which existed before.
+    append_only: bool,
 }
 
 impl Accumulator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Part `i` changed in any way (or was added).
+    fn touched(&mut self, i: usize) {
+        let from = self.changes.map_or(i, |c| c.from.min(i));
+        self.changes = Some(PartsChange { from, append_only: false });
+    }
+
+    /// Text was appended to the existing part `i`.
+    fn appended(&mut self, i: usize) {
+        self.changes = Some(match self.changes {
+            None => PartsChange { from: i, append_only: true },
+            Some(c) if c.from == i => c,
+            Some(c) => PartsChange { from: c.from.min(i), append_only: false },
+        });
+    }
+
+    fn push_part(&mut self, p: Part) {
+        self.parts.push(p);
+        self.touched(self.parts.len() - 1);
+    }
+
+    /// A full copy of `parts()` was just taken: changes so far are in it.
+    pub fn mark_synced(&mut self) {
+        self.changes = None;
+    }
+
+    /// Bring `mirror` (a copy of `parts()` made earlier) up to date, copying
+    /// only what changed since: usually just the text appended to the last part.
+    pub fn sync_parts(&mut self, mirror: &mut Vec<Part>) {
+        let Some(c) = self.changes.take() else { return };
+        let parts = &self.parts;
+        if c.append_only && mirror.len() == parts.len() && c.from < parts.len() {
+            let grown = |m: &mut String, a: &String| {
+                if a.len() >= m.len() && a.is_char_boundary(m.len()) {
+                    m.push_str(&a[m.len()..]);
+                    true
+                } else {
+                    false
+                }
+            };
+            let ok = match (&mut mirror[c.from], &parts[c.from]) {
+                (Part::Text { text: m, .. }, Part::Text { text: a, .. }) => grown(m, a),
+                (Part::Refusal { text: m }, Part::Refusal { text: a }) => grown(m, a),
+                (Part::Reasoning(m), Part::Reasoning(a)) => match (&mut m.text, &a.text) {
+                    (Some(m), Some(a)) => grown(m, a),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if ok {
+                return;
+            }
+        }
+        let from = c.from.min(mirror.len());
+        mirror.truncate(from);
+        mirror.extend_from_slice(&parts[from..]);
     }
 
     pub fn apply(&mut self, ev: StreamEvent) {
@@ -78,8 +154,9 @@ impl Accumulator {
                 }
                 if let Some(Part::Text { text, .. }) = self.parts.last_mut() {
                     text.push_str(&t);
+                    self.appended(self.parts.len() - 1);
                 } else {
-                    self.parts.push(Part::text(t));
+                    self.push_part(Part::text(t));
                 }
             }
             StreamEvent::Reasoning { kind, text, block } => {
@@ -91,23 +168,24 @@ impl Accumulator {
                     && r.kind == kind
                 {
                     r.text.get_or_insert_with(String::new).push_str(&text);
+                    self.appended(self.parts.len() - 1);
                     return;
                 }
                 self.last_reasoning_block = Some(block);
-                self.parts.push(Part::Reasoning(Reasoning { kind, text: Some(text), ..Default::default() }));
+                self.push_part(Part::Reasoning(Reasoning { kind, text: Some(text), ..Default::default() }));
             }
             StreamEvent::OpaqueReasoning { kind } => {
                 let already =
                     self.parts.iter().any(|p| matches!(p, Part::Reasoning(r) if r.kind == kind && r.text.is_none()));
                 if !already {
-                    self.parts.push(Part::Reasoning(Reasoning { kind, ..Default::default() }));
+                    self.push_part(Part::Reasoning(Reasoning { kind, ..Default::default() }));
                 }
             }
             StreamEvent::Image { data, mime } => self.pending_images.push((data, mime)),
             StreamEvent::Tool(call) => {
                 // Update an existing call with the same id, else append.
                 if let Some(id) = &call.id {
-                    for p in self.parts.iter_mut().rev() {
+                    for (i, p) in self.parts.iter_mut().enumerate().rev() {
                         if let Part::ToolCall(c) = p
                             && c.id.as_ref() == Some(id)
                         {
@@ -120,35 +198,41 @@ impl Accumulator {
                             if call.output.is_some() {
                                 c.output = call.output.clone();
                             }
+                            self.touched(i);
                             return;
                         }
                     }
                 }
-                self.parts.push(Part::ToolCall(call));
+                self.push_part(Part::ToolCall(call));
             }
             StreamEvent::Citations(cs) => {
                 // Attach to the last text part (create one if needed).
                 if !matches!(self.parts.last(), Some(Part::Text { .. })) {
-                    if let Some(Part::Text { citations, .. }) =
-                        self.parts.iter_mut().rev().find(|p| matches!(p, Part::Text { .. }))
-                    {
-                        citations.extend(cs);
+                    if let Some(i) = self.parts.iter().rposition(|p| matches!(p, Part::Text { .. })) {
+                        if let Part::Text { citations, .. } = &mut self.parts[i] {
+                            citations.extend(cs);
+                        }
+                        self.touched(i);
                         return;
                     }
-                    self.parts.push(Part::text(""));
+                    self.push_part(Part::text(""));
                 }
                 if let Some(Part::Text { citations, .. }) = self.parts.last_mut() {
                     citations.extend(cs);
+                    self.touched(self.parts.len() - 1);
                 }
             }
             StreamEvent::Refusal(t) => {
                 if let Some(Part::Refusal { text }) = self.parts.last_mut() {
                     text.push_str(&t);
+                    self.appended(self.parts.len() - 1);
                 } else {
-                    self.parts.push(Part::Refusal { text: t });
+                    self.push_part(Part::Refusal { text: t });
                 }
             }
             StreamEvent::Usage(u) => self.usage = Some(u),
+            StreamEvent::LiveUsage(_) => {}
+            StreamEvent::FinishDetails(d) => self.finish_details = Some(d),
             StreamEvent::Finish { reason, native } => {
                 if reason.is_some() {
                     self.finish_reason = reason;
@@ -170,6 +254,7 @@ impl Accumulator {
     pub fn restore_parts(&mut self, parts: Vec<Part>) {
         self.parts = parts;
         self.last_reasoning_block = None;
+        self.touched(0);
     }
 
     /// Generated images not yet stored as blobs. The caller stores them and
@@ -179,7 +264,7 @@ impl Accumulator {
     }
 
     pub fn attach_image(&mut self, blob: BlobRef, dims: Option<(u32, u32)>) {
-        self.parts.push(Part::Image { blob, filename: None, generated: true, dims });
+        self.push_part(Part::Image { blob, filename: None, generated: true, dims });
     }
 
     pub fn parts(&self) -> &[Part] {
@@ -221,6 +306,41 @@ mod tests {
         assert!(matches!(&t.parts[0], Part::Reasoning(r) if r.text.as_deref() == Some("AB")));
         assert!(matches!(&t.parts[1], Part::Reasoning(r) if r.text.as_deref() == Some("C")));
         assert_eq!(t.answer_text(), "hello");
+    }
+
+    #[test]
+    fn sync_parts_keeps_a_mirror_current() {
+        let mut a = Accumulator::new();
+        let mut mirror = Vec::new();
+        let check = |a: &mut Accumulator, mirror: &mut Vec<Part>| {
+            a.sync_parts(mirror);
+            assert_eq!(serde_json::to_value(&*mirror).unwrap(), serde_json::to_value(a.parts()).unwrap());
+        };
+        a.apply(StreamEvent::Reasoning { kind: ReasoningKind::Summary, text: "think".into(), block: 0 });
+        check(&mut a, &mut mirror);
+        a.apply(StreamEvent::Reasoning { kind: ReasoningKind::Summary, text: "ing".into(), block: 0 });
+        check(&mut a, &mut mirror);
+        a.apply(StreamEvent::Tool(ToolCall { id: Some("t".into()), name: "web_search".into(), ..Default::default() }));
+        a.apply(StreamEvent::Text("Hel".into()));
+        check(&mut a, &mut mirror);
+        a.apply(StreamEvent::Text("lo 世界".into()));
+        a.apply(StreamEvent::Text("!".into()));
+        check(&mut a, &mut mirror);
+        // An earlier part changes after text was appended to a later one.
+        a.apply(StreamEvent::Tool(ToolCall {
+            id: Some("t".into()),
+            name: "web_search".into(),
+            status: Some("completed".into()),
+            ..Default::default()
+        }));
+        a.apply(StreamEvent::Text(" more".into()));
+        check(&mut a, &mut mirror);
+        a.apply(StreamEvent::Citations(vec![]));
+        check(&mut a, &mut mirror);
+        a.restore_parts(vec![Part::text("restored")]);
+        check(&mut a, &mut mirror);
+        a.sync_parts(&mut mirror); // no changes: nothing to do
+        check(&mut a, &mut mirror);
     }
 
     #[test]

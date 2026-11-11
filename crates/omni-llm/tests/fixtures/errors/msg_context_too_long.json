@@ -1,0 +1,40 @@
+{
+ "case": "msg_context_too_long",
+ "endpoint": "messages",
+ "model": "anthropic/claude-haiku-4.5",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json"
+ },
+ "body": {
+  "type": "error",
+  "error": {
+   "type": "invalid_request_error",
+   "message": "This endpoint's maximum context length is 200000 tokens. However, you requested about 405064 tokens (405000 of text input, 64 in the output). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically.",
+   "error_type": "invalid_request"
+  },
+  "request_id": "gen-1794391041-6ujUIATt20qhfkUicyUW",
+  "metadata": {
+   "provider_name": null
+  },
+  "openrouter_metadata": {
+   "requested": "anthropic/claude-haiku-4.5",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=1",
+   "attempt": 0,
+   "is_byok": false,
+   "endpoints": {
+    "total": 8,
+    "available": [
+     {
+      "provider": "Anthropic",
+      "model": "anthropic/claude-4.5-haiku-20251001",
+      "selected": false
+     }
+    ]
+   }
+  }
+ }
+}

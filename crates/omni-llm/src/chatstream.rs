@@ -63,6 +63,29 @@ pub async fn run(
     run_with(rb, url, body, idle_timeout, id_header, map_error, cp, sink, observer, cancel).await
 }
 
+/// The error for a non-2xx response before streaming started (`text`: the body).
+/// The whole body is kept as the error's details.
+pub fn http_error(status: u16, retry_after: Option<u64>, text: &str, map_error: ErrorMapper) -> LlmError {
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => {
+            let e = v.get("error").cloned().unwrap_or(v.clone());
+            let mut le = map_error(&e, Some(status), retry_after, ErrorKind::Http);
+            le.details = Some(v);
+            le
+        }
+        Err(_) => {
+            let mut le = LlmError::new(
+                ErrorKind::Http,
+                crate::error::retry_for_status(status, retry_after),
+                format!("HTTP {status}"),
+            );
+            le.status = Some(status);
+            le.details = Some(Value::String(text.to_string()));
+            le
+        }
+    }
+}
+
 /// [`run`] with any dialect parser.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with<P: EventParser>(
@@ -108,30 +131,17 @@ pub async fn run_with<P: EventParser>(
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
         observer.body_text(&text);
-        let err = match serde_json::from_str::<Value>(&text) {
-            Ok(v) => {
-                let e = v.get("error").cloned().unwrap_or(v.clone());
-                let mut le = map_error(&e, Some(status), retry_after, ErrorKind::Http);
-                le.details = Some(v);
-                le
-            }
-            Err(_) => {
-                let mut le = LlmError::new(
-                    ErrorKind::Http,
-                    crate::error::retry_for_status(status, retry_after),
-                    format!("HTTP {status}"),
-                );
-                le.status = Some(status);
-                le.details = Some(Value::String(text));
-                le
-            }
-        };
+        let err = http_error(status, retry_after, &text, map_error);
         return Streamed { result: Err(err), parser: cp, header_id };
     }
 
     let mut parser = SseParser::new();
     let mut stream = resp.bytes_stream();
     let mut done = false;
+    // Longest silence between two chunks (keep-alive comments included), logged at
+    // the end: shows how close streams come to the idle timeout.
+    let mut last_data = tokio::time::Instant::now();
+    let mut longest_gap = std::time::Duration::ZERO;
     let result: Result<(), LlmError> = loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => break Err(LlmError::cancelled()),
@@ -155,6 +165,8 @@ pub async fn run_with<P: EventParser>(
             }
             Ok(Some(Ok(b))) => b,
         };
+        longest_gap = longest_gap.max(last_data.elapsed());
+        last_data = tokio::time::Instant::now();
         let items = parser.feed(&chunk);
         if let Err(e) = handle_items(items, &mut cp, sink, observer, &mut done) {
             break Err(e);
@@ -163,6 +175,11 @@ pub async fn run_with<P: EventParser>(
             break Ok(());
         }
     };
+    tracing::info!(
+        longest_gap_ms = longest_gap.as_millis() as u64,
+        idle_timeout_s = idle_timeout.as_secs(),
+        "stream ended"
+    );
     let result = match result {
         Ok(()) if !done => {
             let tail = parser.finish();

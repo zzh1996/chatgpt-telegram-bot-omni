@@ -1,0 +1,7 @@
+# Reconstructed from the outbox: the first test of a probe file that the bot started at
+# 20:40:11 and that was killed at 20:40:50 by a restart, before it wrote its report.
+# Wait values of refused ops were not recorded.
+== Y1 grow plain 8000->12500 (+4500, x1.56) (killed run)
+  #0  H    send    20000 chars      0 B      0 cp mixed  at   0.00s start   0.000s wall 1794400811712 took    0ms  FLOOD_WAIT ?
+  #0  H    send    20000 chars      0 B      0 cp mixed  at   0.00s start   5.211s wall 1794400816923 took    0ms  ok
+  #1  M    send     8000 chars      0 B      0 cp plain-mixed at   0.00s start   6.000s wall 1794400817712 took    0ms  FLOOD_WAIT ?

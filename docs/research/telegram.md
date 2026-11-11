@@ -510,7 +510,7 @@ source. TDLib passes it through unparsed [TD:RichMessage.cpp#L283-L300], so pars
 | Reply quote | 0–1024 chars, must be an exact substring incl. bold/italic/underline/strike/spoiler/custom_emoji/date | [BAPI#replyparameters] |
 | Date entity span | ≤31 UTF-16 units with format flags, ≤127 without (`ENTITY_DATE_TOO_LONG`) | [ENT] |
 | Send rate | "In a single chat, avoid sending more than one message per second… eventually… 429"; "In a group, bots are not be able to send more than **20 messages per minute**"; bulk ~30 msg/s (paid broadcast up to 1000/s, MTProto `allow_paid_floodskip` at 0.1 Star/msg) | [FAQ], [BAPI#paid-broadcasts] |
-| Edit rate | **Undocumented** for `editMessage`; widget doc: an `editMessageWidgetData` call "counts as one sent message against your bot's limits" → assume edits count toward the same per-chat budget (**UNVERIFIED**) | [WID#changing-the-state] |
+| Edit rate | **Undocumented** for `editMessage`. **Measured 2026-11-11** (groups, rich messages): sends and edits share one per-chat budget (20 operations or 5 heavy ones per fixed minute; 5 operations, at most 1 heavy, per 5 s; deletes free), where an operation is heavy by the size and block structure of the text; see [telegram-flood.md](telegram-flood.md) | [WID#changing-the-state], measured |
 | Typing/draft rate | 20/5 s, 40/30 s per peer (setTyping) | [AI] |
 | Callback alert | `answerCallbackQuery` text 0–200 chars | [BAPI#answercallbackquery] |
 | Copy button | 1–256 chars | [BAPI#copytextbutton] |

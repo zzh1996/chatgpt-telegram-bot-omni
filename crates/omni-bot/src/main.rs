@@ -87,7 +87,8 @@ async fn run(cfg: Config) -> Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "starting omni");
     let db = Db::open(&cfg.general.data_dir.join("omni.sqlite3"))?;
     let blobs = BlobStore::new(cfg.general.data_dir.join("blobs"), db.clone())?;
-    access::seed(&db, &cfg.access.allowed_chats, &cfg.access.allowed_users).await?;
+    let bot_names: Vec<String> = cfg.bots.iter().map(|b| b.name.clone()).collect();
+    access::seed(&db, &bot_names, &cfg.access.allowed_chats).await?;
 
     let orc = cfg.providers.openrouter.clone().context("[providers.openrouter] is required")?;
     let openrouter = OpenRouter::new(OpenRouterConfig {
@@ -106,7 +107,7 @@ async fn run(cfg: Config) -> Result<()> {
                 }
                 fp
             },
-            pin_first_party: orc.pin_first_party,
+            pin_first_party: true,
             require_parameters: orc.require_parameters,
             disable_context_compression: true,
             max_tokens_cap: (orc.max_tokens_cap > 0).then_some(orc.max_tokens_cap),
@@ -136,15 +137,18 @@ async fn run(cfg: Config) -> Result<()> {
     }
 
     let api_id = cfg.telegram.api_id.as_i32()?;
-    let group_iv = Duration::from_secs_f64(cfg.render.min_edit_interval_secs);
-    let private_iv = Duration::from_secs_f64(cfg.render.min_edit_interval_secs.min(1.0));
     let mut bots = Vec::new();
     let mut streams = Vec::new();
     let connects = cfg.bots.iter().map(|b| {
         let db = db.clone();
         let hash = cfg.telegram.api_hash.clone();
-        let gates = Gates::new(group_iv, private_iv);
-        async move { (b.name.clone(), BotConn::connect(&db, b, api_id, &hash, gates).await) }
+        async move {
+            let conn = match Gates::load(&db, &b.name).await {
+                Ok(gates) => BotConn::connect(&db, b, api_id, &hash, gates).await,
+                Err(e) => Err(e),
+            };
+            (b.name.clone(), conn)
+        }
     });
     for (name, r) in futures::future::join_all(connects).await {
         let (conn, stream) = r.with_context(|| format!("connect bot {name}"))?;
@@ -175,8 +179,8 @@ async fn run(cfg: Config) -> Result<()> {
     app.load_runtime_state().await?;
 
     for b in &bots {
-        if let Err(e) = set_commands(b).await {
-            warn!(bot = %b.name, error = %e, "setting bot commands failed");
+        if let Err(e) = set_commands(&app, b).await {
+            warn!(bot = %b.name, error = %format!("{e:#}"), "registering the bot commands failed");
         }
     }
 
@@ -195,10 +199,9 @@ async fn run(cfg: Config) -> Result<()> {
     {
         let app = app.clone();
         tokio::spawn(async move {
-            let mut models: Vec<String> = app
-                .aliases
-                .read()
-                .values()
+            let specs: Vec<String> = app.aliases.read().values().flat_map(|m| m.values().cloned()).collect();
+            let mut models: Vec<String> = specs
+                .iter()
                 .filter_map(|s| omni_core::trigger::parse_spec(s).ok())
                 .map(|t| t.model.strip_prefix("openrouter:").unwrap_or(&t.model).to_string())
                 .filter(|m| m.contains('/'))
@@ -256,31 +259,82 @@ async fn shutdown_signal() {
     }
 }
 
-async fn set_commands(bot: &BotConn) -> Result<()> {
-    let cmds = [
+/// Command lists that earlier versions (or the old bot) may have left for one
+/// language or chat type. Telegram shows the most specific list, so a stale
+/// one hides ours: e.g. the old bot's `en` list for every English client.
+const STALE_COMMAND_LISTS: &[(tl::enums::BotCommandScope, &str)] = &[
+    (tl::enums::BotCommandScope::Default, "en"),
+    (tl::enums::BotCommandScope::Users, ""),
+    (tl::enums::BotCommandScope::Users, "en"),
+    (tl::enums::BotCommandScope::Chats, ""),
+    (tl::enums::BotCommandScope::Chats, "en"),
+    (tl::enums::BotCommandScope::ChatAdmins, ""),
+    (tl::enums::BotCommandScope::ChatAdmins, "en"),
+];
+
+/// Register the command menu at every start (as the old bot did): one list for
+/// every chat and language, after removing more specific lists that would hide
+/// it; administrators also see the admin commands in their private chats.
+async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
+    let marker = app.marker();
+    let continue_with = format!("Reply: continue with another model (spec{marker}text)");
+    let public = [
         ("help", "How to use this bot"),
-        ("models", "List model aliases / search models"),
+        ("models", "List model prefixes / search models"),
         ("model", "Show a model's capabilities"),
-        ("m", "Reply: continue with another model (spec$text)"),
+        ("m", continue_with.as_str()),
         ("raw", "Reply: get the original Markdown and files"),
+        ("dump", "Reply: the whole conversation as a JSON file"),
         ("info", "Reply: show request details"),
         ("retry", "Reply: retry a failed answer"),
         ("continue", "Reply: keep writing an answer that hit its long-decode budget"),
         ("stats", "Usage statistics"),
-        ("usage", "Your spend limits"),
-        ("whoami", "Show your user id"),
-        ("ping", "Check the bot"),
+        ("usage", "Your (and this group's) spend limits"),
+        ("whoami", "Show your user id and this chat's id"),
+        ("ping", "Check the bot, show this chat's id"),
     ];
-    bot.invoke(&tl::functions::bots::SetBotCommands {
-        scope: tl::enums::BotCommandScope::Default,
-        lang_code: String::new(),
-        commands: cmds
-            .iter()
+    let admin = [
+        ("allow", "Admin: allow a chat (group or private chat)"),
+        ("deny", "Admin: remove a chat from the allow list"),
+        ("ban", "Admin: ban someone in a group"),
+        ("unban", "Admin: lift a ban in a group"),
+        ("acl", "Admin: allowed chats and bans"),
+        ("quota", "Admin: spend limits of a chat and its members"),
+        ("alias", "Admin: add a model prefix"),
+        ("unalias", "Admin: remove a model prefix"),
+        ("credits", "Admin: OpenRouter key balance"),
+    ];
+    let list = |cmds: &[(&str, &str)]| -> Vec<tl::enums::BotCommand> {
+        cmds.iter()
             .map(|(c, d)| {
                 tl::types::BotCommand { ephemeral: false, command: c.to_string(), description: d.to_string() }.into()
             })
-            .collect(),
+            .collect()
+    };
+    for (scope, lang) in STALE_COMMAND_LISTS {
+        bot.invoke(&tl::functions::bots::ResetBotCommands { scope: scope.clone(), lang_code: lang.to_string() })
+            .await
+            .with_context(|| format!("reset the {lang:?} command list"))?;
+    }
+    bot.invoke(&tl::functions::bots::SetBotCommands {
+        scope: tl::enums::BotCommandScope::Default,
+        lang_code: String::new(),
+        commands: list(&public),
     })
-    .await?;
+    .await
+    .context("set the command list")?;
+    let all: Vec<_> = public.iter().chain(admin.iter()).copied().collect();
+    for &id in &app.cfg.access.admins {
+        // Only possible once the administrator has talked to this bot.
+        let Ok(peer) = bot.input_peer(id).await else { continue };
+        bot.invoke(&tl::functions::bots::SetBotCommands {
+            scope: tl::types::BotCommandScopePeer { peer }.into(),
+            lang_code: String::new(),
+            commands: list(&all),
+        })
+        .await
+        .with_context(|| format!("set the admin command list for {id}"))?;
+    }
+    info!(bot = %bot.name, "registered the bot commands");
     Ok(())
 }

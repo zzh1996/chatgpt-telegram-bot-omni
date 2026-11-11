@@ -68,7 +68,7 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
             let args = parse_command(&ib.text, &bot.username).map(|(_, a, _)| a.to_string()).unwrap_or_default();
             return crate::commands::run(&app, &bot, &ib, name, &args).await;
         }
-        match access::check(&app, ib.chat_id, user).await? {
+        match access::check(&app, &bot.name, ib.chat_id, user).await? {
             Access::Allowed => {}
             Access::Denied(msg) => {
                 reply::notice(&app, &bot, ib.chat_id, ib.msg_id, &format!("⛔ {msg}")).await;
@@ -83,7 +83,7 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
             Some(Kind::Trigger) => new_conversation(&app, &bot, &ib).await,
             Some(Kind::Reply) => continue_conversation(&app, &bot, &ib, None).await,
             Some(Kind::Hint) => {
-                reply::notice(&app, &bot, ib.chat_id, ib.msg_id, crate::commands::HINT).await;
+                reply::notice(&app, &bot, ib.chat_id, ib.msg_id, &crate::commands::hint(app.marker())).await;
                 Ok(())
             }
             _ => Ok(()),
@@ -102,7 +102,7 @@ async fn kind_of(app: &App, bot: &BotConn, ib: &Inbound) -> Option<Kind> {
     {
         return Some(Kind::Reply);
     }
-    if trigger::find_trigger_dollar(&ib.text).is_some() {
+    if trigger::find_marker(&ib.text, app.marker()).is_some() {
         return Some(Kind::Trigger);
     }
     if ib.chat_id > 0 {
@@ -111,12 +111,16 @@ async fn kind_of(app: &App, bot: &BotConn, ib: &Inbound) -> Option<Kind> {
     None
 }
 
-/// Resolve the specs of a trigger that this bot is responsible for.
+/// Resolve the specs of a trigger for this bot. A prefix it does not know is
+/// an error when the request is explicitly for this bot (`explicit`: private
+/// chats, `/m`); in groups it is ignored, as by an independent bot (another
+/// bot in the group may know it).
 pub async fn resolve_specs(
     app: &App,
     bot: &BotConn,
     chat_id: i64,
     specs: &[SpecToken],
+    explicit: bool,
 ) -> Result<Vec<ResolvedSpec>, String> {
     let cfg = app.bot_cfg(&bot.name).ok_or("bot not configured")?;
     if specs.len() > app.cfg.general.max_parallel_specs {
@@ -125,40 +129,21 @@ pub async fn resolve_specs(
     let strict = chat_id < 0;
     let mut out = Vec::new();
     let mut unknown = Vec::new();
-    let mut unserved = Vec::new();
     for s in specs {
         let mut resolved = app.resolve_spec(s, cfg, strict).await?;
-        if resolved.is_none() && strict && app.plausible_model_id(s) {
+        if resolved.is_none() && strict && app.plausible_model_id(cfg, s) {
             // Maybe a brand-new model: check a fresh catalog before giving up.
             app.refresh_catalog_if_older(std::time::Duration::from_secs(20)).await;
             resolved = app.resolve_spec(s, cfg, strict).await?;
         }
         match resolved {
-            Some(spec) => match app.responsible_bot(chat_id, &spec.canonical(), &bot.name) {
-                Some(b) if b == bot.name => out.push(spec),
-                Some(_) => {} // another of our bots answers this one
-                None => unserved.push(spec.model.clone()),
-            },
-            None => unknown.push(if s.raw.is_empty() { "$".to_string() } else { s.raw.clone() }),
+            Some(spec) => out.push(spec),
+            None => unknown.push(format!("`{}{}`", s.raw, app.marker())),
         }
     }
-    // All bots run in this process, so a prefix none of them knows is an error
-    // (reported once per chat, by its primary bot).
-    let reporter = chat_id > 0 || app.primary_bot(chat_id, &bot.name) == bot.name;
-    if !unknown.is_empty() {
-        if !reporter {
-            return Ok(Vec::new());
-        }
-        return Err(format!(
-            "unknown model or alias: {}. Use an alias from /models or a full OpenRouter model id like `openai/gpt-6$`",
-            unknown.join(", ")
-        ));
-    }
-    if !unserved.is_empty() {
-        if !reporter {
-            return Ok(Vec::new());
-        }
-        return Err(format!("no bot serves {} in this chat (see /models)", unserved.join(", ")));
+    if !unknown.is_empty() && explicit {
+        let ids = crate::commands::direct_ids(app).map(|ids| format!("; {ids} works too")).unwrap_or_default();
+        return Err(format!("unknown prefix: {}. The prefixes are listed by /models{ids}", unknown.join(", ")));
     }
     Ok(out)
 }
@@ -219,7 +204,7 @@ fn user_turns(text: &str, media: Vec<Part>) -> Result<Vec<Turn>, String> {
         None => vec![Turn {
             role: Role::User,
             origin: Origin::Live,
-            parts: if text.is_empty() { vec![] } else { vec![Part::text(text)] },
+            parts: if text.is_empty() { vec![] } else { vec![Part::text(trigger::unescape_markers(text))] },
             native: None,
         }],
         Some(segs) => segs
@@ -272,14 +257,14 @@ pub fn youtube_refs(text: &str) -> Vec<String> {
 }
 
 async fn new_conversation(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
-    let Ok(Some(t)) = trigger::parse_trigger(&ib.text).map_err(|e| e.to_string()).inspect_err(|e| {
+    let Ok(Some(t)) = trigger::parse_trigger(&ib.text, app.marker()).map_err(|e| e.to_string()).inspect_err(|e| {
         let e = e.clone();
         let (app, bot, chat, msg) = (app.clone(), bot.clone(), ib.chat_id, ib.msg_id);
         tokio::spawn(async move { reply::notice(&app, &bot, chat, msg, &format!("⚠️ {e}")).await });
     }) else {
         return Ok(());
     };
-    let specs = match resolve_specs(app, bot, ib.chat_id, &t.specs).await {
+    let specs = match resolve_specs(app, bot, ib.chat_id, &t.specs, ib.chat_id > 0).await {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => return Ok(()),
         Err(e) => {
@@ -326,7 +311,7 @@ pub async fn continue_conversation(
             bot,
             ib.chat_id,
             ib.msg_id,
-            "⚠️ That message failed to generate, so there is nothing to continue from. Reply /retry to it to try again, or reply to an earlier message.",
+            "⚠️ That message failed to generate, so there is nothing to continue from. Press 🔁 Retry under it (or reply /retry to it) to try again, or reply to an earlier message.",
         )
         .await;
         return Ok(());

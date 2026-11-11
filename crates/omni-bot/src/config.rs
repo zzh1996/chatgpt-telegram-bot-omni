@@ -21,7 +21,7 @@ pub struct Config {
     pub access: Access,
     #[serde(default)]
     pub providers: Providers,
-    /// Shortcut names for model specs, e.g. `c` -> `openrouter:anthropic/claude-opus-5-5`.
+    /// Prefixes: name (may be empty: `$text`) -> model spec, e.g. `c` -> `openrouter:anthropic/claude-opus-5.5`.
     #[serde(default)]
     pub aliases: Vec<AliasConfig>,
     /// Default request parameters by model pattern (the "max everything" presets).
@@ -55,6 +55,10 @@ pub struct General {
     pub data_dir: PathBuf,
     /// IANA time zone used for displaying times and day boundaries in stats.
     pub timezone: String,
+    /// What ends the model prefix of a message: `c$hello` with the default `$`.
+    /// Any non-empty text without letters, digits, whitespace and
+    /// ``,+{}"=/-.:_\@` `` works, e.g. `%`, `¥` or `>>`.
+    pub trigger_marker: String,
     /// Max number of models in one `a,b,c$` trigger.
     pub max_parallel_specs: usize,
     /// Max size of a Telegram file the bot downloads and forwards to a model (MB).
@@ -63,7 +67,13 @@ pub struct General {
 
 impl Default for General {
     fn default() -> Self {
-        Self { data_dir: PathBuf::from("data"), timezone: "UTC".into(), max_parallel_specs: 20, max_file_mb: 50 }
+        Self {
+            data_dir: PathBuf::from("data"),
+            timezone: "UTC".into(),
+            trigger_marker: omni_core::trigger::DEFAULT_MARKER.into(),
+            max_parallel_specs: 20,
+            max_file_mb: 50,
+        }
     }
 }
 
@@ -96,17 +106,23 @@ pub struct BotConfig {
     /// Internal name (used in logs and the database). Must be unique and stable.
     pub name: String,
     pub token: String,
-    /// Glob patterns over canonical model ids (`provider:model`) this bot serves.
-    /// Bots are tried in config order; the first bot (present in the chat) whose
-    /// patterns match a model handles requests for it.
+    /// The models this bot has: glob patterns over canonical model ids
+    /// (`provider:author/model`), e.g. `openrouter:openai/*`. A model no pattern
+    /// matches does not exist for the bot (not listed, not searchable, an
+    /// unknown prefix), and neither do models of providers that are not
+    /// configured. Every bot is independent: each one answers the prefixes it has.
     #[serde(default = "default_models")]
     pub models: Vec<String>,
-    /// Alias or model used for a bare `$` trigger.
+    /// Removed: the empty prefix is an ordinary alias (`name = ""`).
     #[serde(default)]
-    pub default_model: Option<String>,
-    /// If set, this bot only works in these chats (in addition to the ACL).
-    #[serde(default)]
-    pub chats: Option<Vec<i64>>,
+    default_model: Option<String>,
+}
+
+impl BotConfig {
+    /// Whether this bot has the canonical model id (`openrouter:author/model`, `ark:model`).
+    pub fn serves(&self, canonical: &str) -> bool {
+        self.models.iter().any(|p| glob_match(p, canonical))
+    }
 }
 
 fn default_models() -> Vec<String> {
@@ -118,10 +134,9 @@ fn default_models() -> Vec<String> {
 pub struct Access {
     /// Telegram user ids of administrators.
     pub admins: Vec<i64>,
-    /// Chats allowed at first start (seeded into the ACL; manage at runtime with commands).
+    /// Chats (group ids, or user ids for private chats) allowed for every bot,
+    /// once, at the first start after being added; then managed with /allow, /deny.
     pub allowed_chats: Vec<i64>,
-    /// Users allowed to use the bot in private chat at first start.
-    pub allowed_users: Vec<i64>,
     /// Users who may ask for higher-priority (more expensive) service tiers
     /// (`+tier=priority`, fast modes). Nobody gets them by default.
     pub priority_users: Vec<i64>,
@@ -140,6 +155,11 @@ pub struct Providers {
 pub struct ArkConfig {
     #[serde(default)]
     pub api_key: String,
+    /// Whether users may type the id of a model of this provider that no prefix
+    /// names, as a prefix of its own (`author/model$`, `ark:model$`). Off: only
+    /// the prefixes of `[[aliases]]` and `/alias` reach this provider.
+    #[serde(default)]
+    pub allow_unlisted_models: bool,
     #[serde(default = "default_ark_base")]
     pub base_url: String,
     #[serde(default = "default_connect_timeout")]
@@ -173,6 +193,11 @@ fn default_cny_per_usd() -> f64 {
 #[serde(deny_unknown_fields)]
 pub struct OpenRouterConfig {
     pub api_key: String,
+    /// Whether users may type the id of a model of this provider that no prefix
+    /// names, as a prefix of its own (`author/model$`, `ark:model$`). Off: only
+    /// the prefixes of `[[aliases]]` and `/alias` reach this provider.
+    #[serde(default)]
+    pub allow_unlisted_models: bool,
     #[serde(default = "default_openrouter_base")]
     pub base_url: String,
     /// Optional app attribution headers.
@@ -189,10 +214,6 @@ pub struct OpenRouterConfig {
     /// Send a stable, salted hash of the Telegram user id as the `user` field (abuse attribution).
     #[serde(default)]
     pub user_id_salt: Option<String>,
-    /// Pin each model to its creator's own endpoint (`provider.only`, no fallbacks).
-    /// Override per request with `+p=<slug>` or `+p=any`.
-    #[serde(default = "yes")]
-    pub pin_first_party: bool,
     /// Only route to endpoints supporting every sent parameter (no silent dropping).
     #[serde(default = "yes")]
     pub require_parameters: bool,
@@ -213,8 +234,8 @@ pub struct OpenRouterConfig {
     /// (continuation hops); `max_tokens` is then a total budget across hops.
     #[serde(default = "default_long_decode")]
     pub long_decode: Vec<String>,
-    /// Default total output budget for long-decode models (`+max=` overrides;
-    /// `/continue` extends a reply that hit it).
+    /// Total output budget for long-decode models (`/continue` extends a reply
+    /// that hit it by the same amount).
     #[serde(default = "default_max_tokens_cap")]
     pub long_decode_budget: u64,
 }
@@ -238,14 +259,16 @@ fn default_connect_timeout() -> u64 {
     15
 }
 fn default_idle_timeout() -> u64 {
-    900
+    // Long hidden thinking is fine: OpenRouter's keep-alive comments count as data.
+    // This only catches connections that went silent altogether.
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AliasConfig {
     pub name: String,
-    /// A spec in trigger syntax without the `$`, e.g. `openrouter:anthropic/claude-opus-5-5+search`.
+    /// A spec in trigger syntax without the marker, e.g. `openrouter:anthropic/claude-opus-5.5+s`.
     pub spec: String,
     /// Free-form documentation in the config file (not used by the bot).
     #[serde(default)]
@@ -283,12 +306,8 @@ impl PresetConfig {
 pub struct RenderConfig {
     /// `clean` (rendered Markdown) or `raw` (exact source with decorations).
     pub markdown: omni_markdown::Mode,
-    /// Minimum interval between edits/sends in the same chat, per bot (seconds).
-    pub min_edit_interval_secs: f64,
     /// Delay before the first flush of a new reply (seconds), to batch the first tokens.
     pub first_flush_delay_secs: f64,
-    /// Maximum Telegram messages per reply before the rest is only available as a file.
-    pub max_messages_per_reply: usize,
     /// Show usage/cost footer: `always`, `never`, or a USD threshold like `0.05`.
     pub show_usage: String,
 }
@@ -297,9 +316,7 @@ impl Default for RenderConfig {
     fn default() -> Self {
         Self {
             markdown: omni_markdown::Mode::Clean,
-            min_edit_interval_secs: 3.0,
             first_flush_delay_secs: 1.0,
-            max_messages_per_reply: 30,
             show_usage: "always".into(),
         }
     }
@@ -310,14 +327,28 @@ impl Default for RenderConfig {
 pub struct RetryConfig {
     /// Max attempts per reply (including the first).
     pub max_attempts: u32,
-    /// Base delay between attempts (seconds); doubled each time, capped by `max_delay_secs`.
-    pub base_delay_secs: f64,
-    pub max_delay_secs: f64,
+    /// Wait before the 1st, 2nd, … retry (seconds); the last value repeats.
+    /// A longer wait the upstream asks for (Retry-After, rate limits) wins.
+    pub delays_secs: Vec<f64>,
+    /// Settings of older versions (doubling backoff): accepted and ignored.
+    #[allow(dead_code)]
+    base_delay_secs: Option<f64>,
+    #[allow(dead_code)]
+    max_delay_secs: Option<f64>,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
-        Self { max_attempts: 4, base_delay_secs: 10.0, max_delay_secs: 120.0 }
+        Self { max_attempts: 4, delays_secs: vec![2.0, 10.0, 30.0, 60.0], base_delay_secs: None, max_delay_secs: None }
+    }
+}
+
+impl RetryConfig {
+    /// Wait before retry number `n` (1-based).
+    pub fn delay(&self, n: u32) -> std::time::Duration {
+        let i = (n.max(1) - 1) as usize;
+        let secs = self.delays_secs.get(i).or(self.delays_secs.last()).copied().unwrap_or(10.0);
+        std::time::Duration::from_secs_f64(secs.max(0.0))
     }
 }
 
@@ -403,15 +434,25 @@ impl Config {
             if b.token.split(':').next().and_then(|s| s.parse::<i64>().ok()).is_none() {
                 bail!("bot {:?}: token does not look like a bot token", b.name);
             }
+            if let Some(d) = &b.default_model {
+                bail!(
+                    "bot {:?}: `default_model` was removed. The empty prefix is an ordinary alias now: \
+                     [[aliases]] name = \"\" spec = \"<spec of {d:?}>\"",
+                    b.name
+                );
+            }
         }
+        let marker = &self.general.trigger_marker;
+        omni_core::trigger::check_marker(marker).map_err(|e| anyhow::anyhow!("general.trigger_marker: {e}"))?;
         let mut aliases: BTreeMap<&str, ()> = BTreeMap::new();
         for a in &self.aliases {
             if aliases.insert(a.name.as_str(), ()).is_some() {
                 bail!("duplicate alias {:?}", a.name);
             }
-            if a.name.contains(['$', ',', '+', '{', '}', ' ', '\n']) {
-                bail!("alias {:?} contains reserved characters", a.name);
+            if !omni_core::trigger::alias_name_ok(&a.name, marker) {
+                bail!("alias {:?} contains the trigger marker {marker:?}, whitespace or one of `,+{{}}`", a.name);
             }
+            omni_core::trigger::parse_spec(&a.spec).map_err(|e| anyhow::anyhow!("alias {:?}: spec {:?}: {e}", a.name, a.spec))?;
         }
         for p in &self.presets {
             p.requested().with_context(|| format!("preset {:?}", p.pattern))?;
@@ -465,6 +506,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_delays() {
+        let r = RetryConfig::default();
+        let secs: Vec<u64> = (1..=6).map(|n| r.delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![2, 10, 30, 60, 60, 60]);
+        let empty = RetryConfig { delays_secs: vec![], ..Default::default() };
+        // A config written for an older version still loads.
+        let old: RetryConfig = toml::from_str("max_attempts = 4\nbase_delay_secs = 10\nmax_delay_secs = 120").unwrap();
+        assert_eq!(old.delay(1).as_secs(), 2);
+        assert_eq!(empty.delay(1).as_secs(), 10);
+    }
+
+    #[test]
     fn env_interpolation() {
         let env = |k: &str| match k {
             "A" => Some("1".to_string()),
@@ -480,6 +533,20 @@ mod tests {
         assert!(glob_match("openrouter:anthropic/*", "openrouter:anthropic/claude-opus-5-5"));
         assert!(!glob_match("openrouter:anthropic/*", "openrouter:openai/gpt-6"));
         assert!(glob_match("*:google/gemini-?-*", "openrouter:google/gemini-4-carbon"));
+    }
+
+    #[test]
+    fn a_bot_has_the_models_its_patterns_list() {
+        let b = BotConfig {
+            name: "b".into(),
+            token: "1:a".into(),
+            models: vec!["openrouter:openai/*".into(), "openrouter:anthropic/*".into()],
+            default_model: None,
+        };
+        assert!(b.serves("openrouter:openai/gpt-chat-latest"));
+        assert!(b.serves("openrouter:anthropic/claude-opus-5.5"));
+        assert!(!b.serves("openrouter:bytedance-seed/seed-2.0-mini"));
+        assert!(!b.serves("ark:doubao-seed-2-1-pro-260915"));
     }
 
     #[test]

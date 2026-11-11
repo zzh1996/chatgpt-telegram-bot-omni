@@ -107,10 +107,7 @@ pub async fn record_call(
         })
         .await?;
     if inserted && let Some(c) = usage.cost_usd {
-        crate::access::charge(db, "user", meta.user_id, c).await?;
-        if meta.chat_id < 0 {
-            crate::access::charge(db, "chat", meta.chat_id, c).await?;
-        }
+        crate::access::charge(db, &meta.bot, meta.chat_id, meta.user_id, c).await?;
     }
     Ok(inserted)
 }

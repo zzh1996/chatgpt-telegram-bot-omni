@@ -1,0 +1,38 @@
+{
+ "case": "cc_reasoning_mandatory_off",
+ "endpoint": "chat",
+ "model": "google/gemini-3.8-flash",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "client"
+ },
+ "body": {
+  "error": {
+   "message": "Reasoning is mandatory for this endpoint and cannot be disabled.",
+   "code": 400,
+   "metadata": {
+    "provider_name": null
+   }
+  },
+  "openrouter_metadata": {
+   "requested": "google/gemini-3.8-flash",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=1",
+   "attempt": 0,
+   "is_byok": false,
+   "endpoints": {
+    "total": 7,
+    "available": [
+     {
+      "provider": "Google AI Studio",
+      "model": "google/gemini-3.8-flash-20260902",
+      "selected": false
+     }
+    ]
+   }
+  }
+ }
+}

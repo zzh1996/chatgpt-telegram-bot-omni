@@ -1,0 +1,57 @@
+{
+ "case": "msg_bad_image_claude",
+ "endpoint": "messages",
+ "model": "anthropic/claude-haiku-5.5",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json"
+ },
+ "body": {
+  "type": "error",
+  "error": {
+   "type": "invalid_request_error",
+   "message": "messages.0.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size: 8000 pixels",
+   "error_type": "invalid_request"
+  },
+  "request_id": "gen-1794391045-DoY3C4RyapM7FzujJTj9",
+  "metadata": {
+   "raw": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.0.content.1.image.source.base64.data: At least one of the image dimensions exceed max allowed size: 8000 pixels\"},\"request_id\":\"req_011Cgvwc2AWZe87gQ6PRLFHg\"}",
+   "provider_name": "Anthropic",
+   "is_byok": false
+  },
+  "openrouter_metadata": {
+   "requested": "anthropic/claude-haiku-5.5",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=1",
+   "attempt": 1,
+   "is_byok": false,
+   "endpoints": {
+    "total": 10,
+    "available": [
+     {
+      "provider": "Anthropic",
+      "model": "anthropic/claude-haiku-5.5-20261007",
+      "selected": false
+     }
+    ]
+   },
+   "generation_time": 254,
+   "pipeline": [
+    {
+     "type": "guardrail",
+     "name": "moderation",
+     "summary": "OpenAI moderation ran (result unavailable)",
+     "data": {
+      "engine": "openai-moderations",
+      "flagged": null,
+      "moderator_ids": [
+       "OpenAIOmniModerator"
+      ]
+     }
+    }
+   ]
+  }
+ }
+}

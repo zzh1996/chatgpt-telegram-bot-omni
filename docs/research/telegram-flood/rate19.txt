@@ -1,0 +1,57 @@
+== pause (let the previous windows run out)
+
+== L-A header + reasoning + divider + 2 footers
+  #0  H    send    20000 chars  30136 B  20111 cp  3 top mixed  at   0.00s start   0.002s wall 1794409686862 took  791ms  ok
+  #1  M    send        0 chars  13660 B   9089 cp  5 top blocks at   6.00s start   6.002s wall 1794409692862 took  758ms  ok
+  #2  H    edit    20000 chars  30136 B  20111 cp  3 top mixed  at   7.00s start   7.002s wall 1794409693862 took  213ms  FLOOD_WAIT 5
+  #3  M    edit        0 chars  13660 B   9089 cp  5 top blocks at  13.00s start  13.216s wall 1794409700076 took  243ms  ok
+  #4  H    edit    20000 chars  30136 B  20111 cp  3 top mixed  at  14.00s start  14.003s wall 1794409700863 took  204ms  FLOOD_WAIT 5
+  read H    20098 cp stored, 3 top-level blocks, ends "ars"
+  read M    9079 cp stored, 5 top-level blocks, ends "678"
+
+== L-B model name in the reasoning title + footer
+  #0  H    send    20000 chars  30138 B  20113 cp  3 top mixed  at   0.00s start   0.002s wall 1794409750670 took  740ms  ok
+  #1  M    send        0 chars  13665 B   9092 cp  2 top blocks at   6.00s start   6.001s wall 1794409756669 took  755ms  ok
+  #2  H    edit    20000 chars  30138 B  20113 cp  3 top mixed  at   7.00s start   7.003s wall 1794409757671 took  210ms  FLOOD_WAIT 4
+  #3  M    edit        0 chars  13665 B   9092 cp  2 top blocks at  13.00s start  13.001s wall 1794409763670 took  293ms  ok
+  #4  H    edit    20000 chars  30138 B  20113 cp  3 top mixed  at  14.00s start  14.003s wall 1794409764671 took  241ms  ok
+  read H    20100 cp stored, 3 top-level blocks, ends "ars"
+  read M    9085 cp stored, 2 top-level blocks, ends "678"
+
+== L-C small header + reasoning + divider + 2 footers
+  #0  H    send    20000 chars  30142 B  20117 cp  3 top mixed  at   0.00s start   0.003s wall 1794409814507 took 1039ms  ok
+  #1  M    send        0 chars  13660 B   9089 cp  5 top blocks at   6.00s start   6.017s wall 1794409820522 took  798ms  ok
+  #2  H    edit    20000 chars  30142 B  20117 cp  3 top mixed  at   7.00s start   7.002s wall 1794409821507 took  216ms  FLOOD_WAIT 4
+  #3  M    edit        0 chars  13660 B   9089 cp  5 top blocks at  13.00s start  13.001s wall 1794409827506 took  229ms  ok
+  #4  H    edit    20000 chars  30142 B  20117 cp  3 top mixed  at  14.00s start  14.002s wall 1794409828507 took  207ms  FLOOD_WAIT 4
+  read H    20104 cp stored, 3 top-level blocks, ends "ars"
+  read M    9079 cp stored, 5 top-level blocks, ends "678"
+
+== L-D header + reasoning + 3 footers
+  #0  H    send    20000 chars  30126 B  20101 cp  3 top mixed  at   0.00s start   0.002s wall 1794409878308 took  748ms  ok
+  #1  M    send        0 chars  13681 B   9109 cp  5 top blocks at   6.00s start   6.001s wall 1794409884306 took  743ms  ok
+  #2  H    edit    20000 chars  30126 B  20101 cp  3 top mixed  at   7.00s start   7.002s wall 1794409885308 took  202ms  FLOOD_WAIT 4
+  #3  M    edit        0 chars  13681 B   9109 cp  5 top blocks at  13.00s start  13.001s wall 1794409891306 took  287ms  ok
+  #4  H    edit    20000 chars  30126 B  20101 cp  3 top mixed  at  14.00s start  14.002s wall 1794409892307 took  207ms  FLOOD_WAIT 4
+  read H    20088 cp stored, 3 top-level blocks, ends "ars"
+  read M    9099 cp stored, 5 top-level blocks, ends "123"
+
+== R1 paragraph + details 9000 (1 non-details block)
+  #0  H    send    20000 chars  30141 B  20116 cp  3 top mixed  at   0.00s start   0.002s wall 1794409942177 took  711ms  ok
+  #1  M    send        0 chars  13643 B   9048 cp  2 top blocks at   6.00s start   6.001s wall 1794409948177 took  726ms  ok
+  #2  H    edit    20000 chars  30141 B  20116 cp  3 top mixed  at   7.00s start   7.003s wall 1794409949178 took  211ms  FLOOD_WAIT 4
+  #3  M    edit        0 chars  13644 B   9049 cp  2 top blocks at  13.00s start  13.001s wall 1794409955176 took  248ms  ok
+  #4  H    edit    20000 chars  30141 B  20116 cp  3 top mixed  at  14.00s start  14.002s wall 1794409956177 took  207ms  FLOOD_WAIT 4
+  read H    20103 cp stored, 3 top-level blocks, ends "ars"
+  read M    9042 cp stored, 2 top-level blocks, ends "于测试"
+
+== R2 two details blocks (0 non-details)
+  #0  H    send    20000 chars  30129 B  20104 cp  3 top mixed  at   0.00s start   0.002s wall 1794410005983 took  763ms  ok
+  #1  M    send        0 chars  13639 B   9025 cp  2 top blocks at   6.00s start   6.002s wall 1794410011983 took  744ms  ok
+  #2  H    edit    20000 chars  30129 B  20104 cp  3 top mixed  at   7.00s start   7.003s wall 1794410012984 took  214ms  FLOOD_WAIT 4
+  #3  M    edit        0 chars  13639 B   9025 cp  2 top blocks at  13.00s start  13.001s wall 1794410018982 took  257ms  ok
+  #4  H    edit    20000 chars  30129 B  20104 cp  3 top mixed  at  14.00s start  14.002s wall 1794410019984 took  210ms  FLOOD_WAIT 4
+  read H    20091 cp stored, 3 top-level blocks, ends "ars"
+  read M    9017 cp stored, 2 top-level blocks, ends "d 3"
+
+DONE

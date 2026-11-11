@@ -10,8 +10,9 @@
 //! Markdown source in a `markdown` preformatted block — per block, so the rest
 //! of the answer keeps its formatting.
 //!
-//! Anti-spoofing: the Markdown renderer never produces `Underline`, `Footer`,
-//! `Details` or `CollapsedQuote`; those are reserved for bot-generated structure.
+//! Anti-spoofing: the Markdown renderer never produces `Underline`, `Sub`,
+//! `Super`, `Footer`, `Details` or `CollapsedQuote`; those are reserved for
+//! bot-generated structure.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,10 @@ pub enum RText {
     Strike(Box<RText>),
     Fixed(Box<RText>),
     Spoiler(Box<RText>),
+    /// Smaller text below the line (`textSubscript`). Bot-only.
+    Sub(Box<RText>),
+    /// Smaller text above the line (`textSuperscript`). Bot-only.
+    Super(Box<RText>),
     Url { text: Box<RText>, url: String },
     Math(String),
     Concat(Vec<RText>),
@@ -48,6 +53,12 @@ impl RText {
     pub fn fixed(t: RText) -> Self {
         RText::Fixed(Box::new(t))
     }
+    pub fn sub(t: RText) -> Self {
+        RText::Sub(Box::new(t))
+    }
+    pub fn sup(t: RText) -> Self {
+        RText::Super(Box::new(t))
+    }
     pub fn concat(v: Vec<RText>) -> Self {
         let mut v: Vec<RText> = v.into_iter().filter(|t| !t.is_empty()).collect();
         match v.len() {
@@ -66,7 +77,9 @@ impl RText {
             | RText::Underline(t)
             | RText::Strike(t)
             | RText::Fixed(t)
-            | RText::Spoiler(t) => t.is_empty(),
+            | RText::Spoiler(t)
+            | RText::Sub(t)
+            | RText::Super(t) => t.is_empty(),
             RText::Url { text, .. } => text.is_empty(),
         }
     }
@@ -80,7 +93,9 @@ impl RText {
             | RText::Underline(t)
             | RText::Strike(t)
             | RText::Fixed(t)
-            | RText::Spoiler(t) => t.chars(),
+            | RText::Spoiler(t)
+            | RText::Sub(t)
+            | RText::Super(t) => t.chars(),
             RText::Url { text, .. } => text.chars(),
         }
     }
@@ -93,7 +108,9 @@ impl RText {
             | RText::Underline(t)
             | RText::Strike(t)
             | RText::Fixed(t)
-            | RText::Spoiler(t) => 1 + t.depth(),
+            | RText::Spoiler(t)
+            | RText::Sub(t)
+            | RText::Super(t) => 1 + t.depth(),
             RText::Url { text, .. } => 1 + text.depth(),
         }
     }
@@ -111,7 +128,9 @@ impl RText {
             | RText::Underline(t)
             | RText::Strike(t)
             | RText::Fixed(t)
-            | RText::Spoiler(t) => t.write_plain(out),
+            | RText::Spoiler(t)
+            | RText::Sub(t)
+            | RText::Super(t) => t.write_plain(out),
             RText::Url { text, .. } => text.write_plain(out),
         }
     }
@@ -363,6 +382,8 @@ fn sanitize_text(t: RText) -> RText {
         RText::Strike(x) => RText::Strike(Box::new(sanitize_text(*x))),
         RText::Fixed(x) => RText::Fixed(Box::new(sanitize_text(*x))),
         RText::Spoiler(x) => RText::Spoiler(Box::new(sanitize_text(*x))),
+        RText::Sub(x) => RText::Sub(Box::new(sanitize_text(*x))),
+        RText::Super(x) => RText::Super(Box::new(sanitize_text(*x))),
         RText::Url { text, url } => RText::Url { text: Box::new(sanitize_text(*text)), url },
         RText::Concat(v) => RText::Concat(v.into_iter().map(sanitize_text).collect()),
         other => other,

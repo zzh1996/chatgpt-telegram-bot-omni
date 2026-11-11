@@ -70,10 +70,6 @@ pub fn default_first_party() -> Vec<(String, String)> {
         ("z-ai", "z-ai"),
         ("moonshotai", "moonshotai"),
         ("qwen", "alibaba"),
-        ("mistralai", "mistral"),
-        ("meta-llama", "meta"),
-        ("minimax", "minimax"),
-        ("xiaomi", "xiaomi"),
         ("bytedance-seed", "seed"),
     ]
     .into_iter()

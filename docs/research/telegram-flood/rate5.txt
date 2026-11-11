@@ -1,0 +1,57 @@
+== S3 send plain 2200 | 2300 cp
+  #0  H    send    20000 chars  30120 B  20095 cp mixed  at   0.00s start   0.002s wall 1794399779299 took  713ms  ok
+  #1  M1   send     2200 chars   3321 B   2201 cp plain-mixed at   6.00s start   6.002s wall 1794399785299 took  713ms  ok
+  #2  H    edit    20000 chars  30120 B  20095 cp mixed  at   7.00s start   7.003s wall 1794399786300 took  198ms  FLOOD_WAIT 4
+  #3  M2   send     2300 chars   3453 B   2301 cp plain-mixed at  13.00s start  13.002s wall 1794399792299 took  756ms  ok
+  #4  H    edit    20000 chars  30120 B  20095 cp mixed  at  14.00s start  14.003s wall 1794399793300 took  202ms  FLOOD_WAIT 4
+
+== S4 send plain 2400 | 2500 cp
+  #0  H    send    20000 chars  30120 B  20095 cp mixed  at   0.00s start   0.002s wall 1794399842702 took  738ms  ok
+  #1  M1   send     2400 chars   3617 B   2401 cp plain-mixed at   6.00s start   6.002s wall 1794399848702 took  704ms  ok
+  #2  H    edit    20000 chars  30120 B  20095 cp mixed  at   7.00s start   7.002s wall 1794399849703 took  205ms  FLOOD_WAIT 4
+  #3  M2   send     2500 chars   3755 B   2501 cp plain-mixed at  13.00s start  13.002s wall 1794399855702 took  699ms  ok
+  #4  H    edit    20000 chars  30120 B  20095 cp mixed  at  14.00s start  14.003s wall 1794399856703 took  200ms  FLOOD_WAIT 4
+
+== S5 send plain 2700 | 3000 cp
+  #0  H    send    20000 chars  30120 B  20095 cp mixed  at   0.00s start   0.002s wall 1794399906115 took  726ms  ok
+  #1  M1   send     2700 chars   4067 B   2701 cp plain-mixed at   6.00s start   6.001s wall 1794399912114 took  721ms  ok
+  #2  H    edit    20000 chars  30120 B  20095 cp mixed  at   7.00s start   7.002s wall 1794399913115 took  204ms  FLOOD_WAIT 4
+  #3  M2   send     3000 chars   4505 B   3001 cp plain-mixed at  13.00s start  13.001s wall 1794399919114 took  698ms  ok
+  #4  H    edit    20000 chars  30120 B  20095 cp mixed  at  14.00s start  14.002s wall 1794399920115 took  324ms  FLOOD_WAIT 4
+
+== M5 edit plain 8352->8352
+  #0  H    send    20000 chars  30116 B  20091 cp mixed  at   0.00s start   0.002s wall 1794399969645 took  739ms  ok
+  #1  M    send     8352 chars  12545 B   8353 cp plain-mixed at   6.00s start   6.001s wall 1794399975644 took  751ms  ok
+  #2  H    edit    20000 chars  30116 B  20091 cp mixed  at   7.00s start   7.002s wall 1794399976645 took  248ms  FLOOD_WAIT 4
+  #3  M    edit     8352 chars  12545 B   8353 cp plain-mixed at  13.00s start  13.001s wall 1794399982644 took  283ms  ok
+  #4  H    edit    20000 chars  30116 B  20091 cp mixed  at  14.00s start  14.002s wall 1794399983644 took  248ms  ok
+
+== M6 edit plain 8400->8400
+  #0  H    send    20000 chars  30116 B  20091 cp mixed  at   0.00s start   0.002s wall 1794400033106 took  822ms  ok
+  #1  M    send     8400 chars  12623 B   8401 cp plain-mixed at   6.00s start   6.001s wall 1794400039105 took  799ms  ok
+  #2  H    edit    20000 chars  30116 B  20091 cp mixed  at   7.00s start   7.002s wall 1794400040106 took  199ms  FLOOD_WAIT 4
+  #3  M    edit     8400 chars  12623 B   8401 cp plain-mixed at  13.00s start  13.001s wall 1794400046105 took  238ms  ok
+  #4  H    edit    20000 chars  30116 B  20091 cp mixed  at  14.00s start  14.002s wall 1794400047106 took  272ms  ok
+
+== M7 edit plain 8500->8500
+  #0  H    send    20000 chars  30116 B  20091 cp mixed  at   0.00s start   0.002s wall 1794400096576 took  786ms  ok
+  #1  M    send     8500 chars  12757 B   8501 cp plain-mixed at   6.00s start   6.001s wall 1794400102575 took  830ms  ok
+  #2  H    edit    20000 chars  30116 B  20091 cp mixed  at   7.00s start   7.003s wall 1794400103577 took  224ms  FLOOD_WAIT 4
+  #3  M    edit     8500 chars  12757 B   8501 cp plain-mixed at  13.00s start  13.001s wall 1794400109575 took  234ms  ok
+  #4  H    edit    20000 chars  30116 B  20091 cp mixed  at  14.00s start  14.002s wall 1794400110576 took  229ms  ok
+
+== M8 edit plain 9000->9000
+  #0  H    send    20000 chars  30116 B  20091 cp mixed  at   0.00s start   0.004s wall 1794400160038 took  743ms  ok
+  #1  M    send     9000 chars  13513 B   9001 cp plain-mixed at   6.00s start   6.003s wall 1794400166037 took  731ms  ok
+  #2  H    edit    20000 chars  30116 B  20091 cp mixed  at   7.00s start   7.002s wall 1794400167037 took  202ms  FLOOD_WAIT 4
+  #3  M    edit     9000 chars  13513 B   9001 cp plain-mixed at  13.00s start  13.010s wall 1794400173044 took  227ms  ok
+  #4  H    edit    20000 chars  30116 B  20091 cp mixed  at  14.00s start  14.003s wall 1794400174037 took  234ms  ok
+
+== M9 edit plain 10000->10000
+  #0  H    send    20000 chars  30118 B  20093 cp mixed  at   0.00s start   0.002s wall 1794400223465 took  740ms  ok
+  #1  M    send    10000 chars  15023 B  10001 cp plain-mixed at   6.00s start   6.016s wall 1794400229479 took  783ms  ok
+  #2  H    edit    20000 chars  30118 B  20093 cp mixed  at   7.00s start   7.003s wall 1794400230466 took  202ms  FLOOD_WAIT 4
+  #3  M    edit    10000 chars  15023 B  10001 cp plain-mixed at  13.00s start  13.002s wall 1794400236465 took  252ms  ok
+  #4  H    edit    20000 chars  30118 B  20093 cp mixed  at  14.00s start  14.004s wall 1794400237467 took  243ms  ok
+
+DONE

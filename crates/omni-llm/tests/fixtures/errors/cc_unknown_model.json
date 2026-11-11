@@ -1,0 +1,18 @@
+{
+ "case": "cc_unknown_model",
+ "endpoint": "chat",
+ "model": "openai/gpt-does-not-exist",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "client"
+ },
+ "body": {
+  "error": {
+   "message": "openai/gpt-does-not-exist is not a valid model ID",
+   "code": 400
+  },
+  "user_id": "user_REDACTED"
+ }
+}

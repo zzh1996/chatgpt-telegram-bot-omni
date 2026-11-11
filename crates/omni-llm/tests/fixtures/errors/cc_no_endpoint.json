@@ -1,0 +1,95 @@
+{
+ "case": "cc_no_endpoint",
+ "endpoint": "chat",
+ "model": "google/gemini-3.5-flash-lite",
+ "recorded": "2026-11-11",
+ "status": 404,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "client"
+ },
+ "body": {
+  "error": {
+   "message": "No allowed providers are available for the selected model. Providers serving google/gemini-3.5-flash-lite-20260721: google-ai-studio, google-vertex, but your request's provider.only preference permits only: anthropic.",
+   "code": 404,
+   "metadata": {
+    "available_providers": [
+     "google-ai-studio",
+     "google-vertex"
+    ],
+    "requested_providers": [
+     "anthropic"
+    ],
+    "routing_funnel": [
+     {
+      "step": "Initial Endpoints",
+      "endpoint_count": 8
+     },
+     {
+      "step": "Filter by Regional Surcharge",
+      "endpoint_count": 6
+     },
+     {
+      "step": "Filter by Tier Endpoint Rows",
+      "endpoint_count": 2,
+      "reason": "Excluded tier endpoint rows the request did not opt into"
+     }
+    ],
+    "failed_routing_step": "Filter by Allowed Providers"
+   }
+  },
+  "openrouter_metadata": {
+   "requested": "google/gemini-3.5-flash-lite",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=8",
+   "attempt": 0,
+   "is_byok": false,
+   "endpoints": {
+    "total": 8,
+    "available": [
+     {
+      "provider": "Google",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google AI Studio",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google AI Studio",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     },
+     {
+      "provider": "Google AI Studio",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     }
+    ]
+   }
+  }
+ }
+}

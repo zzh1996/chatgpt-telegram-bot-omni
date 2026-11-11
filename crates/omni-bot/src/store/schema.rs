@@ -289,4 +289,121 @@ CREATE TABLE tg_uploads (
     PRIMARY KEY (bot, key, want)
 );
 "#,
+    // ---- v5: flood accounting: what each message shows, and operations Telegram may still count
+    r#"
+ALTER TABLE outbox ADD COLUMN shape_chars INTEGER;  -- code points of all text Telegram shows
+ALTER TABLE outbox ADD COLUMN shape_top INTEGER;    -- its top-level blocks
+CREATE TABLE flood_log (
+    bot TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    at INTEGER NOT NULL,               -- ms: when Telegram's answer arrived
+    units INTEGER NOT NULL             -- 1 light, 16 heavy
+);
+CREATE INDEX flood_log_at ON flood_log(at);
+"#,
+    // ---- v6: every bot is an independent instance: its own access rules (allowed
+    //          places, bans everywhere or in one group), spend limits and runtime aliases.
+    //          Existing rows are copied to every bot seen so far.
+    r#"
+CREATE TABLE access_rules (
+    bot TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,          -- a group, a private chat (= the user's id), or 0 = everywhere
+    user_id INTEGER NOT NULL,          -- 0 = everyone there
+    status TEXT NOT NULL CHECK (status IN ('allow', 'deny')),
+    note TEXT,
+    set_by INTEGER,
+    set_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, chat_id, user_id)
+);
+INSERT OR IGNORE INTO access_rules(bot, chat_id, user_id, status, note, set_by, set_at)
+  SELECT b.bot,
+         CASE WHEN a.scope = 'user' AND a.status = 'deny' THEN 0 ELSE a.id END,
+         CASE WHEN a.scope = 'user' AND a.status = 'deny' THEN a.id ELSE 0 END,
+         a.status, a.note, a.set_by, a.set_at
+  FROM acl a CROSS JOIN (SELECT DISTINCT bot FROM bot_chats) b;
+DROP TABLE acl;
+
+CREATE TABLE quota_rules_v6 (
+    bot TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('user', 'chat')),
+    id INTEGER NOT NULL,               -- 0 = default for the scope
+    capacity_usd REAL NOT NULL,
+    refill_usd_per_day REAL NOT NULL,
+    set_by INTEGER,
+    set_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, scope, id)
+);
+INSERT INTO quota_rules_v6(bot, scope, id, capacity_usd, refill_usd_per_day, set_by, set_at)
+  SELECT b.bot, q.scope, q.id, q.capacity_usd, q.refill_usd_per_day, q.set_by, q.set_at
+  FROM quota_rules q CROSS JOIN (SELECT DISTINCT bot FROM bot_chats) b;
+DROP TABLE quota_rules;
+ALTER TABLE quota_rules_v6 RENAME TO quota_rules;
+
+CREATE TABLE quota_buckets_v6 (
+    bot TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    id INTEGER NOT NULL,
+    level_usd REAL NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, scope, id)
+);
+INSERT INTO quota_buckets_v6(bot, scope, id, level_usd, updated_at)
+  SELECT b.bot, q.scope, q.id, q.level_usd, q.updated_at
+  FROM quota_buckets q CROSS JOIN (SELECT DISTINCT bot FROM bot_chats) b;
+DROP TABLE quota_buckets;
+ALTER TABLE quota_buckets_v6 RENAME TO quota_buckets;
+
+CREATE TABLE aliases_v6 (
+    bot TEXT NOT NULL,
+    name TEXT NOT NULL,                -- may be empty: the `$text` prefix
+    spec TEXT NOT NULL,
+    note TEXT,
+    created_by INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, name)
+);
+INSERT INTO aliases_v6(bot, name, spec, note, created_by, created_at)
+  SELECT b.bot, a.name, a.spec, a.note, a.created_by, a.created_at
+  FROM aliases a CROSS JOIN (SELECT DISTINCT bot FROM bot_chats) b;
+DROP TABLE aliases;
+ALTER TABLE aliases_v6 RENAME TO aliases;
+CREATE INDEX usage_bot_chat ON usage_ledger(bot, chat_id, ts);
+"#,
+    // ---- v7: access and spend limits form a tree, bot → chat → person: bans and
+    //          limits live inside one chat (groups and private chats alike);
+    //          bot-wide bans and per-person limits across chats are gone.
+    r#"
+DELETE FROM access_rules WHERE chat_id = 0;
+
+CREATE TABLE quota_rules_v7 (
+    bot TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,          -- a group, or a private chat (= the user's id)
+    target TEXT NOT NULL CHECK (target IN ('chat', 'member')),
+    user_id INTEGER NOT NULL,          -- 'chat': 0; 'member': the person, or 0 = each member by default
+    capacity_usd REAL NOT NULL,
+    refill_usd_per_day REAL NOT NULL,
+    set_by INTEGER,
+    set_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, chat_id, target, user_id)
+);
+INSERT INTO quota_rules_v7(bot, chat_id, target, user_id, capacity_usd, refill_usd_per_day, set_by, set_at)
+  SELECT bot, id, 'chat', 0, capacity_usd, refill_usd_per_day, set_by, set_at
+  FROM quota_rules WHERE scope = 'chat' AND id <> 0;
+DROP TABLE quota_rules;
+ALTER TABLE quota_rules_v7 RENAME TO quota_rules;
+
+CREATE TABLE quota_buckets_v7 (
+    bot TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    user_id INTEGER NOT NULL,          -- 'chat': 0; 'member': the person
+    level_usd REAL NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, chat_id, target, user_id)
+);
+INSERT INTO quota_buckets_v7(bot, chat_id, target, user_id, level_usd, updated_at)
+  SELECT bot, id, 'chat', 0, level_usd, updated_at FROM quota_buckets WHERE scope = 'chat' AND id <> 0;
+DROP TABLE quota_buckets;
+ALTER TABLE quota_buckets_v7 RENAME TO quota_buckets;
+"#,
 ];

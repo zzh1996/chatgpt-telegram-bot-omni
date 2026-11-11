@@ -171,7 +171,8 @@ impl Ark {
             "model": input.model,
             "messages": messages,
             "stream": true,
-            "stream_options": {"include_usage": true},
+            // Cumulative usage on every chunk: tokens and cost update while streaming.
+            "stream_options": {"include_usage": true, "chunk_include_usage": true},
         });
         let mut applied = Vec::new();
         let mut settings = Vec::new();
@@ -422,6 +423,7 @@ mod tests {
         assert_eq!(p.body["reasoning_effort"], "minimal");
         assert_eq!(p.body["max_tokens"], 65_536);
         assert_eq!(p.body["stream_options"]["include_usage"], true);
+        assert_eq!(p.body["stream_options"]["chunk_include_usage"], true);
         assert!(p.body.get("user").is_none(), "Ark Chat has no `user` field");
         // Defaults without options: max effort, explicit max_tokens (answer only, capped).
         let input = CallInput { options: &[], ..input };

@@ -1,4 +1,5 @@
-//! Shared application state, model resolution and multi-bot routing.
+//! Shared application state and model resolution. Every bot is independent:
+//! it answers the prefixes it serves, with its own aliases and access rules.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BotConfig, Config, glob_match};
+
 use crate::conv::ResolvedSpec;
 use crate::store::blobs::BlobStore;
 use crate::store::{Db, now_ms};
@@ -31,8 +33,9 @@ pub struct App {
     pub bots: Vec<Arc<BotConn>>,
     /// (bot name, chat id) pairs where the bot is known to be a member.
     pub membership: Mutex<HashSet<(String, i64)>>,
-    /// Aliases from config plus runtime (admin-defined) ones: name -> spec string.
-    pub aliases: RwLock<BTreeMap<String, String>>,
+    /// Per bot: the config's aliases overlaid with the bot's runtime ones
+    /// (`/alias`): bot -> name (may be empty) -> spec string.
+    pub aliases: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
     /// Assistant turns currently being generated (dedupe of job runners).
     pub running: Mutex<HashSet<i64>>,
     /// Fires with a turn id whenever an assistant turn finishes.
@@ -48,6 +51,11 @@ impl App {
         self.bots.iter().find(|b| b.name == name)
     }
 
+    /// What ends the model prefix of a message (`$` unless configured otherwise).
+    pub fn marker(&self) -> &str {
+        &self.cfg.general.trigger_marker
+    }
+
     pub fn bot_cfg(&self, name: &str) -> Option<&BotConfig> {
         self.cfg.bots.iter().find(|b| b.name == name)
     }
@@ -61,14 +69,16 @@ impl App {
     }
 
     pub async fn load_runtime_state(&self) -> Result<()> {
-        let mut aliases: BTreeMap<String, String> =
+        let config: BTreeMap<String, String> =
             self.cfg.aliases.iter().map(|a| (a.name.clone(), a.spec.clone())).collect();
+        let mut aliases: BTreeMap<String, BTreeMap<String, String>> =
+            self.cfg.bots.iter().map(|b| (b.name.clone(), config.clone())).collect();
         let (db_aliases, members) = self
             .db
             .call(|c| {
-                let mut s = c.prepare("SELECT name, spec FROM aliases")?;
+                let mut s = c.prepare("SELECT bot, name, spec FROM aliases")?;
                 let a = s
-                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut s = c.prepare("SELECT bot, chat_id FROM bot_chats WHERE status = 'member'")?;
                 let m = s
@@ -77,7 +87,11 @@ impl App {
                 Ok((a, m))
             })
             .await?;
-        aliases.extend(db_aliases);
+        for (bot, name, spec) in db_aliases {
+            if let Some(m) = aliases.get_mut(&bot) {
+                m.insert(name, spec);
+            }
+        }
         *self.aliases.write() = aliases;
         self.membership.lock().extend(members);
         Ok(())
@@ -106,7 +120,82 @@ impl App {
         Ok(())
     }
 
-    /// Resolve a typed spec into provider + model + options.
+    /// A bot's alias (the empty name is the `$text` prefix).
+    pub fn alias(&self, bot: &str, name: &str) -> Option<String> {
+        self.aliases.read().get(bot)?.get(name).cloned()
+    }
+
+    /// All aliases of a bot, by name (the empty name first).
+    pub fn aliases_of(&self, bot: &str) -> BTreeMap<String, String> {
+        self.aliases.read().get(bot).cloned().unwrap_or_default()
+    }
+
+    /// A bot's prefixes for display: the config's in file order, then the
+    /// runtime-only ones by name.
+    pub fn aliases_in_order(&self, bot: &str) -> Vec<(String, String)> {
+        let all = self.aliases_of(bot);
+        let mut out: Vec<(String, String)> =
+            self.cfg.aliases.iter().filter_map(|a| Some((a.name.clone(), all.get(&a.name)?.clone()))).collect();
+        for (n, s) in &all {
+            if !self.cfg.aliases.iter().any(|a| &a.name == n) {
+                out.push((n.clone(), s.clone()));
+            }
+        }
+        out
+    }
+
+    /// Set (`Some`) or remove a runtime alias of a bot in memory; removing one
+    /// brings back the config's alias of that name, if any.
+    pub fn set_runtime_alias(&self, bot: &str, name: &str, spec: Option<String>) {
+        let mut all = self.aliases.write();
+        let Some(m) = all.get_mut(bot) else { return };
+        match spec.or_else(|| self.cfg.aliases.iter().find(|a| a.name == name).map(|a| a.spec.clone())) {
+            Some(s) => m.insert(name.to_string(), s),
+            None => m.remove(name),
+        };
+    }
+
+    /// Whether a provider exists in this deployment (`ark` only when configured).
+    pub fn provider_enabled(&self, provider: &str) -> bool {
+        match provider {
+            "openrouter" => true,
+            "ark" => self.ark.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether users may type model ids of `provider` that no prefix names
+    /// (`allow_unlisted_models` of the provider's config).
+    pub fn unlisted_models_allowed(&self, provider: &str) -> bool {
+        let p = &self.cfg.providers;
+        self.provider_enabled(provider)
+            && match provider {
+                "openrouter" => p.openrouter.as_ref().is_some_and(|c| c.allow_unlisted_models),
+                "ark" => p.ark.as_ref().is_some_and(|c| c.allow_unlisted_models),
+                _ => false,
+            }
+    }
+
+    /// The canonical model id (`provider:model`) of a spec string, if it names
+    /// a model of an enabled provider that `bot` serves.
+    pub fn served_canonical(&self, bot: &BotConfig, spec: &str) -> Option<String> {
+        let model = parse_spec(spec).ok()?.model;
+        let (provider, model) = match model.split_once(':') {
+            Some((p, m)) if PROVIDERS.contains(&p) => (p, m),
+            _ => ("openrouter", model.as_str()),
+        };
+        let canonical = format!("{provider}:{model}");
+        let ok = self.provider_enabled(provider)
+            && !model.is_empty()
+            && (provider != "openrouter" || model.contains('/'))
+            && bot.serves(&canonical);
+        ok.then_some(canonical)
+    }
+
+    /// Resolve a typed spec into provider + model + options, for one bot.
+    /// `None`: not a model this bot knows (no such alias or model, a provider
+    /// that is not configured, a model the bot does not have, or a model id
+    /// typed directly where the provider does not allow unlisted models).
     ///
     /// `strict`: only accept raw model ids that exist in the catalog (used in
     /// groups, so that random text containing `a/b$` does not trigger requests).
@@ -119,22 +208,15 @@ impl App {
         let mut model_token = token.model.clone();
         let mut options: Vec<OptionToken> = Vec::new();
         let mut label = token.model.clone();
-        if model_token.is_empty() {
-            match &bot.default_model {
-                Some(d) => {
-                    model_token = d.clone();
-                    label = d.clone();
-                }
-                None => return Ok(None),
-            }
-        }
-        // Alias expansion (one level).
-        let alias = self.aliases.read().get(&model_token).cloned();
-        if let Some(spec) = alias {
-            let parsed =
-                parse_spec(&spec).map_err(|e| format!("alias `{model_token}` has an invalid spec `{spec}`: {e}"))?;
+        // Alias expansion (one level). The empty name is an alias like any other.
+        let via_alias = self.alias(&bot.name, &model_token).is_some();
+        if let Some(spec) = self.alias(&bot.name, &model_token) {
+            let parsed = parse_spec(&spec)
+                .map_err(|e| format!("alias `{model_token}{}` has an invalid spec `{spec}`: {e}", self.marker()))?;
             model_token = parsed.model;
             options.extend(parsed.options);
+        } else if model_token.is_empty() {
+            return Ok(None);
         }
         options.extend(token.options.iter().cloned());
         let (provider, model) = match model_token.split_once(':') {
@@ -145,7 +227,11 @@ impl App {
         if provider == "openrouter" && !model.contains('/') {
             return Ok(None);
         }
-        if model.is_empty() {
+        if model.is_empty()
+            || !self.provider_enabled(&provider)
+            || !bot.serves(&format!("{provider}:{model}"))
+            || !via_alias && !self.unlisted_models_allowed(&provider)
+        {
             return Ok(None);
         }
         // Strict mode never blocks on the network (it runs in the update loop):
@@ -160,15 +246,19 @@ impl App {
         Ok(Some(ResolvedSpec { provider, model, label, options, raw: token.raw.clone() }))
     }
 
-    /// Whether `token` looks like a full OpenRouter model id (`author/model`),
-    /// possibly one that is too new for the cached catalog.
-    pub fn plausible_model_id(&self, token: &SpecToken) -> bool {
+    /// Whether `token` looks like a full OpenRouter model id (`author/model`)
+    /// that `bot` would serve, possibly one too new for the cached catalog.
+    pub fn plausible_model_id(&self, bot: &BotConfig, token: &SpecToken) -> bool {
         let m = token.model.strip_prefix("openrouter:").unwrap_or(&token.model);
         let Some((author, model)) = m.split_once('/') else { return false };
         let ok = |s: &str, extra: &str| {
             !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c) || extra.contains(c))
         };
-        ok(author, "") && ok(model, ":") && !self.aliases.read().contains_key(&token.model)
+        ok(author, "")
+            && ok(model, ":")
+            && self.alias(&bot.name, &token.model).is_none()
+            && self.unlisted_models_allowed("openrouter")
+            && bot.serves(&format!("openrouter:{m}"))
     }
 
     /// Refresh the catalog now unless it was refreshed in the last `max_age`
@@ -203,45 +293,6 @@ impl App {
         });
     }
 
-    /// Which of our bots should answer requests for `spec` in `chat`.
-    pub fn responsible_bot(&self, chat_id: i64, canonical: &str, receiving: &str) -> Option<String> {
-        if chat_id > 0 {
-            // Private chats are per bot: only the receiving bot can answer.
-            let b = self.bot_cfg(receiving)?;
-            return b.models.iter().any(|p| glob_match(p, canonical)).then(|| receiving.to_string());
-        }
-        let members = self.membership.lock();
-        for b in &self.cfg.bots {
-            if !b.models.iter().any(|p| glob_match(p, canonical)) {
-                continue;
-            }
-            if let Some(chats) = &b.chats
-                && !chats.contains(&chat_id)
-            {
-                continue;
-            }
-            if b.name == receiving || members.contains(&(b.name.clone(), chat_id)) {
-                return Some(b.name.clone());
-            }
-        }
-        None
-    }
-
-    /// The bot that answers un-addressed commands in a chat (first member in config order).
-    pub fn primary_bot(&self, chat_id: i64, receiving: &str) -> String {
-        if chat_id > 0 {
-            return receiving.to_string();
-        }
-        let members = self.membership.lock();
-        for b in &self.cfg.bots {
-            if b.name == receiving || members.contains(&(b.name.clone(), chat_id)) {
-                return b.name.clone();
-            }
-        }
-        receiving.to_string()
-    }
-
-    /// Config presets (JSON merge patches) matching a canonical model id.
     /// Default options from config presets matching a canonical model id.
     pub fn presets_for(&self, canonical: &str) -> Vec<omni_llm::request::Requested> {
         self.cfg

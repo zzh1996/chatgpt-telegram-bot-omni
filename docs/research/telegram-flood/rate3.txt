@@ -1,0 +1,158 @@
+== E1 edit mixed 8100->10100 (grow op5)
+  #0  H    send  20000 chars  30128 B mixed at   0.00s start   0.002s wall 1794397794061 took  730ms  ok
+  #1  M    send   8100 chars  12270 B mixed at   6.00s start   6.002s wall 1794397800061 took  886ms  ok
+  #2  H    edit  20000 chars  30128 B mixed at   7.00s start   7.002s wall 1794397801061 took  202ms  FLOOD_WAIT 4
+  #3  M    edit  10100 chars  15264 B mixed at  13.00s start  13.002s wall 1794397807061 took  233ms  ok
+  #4  H    edit  20000 chars  30128 B mixed at  14.00s start  14.003s wall 1794397808062 took  257ms  ok
+
+== E2 edit mixed 500->10100
+  #0  H    send  20000 chars  30116 B mixed at   0.00s start   0.002s wall 1794397857565 took  830ms  ok
+  #1  M    send    500 chars    845 B mixed at   6.00s start   6.001s wall 1794397863564 took  701ms  ok
+  #2  H    edit  20000 chars  30116 B mixed at   7.00s start   7.002s wall 1794397864565 took  233ms  ok
+  #3  M    edit  10100 chars  15252 B mixed at  13.00s start  13.001s wall 1794397870564 took  268ms  ok
+  #4  H    edit  20000 chars  30116 B mixed at  14.00s start  14.002s wall 1794397871565 took  200ms  FLOOD_WAIT 4
+
+== E3 edit mixed 500->5500
+  #0  H    send  20000 chars  30115 B mixed at   0.00s start   0.002s wall 1794397920966 took  756ms  ok
+  #1  M    send    500 chars    844 B mixed at   6.00s start   6.001s wall 1794397926965 took  700ms  ok
+  #2  H    edit  20000 chars  30115 B mixed at   7.00s start   7.002s wall 1794397927965 took  275ms  ok
+  #3  M    edit   5500 chars   8343 B mixed at  13.00s start  13.002s wall 1794397933965 took  230ms  ok
+  #4  H    edit  20000 chars  30115 B mixed at  14.00s start  14.001s wall 1794397934965 took  200ms  FLOOD_WAIT 4
+
+== E4 edit cjk 5000->cjk2 5000 (rewrite)
+  #0  H    send  20000 chars  30129 B mixed at   0.00s start   0.002s wall 1794397984372 took  720ms  ok
+  #1  M    send   5000 chars  15105 B cjk   at   6.00s start   6.001s wall 1794397990371 took  705ms  ok
+  #2  H    edit  20000 chars  30129 B mixed at   7.00s start   7.002s wall 1794397991371 took  199ms  FLOOD_WAIT 4
+  #3  M    edit   5000 chars  15105 B cjk2  at  13.00s start  13.001s wall 1794397997371 took  344ms  ok
+  #4  H    edit  20000 chars  30129 B mixed at  14.00s start  14.002s wall 1794397998372 took  230ms  ok
+
+== E5 edit mixed 8100->mixed2 8100 (rewrite)
+  #0  H    send  20000 chars  30133 B mixed at   0.00s start   0.001s wall 1794398047805 took  702ms  ok
+  #1  M    send   8100 chars  12275 B mixed at   6.00s start   6.006s wall 1794398053810 took  721ms  ok
+  #2  H    edit  20000 chars  30133 B mixed at   7.00s start   7.002s wall 1794398054806 took  218ms  FLOOD_WAIT 4
+  #3  M    edit   8100 chars  11617 B mixed2 at  13.00s start  13.001s wall 1794398060805 took  240ms  ok
+  #4  H    edit  20000 chars  30133 B mixed at  14.00s start  14.002s wall 1794398061806 took  236ms  ok
+
+== E6 edit mixed 8100->12100
+  #0  H    send  20000 chars  30117 B mixed at   0.00s start   0.002s wall 1794398111249 took  707ms  ok
+  #1  M    send   8100 chars  12259 B mixed at   6.00s start   6.004s wall 1794398117250 took  700ms  ok
+  #2  H    edit  20000 chars  30117 B mixed at   7.00s start   7.003s wall 1794398118250 took  201ms  FLOOD_WAIT 4
+  #3  M    edit  12100 chars  18254 B mixed at  13.00s start  13.002s wall 1794398124248 took  262ms  ok
+  #4  H    edit  20000 chars  30117 B mixed at  14.00s start  14.002s wall 1794398125248 took  239ms  ok
+
+== E7 edit mixed 8300->8300
+  #0  H    send  20000 chars  30116 B mixed at   0.00s start   0.002s wall 1794398174687 took  746ms  ok
+  #1  M    send   8300 chars  12554 B mixed at   6.00s start   6.002s wall 1794398180687 took  699ms  ok
+  #2  H    edit  20000 chars  30116 B mixed at   7.00s start   7.002s wall 1794398181687 took  214ms  FLOOD_WAIT 4
+  #3  M    edit   8300 chars  12554 B mixed at  13.00s start  13.002s wall 1794398187687 took  230ms  ok
+  #4  H    edit  20000 chars  30116 B mixed at  14.00s start  14.003s wall 1794398188688 took  209ms  FLOOD_WAIT 4
+
+== F1 send ascii 4000 | cjk 1400
+  #0  H    send  20000 chars  30121 B mixed at   0.00s start   0.002s wall 1794398238112 took  736ms  ok
+  #1  M1   send   4000 chars   4097 B ascii at   6.00s start   6.002s wall 1794398244112 took  777ms  ok
+  #2  H    edit  20000 chars  30121 B mixed at   7.00s start   7.002s wall 1794398245112 took  202ms  FLOOD_WAIT 4
+  #3  M2   send   1400 chars   4296 B cjk   at  13.00s start  13.004s wall 1794398251114 took  686ms  ok
+  #4  H    edit  20000 chars  30121 B mixed at  14.00s start  14.003s wall 1794398252113 took  236ms  ok
+
+== F2 send ascii 7000 | cjk 2400
+  #0  H    send  20000 chars  30121 B mixed at   0.00s start   0.002s wall 1794398301559 took  744ms  ok
+  #1  M1   send   7000 chars   7099 B ascii at   6.00s start   6.002s wall 1794398307559 took  705ms  ok
+  #2  H    edit  20000 chars  30121 B mixed at   7.00s start   7.002s wall 1794398308559 took  199ms  FLOOD_WAIT 4
+  #3  M2   send   2400 chars   7297 B cjk   at  13.00s start  13.001s wall 1794398314559 took  736ms  ok
+  #4  H    edit  20000 chars  30121 B mixed at  14.00s start  14.002s wall 1794398315560 took  205ms  FLOOD_WAIT 4
+
+== F3 send mixed 3000 | mixed 5000
+  #0  H    send  20000 chars  30123 B mixed at   0.00s start   0.002s wall 1794398364968 took  712ms  ok
+  #1  M1   send   3000 chars   4603 B mixed at   6.00s start   6.001s wall 1794398370967 took  695ms  ok
+  #2  H    edit  20000 chars  30123 B mixed at   7.00s start   7.002s wall 1794398371968 took  201ms  FLOOD_WAIT 4
+  #3  M2   send   5000 chars   7612 B mixed at  13.00s start  13.007s wall 1794398377973 took  711ms  ok
+  #4  H    edit  20000 chars  30123 B mixed at  14.00s start  14.002s wall 1794398378968 took  218ms  FLOOD_WAIT 4
+
+== G1 short 1H+2L both orders
+  #0  s    send    500 chars    847 B mixed at   0.00s start   0.001s wall 1794398428391 took  701ms  ok
+  #1  H    send  20000 chars  30118 B mixed at   6.00s start   6.003s wall 1794398434393 took  737ms  ok
+  #2  s    edit    500 chars    847 B mixed at   7.00s start   7.001s wall 1794398435391 took  214ms  ok
+  #3  s    edit    500 chars    847 B mixed at   8.00s start   8.005s wall 1794398436395 took  209ms  ok
+  #4  s    edit    500 chars    847 B mixed at   9.00s start   9.001s wall 1794398437391 took  207ms  ok
+  #5  s    edit    500 chars    847 B mixed at  18.00s start  18.001s wall 1794398446391 took  242ms  ok
+  #6  s    edit    500 chars    847 B mixed at  19.00s start  19.002s wall 1794398447392 took  223ms  ok
+  #7  H    edit  20000 chars  30118 B mixed at  20.00s start  20.002s wall 1794398448393 took  272ms  ok
+  #8  s    edit    500 chars    847 B mixed at  21.00s start  21.001s wall 1794398449391 took  225ms  ok
+
+== G2 long 5H then lights
+  #0  H    send  20000 chars  30114 B mixed at   0.00s start   0.002s wall 1794398491818 took  717ms  ok
+  #1  H    edit  20000 chars  30114 B mixed at   6.00s start   6.002s wall 1794398497818 took  262ms  ok
+  #2  H    edit  20000 chars  30114 B mixed at  12.00s start  12.003s wall 1794398503818 took  341ms  ok
+  #3  H    edit  20000 chars  30114 B mixed at  18.00s start  18.003s wall 1794398509819 took  239ms  ok
+  #4  H    edit  20000 chars  30114 B mixed at  24.00s start  24.007s wall 1794398515823 took  248ms  ok
+  #5  s    send    500 chars    843 B mixed at  29.50s start  29.501s wall 1794398521317 took  193ms  FLOOD_WAIT 30
+  #6  s    edit    500 chars    843 B mixed at  31.00s start  60.696s wall 1794398552512 took    0ms  ERROR bad step edit on s
+  #7  s    edit    500 chars    843 B mixed at  32.50s start  60.696s wall 1794398552512 took    0ms  ERROR bad step edit on s
+  #8  s    edit    500 chars    843 B mixed at  34.00s start  60.696s wall 1794398552512 took    0ms  ERROR bad step edit on s
+  #9  s    edit    500 chars    843 B mixed at  35.50s start  60.696s wall 1794398552512 took    0ms  ERROR bad step edit on s
+
+== G3 long 4H then lights
+  #0  H    send  20000 chars  30114 B mixed at   0.00s start   0.002s wall 1794398580227 took  722ms  ok
+  #1  H    edit  20000 chars  30114 B mixed at   6.00s start   6.002s wall 1794398586227 took  253ms  ok
+  #2  H    edit  20000 chars  30114 B mixed at  12.00s start  12.002s wall 1794398592226 took  387ms  ok
+  #3  H    edit  20000 chars  30114 B mixed at  18.00s start  18.003s wall 1794398598227 took  280ms  ok
+  #4  s    send    500 chars    843 B mixed at  23.50s start  23.501s wall 1794398603725 took  701ms  ok
+  #5  s    edit    500 chars    843 B mixed at  25.00s start  25.002s wall 1794398605226 took  265ms  ok
+  #6  s    edit    500 chars    843 B mixed at  26.50s start  26.501s wall 1794398606725 took  216ms  ok
+  #7  s    edit    500 chars    843 B mixed at  28.00s start  28.001s wall 1794398608225 took  232ms  ok
+  #8  s    edit    500 chars    843 B mixed at  29.50s start  29.501s wall 1794398609726 took  227ms  ok
+  #9  s    edit    500 chars    843 B mixed at  31.00s start  31.001s wall 1794398611226 took  212ms  ok
+  #10 s    edit    500 chars    844 B mixed at  32.50s start  32.500s wall 1794398612725 took  221ms  ok
+  #11 s    edit    500 chars    844 B mixed at  34.00s start  34.001s wall 1794398614226 took  215ms  ok
+
+== D1 19 lights, delete, lights
+  #0  s    send    500 chars    849 B mixed at   0.00s start   0.001s wall 1794398643641 took  686ms  ok
+  #1  d    send    500 chars    849 B mixed at   1.25s start   1.251s wall 1794398644891 took  722ms  ok
+  #2  s    edit    500 chars    849 B mixed at   2.50s start   2.501s wall 1794398646141 took  220ms  ok
+  #3  s    edit    500 chars    849 B mixed at   3.75s start   3.750s wall 1794398647390 took  208ms  ok
+  #4  s    edit    500 chars    849 B mixed at   5.00s start   5.001s wall 1794398648641 took  213ms  ok
+  #5  s    edit    500 chars    849 B mixed at   6.25s start   6.251s wall 1794398649890 took  223ms  ok
+  #6  s    edit    500 chars    849 B mixed at   7.50s start   7.501s wall 1794398651141 took  240ms  ok
+  #7  s    edit    500 chars    849 B mixed at   8.75s start   8.751s wall 1794398652390 took  257ms  ok
+  #8  s    edit    500 chars    849 B mixed at  10.00s start  10.001s wall 1794398653641 took  300ms  ok
+  #9  s    edit    500 chars    849 B mixed at  11.25s start  11.253s wall 1794398654892 took  232ms  ok
+  #10 s    edit    500 chars    850 B mixed at  12.50s start  12.501s wall 1794398656140 took  212ms  ok
+  #11 s    edit    500 chars    850 B mixed at  13.75s start  13.750s wall 1794398657390 took  209ms  ok
+  #12 s    edit    500 chars    850 B mixed at  15.00s start  15.001s wall 1794398658641 took  226ms  ok
+  #13 s    edit    500 chars    850 B mixed at  16.25s start  16.251s wall 1794398659891 took  222ms  ok
+  #14 s    edit    500 chars    850 B mixed at  17.50s start  17.501s wall 1794398661140 took  218ms  ok
+  #15 s    edit    500 chars    850 B mixed at  18.75s start  18.751s wall 1794398662390 took  211ms  ok
+  #16 s    edit    500 chars    850 B mixed at  20.00s start  20.001s wall 1794398663640 took  211ms  ok
+  #17 s    edit    500 chars    850 B mixed at  21.25s start  21.251s wall 1794398664890 took  222ms  ok
+  #18 s    edit    500 chars    850 B mixed at  22.50s start  22.500s wall 1794398666140 took  217ms  ok
+  #19 d    delete      0 chars     91 B mixed at  23.75s start  23.750s wall 1794398667390 took  196ms  ok
+  #20 s    edit    500 chars    850 B mixed at  25.00s start  25.001s wall 1794398668641 took  211ms  ok
+  #21 s    edit    500 chars    850 B mixed at  26.25s start  26.251s wall 1794398669890 took  192ms  FLOOD_WAIT 34
+  #22 s    edit    500 chars    850 B mixed at  27.50s start  61.444s wall 1794398705083 took  248ms  ok
+
+== Q1 wait rounding
+  #0  H    send  20000 chars  30108 B mixed at   0.00s start   0.002s wall 1794398742004 took  716ms  ok
+  #1  H    edit  20000 chars  30108 B mixed at   6.00s start   6.003s wall 1794398748005 took  240ms  ok
+  #2  H    edit  20000 chars  30108 B mixed at   7.75s start   7.753s wall 1794398749755 took  215ms  FLOOD_WAIT 4
+  #3  H    edit  20000 chars  30108 B mixed at  12.70s start  12.970s wall 1794398754972 took  277ms  ok
+  #4  H    edit  20000 chars  30108 B mixed at  13.30s start  13.303s wall 1794398755305 took  203ms  FLOOD_WAIT 5
+  #5  H    edit  20000 chars  30108 B mixed at  18.20s start  19.509s wall 1794398761511 took  257ms  ok
+  #6  H    edit  20000 chars  30108 B mixed at  18.75s start  19.767s wall 1794398761769 took  283ms  FLOOD_WAIT 5
+  #7  H    edit  20000 chars  30108 B mixed at  24.30s start  26.052s wall 1794398768054 took  235ms  ok
+  #8  H    edit  20000 chars  30108 B mixed at  25.60s start  26.289s wall 1794398768290 took  354ms  FLOOD_WAIT 34
+
+== Q2 window edge under 5s
+  #0  H    send  20000 chars  30115 B mixed at   0.00s start   0.002s wall 1794398807003 took  705ms  ok
+  #1  H    edit  20000 chars  30115 B mixed at   6.70s start   6.702s wall 1794398813704 took  234ms  ok
+  #2  H    edit  20000 chars  30115 B mixed at  11.25s start  11.252s wall 1794398818254 took  204ms  FLOOD_WAIT 3
+  #3  H    edit  20000 chars  30115 B mixed at  17.70s start  17.703s wall 1794398824704 took  254ms  ok
+  #4  H    edit  20000 chars  30115 B mixed at  22.20s start  22.202s wall 1794398829204 took  205ms  FLOOD_WAIT 3
+
+== Q3 window edge over/under 5s
+  #0  H    send  20000 chars  30120 B mixed at   0.00s start   0.002s wall 1794398871004 took  801ms  ok
+  #1  H    edit  20000 chars  30120 B mixed at   6.20s start   6.203s wall 1794398877205 took  238ms  ok
+  #2  H    edit  20000 chars  30120 B mixed at  11.30s start  11.303s wall 1794398882305 took  239ms  ok
+  #3  H    edit  20000 chars  30120 B mixed at  17.30s start  17.302s wall 1794398888304 took  225ms  ok
+  #4  H    edit  20000 chars  30120 B mixed at  22.25s start  22.253s wall 1794398893255 took  201ms  FLOOD_WAIT 3
+
+DONE

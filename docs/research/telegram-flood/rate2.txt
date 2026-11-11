@@ -1,0 +1,57 @@
+== C1 send 20K, edit 20K->500
+  #0  H    send  20000 chars  30118 B mixed at   0.00s start   0.002s wall 1794396554465 took  730ms  ok
+  #1  M    send  20000 chars  30118 B mixed at   6.00s start   6.003s wall 1794396560466 took  750ms  ok
+  #2  H    edit  20000 chars  30118 B mixed at   7.00s start   7.003s wall 1794396561466 took  207ms  FLOOD_WAIT 4
+  #3  M    edit    500 chars    847 B mixed at  13.00s start  13.001s wall 1794396567464 took  237ms  ok
+  #4  H    edit  20000 chars  30118 B mixed at  14.00s start  14.003s wall 1794396568466 took  230ms  ok
+
+== C2 send 500, edit 500->20K
+  #0  H    send  20000 chars  30118 B mixed at   0.00s start   0.002s wall 1794396633907 took  726ms  ok
+  #1  M    send    500 chars    847 B mixed at   6.00s start   6.001s wall 1794396639906 took  851ms  ok
+  #2  H    edit  20000 chars  30118 B mixed at   7.00s start   7.003s wall 1794396640907 took  238ms  ok
+  #3  M    edit  20000 chars  30118 B mixed at  13.00s start  13.002s wall 1794396646907 took  249ms  ok
+  #4  H    edit  20000 chars  30118 B mixed at  14.00s start  14.002s wall 1794396647907 took  216ms  FLOOD_WAIT 4
+
+== C3 mixed 8.5K
+  #0  H    send  20000 chars  30105 B mixed at   0.00s start   0.002s wall 1794396713339 took  705ms  ok
+  #1  M    send   8500 chars  12839 B mixed at   6.00s start   6.002s wall 1794396719338 took  715ms  ok
+  #2  H    edit  20000 chars  30105 B mixed at   7.00s start   7.002s wall 1794396720339 took  207ms  FLOOD_WAIT 4
+  #3  M    edit   8500 chars  12839 B mixed at  13.00s start  13.002s wall 1794396726338 took  248ms  ok
+  #4  H    edit  20000 chars  30105 B mixed at  14.00s start  14.003s wall 1794396727339 took  212ms  FLOOD_WAIT 4
+
+== C4 mixed 9K
+  #0  H    send  20000 chars  30103 B mixed at   0.00s start   0.002s wall 1794396792770 took  716ms  ok
+  #1  M    send   9000 chars  13593 B mixed at   6.00s start   6.006s wall 1794396798775 took  686ms  ok
+  #2  H    edit  20000 chars  30103 B mixed at   7.00s start   7.003s wall 1794396799771 took  200ms  FLOOD_WAIT 4
+  #3  M    edit   9000 chars  13593 B mixed at  13.00s start  13.002s wall 1794396805770 took  224ms  ok
+  #4  H    edit  20000 chars  30103 B mixed at  14.00s start  14.003s wall 1794396806771 took  202ms  FLOOD_WAIT 4
+
+== C5 mixed 9.5K
+  #0  H    send  20000 chars  30105 B mixed at   0.00s start   0.002s wall 1794396872172 took  718ms  ok
+  #1  M    send   9500 chars  14351 B mixed at   6.00s start   6.002s wall 1794396878171 took  756ms  ok
+  #2  H    edit  20000 chars  30105 B mixed at   7.00s start   7.002s wall 1794396879171 took  208ms  FLOOD_WAIT 4
+  #3  M    edit   9500 chars  14351 B mixed at  13.00s start  13.004s wall 1794396885173 took  232ms  ok
+  #4  H    edit  20000 chars  30105 B mixed at  14.00s start  14.002s wall 1794396886172 took  204ms  FLOOD_WAIT 4
+
+== C6 ascii 10K
+  #0  H    send  20000 chars  30104 B mixed at   0.00s start   0.002s wall 1794396951578 took  963ms  ok
+  #1  M    send  10000 chars  10083 B ascii at   6.00s start   6.001s wall 1794396957577 took  722ms  ok
+  #2  H    edit  20000 chars  30104 B mixed at   7.00s start   7.002s wall 1794396958578 took  200ms  FLOOD_WAIT 4
+  #3  M    edit  10000 chars  10083 B ascii at  13.00s start  13.001s wall 1794396964577 took  229ms  ok
+  #4  H    edit  20000 chars  30104 B mixed at  14.00s start  14.002s wall 1794396965578 took  207ms  FLOOD_WAIT 4
+
+== C7 cjk 4K
+  #0  H    send  20000 chars  30101 B mixed at   0.00s start   0.002s wall 1794397031007 took  701ms  ok
+  #1  M    send   4000 chars  12076 B cjk   at   6.00s start   6.001s wall 1794397037006 took  699ms  ok
+  #2  H    edit  20000 chars  30101 B mixed at   7.00s start   7.002s wall 1794397038007 took  209ms  FLOOD_WAIT 4
+  #3  M    edit   4000 chars  12076 B cjk   at  13.00s start  13.001s wall 1794397044006 took  253ms  ok
+  #4  H    edit  20000 chars  30101 B mixed at  14.00s start  14.002s wall 1794397045007 took  246ms  ok
+
+== C8 cjk 5K
+  #0  H    send  20000 chars  30101 B mixed at   0.00s start   0.002s wall 1794397110461 took  760ms  ok
+  #1  M    send   5000 chars  15077 B cjk   at   6.00s start   6.002s wall 1794397116460 took  706ms  ok
+  #2  H    edit  20000 chars  30101 B mixed at   7.00s start   7.002s wall 1794397117461 took  201ms  FLOOD_WAIT 4
+  #3  M    edit   5000 chars  15077 B cjk   at  13.00s start  13.001s wall 1794397123460 took  275ms  ok
+  #4  H    edit  20000 chars  30101 B mixed at  14.00s start  14.002s wall 1794397124461 took  273ms  ok
+
+DONE

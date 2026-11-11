@@ -1,0 +1,92 @@
+== T1 two long (A,B) alternate 3.5s
+  #0  A    send  20000 chars  30124 B mixed at   0.00s start   0.002s took  724ms  ok
+  #1  B    send  20000 chars  30124 B mixed at   3.50s start   3.509s took  199ms  FLOOD_WAIT 3
+  #2  A    edit  20000 chars  30124 B mixed at   7.00s start   7.711s took  236ms  ok
+  #3  B    edit  20000 chars  30124 B mixed at  10.50s start  10.503s took    0ms  ERROR bad step edit on B
+  #4  A    edit  20000 chars  30124 B mixed at  14.00s start  14.003s took  250ms  ok
+  #5  B    edit  20000 chars  30124 B mixed at  17.50s start  17.502s took    0ms  ERROR bad step edit on B
+  #6  A    edit  20000 chars  30124 B mixed at  21.00s start  21.002s took  234ms  ok
+  #7  B    edit  20000 chars  30124 B mixed at  24.50s start  24.502s took    0ms  ERROR bad step edit on B
+  #8  A    edit  20000 chars  30124 B mixed at  28.00s start  28.002s took  303ms  ok
+  #9  B    edit  20000 chars  30124 B mixed at  31.50s start  31.502s took    0ms  ERROR bad step edit on B
+  #10 A    edit  20000 chars  30125 B mixed at  35.00s start  35.002s took  204ms  FLOOD_WAIT 25
+  #11 B    edit  20000 chars  30125 B mixed at  38.50s start  61.208s took    0ms  ERROR bad step edit on B
+  #12 A    edit  20000 chars  30125 B mixed at  42.00s start  61.209s took  237ms  ok
+  #13 B    edit  20000 chars  30125 B mixed at  45.50s start  61.448s took    0ms  ERROR bad step edit on B
+  #14 A    edit  20000 chars  30125 B mixed at  49.00s start  61.449s took  204ms  FLOOD_WAIT 4
+  #15 B    edit  20000 chars  30125 B mixed at  52.50s start  66.654s took    0ms  ERROR bad step edit on B
+  #16 A    edit  20000 chars  30125 B mixed at  56.00s start  66.656s took  238ms  ok
+  #17 B    edit  20000 chars  30125 B mixed at  59.50s start  66.895s took    0ms  ERROR bad step edit on B
+  #18 A    edit  20000 chars  30125 B mixed at  63.00s start  66.896s took  213ms  FLOOD_WAIT 5
+  #19 B    edit  20000 chars  30125 B mixed at  66.50s start  73.111s took    0ms  ERROR bad step edit on B
+  #20 A    edit  20000 chars  30125 B mixed at  70.00s start  73.112s took  226ms  ok
+
+== T2 long A + short s alternate 3.5s
+  #0  A    send  20000 chars  30126 B mixed at   0.00s start   0.002s took  729ms  ok
+  #1  s    send    500 chars    855 B mixed at   3.50s start   3.507s took  682ms  ok
+  #2  A    edit  20000 chars  30126 B mixed at   7.00s start   7.003s took  259ms  ok
+  #3  s    edit    500 chars    855 B mixed at  10.50s start  10.502s took  217ms  ok
+  #4  A    edit  20000 chars  30126 B mixed at  14.00s start  14.006s took  293ms  ok
+  #5  s    edit    500 chars    855 B mixed at  17.50s start  17.502s took  213ms  ok
+  #6  A    edit  20000 chars  30126 B mixed at  21.00s start  21.003s took  257ms  ok
+  #7  s    edit    500 chars    855 B mixed at  24.50s start  24.501s took  230ms  ok
+  #8  A    edit  20000 chars  30126 B mixed at  28.00s start  28.003s took  204ms  FLOOD_WAIT 32
+  #9  s    edit    500 chars    855 B mixed at  31.50s start  61.209s took  219ms  ok
+  #10 A    edit  20000 chars  30127 B mixed at  35.00s start  61.429s took  250ms  ok
+  #11 s    edit    500 chars    856 B mixed at  38.50s start  61.680s took  218ms  ok
+  #12 A    edit  20000 chars  30127 B mixed at  42.00s start  61.900s took  203ms  FLOOD_WAIT 4
+  #13 s    edit    500 chars    856 B mixed at  45.50s start  67.105s took  221ms  ok
+  #14 A    edit  20000 chars  30127 B mixed at  49.00s start  67.328s took  230ms  ok
+  #15 s    edit    500 chars    856 B mixed at  52.50s start  67.558s took  212ms  ok
+  #16 A    edit  20000 chars  30127 B mixed at  56.00s start  67.772s took  203ms  FLOOD_WAIT 4
+  #17 s    edit    500 chars    856 B mixed at  59.50s start  72.976s took  213ms  ok
+  #18 A    edit  20000 chars  30127 B mixed at  63.00s start  73.191s took  237ms  ok
+  #19 s    edit    500 chars    856 B mixed at  66.50s start  73.429s took  215ms  ok
+  #20 A    edit  20000 chars  30127 B mixed at  70.00s start  73.645s took  200ms  FLOOD_WAIT 5
+
+== T3 short every 1s
+  #0  s    send    500 chars    838 B mixed at   0.00s start   0.001s took  743ms  ok
+  #1  s    edit    500 chars    838 B mixed at   1.00s start   1.001s took  238ms  ok
+  #2  s    edit    500 chars    838 B mixed at   2.00s start   2.001s took  234ms  ok
+  #3  s    edit    500 chars    838 B mixed at   3.00s start   3.001s took  280ms  ok
+  #4  s    edit    500 chars    838 B mixed at   4.00s start   4.000s took  238ms  ok
+  #5  s    edit    500 chars    838 B mixed at   5.00s start   5.001s took  267ms  ok
+  #6  s    edit    500 chars    838 B mixed at   6.00s start   6.001s took  225ms  ok
+  #7  s    edit    500 chars    838 B mixed at   7.00s start   7.001s took  219ms  ok
+  #8  s    edit    500 chars    838 B mixed at   8.00s start   8.001s took  230ms  ok
+  #9  s    edit    500 chars    838 B mixed at   9.00s start   9.001s took  224ms  ok
+  #10 s    edit    500 chars    839 B mixed at  10.00s start  10.001s took  197ms  FLOOD_WAIT 3
+  #11 s    edit    500 chars    839 B mixed at  11.00s start  14.200s took  213ms  ok
+  #12 s    edit    500 chars    839 B mixed at  12.00s start  14.414s took  213ms  ok
+  #13 s    edit    500 chars    839 B mixed at  13.00s start  14.627s took  225ms  ok
+  #14 s    edit    500 chars    839 B mixed at  14.00s start  14.852s took  232ms  ok
+  #15 s    edit    500 chars    839 B mixed at  15.00s start  15.085s took  225ms  ok
+  #16 s    edit    500 chars    839 B mixed at  16.00s start  16.001s took  195ms  FLOOD_WAIT 3
+  #17 s    edit    500 chars    839 B mixed at  17.00s start  20.198s took  209ms  ok
+  #18 s    edit    500 chars    839 B mixed at  18.00s start  20.407s took  213ms  ok
+  #19 s    edit    500 chars    839 B mixed at  19.00s start  20.621s took  228ms  ok
+  #20 s    edit    500 chars    839 B mixed at  20.00s start  20.849s took  274ms  ok
+  #21 s    edit    500 chars    839 B mixed at  21.00s start  21.124s took  235ms  ok
+  #22 s    edit    500 chars    839 B mixed at  22.00s start  22.001s took  190ms  FLOOD_WAIT 38
+  #23 s    edit    500 chars    839 B mixed at  23.00s start  61.193s took  234ms  ok
+  #24 s    edit    500 chars    839 B mixed at  24.00s start  61.428s took  217ms  ok
+  #25 s    edit    500 chars    839 B mixed at  25.00s start  61.646s took  214ms  ok
+  #26 s    edit    500 chars    839 B mixed at  26.00s start  61.860s took  210ms  ok
+  #27 s    edit    500 chars    839 B mixed at  27.00s start  62.070s took  210ms  ok
+  #28 s    edit    500 chars    839 B mixed at  28.00s start  62.281s took  193ms  FLOOD_WAIT 4
+  #29 s    edit    500 chars    839 B mixed at  29.00s start  67.476s took  207ms  ok
+  #30 s    edit    500 chars    839 B mixed at  30.00s start  67.683s took  218ms  ok
+
+== T4 long every 8s
+  #0  A    send  20000 chars  30108 B mixed at   0.00s start   0.002s took  706ms  ok
+  #1  A    edit  20000 chars  30108 B mixed at   8.00s start   8.002s took  239ms  ok
+  #2  A    edit  20000 chars  30108 B mixed at  16.00s start  16.002s took  237ms  ok
+  #3  A    edit  20000 chars  30108 B mixed at  24.00s start  24.002s took  236ms  ok
+  #4  A    edit  20000 chars  30108 B mixed at  32.00s start  32.002s took  247ms  ok
+  #5  A    edit  20000 chars  30108 B mixed at  40.00s start  40.002s took  202ms  FLOOD_WAIT 20
+  #6  A    edit  20000 chars  30108 B mixed at  48.00s start  61.206s took  239ms  ok
+  #7  A    edit  20000 chars  30108 B mixed at  56.00s start  61.447s took  202ms  FLOOD_WAIT 5
+  #8  A    edit  20000 chars  30108 B mixed at  64.00s start  67.651s took  235ms  ok
+  #9  A    edit  20000 chars  30108 B mixed at  72.00s start  72.002s took  204ms  FLOOD_WAIT 3
+
+DONE

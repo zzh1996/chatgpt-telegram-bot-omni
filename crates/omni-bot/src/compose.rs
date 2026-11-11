@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use omni_core::Usage;
-use omni_core::content::{Part, ReasoningKind, ToolCall};
+use omni_core::content::{Citation, Part, ReasoningKind, ToolCall};
 use omni_llm::LlmError;
 use omni_markdown::rich::{self, RBlock, RItem, RText, RichLimits};
 use omni_markdown::{EntityKind, Formatted, Mode};
@@ -34,8 +34,18 @@ pub enum Status {
     Retrying {
         in_secs: u64,
     },
-    /// Interrupted by a bot restart.
-    Interrupted,
+}
+
+/// An earlier attempt of the same reply (failed or interrupted): shown folded
+/// above the current attempt, in order, in the same messages.
+#[derive(Debug, Clone)]
+pub struct PriorAttempt {
+    pub n: i64,
+    pub parts: Vec<Part>,
+    pub error: Option<LlmError>,
+    pub interrupted: bool,
+    pub usage: Option<Usage>,
+    pub elapsed: Option<Duration>,
 }
 
 pub struct ComposeInput<'a> {
@@ -66,6 +76,8 @@ pub struct ComposeInput<'a> {
     /// What the request actually asks for (effort, user options expanded), from
     /// the request body; empty when no request was built.
     pub settings: &'a [String],
+    /// Earlier attempts of this reply, oldest first.
+    pub prior: &'a [PriorAttempt],
 }
 
 /// The model output of `parts` as Markdown, exactly (reasoning in HTML comments).
@@ -113,7 +125,10 @@ fn fmt_tokens(n: u64) -> String {
 }
 
 pub fn fmt_cost(c: f64) -> String {
-    if c >= 1.0 {
+    if c == 0.0 {
+        // Also -0.0, which is what an empty f64 sum gives.
+        "$0".to_string()
+    } else if c >= 1.0 {
         format!("${c:.2}")
     } else if c >= 0.01 {
         format!("${c:.3}")
@@ -126,136 +141,227 @@ fn ai_blocks(md: &str, raw: bool, base_depth: usize) -> Vec<RBlock> {
     if raw { rich::raw_markdown_blocks(md) } else { rich::markdown_to_blocks(md, base_depth, RichLimits::TELEGRAM) }
 }
 
+/// Whether a part shows up in the reply (something "after" a reasoning block).
+fn visible(p: &Part) -> bool {
+    match p {
+        Part::Reasoning(r) => r.text.as_deref().is_some_and(|t| !t.is_empty()),
+        Part::Text { text, citations } => !text.trim().is_empty() || !citations.is_empty(),
+        Part::ToolCall(_) | Part::Refusal { .. } => true,
+        Part::Image { generated, .. } => *generated,
+        _ => false,
+    }
+}
+
+fn tool_item(t: &ToolCall) -> RItem {
+    let mut s = t.name.clone();
+    if let Some(st) = &t.status {
+        s.push_str(&format!(" [{st}]"));
+    }
+    let mut blocks = vec![RBlock::Paragraph(RText::bold(RText::plain(s)))];
+    if let Some(i) = &t.input {
+        blocks.push(RBlock::Pre { text: pretty(i), language: "json".into() });
+    }
+    if let Some(o) = &t.output {
+        blocks.push(RBlock::Pre { text: pretty(o), language: "json".into() });
+    }
+    RItem { checkbox: None, blocks }
+}
+
+/// Emit the pending answer text, followed by the sources it cites.
+fn flush_answer(out: &mut Vec<RBlock>, answer: &mut String, citations: &mut Vec<Citation>, raw: bool, depth: usize) {
+    if !answer.trim().is_empty() {
+        out.extend(ai_blocks(answer, raw, depth));
+    }
+    answer.clear();
+    let mut seen = std::collections::HashSet::new();
+    let sources: Vec<Citation> =
+        citations.drain(..).filter(|c| c.url.as_ref().is_some_and(|u| seen.insert(u.clone()))).collect();
+    if sources.is_empty() {
+        return;
+    }
+    let items = sources
+        .iter()
+        .map(|c| {
+            let url = c.url.clone().unwrap_or_default();
+            let title = c.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| url.clone());
+            let link = if omni_markdown::render::is_safe_url(&url) {
+                RText::Url { text: Box::new(RText::plain(title)), url }
+            } else {
+                RText::plain(title)
+            };
+            RItem { checkbox: None, blocks: vec![RBlock::Paragraph(link)] }
+        })
+        .collect();
+    out.push(RBlock::Details {
+        open: false,
+        title: RText::plain(format!("📚 Sources · {}", sources.len())),
+        blocks: vec![RBlock::OrderedList { start: 1, items }],
+    });
+}
+
+/// The model's output, strictly in the order it was produced: reasoning, tool
+/// calls, answer text, generated images, refusals. Only adjacent parts of one
+/// kind are joined into a block; nothing is moved past anything else. Sources
+/// follow the answer text they belong to. `depth`: nesting of the output
+/// (0 at the top of the message, 1 inside an earlier attempt's block).
+fn output_blocks(parts: &[Part], raw: bool, depth: usize, generating: bool) -> Vec<RBlock> {
+    let mut out = Vec::new();
+    let mut answer = String::new();
+    let mut citations: Vec<Citation> = Vec::new();
+    let mut i = 0;
+    while i < parts.len() {
+        match &parts[i] {
+            Part::Reasoning(_) => {
+                let mut text = String::new();
+                let mut kinds = Vec::new();
+                while let Some(Part::Reasoning(r)) = parts.get(i) {
+                    match &r.text {
+                        Some(t) if !t.is_empty() => {
+                            if !text.is_empty() {
+                                text.push_str("\n\n");
+                            }
+                            text.push_str(t);
+                            if !kinds.contains(&r.kind) {
+                                kinds.push(r.kind);
+                            }
+                        }
+                        // Reasoning that was not returned (encrypted, redacted): nothing to show.
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if !text.is_empty() {
+                    flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                    let what =
+                        if kinds.iter().all(|k| *k == ReasoningKind::Summary) { "Reasoning summary" } else { "Reasoning" };
+                    // Open only while the model is thinking: nothing has come after it yet.
+                    let open = generating && !parts[i..].iter().any(visible);
+                    out.push(RBlock::Details {
+                        open,
+                        title: RText::plain(format!("💭 {what}")),
+                        blocks: ai_blocks(&text, raw, depth + 1),
+                    });
+                }
+            }
+            Part::ToolCall(_) => {
+                flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                let mut items = Vec::new();
+                while let Some(Part::ToolCall(t)) = parts.get(i) {
+                    items.push(tool_item(t));
+                    i += 1;
+                }
+                out.push(RBlock::Details {
+                    open: false,
+                    title: RText::plain(format!("🔧 Tool calls · {}", items.len())),
+                    blocks: vec![RBlock::List { items }],
+                });
+            }
+            Part::Text { text, citations: c } => {
+                answer.push_str(text);
+                citations.extend(c.iter().cloned());
+                i += 1;
+            }
+            Part::Image { blob, generated: true, dims, .. } => {
+                flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                out.push(RBlock::Photo { key: blob.sha256.clone(), caption: RText::plain(image_caption(blob, *dims)) });
+                i += 1;
+            }
+            Part::Refusal { text } => {
+                flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                out.push(RBlock::Details {
+                    open: true,
+                    title: RText::plain("⛔ Refusal"),
+                    blocks: vec![RBlock::Paragraph(RText::plain(text.clone()))],
+                });
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+    out
+}
+
+/// An earlier attempt of this reply: its output and error, folded.
+fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool) -> RBlock {
+    let title = if a.interrupted {
+        format!("⚠️ Attempt {} interrupted by a bot restart", a.n)
+    } else if let Some(e) = &a.error {
+        format!("⚠️ Attempt {} failed: {e}", a.n)
+    } else {
+        format!("⚠️ Attempt {} failed", a.n)
+    };
+    let mut blocks = output_blocks(&a.parts, raw, 1, false);
+    if let Some(d) = a.error.as_ref().and_then(|e| e.details.as_ref()) {
+        blocks.push(RBlock::Pre { text: pretty(&error_shown(d)), language: "json".into() });
+    }
+    let mut f = Vec::new();
+    if show_usage && let Some(u) = &a.usage {
+        f.extend(usage_parts(u));
+    }
+    if let Some(t) = a.elapsed.filter(|t| !t.is_zero()) {
+        f.push(format!("{:.1}s", t.as_secs_f64()));
+    }
+    if !f.is_empty() {
+        blocks.push(RBlock::Footer(RText::plain(f.join(" · "))));
+    }
+    if blocks.is_empty() {
+        blocks.push(RBlock::Footer(RText::plain("no output")));
+    }
+    RBlock::Details { open: false, title: RText::plain(title), blocks }
+}
+
+/// Usage in words: input (cache), output (reasoning), cost.
+fn usage_parts(u: &Usage) -> Vec<String> {
+    let mut f = Vec::new();
+    if let Some(x) = u.input_tokens {
+        let mut s = format!("in {}", fmt_tokens(x));
+        let mut cache = Vec::new();
+        if let Some(c) = u.cached_input_tokens.filter(|c| *c > 0) {
+            cache.push(format!("cached {}", fmt_tokens(c)));
+        }
+        if let Some(c) = u.cache_write_tokens.filter(|c| *c > 0) {
+            cache.push(format!("cache write {}", fmt_tokens(c)));
+        }
+        if !cache.is_empty() {
+            s.push_str(&format!(" ({})", cache.join(", ")));
+        }
+        f.push(s);
+    }
+    if let Some(x) = u.output_tokens {
+        let mut s = format!("out {}", fmt_tokens(x));
+        // A total for the whole reply: providers do not count reasoning per block.
+        if let Some(r) = u.reasoning_tokens.filter(|r| *r > 0) {
+            s.push_str(&format!(" (reasoning {})", fmt_tokens(r)));
+        }
+        f.push(s);
+    }
+    if let Some(c) = u.cost_usd {
+        f.push(fmt_cost(c));
+    }
+    f
+}
+
 pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     let raw = inp.raw_ai || inp.mode == Mode::Raw;
     let finished = inp.status != Status::Generating;
     let mut out = vec![header(inp.model, None)];
 
-    // 2. reasoning
-    let mut reasoning = String::new();
-    let mut kinds = Vec::new();
-    let mut opaque = None;
-    for p in inp.parts {
-        if let Part::Reasoning(r) = p {
-            match &r.text {
-                Some(t) if !t.is_empty() => {
-                    if !reasoning.is_empty() {
-                        reasoning.push_str("\n\n");
-                    }
-                    reasoning.push_str(t);
-                    if !kinds.contains(&r.kind) {
-                        kinds.push(r.kind);
-                    }
-                }
-                _ => opaque = Some(r.kind),
-            }
-        }
+    // 2. earlier attempts of this reply (failed or interrupted), oldest first, folded.
+    for a in inp.prior {
+        out.push(prior_block(a, raw, inp.show_usage));
     }
-    let reasoning_tokens = inp.usage.and_then(|u| u.reasoning_tokens).filter(|r| *r > 0);
-    let has_answer = inp.parts.iter().any(|p| matches!(p, Part::Text { text, .. } if !text.trim().is_empty()));
-    let mut tokens_in_title = false;
-    if !reasoning.is_empty() {
-        let what = if kinds.iter().all(|k| *k == ReasoningKind::Summary) { "Reasoning summary" } else { "Reasoning" };
-        let mut title = format!("💭 {what}");
-        if finished && let Some(r) = reasoning_tokens {
-            title.push_str(&format!(" · {} tokens", fmt_tokens(r)));
-            tokens_in_title = true;
-        }
-        let open = inp.status == Status::Generating && !has_answer;
-        out.push(RBlock::Details { open, title: RText::plain(title), blocks: ai_blocks(&reasoning, raw, 1) });
-    }
+    // 3. this attempt's output, in the order it was produced.
+    out.extend(output_blocks(inp.parts, raw, 0, inp.status == Status::Generating));
 
-    // 3. tool calls
-    let tools: Vec<&ToolCall> =
-        inp.parts.iter().filter_map(|p| if let Part::ToolCall(t) = p { Some(t) } else { None }).collect();
-    if !tools.is_empty() {
-        let items = tools
-            .iter()
-            .map(|t| {
-                let mut s = t.name.clone();
-                if let Some(st) = &t.status {
-                    s.push_str(&format!(" [{st}]"));
-                }
-                let mut blocks = vec![RBlock::Paragraph(RText::bold(RText::plain(s)))];
-                if let Some(i) = &t.input {
-                    blocks.push(RBlock::Pre { text: pretty(i), language: "json".into() });
-                }
-                if let Some(o) = &t.output {
-                    blocks.push(RBlock::Pre { text: pretty(o), language: "json".into() });
-                }
-                RItem { checkbox: None, blocks }
-            })
-            .collect();
-        out.push(RBlock::Details {
-            open: false,
-            title: RText::plain(format!("🔧 Tool calls · {}", tools.len())),
-            blocks: vec![RBlock::List { items }],
-        });
-    }
-
-    // 4. answer, with generated images in the place the model put them
-    //    (and refusals, which are model output but not the answer)
-    let mut answer = String::new();
-    let mut citations = Vec::new();
-    for p in inp.parts {
-        match p {
-            Part::Text { text, citations: c } => {
-                answer.push_str(text);
-                citations.extend(c.iter().cloned());
-            }
-            Part::Image { blob, generated: true, dims, .. } => {
-                if !answer.trim().is_empty() {
-                    out.extend(ai_blocks(&answer, raw, 0));
-                }
-                answer.clear();
-                out.push(RBlock::Photo { key: blob.sha256.clone(), caption: RText::plain(image_caption(blob, *dims)) });
-            }
-            Part::Refusal { text } => out.push(RBlock::Details {
-                open: true,
-                title: RText::plain("⛔ Refusal"),
-                blocks: vec![RBlock::Paragraph(RText::plain(text.clone()))],
-            }),
-            _ => {}
-        }
-    }
-    if !answer.trim().is_empty() {
-        out.extend(ai_blocks(&answer, raw, 0));
-    }
-
-    // 5. sources
-    let mut seen = std::collections::HashSet::new();
-    let sources: Vec<_> =
-        citations.into_iter().filter(|c| c.url.as_ref().is_some_and(|u| seen.insert(u.clone()))).collect();
-    if !sources.is_empty() {
-        let items = sources
-            .iter()
-            .map(|c| {
-                let url = c.url.clone().unwrap_or_default();
-                let title = c.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| url.clone());
-                let link = if omni_markdown::render::is_safe_url(&url) {
-                    RText::Url { text: Box::new(RText::plain(title)), url }
-                } else {
-                    RText::plain(title)
-                };
-                RItem { checkbox: None, blocks: vec![RBlock::Paragraph(link)] }
-            })
-            .collect();
-        out.push(RBlock::Details {
-            open: false,
-            title: RText::plain(format!("📚 Sources · {}", sources.len())),
-            blocks: vec![RBlock::OrderedList { start: 1, items }],
-        });
-    }
-
-    // 6. error: the message in the title; only the parts of the error object
-    //    that carry information beyond it (metadata, upstream raw error…) inside.
+    // 6. error: the message in the title; the complete error object inside.
     if let Some(e) = inp.error {
         let title = format!("⚠️ Error: {e}");
-        match e.details.as_ref().and_then(error_extra) {
+        match &e.details {
             Some(d) => out.push(RBlock::Details {
                 open: false,
                 title: RText::plain(title),
-                blocks: vec![RBlock::Pre { text: pretty(&d), language: "json".into() }],
+                blocks: vec![RBlock::Pre { text: pretty(&error_shown(d)), language: "json".into() }],
             }),
             None => out.push(RBlock::Footer(RText::plain(title))),
         }
@@ -264,8 +370,7 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     // 7. footers: status and notes, then the summary line
     let mut lines: Vec<String> = Vec::new();
     match &inp.status {
-        Status::Retrying { in_secs } => lines.push(format!("🔁 retrying in {in_secs}s — continues in a new message")),
-        Status::Interrupted => lines.push("⚠️ interrupted by a bot restart — retrying in a new message".into()),
+        Status::Retrying { in_secs } => lines.push(format!("🔁 retrying in {in_secs}s")),
         Status::Failed if inp.error.is_none() => lines.push("⚠️ failed".into()),
         Status::Done => {
             if let Some(why) = abnormal_finish(inp.finish_reason) {
@@ -295,44 +400,16 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     }
     if inp.continuation {
         f.push("continued".into());
+    } else if inp.attempt > inp.max_attempts as i64 {
+        // Retried by hand after the automatic attempts ran out.
+        f.push(format!("attempt {}", inp.attempt));
     } else if inp.attempt > 1 {
         f.push(format!("attempt {}/{}", inp.attempt, inp.max_attempts));
     }
-    let hidden = match opaque {
-        Some(_) if !reasoning.is_empty() => None,
-        Some(ReasoningKind::Redacted) => Some("redacted"),
-        Some(_) => Some("not shown"),
-        None => None,
-    };
     if inp.show_usage
         && let Some(u) = inp.usage
     {
-        if let Some(x) = u.input_tokens {
-            let mut s = format!("in {}", fmt_tokens(x));
-            let mut cache = Vec::new();
-            if let Some(c) = u.cached_input_tokens.filter(|c| *c > 0) {
-                cache.push(format!("cached {}", fmt_tokens(c)));
-            }
-            if let Some(c) = u.cache_write_tokens.filter(|c| *c > 0) {
-                cache.push(format!("cache write {}", fmt_tokens(c)));
-            }
-            if !cache.is_empty() {
-                s.push_str(&format!(" ({})", cache.join(", ")));
-            }
-            f.push(s);
-        }
-        if let Some(x) = u.output_tokens {
-            let mut s = format!("out {}", fmt_tokens(x));
-            match (reasoning_tokens, tokens_in_title, hidden) {
-                (Some(r), false, Some(h)) => s.push_str(&format!(" (reasoning {}, {h})", fmt_tokens(r))),
-                (Some(r), false, None) => s.push_str(&format!(" (reasoning {})", fmt_tokens(r))),
-                _ => {}
-            }
-            f.push(s);
-        }
-        if let Some(c) = u.cost_usd {
-            f.push(fmt_cost(c));
-        }
+        f.extend(usage_parts(u));
     }
     if finished && !inp.elapsed.is_zero() {
         f.push(format!("{:.1}s", inp.elapsed.as_secs_f64()));
@@ -376,64 +453,30 @@ pub fn fmt_bytes(n: u64) -> String {
     }
 }
 
-/// What an error object says beyond its message and status. Known shapes
-/// (`{"error": {message, code, metadata}, "user_id"}` from OpenRouter, Ark's
-/// `{code, message, param, type}`, in-band stream chunks) are reduced to the
-/// parts that vary; anything unrecognized is shown whole.
-fn error_extra(details: &Value) -> Option<Value> {
-    let Some(obj) = details.as_object() else {
-        return Some(details.clone());
-    };
-    // Fields that are the same for every error (or noise) at the top level.
-    // (`openrouter_metadata` / `metadata.debug` describe the request, shown by /info.)
-    const OUTER_NOISE: &[&str] = &[
-        "error",
-        "user_id",
-        "id",
-        "object",
-        "created",
-        "model",
-        "choices",
-        "system_fingerprint",
-        "openrouter_metadata",
-    ];
-    const META_NOISE: &[&str] = &["debug", "is_byok"];
-    let (err, outer) = match obj.get("error").and_then(Value::as_object) {
-        Some(e) => (e, Some(obj)),
-        None => (obj, None),
-    };
-    if !err.contains_key("message") {
-        return Some(details.clone());
+/// The complete error object as shown to users: everything the provider and
+/// router returned, except the requester's `user_id` and OpenRouter's echo of
+/// our own request (`metadata.debug`, which can be huge; it is in /info).
+/// A JSON string in `metadata.raw` (the upstream body) is shown parsed.
+fn error_shown(details: &Value) -> Value {
+    let mut d = details.clone();
+    if let Some(o) = d.as_object_mut() {
+        o.remove("user_id");
     }
-    let mut extra = serde_json::Map::new();
-    if let Some(o) = outer {
-        for (k, v) in o {
-            if !OUTER_NOISE.contains(&k.as_str()) {
-                extra.insert(k.clone(), v.clone());
+    for meta in [d.pointer_mut("/error/metadata"), None].into_iter().flatten() {
+        if let Some(m) = meta.as_object_mut() {
+            m.remove("debug");
+            if let Some(raw) = m.get_mut("raw")
+                && let Some(parsed) = raw.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok())
+                && (parsed.is_object() || parsed.is_array())
+            {
+                *raw = parsed;
             }
         }
     }
-    for (k, v) in err {
-        match (k.as_str(), v) {
-            ("message", _) => {}
-            ("code", Value::Number(_)) => {} // the HTTP status, already in the title
-            ("metadata", Value::Object(m)) => {
-                for (mk, mv) in m.iter().filter(|(k, _)| !META_NOISE.contains(&k.as_str())) {
-                    // `raw` is often the upstream error as a JSON string: show it parsed.
-                    let mv = match mv.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                        Some(parsed) if parsed.is_object() || parsed.is_array() => parsed,
-                        _ => mv.clone(),
-                    };
-                    extra.insert(mk.clone(), mv);
-                }
-            }
-            (_, Value::Null) => {}
-            _ => {
-                extra.insert(k.clone(), v.clone());
-            }
-        }
+    if let Some(m) = d.get_mut("metadata").and_then(Value::as_object_mut) {
+        m.remove("debug");
     }
-    (!extra.is_empty()).then_some(Value::Object(extra))
+    d
 }
 
 /// Why a successfully streamed answer may be incomplete, from its finish reason.
@@ -501,7 +544,9 @@ fn write_text(f: &mut Formatted, t: &RText) {
             write_text(f, x);
             f.wrap_from(s, EntityKind::Bold);
         }
-        RText::Italic(x) | RText::Strike(x) | RText::Fixed(x) | RText::Spoiler(x) => write_text(f, x),
+        RText::Italic(x) | RText::Strike(x) | RText::Fixed(x) | RText::Spoiler(x) | RText::Sub(x) | RText::Super(x) => {
+            write_text(f, x)
+        }
         RText::Url { text, .. } => write_text(f, text),
     }
 }
@@ -596,6 +641,7 @@ mod tests {
             continuation: false,
             attachments: &[],
             settings: &[],
+            prior: &[],
         }
     }
 
@@ -625,10 +671,8 @@ mod tests {
         assert!(matches!(&blocks[0], RBlock::Paragraph(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5"));
         let dbg = format!("{blocks:?}");
         assert!(!dbg.contains("Underline") && !dbg.contains("Italic"), "{dbg}");
-        // Reasoning collapsed, with its token count.
-        assert!(
-            matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭 Reasoning · 40 tokens")
-        );
+        // Reasoning collapsed; its token count (a total for the whole reply) is in the footer.
+        assert!(matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭 Reasoning"));
         // The answer follows directly; everything after it is details/footer.
         let answer_end = blocks.iter().rposition(|b| !matches!(b, RBlock::Details { .. } | RBlock::Footer(_))).unwrap();
         for b in &blocks[2..=answer_end] {
@@ -642,7 +686,7 @@ mod tests {
         match blocks.last().unwrap() {
             RBlock::Footer(t) => {
                 let f = t.to_plain();
-                assert!(f.contains("+s") && f.contains("out 50") && !f.contains("reasoning"), "{f}");
+                assert!(f.contains("+s") && f.contains("out 50 (reasoning 40)"), "{f}");
             }
             b => panic!("{b:?}"),
         }
@@ -652,15 +696,14 @@ mod tests {
     fn errors_and_notes_are_never_plain_paragraphs() {
         let parts = vec![Part::text("partial")];
         let mut i = input(&parts, Status::Retrying { in_secs: 10 });
-        let mut e = LlmError::request("boom");
-        e.details = Some(serde_json::json!({"error": {"message": "boom"}}));
+        let e = LlmError::request("boom");
         i.error = Some(&e);
         let notes = vec!["a note".to_string()];
         i.notes = &notes;
         let blocks = compose(&i);
         let tail = &blocks[2..];
         assert!(tail.iter().all(|b| matches!(b, RBlock::Details { .. } | RBlock::Footer(_))), "{tail:?}");
-        // Nothing beyond the message: a small-text line.
+        // No error object at all: a small-text line.
         assert!(tail.iter().any(|b| matches!(b, RBlock::Footer(t) if t.to_plain().starts_with("⚠️ Error"))));
         // With upstream details: collapsible, details inside.
         let mut e2 = LlmError::request("boom");
@@ -675,20 +718,112 @@ mod tests {
     }
 
     #[test]
-    fn error_details_keep_only_what_varies() {
-        let or = serde_json::json!({"error": {"message": "bad temp", "code": 400}, "user_id": "user_x"});
-        assert_eq!(error_extra(&or), None);
-        let or2 = serde_json::json!({"error": {"message": "upstream", "code": 502, "metadata": {"provider_name": "Google", "raw": "{\"error\":{\"status\":\"UNAVAILABLE\"}}"}}, "user_id": "u"});
+    fn errors_are_shown_completely_except_user_id_and_request_echo() {
+        let or = serde_json::json!({
+            "error": {"message": "upstream", "code": 502, "metadata": {
+                "provider_name": "Google", "is_byok": false,
+                "raw": "{\"error\":{\"status\":\"UNAVAILABLE\"}}",
+                "debug": {"echo_upstream_body": {"contents": []}}}},
+            "user_id": "user_x",
+            "openrouter_metadata": {"region": "HEL"}});
         assert_eq!(
-            error_extra(&or2),
-            Some(serde_json::json!({"provider_name": "Google", "raw": {"error": {"status": "UNAVAILABLE"}}}))
+            error_shown(&or),
+            serde_json::json!({
+                "error": {"message": "upstream", "code": 502, "metadata": {
+                    "provider_name": "Google", "is_byok": false, "raw": {"error": {"status": "UNAVAILABLE"}}}},
+                "openrouter_metadata": {"region": "HEL"}})
         );
         let ark = serde_json::json!({"code": "QuotaExceeded", "message": "m", "param": "", "type": "TooManyRequests"});
+        assert_eq!(error_shown(&ark), ark);
+        assert_eq!(error_shown(&serde_json::json!("plain text")), serde_json::json!("plain text"));
+    }
+
+    /// A compact signature of a block, for order checks.
+    fn kind(b: &RBlock) -> String {
+        match b {
+            RBlock::Details { title, open, .. } => {
+                format!("{}{}", title.to_plain().split(' ').next().unwrap_or(""), if *open { "+" } else { "" })
+            }
+            RBlock::Photo { .. } => "photo".into(),
+            RBlock::Footer(_) => "footer".into(),
+            RBlock::Paragraph(t) if t.to_plain().starts_with("🤖") => "header".into(),
+            RBlock::Paragraph(t) => format!("p:{}", t.to_plain()),
+            other => format!("{other:?}").chars().take(12).collect(),
+        }
+    }
+
+    #[test]
+    fn output_is_shown_in_the_order_it_was_produced() {
+        let reasoning =
+            |t: &str| Part::Reasoning(Reasoning { kind: ReasoningKind::Summary, text: Some(t.into()), ..Default::default() });
+        let tool = Part::ToolCall(ToolCall {
+            id: Some("1".into()),
+            name: "web_search".into(),
+            status: Some("completed".into()),
+            ..Default::default()
+        });
+        let cite = Citation { url: Some("https://a.b".into()), title: Some("A".into()), ..Default::default() };
+        let image = Part::Image {
+            blob: omni_core::BlobRef::for_bytes(b"png", "image/png"),
+            filename: None,
+            generated: true,
+            dims: Some((1, 1)),
+        };
+        let parts = vec![
+            reasoning("plan"),
+            reasoning("more plan"),
+            tool.clone(),
+            reasoning("after the search"),
+            Part::Text { text: "first".into(), citations: vec![cite] },
+            image,
+            Part::text("second"),
+            tool,
+        ];
+        let blocks = compose(&input(&parts, Status::Done));
+        let kinds: Vec<String> = blocks.iter().map(kind).collect();
         assert_eq!(
-            error_extra(&ark),
-            Some(serde_json::json!({"code": "QuotaExceeded", "param": "", "type": "TooManyRequests"}))
+            kinds,
+            vec!["header", "💭", "🔧", "💭", "p:first", "📚", "photo", "p:second", "🔧", "footer"],
+            "{blocks:#?}"
         );
-        assert_eq!(error_extra(&serde_json::json!("plain text")), Some(serde_json::json!("plain text")));
+        // Adjacent reasoning parts form one block, in order.
+        assert!(format!("{:?}", blocks[1]).contains("plan") && format!("{:?}", blocks[1]).contains("more plan"));
+
+        // While generating, only reasoning with nothing after it yet is open.
+        let parts = vec![reasoning("a"), Part::text("x"), reasoning("b")];
+        let kinds: Vec<String> = compose(&input(&parts, Status::Generating)).iter().map(kind).collect();
+        assert_eq!(kinds, vec!["header", "💭", "p:x", "💭+", "footer"]);
+    }
+
+    #[test]
+    fn earlier_attempts_are_folded_above_in_order() {
+        let mut e = LlmError::request("boom");
+        e.details = Some(serde_json::json!({"error": {"message": "boom", "metadata": {"provider_name": "X"}}, "user_id": "u"}));
+        let prior = vec![
+            PriorAttempt {
+                n: 1,
+                parts: vec![Part::text("partial answer")],
+                error: Some(e),
+                interrupted: false,
+                usage: Some(Usage { input_tokens: Some(5), output_tokens: Some(7), cost_usd: Some(0.001), ..Default::default() }),
+                elapsed: Some(Duration::from_millis(2500)),
+            },
+            PriorAttempt { n: 2, parts: vec![], error: None, interrupted: true, usage: None, elapsed: None },
+        ];
+        let parts = vec![Part::text("final answer")];
+        let mut i = input(&parts, Status::Done);
+        i.attempt = 3;
+        i.prior = &prior;
+        let blocks = compose(&i);
+        let kinds: Vec<String> = blocks.iter().map(kind).collect();
+        assert_eq!(kinds, vec!["header", "⚠️", "⚠️", "p:final answer", "footer"], "{blocks:#?}");
+        let RBlock::Details { title, blocks: inner, .. } = &blocks[1] else { unreachable!() };
+        assert!(title.to_plain().starts_with("⚠️ Attempt 1 failed: "), "{}", title.to_plain());
+        let inner_dbg = format!("{inner:?}");
+        assert!(inner_dbg.contains("partial answer") && inner_dbg.contains("provider_name") && !inner_dbg.contains("user_id"));
+        assert!(inner_dbg.contains("out 7") && inner_dbg.contains("2.5s"), "{inner_dbg}");
+        assert!(matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "⚠️ Attempt 2 interrupted by a bot restart"));
+        assert!(matches!(blocks.last(), Some(RBlock::Footer(t)) if t.to_plain().contains("attempt 3/4")));
     }
 
     #[test]

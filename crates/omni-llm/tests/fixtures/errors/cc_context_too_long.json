@@ -1,0 +1,38 @@
+{
+ "case": "cc_context_too_long",
+ "endpoint": "chat",
+ "model": "z-ai/glm-4.5-air",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "client"
+ },
+ "body": {
+  "error": {
+   "message": "This endpoint's maximum context length is 131072 tokens. However, you requested about 202500 tokens (202500 of text input). Please reduce the length of either one, or use the context-compression plugin to compress your prompt automatically.",
+   "code": 400,
+   "metadata": {
+    "provider_name": null
+   }
+  },
+  "openrouter_metadata": {
+   "requested": "z-ai/glm-4.5-air",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=1",
+   "attempt": 0,
+   "is_byok": false,
+   "endpoints": {
+    "total": 3,
+    "available": [
+     {
+      "provider": "Z.AI",
+      "model": "z-ai/glm-4.5-air",
+      "selected": false
+     }
+    ]
+   }
+  }
+ }
+}

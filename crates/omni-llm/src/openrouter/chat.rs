@@ -335,6 +335,16 @@ impl ChunkParser {
             }
             let fr = choice.get("finish_reason").and_then(Value::as_str).map(str::to_string);
             let nfr = choice.get("native_finish_reason").and_then(Value::as_str).map(str::to_string);
+            if matches!(fr.as_deref(), Some("content_filter" | "error")) {
+                // The provider's account of the stop, verbatim (without the content itself).
+                let mut c = choice.clone();
+                if let Some(o) = c.as_object_mut() {
+                    for k in ["delta", "message", "logprobs"] {
+                        o.remove(k);
+                    }
+                }
+                evs.push(StreamEvent::FinishDetails(c));
+            }
             if fr.is_some() || nfr.is_some() {
                 self.finished = true;
                 evs.push(StreamEvent::Finish { reason: fr, native: nfr });

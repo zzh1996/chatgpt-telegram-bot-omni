@@ -1,0 +1,33 @@
+== pause (let the previous file's windows run out)
+
+== I20 light, 20 s idle, then 5 heavy ops
+  #0  s    send      500 chars    859 B    594 cp mixed  at   0.00s start   0.001s wall 1794403370557 took  693ms  ok
+  #1  H    send    20000 chars  30130 B  20105 cp mixed  at  20.00s start  20.003s wall 1794403390558 took  733ms  ok
+  #2  H    edit    20000 chars  30130 B  20105 cp mixed  at  26.00s start  26.003s wall 1794403396558 took  268ms  ok
+  #3  H    edit    20000 chars  30130 B  20105 cp mixed  at  32.00s start  32.002s wall 1794403402557 took  231ms  ok
+  #4  H    edit    20000 chars  30130 B  20105 cp mixed  at  38.00s start  38.003s wall 1794403408558 took  315ms  ok
+  #5  H    edit    20000 chars  30130 B  20105 cp mixed  at  44.00s start  44.005s wall 1794403414560 took  219ms  FLOOD_WAIT 16
+  read H    20092 cp stored, 3 top-level blocks, ends "ars"
+  read s    590 cp stored, 3 top-level blocks, ends "ars"
+
+== I25 light, 25 s idle, then 5 heavy ops
+  #0  s    send      500 chars    859 B    594 cp mixed  at   0.00s start   0.001s wall 1794403477415 took  724ms  ok
+  #1  H    send    20000 chars  30130 B  20105 cp mixed  at  25.00s start  25.003s wall 1794403502417 took  744ms  ok
+  #2  H    edit    20000 chars  30130 B  20105 cp mixed  at  31.00s start  31.003s wall 1794403508417 took  270ms  ok
+  #3  H    edit    20000 chars  30130 B  20105 cp mixed  at  37.00s start  37.003s wall 1794403514417 took  338ms  ok
+  #4  H    edit    20000 chars  30130 B  20105 cp mixed  at  43.00s start  43.003s wall 1794403520417 took  230ms  ok
+  #5  H    edit    20000 chars  30130 B  20105 cp mixed  at  49.00s start  49.003s wall 1794403526417 took  199ms  FLOOD_WAIT 11
+  read H    20092 cp stored, 3 top-level blocks, ends "ars"
+  read s    590 cp stored, 3 top-level blocks, ends "ars"
+
+== I30 light, 30 s idle, then 5 heavy ops
+  #0  s    send      500 chars    859 B    594 cp mixed  at   0.00s start   0.001s wall 1794403589230 took  777ms  ok
+  #1  H    send    20000 chars  30130 B  20105 cp mixed  at  30.00s start  30.003s wall 1794403619232 took  767ms  ok
+  #2  H    edit    20000 chars  30130 B  20105 cp mixed  at  36.00s start  36.003s wall 1794403625232 took  237ms  ok
+  #3  H    edit    20000 chars  30130 B  20105 cp mixed  at  42.00s start  42.002s wall 1794403631231 took  255ms  ok
+  #4  H    edit    20000 chars  30130 B  20105 cp mixed  at  48.00s start  48.003s wall 1794403637232 took  252ms  ok
+  #5  H    edit    20000 chars  30130 B  20105 cp mixed  at  54.00s start  54.002s wall 1794403643231 took  203ms  FLOOD_WAIT 6
+  read H    20092 cp stored, 3 top-level blocks, ends "ars"
+  read s    590 cp stored, 3 top-level blocks, ends "ars"
+
+DONE

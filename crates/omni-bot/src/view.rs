@@ -1,13 +1,20 @@
 //! A reply view: keeps the Telegram messages of one attempt in sync with the
-//! latest render state.
+//! newest render state.
 //!
-//! Updates are coalesced (only the newest state is ever rendered) and all
-//! operations go through the per-chat gate, so many concurrent streams in one
-//! group share the rate budget fairly (FIFO).
+//! The generation side keeps a buffer with the newest version of the reply
+//! up to date (a `watch` channel: every token updates it). The view queues for
+//! a slot of the chat's gate, and only once it has the slot does it read the
+//! buffer and render, so every message operation carries the newest content.
+//! Each operation is weighed (see [`crate::tg::flood`]) and the gate starts it
+//! only when Telegram's budget has room. Finished replies go first, then the
+//! first message of a new reply, then updates of replies still being
+//! generated, each at its own pace: young replies often, long-running ones
+//! less often (see [`pace`] and [`crate::tg::gate`]).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use grammers_tl_types as tl;
 use omni_core::{Part, Usage};
 use omni_llm::LlmError;
 use omni_markdown::Mode;
@@ -16,10 +23,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::app::App;
-use crate::compose::{self, ComposeInput, Status};
+use crate::compose::{self, ComposeInput, PriorAttempt, Status};
 use crate::conv;
 use crate::tg::bot::BotConn;
-use crate::tg::outbox::{self, Content, Link, SendError, SendReq};
+use crate::tg::flood::{self, Shape, Weight};
+use crate::tg::gate::{Ask, Class, GatePermit};
+use crate::tg::outbox::{self, Content, Link, OpError, SendReq};
 use crate::tg::rich::RichMedia;
 use crate::tg::upload::{self, Source, Want};
 
@@ -38,6 +47,8 @@ pub struct RenderState {
     pub native_finish_reason: Option<String>,
     pub notes: Vec<String>,
     pub started: Instant,
+    /// When this version was made: the time shown while generating.
+    pub as_of: Instant,
     pub elapsed_override: Option<Duration>,
     /// Completed long-decode continuation hops.
     pub hops: u32,
@@ -49,6 +60,10 @@ pub struct RenderState {
     pub settings: Vec<String>,
     pub show_usage: bool,
     pub mode: Mode,
+    /// Earlier attempts of this reply (shown above, in the same messages).
+    pub prior: Vec<PriorAttempt>,
+    /// The reply finally failed: a "🔁 Retry" button under its last message.
+    pub retry_button: bool,
     /// Final state: sync it and stop.
     pub done: bool,
 }
@@ -68,7 +83,7 @@ impl RenderState {
             finish_reason: self.finish_reason.as_deref(),
             native_finish_reason: self.native_finish_reason.as_deref(),
             notes: &self.notes,
-            elapsed: self.elapsed_override.unwrap_or_else(|| self.started.elapsed()),
+            elapsed: self.elapsed_override.unwrap_or_else(|| self.as_of.saturating_duration_since(self.started)),
             show_usage: self.show_usage,
             mode: self.mode,
             raw_ai,
@@ -76,6 +91,7 @@ impl RenderState {
             continuation: self.continuation,
             attachments: &self.attachments.iter().map(|a| a.key.clone()).collect::<Vec<_>>(),
             settings: &self.settings,
+            prior: &self.prior,
         })
     }
 }
@@ -89,7 +105,7 @@ pub struct Attachment {
 }
 
 pub struct ReplyView {
-    tx: watch::Sender<Option<RenderState>>,
+    tx: Arc<watch::Sender<Option<RenderState>>>,
     task: JoinHandle<Vec<i32>>,
 }
 
@@ -111,13 +127,27 @@ impl ReplyView {
         attempt_id: i64,
         first_delay: Duration,
     ) -> Self {
-        let (tx, rx) = watch::channel::<Option<RenderState>>(None);
-        let task = tokio::spawn(sync_loop(app, bot, chat_id, reply_to, turn_id, attempt_id, rx, first_delay));
+        let tx = Arc::new(watch::channel::<Option<RenderState>>(None).0);
+        let rx = tx.subscribe();
+        let ctx = Ctx { app, bot, chat_id, turn_id, attempt_id, tx: Arc::downgrade(&tx) };
+        let task = tokio::spawn(sync_loop(ctx, reply_to, rx, first_delay));
         Self { tx, task }
     }
 
-    pub fn update(&self, s: RenderState) {
-        let _ = self.tx.send(Some(s));
+    /// Replace the newest version.
+    pub fn update(&self, mut s: RenderState) {
+        s.as_of = Instant::now();
+        self.tx.send_replace(Some(s));
+    }
+
+    /// Change the newest version in place (cheap: called for every token).
+    pub fn modify(&self, f: impl FnOnce(&mut RenderState)) {
+        self.tx.send_modify(|o| {
+            if let Some(s) = o.as_mut() {
+                f(s);
+                s.as_of = Instant::now();
+            }
+        });
     }
 
     /// Push the final state and wait until Telegram shows it. Returns message ids.
@@ -127,135 +157,322 @@ impl ReplyView {
         if s.elapsed_override.is_none() {
             s.elapsed_override = Some(s.started.elapsed());
         }
-        let _ = self.tx.send(Some(s));
+        s.as_of = Instant::now();
+        self.tx.send_replace(Some(s));
         self.task.await.unwrap_or_default()
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn sync_loop(
+struct Ctx {
     app: Arc<App>,
     bot: Arc<BotConn>,
     chat_id: i64,
-    reply_to: Option<i32>,
     turn_id: i64,
     attempt_id: i64,
+    /// The newest-version buffer, owned by the [`ReplyView`] (weak, so that the
+    /// view ends when its owner drops it without a final state).
+    tx: Weak<watch::Sender<Option<RenderState>>>,
+}
+
+fn is_done(rx: &watch::Receiver<Option<RenderState>>) -> bool {
+    rx.borrow().as_ref().is_some_and(|s| s.done)
+}
+
+/// Resolves once the newest version is final (never, if the sender is gone first).
+async fn until_done(mut rx: watch::Receiver<Option<RenderState>>) {
+    loop {
+        if rx.borrow_and_update().as_ref().is_some_and(|s| s.done) {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// A slot of the chat's gate. A reply that finishes while waiting moves up to
+/// the class of finished content at once.
+async fn slot(ctx: &Ctx, rx: &watch::Receiver<Option<RenderState>>, ask: Ask) -> GatePermit {
+    let gate = ctx.bot.gates.get(ctx.chat_id);
+    if ask.class == Class::Final || is_done(rx) {
+        return gate.acquire(Ask::finals(ask.weight)).await;
+    }
+    tokio::select! {
+        p = gate.acquire(ask) => p,
+        _ = until_done(rx.clone()) => gate.acquire(Ask::finals(ask.weight)).await,
+    }
+}
+
+/// How often a reply still being generated is updated, by its age: short
+/// exchanges should feel fast; people mind slower updates of a long-running
+/// reply less, and those leave room for the others in the chat.
+pub fn pace(age: Duration) -> Duration {
+    let s = age.as_secs_f64();
+    Duration::from_secs_f64(if s < 10.0 {
+        1.5
+    } else if s < 60.0 {
+        3.0
+    } else {
+        (3.0 + (s - 60.0) / 30.0).min(10.0)
+    })
+}
+
+/// Telegram shows `sent` (id, page hash, shape) for a reply: the first page that differs.
+fn next_page<'a>(
+    pages: &'a [Content],
+    sent: &[(i32, Option<String>, Option<Shape>)],
+    markup_of: impl Fn(usize) -> Option<&'a tl::enums::ReplyMarkup>,
+) -> Option<(usize, &'a Content, String)> {
+    pages.iter().enumerate().map(|(i, c)| (i, c, outbox::page_hash(c, markup_of(i)))).find(|(i, _, h)| {
+        sent.get(*i).and_then(|(_, sh, _)| sh.as_deref()) != Some(h.as_str())
+    })
+}
+
+/// What sending or editing page `i` to `content` weighs.
+fn page_weight(sent: &[(i32, Option<String>, Option<Shape>)], i: usize, content: &Content) -> Weight {
+    let shape = Shape::of(content);
+    match sent.get(i) {
+        Some((_, _, old)) => flood::edit_weight(*old, shape),
+        None => flood::send_weight(shape),
+    }
+}
+
+async fn sleep_or_shutdown(app: &App, d: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => true,
+        _ = app.shutdown.cancelled() => false,
+    }
+}
+
+async fn sync_loop(
+    ctx: Ctx,
+    reply_to: Option<i32>,
     mut rx: watch::Receiver<Option<RenderState>>,
     first_delay: Duration,
 ) -> Vec<i32> {
-    // Messages already sent for this attempt (non-empty when resuming after a restart).
-    let mut sent: Vec<(i32, Option<String>)> = conv::attempt_messages(&app.db, &bot.name, attempt_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(_, id, h)| (id, h))
-        .collect();
+    let (app, bot, chat_id, turn_id, attempt_id) = (&ctx.app, &ctx.bot, ctx.chat_id, ctx.turn_id, ctx.attempt_id);
+    // The reply's messages so far: every attempt of a reply uses the same messages
+    // (earlier attempts are shown folded above), except `/continue`, which has its own.
+    let mut sent: Vec<(i32, Option<String>, Option<Shape>)> =
+        conv::reply_messages(&app.db, &bot.name, turn_id, attempt_id).await.unwrap_or_default();
+    let ids = |sent: &[(i32, Option<String>, Option<Shape>)]| sent.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+    // When Telegram last accepted an update of this reply (its pace counts from there).
+    let mut last_update: Option<tokio::time::Instant> = None;
+    let mut reply_to = reply_to;
     let mut fallback = Fallback::None;
     let mut media = RichMedia::default();
-    let mut first = sent.is_empty();
-    let tick = Duration::from_secs(30);
-    loop {
-        if first {
-            // Batch the first tokens a little before sending the first message.
-            let deadline = tokio::time::Instant::now() + first_delay;
-            loop {
-                let done = rx.borrow().as_ref().is_some_and(|s| s.done);
-                if done {
-                    break;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    r = rx.changed() => if r.is_err() { break },
-                }
-            }
-            first = false;
-        } else {
-            let done = rx.borrow().as_ref().is_some_and(|s| s.done);
-            if !done && let Ok(Err(_)) = tokio::time::timeout(tick, rx.changed()).await {
-                break;
+    let mut media_refreshed = false;
+    // Final state handled once: rendering reset, read-back check, separate images.
+    let mut final_seen = false;
+    let mut verified = false;
+    let mut failures = 0u32;
+    let heartbeat = Duration::from_secs(30);
+
+    if sent.is_empty() {
+        // Batch the first tokens a little before sending the first message.
+        let deadline = tokio::time::Instant::now() + first_delay;
+        while !is_done(&rx) {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                r = rx.changed() => if r.is_err() { break },
             }
         }
-        let Some(state) = rx.borrow_and_update().clone() else { continue };
-        let done = state.done;
-        if done && fallback != Fallback::None {
+    }
+    // Whether the newest version may not be fully shown yet.
+    let mut pending = true;
+    loop {
+        if !pending {
+            // Telegram shows the newest version: wait for a newer one.
+            let changed = tokio::select! {
+                r = tokio::time::timeout(heartbeat, rx.changed()) => r,
+                _ = app.shutdown.cancelled() => return ids(&sent),
+            };
+            match changed {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return ids(&sent), // the generation side is gone without a final state
+                Err(_) => {
+                    // Nothing new for a while (e.g. long hidden thinking): refresh the time shown.
+                    let Some(tx) = ctx.tx.upgrade() else { return ids(&sent) };
+                    tx.send_modify(|o| {
+                        if let Some(s) = o.as_mut().filter(|s| !s.done) {
+                            s.as_of = Instant::now();
+                        }
+                    });
+                }
+            }
+            pending = true;
+        }
+        // What the next operation is likely to be, to ask for a fitting slot (rendered
+        // from a copy: the generation side writes the buffer for every token).
+        let current = rx.borrow().clone();
+        let ask = match current.as_ref() {
+            Some(state) => {
+                let pages = pages_for(state, fallback);
+                let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
+                let markup_of = |i: usize| if i + 1 == pages.len() { markup.as_ref() } else { None };
+                let weight = next_page(&pages, &sent, markup_of).map_or(Weight::Light, |(i, c, _)| page_weight(&sent, i, c));
+                let class = if state.done {
+                    Class::Final
+                } else if sent.is_empty() {
+                    Class::First
+                } else {
+                    Class::Stream
+                };
+                let not_before =
+                    if class == Class::Stream { last_update.map(|t| t + pace(state.started.elapsed())) } else { None };
+                Ask { class, weight, not_before }
+            }
+            None => Ask { class: Class::First, weight: Weight::Light, not_before: None },
+        };
+        let permit = slot(&ctx, &rx, ask).await;
+        // The slot is ours: render the newest version now.
+        let Some(state) = rx.borrow_and_update().clone() else {
+            permit.unused();
+            pending = false;
+            continue;
+        };
+        if state.done && !final_seen {
+            final_seen = true;
             // A rejection while streaming may have come from an unfinished construct:
             // give the final content the full rendering again.
             fallback = Fallback::None;
         }
-        if let Err(e) =
-            apply(&app, &bot, chat_id, reply_to, turn_id, attempt_id, &state, &mut sent, &mut fallback, &mut media)
-                .await
-        {
-            warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "failed to update reply messages");
-            if done {
-                // Never leave a reply stuck in "generating": keep trying the final state.
-                let mut wait = Duration::from_secs(5);
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = app.shutdown.cancelled() => return sent.into_iter().map(|(id, _)| id).collect(),
-                    }
-                    match apply(
-                        &app,
-                        &bot,
-                        chat_id,
-                        reply_to,
-                        turn_id,
-                        attempt_id,
-                        &state,
-                        &mut sent,
-                        &mut fallback,
-                        &mut media,
-                    )
-                    .await
-                    {
-                        Ok(()) => break,
-                        Err(e) => {
-                            warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "final update still failing; retrying");
-                            wait = (wait * 2).min(Duration::from_secs(120));
-                        }
-                    }
+        let pages = pages_for(&state, fallback);
+        let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
+        let markup_of = |i: usize| if i + 1 == pages.len() { markup.as_ref() } else { None };
+        let sources = media_sources(&state, &pages);
+        if sources.iter().any(|s| !media.items.contains_key(&s.key)) {
+            // Upload outside the gate, then queue again.
+            permit.unused();
+            drop(permit);
+            if let Err(e) = upload::ensure(app, bot, chat_id, &sources, &mut media).await {
+                warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %format!("{e:#}"), "uploading media failed");
+                failures += 1;
+                if !sleep_or_shutdown(app, retry_wait(failures)).await {
+                    return ids(&sent);
                 }
-                break;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
-        if done {
-            // Telegram has stored messages differently from what was sent before
-            // (silent truncation): read the final messages back, and if the text
-            // was altered after all, attach the exact original so nothing is lost.
-            if fallback != Fallback::PlainText
-                && let Some(problem) = verify(&bot, chat_id, &sent, &state, fallback).await
-            {
-                warn!(bot = %bot.name, chat = chat_id, turn = turn_id, %problem, "Telegram altered the stored reply text");
-                let mut st = state.clone();
-                match attach_original(&app, turn_id, &mut st).await {
-                    Ok(()) => {
-                        if let Err(e) = apply(
-                            &app,
-                            &bot,
-                            chat_id,
-                            reply_to,
-                            turn_id,
-                            attempt_id,
-                            &st,
-                            &mut sent,
-                            &mut fallback,
-                            &mut media,
-                        )
-                        .await
-                        {
-                            warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "attaching the original failed");
-                        }
+        // The first message that differs from what Telegram shows.
+        let Some((i, content, hash)) = next_page(&pages, &sent, markup_of) else {
+            // Telegram shows the newest version.
+            if state.done && sent.len() > pages.len() {
+                let extra: Vec<i32> = sent[pages.len()..].iter().map(|(id, _, _)| *id).collect();
+                debug!(?extra, "deleting surplus messages");
+                match outbox::delete_once(&app.db, bot, &permit, chat_id, &extra).await {
+                    Ok(()) => sent.truncate(pages.len()),
+                    Err(OpError::Flood(_)) => {}
+                    Err(e) => {
+                        warn!(error = %e, "delete surplus failed");
+                        sent.truncate(pages.len());
                     }
-                    Err(e) => warn!(error = %format!("{e:#}"), "cannot store the original Markdown"),
+                }
+                continue;
+            }
+            permit.unused();
+            drop(permit);
+            if !state.done {
+                pending = false;
+                continue;
+            }
+            if fallback == Fallback::PlainText {
+                // Plain text cannot hold images: only now are they sent as separate messages.
+                let first = sent.first().map(|(id, _, _)| *id).or(reply_to);
+                send_images_separately(app, bot, chat_id, first, turn_id, attempt_id, &state.parts).await;
+            }
+            if !verified && fallback != Fallback::PlainText {
+                verified = true;
+                // Telegram may store messages differently from what was sent (silent
+                // truncation): read them back, and if the text was altered after all,
+                // attach the exact original so nothing is lost.
+                if let Some(problem) = verify(bot, chat_id, &sent, &state, fallback).await {
+                    warn!(bot = %bot.name, chat = chat_id, turn = turn_id, %problem, "Telegram altered the stored reply text");
+                    let mut st = state.clone();
+                    match attach_original(app, turn_id, &mut st).await {
+                        Ok(()) => {
+                            if let Some(tx) = ctx.tx.upgrade() {
+                                tx.send_replace(Some(st));
+                                continue;
+                            }
+                        }
+                        Err(e) => warn!(error = %format!("{e:#}"), "cannot store the original Markdown"),
+                    }
                 }
             }
-            break;
+            return ids(&sent);
+        };
+        // The newest content may weigh more than what the slot was asked for.
+        let weight = page_weight(&sent, i, content);
+        if weight > ask.weight && !permit.fits(weight) {
+            permit.unused();
+            continue;
+        }
+        permit.set_weight(weight);
+        let shape = Shape::of(content);
+        let res = if i < sent.len() {
+            outbox::edit_once(&app.db, bot, &permit, chat_id, sent[i].0, content, Some(&media), markup_of(i))
+                .await
+                .map(|_| sent[i].0)
+        } else {
+            let rt = if i == 0 { reply_to } else { Some(sent[i - 1].0) };
+            let req = SendReq {
+                chat_id,
+                reply_to: rt,
+                content,
+                link: Link { turn_id, attempt_id: Some(attempt_id), part_index: i as i64 },
+                media: Some(&media),
+            };
+            outbox::send_once(&app.db, bot, &permit, &req, markup_of(i)).await
+        };
+        drop(permit);
+        match res {
+            Ok(id) => {
+                failures = 0;
+                last_update = Some(tokio::time::Instant::now());
+                if i < sent.len() {
+                    sent[i] = (id, Some(hash), Some(shape));
+                } else {
+                    sent.push((id, Some(hash), Some(shape)));
+                }
+            }
+            // The gate is blocked for the wait; the next slot renders the newest version again.
+            Err(OpError::Flood(wait)) => warn!(bot = %bot.name, chat = chat_id, ?wait, "flood wait"),
+            Err(OpError::ReplyGone) => {
+                warn!(bot = %bot.name, chat = chat_id, "replied-to message is gone; sending without reply");
+                if i == 0 {
+                    reply_to = None;
+                }
+            }
+            Err(OpError::Rejected(e)) if !media_refreshed && is_media_error(&e) && !media.items.is_empty() => {
+                // A cached upload went stale (file reference): upload again once.
+                warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "media rejected; uploading again");
+                media_refreshed = true;
+                let keys: Vec<String> = media.items.keys().cloned().collect();
+                if let Err(e) = upload::forget(&app.db, &bot.name, &keys, &mut media).await {
+                    warn!(error = %format!("{e:#}"), "forgetting stale uploads failed");
+                }
+            }
+            Err(OpError::Rejected(e)) if fallback != Fallback::PlainText => {
+                let next = if fallback == Fallback::None { Fallback::RawAi } else { Fallback::PlainText };
+                warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, ?next, "content rejected; degrading rendering");
+                fallback = next;
+            }
+            Err(e) => {
+                // Network trouble, or even plain text rejected: keep trying (a reply must
+                // never stay stuck in "generating"), backing off.
+                failures += 1;
+                warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, failures, "failed to update reply messages");
+                if !sleep_or_shutdown(app, retry_wait(failures)).await {
+                    return ids(&sent);
+                }
+            }
         }
     }
-    sent.into_iter().map(|(id, _)| id).collect()
+}
+
+fn retry_wait(failures: u32) -> Duration {
+    Duration::from_secs((5u64 << failures.saturating_sub(1).min(5)).min(120))
 }
 
 /// Telegram's own normalization of rich-message text (measured 2026-11-11):
@@ -277,12 +494,12 @@ fn telegram_normalized(s: &str) -> String {
 async fn verify(
     bot: &BotConn,
     chat_id: i64,
-    sent: &[(i32, Option<String>)],
+    sent: &[(i32, Option<String>, Option<Shape>)],
     state: &RenderState,
     fallback: Fallback,
 ) -> Option<String> {
     let pages = pages_for(state, fallback);
-    let ids: Vec<i32> = sent.iter().map(|(id, _)| *id).collect();
+    let ids: Vec<i32> = sent.iter().map(|(id, _, _)| *id).collect();
     let msgs = match bot.get_messages(chat_id, &ids).await {
         Ok(m) => m,
         Err(e) => {
@@ -337,95 +554,6 @@ fn pages_for(state: &RenderState, fallback: Fallback) -> Vec<Content> {
                 .map(Content::Text)
                 .collect()
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn apply(
-    app: &Arc<App>,
-    bot: &Arc<BotConn>,
-    chat_id: i64,
-    reply_to: Option<i32>,
-    turn_id: i64,
-    attempt_id: i64,
-    state: &RenderState,
-    sent: &mut Vec<(i32, Option<String>)>,
-    fallback: &mut Fallback,
-    media: &mut RichMedia,
-) -> Result<(), String> {
-    let mut media_refreshed = false;
-    'retry: loop {
-        let pages = pages_for(state, *fallback);
-        // Upload the images these pages show (cached: never uploaded twice).
-        let sources = media_sources(state, &pages);
-        if !sources.is_empty() {
-            upload::ensure(app, bot, chat_id, &sources, media).await.map_err(|e| format!("uploading media: {e:#}"))?;
-        }
-        for (i, content) in pages.iter().enumerate() {
-            let hash = content.hash();
-            let res = if i < sent.len() {
-                if sent[i].1.as_deref() == Some(hash.as_str()) {
-                    continue;
-                }
-                outbox::edit(&app.db, bot, chat_id, sent[i].0, content, Some(media)).await.map(|_| sent[i].0)
-            } else {
-                let rt = if i == 0 { reply_to } else { Some(sent[i - 1].0) };
-                outbox::send(
-                    &app.db,
-                    bot,
-                    SendReq {
-                        chat_id,
-                        reply_to: rt,
-                        content,
-                        link: Link { turn_id, attempt_id: Some(attempt_id), part_index: i as i64 },
-                        media: Some(media),
-                    },
-                )
-                .await
-            };
-            match res {
-                Ok(id) => {
-                    if i < sent.len() {
-                        sent[i] = (id, Some(hash));
-                    } else {
-                        sent.push((id, Some(hash)));
-                    }
-                }
-                Err(SendError::Rejected(e)) if !media_refreshed && is_media_error(&e) && !media.items.is_empty() => {
-                    // A cached upload went stale (file reference): upload again once.
-                    warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, "media rejected; uploading again");
-                    media_refreshed = true;
-                    let keys: Vec<String> = media.items.keys().cloned().collect();
-                    upload::forget(&app.db, &bot.name, &keys, media).await.map_err(|e| format!("{e:#}"))?;
-                    continue 'retry;
-                }
-                Err(SendError::Rejected(e)) => {
-                    let next = match *fallback {
-                        Fallback::None => Fallback::RawAi,
-                        Fallback::RawAi => Fallback::PlainText,
-                        Fallback::PlainText => return Err(format!("Telegram rejected even plain text: {e}")),
-                    };
-                    warn!(bot = %bot.name, chat = chat_id, turn = turn_id, error = %e, ?next, "content rejected; degrading rendering");
-                    *fallback = next;
-                    continue 'retry;
-                }
-                Err(SendError::Other(e)) => return Err(format!("{e:#}")),
-            }
-        }
-        if state.done && *fallback == Fallback::PlainText {
-            // Plain text cannot hold images: only now are they sent as separate messages.
-            let first = sent.first().map(|(id, _)| *id).or(reply_to);
-            send_images_separately(app, bot, chat_id, first, turn_id, attempt_id, &state.parts).await;
-        }
-        if state.done && sent.len() > pages.len() {
-            let extra: Vec<i32> = sent[pages.len()..].iter().map(|(id, _)| *id).collect();
-            debug!(?extra, "deleting surplus messages");
-            if let Err(e) = outbox::delete(&app.db, bot, chat_id, &extra).await {
-                warn!(error = %e, "delete surplus failed");
-            }
-            sent.truncate(pages.len());
-        }
-        return Ok(());
     }
 }
 

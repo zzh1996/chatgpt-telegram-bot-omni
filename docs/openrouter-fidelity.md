@@ -4,25 +4,25 @@
 
 来源记号同缺口文档 §1。"实测 2026-11-11"指维护者当天用真实请求测得的结果。
 
-bot 经 OR 的请求目前只走 Chat Completions（CC，`/api/v1/chat/completions`）。豆包另有直连火山方舟的 provider（`ark:`，见 [usage.md](usage.md)），不在本文范围内。
+bot 经 OR 时按厂商用最接近官方原生的接口：OpenAI、xAI 走 Responses（RSP，`/api/v1/responses`），Anthropic 走 Messages（MSG，`/api/v1/messages`），其余走 Chat Completions（CC，`/api/v1/chat/completions`）。豆包另有直连火山方舟的 provider（`ark:`，见 [usage.md](usage.md)），不在本文范围内。
 
 ## 1. bot 的规避措施
 
-默认值来自 `FidelityConfig::standard()`、`[providers.openrouter]` 配置和 auto-max 预设（`crates/omni-llm/src/openrouter/options.rs`、`crates/omni-llm/src/budget.rs`）。每个请求用了哪些补丁，回复 + `/info` 都能看到。
+默认值来自 `[providers.openrouter]` 配置和 auto-max 预设（`crates/omni-llm/src/openrouter/options.rs`、`crates/omni-llm/src/budget.rs`）。每个请求用了哪些补丁，回复 + `/info` 都能看到。
 
 | 措施 | 请求中的体现 | 如何关闭或覆盖 | 局限 |
 |---|---|---|---|
-| 固定第一方 provider | `provider.only:["<slug>"]`，按模型作者映射：`openai`→`openai`、`anthropic`→`anthropic`、`google`→`google-ai-studio`、`x-ai`→`xai`、`deepseek`→`deepseek`、`z-ai`→`z-ai`、`moonshotai`→`moonshotai`、`qwen`→`alibaba`、`bytedance-seed`→`seed`（另有 mistralai、meta-llama、minimax、xiaomi）；配置 `[providers.openrouter.first_party]` 可改 | `+p=<slug>` 换成别的 endpoint；`+p=any` 交回 OR 默认路由；配置 `pin_first_party = false` | 基础 slug 匹配同一 provider 的所有区域和变体（`xai` 也匹配 `xai/zdr/us`），但不匹配 tier endpoint；没有第一方 endpoint 的模型直接失败，不重试（如 DeepSeek 不带日期的 slug） |
-| 禁止 fallback | `provider.allow_fallbacks:false` | `+p=any` | — |
-| 不静默丢参数 | `provider.require_parameters:true` | `+p=any`；配置 `require_parameters = false` | 只按 endpoint 的 `supported_parameters` 判断，不支持就失败；管不到 OR 自己的改写（§3）和厂商"接受但忽略"的参数（如 xAI ≥4.20 的 logprobs） |
+| 固定第一方 provider | `provider.only:["<slug>"]`，按模型作者映射：`openai`→`openai`、`anthropic`→`anthropic`、`google`→`google-ai-studio`、`x-ai`→`xai`、`deepseek`→`deepseek`、`z-ai`→`z-ai`、`moonshotai`→`moonshotai`、`qwen`→`alibaba`、`bytedance-seed`→`seed`；配置 `[providers.openrouter.first_party]` 可改 | `+p=<slug>`（多个：`p=a\|b`）换成白名单 `allowed_providers` 里的其它官方 endpoint；不能交回 OR 自由路由（白名单检查会拒绝） | 基础 slug 匹配同一 provider 的所有区域和变体（`xai` 也匹配 `xai/zdr/us`），但不匹配 tier endpoint；没有第一方 endpoint 的模型直接失败，不重试（如 DeepSeek 不带日期的 slug） |
+| 禁止 fallback | `provider.allow_fallbacks:false` | 总是发送 | — |
+| 不静默丢参数 | `provider.require_parameters:true` | 配置 `require_parameters = false` | 只按 endpoint 的 `supported_parameters` 判断，不支持就失败；管不到 OR 自己的改写（§3）和厂商"接受但忽略"的参数（如 xAI ≥4.20 的 logprobs） |
 | 服务等级 | `+tier=<x>` 发 `service_tier`，并把 `<slug>/<tier>` 加进 `provider.only` | 不写 `tier` | 基础 slug 仍在列表里，tier endpoint 不可用时 OR 可能回落到普通档（看响应的 `service_tier`） |
-| 关闭上下文压缩 | `plugins:[{"id":"context-compression","enabled":false}]`（OR 默认对上下文 ≤8,192 的 endpoint 开启它，从中间删消息） | 总是发送，`+p=any` 也不影响 | 账户开启 "Prevent overrides" 时无效 |
-| 显式 `max_tokens` | 取 min(第一方 endpoint 的 `max_completion_tokens`, 393216, 上下文 − 估算 prompt − 余量)。prompt 用上一轮同模型回答报告的 token 数，加上之后新消息的保守估算；余量为 max(上下文/50, 1024)。仍超上下文时，按报错里的数字缩小后立即重发。Gemini 4（long decode）的值是跨 hop 的总预算：min(393216, 上下文 − 估算 prompt − 余量)，用完后回复 `/continue` 续写 | `+max=<n>`；配置 `max_tokens_cap`、`long_decode_budget`；`+pure` 去掉它，此时由 OR 注入（§3） | endpoint 标的值可能低于官方上限（如 Seed），也可能不被 OR 强制（Gemini 4）；OR 按 `max_tokens` 冻结在途额度，额度很小的 key 上并发大请求可能 402 |
-| 其它 auto-max 预设 | 推理强度取 `supported_efforts` 的最高档（没有档位列表的推理模型发 `reasoning.enabled:true`）；OpenAI 发 `reasoning.summary:"detailed"`；图片输出模型发 `modalities`。配置里的预设（如 Gemini 图片 4K）另外生效 | `+pure`（配置预设不受影响）；单项用选项或 `+{json}` 覆盖 | 所选档位不在列表里、或对 mandatory 模型选 `none` 时只给警告（OR 会映射或报 400） |
-| 原样回传推理 | 同一模型、同一方言的 assistant 消息带回原始 `reasoning_details` | — | 换模型时只回传文本；OR 是否把它转成上游的 `reasoning_content`、`encrypted_content`，见缺口文档 §2 疑似 |
-| 文件只走原生 | PDF/文档只在 `input_modalities` 含 `file` 时发送，否则报错；发送时附 `file-parser` 的 `pdf.engine:"native"`；响应出现 `file` annotation 时提示"OR 自行解析了文件"。纯文本文件作为独立 text 段内联，并在回答里注明。图片、音频、视频以 base64/data URL 发送，图片带 `detail:"original"`；YouTube 等远程视频链接原样发送 | — | endpoint 不支持原生文件时 `engine:"native"` 的行为没有文档（bot 已先按模态拦截） |
-| 搜索只用原生 | `+s` → `openrouter:web_search` + `engine:"native"`；发送前检查所固定 endpoint 的 `native_tools`，没有原生搜索就报错（否则 OR 会静默改用 Exa） | `+s=exa` 等显式选 OR 的第三方引擎 | 只查缓存的 endpoint 元数据；允许的 endpoint 里只有部分有原生搜索时只给警告 |
-| 审计 | 配置 `echo_upstream_body`（默认开）→ 每个请求都带 `debug.echo_upstream_body:true`，回显记入日志和 `/info`；配置关闭时，`+debug` 仍可对单个请求开启。总是发送 `X-OpenRouter-Metadata: enabled`，可看 `openrouter_metadata` 里的 pipeline、attempts | 配置关闭 | 回显只在流式 CC/RSP 上有（MSG 没有）；脱敏是 best effort |
+| 关闭上下文压缩 | `plugins:[{"id":"context-compression","enabled":false}]`（OR 默认对上下文 ≤8,192 的 endpoint 开启它，从中间删消息） | 总是发送 | 账户开启 "Prevent overrides" 时无效 |
+| 显式 `max_tokens` | 取 min(第一方 endpoint 的 `max_completion_tokens`, 393216, 上下文 − 估算 prompt − 余量)。prompt 用上一轮同模型回答报告的 token 数，加上之后新消息的保守估算；余量为 max(上下文/50, 1024)。仍超上下文时，按报错里的数字缩小后立即重发。Gemini 4（long decode）的值是跨 hop 的总预算：min(393216, 上下文 − 估算 prompt − 余量)，用完后回复 `/continue` 续写 | 配置 `max_tokens_cap`（0 = 不封顶）、`long_decode_budget`；没有按请求覆盖的选项 | endpoint 标的值可能低于官方上限（如 Seed），也可能不被 OR 强制（Gemini 4）；OR 按 `max_tokens` 冻结在途额度，额度很小的 key 上并发大请求可能 402 |
+| 其它 auto-max 预设 | 推理强度取 `supported_efforts` 的最高档（没有档位列表的推理模型：CC 发 `reasoning.enabled:true`，MSG 发 adaptive thinking）；OpenAI 发 `reasoning.summary:"detailed"`；Claude（有该选项的模型）发 `thinking.display:"summarized"`；图片输出模型发 `modalities`。配置里的预设（如 Gemini 图片 4K）另外生效 | 单项用选项覆盖（`e=`、`budget=` 等，见 usage.md）；没有关闭全部预设的开关，也没有任意 JSON | 所选档位不在列表里、或对不能关闭推理的模型写 `e=none`：发送前本地报错，不交给 OR 映射 |
+| 原样回传推理 | 同一模型、同一接口的 assistant 回合原样回放：CC 带回 `reasoning_details`，RSP 带回全部输出项（加密推理、`phase`、托管工具调用），MSG 带回原始 content block（带签名的 thinking 等） | — | 换模型时只回传文本；CC 上 OR 是否把 `reasoning_details` 转成上游的 `reasoning_content`、`encrypted_content`，见缺口文档 §2 疑似 |
+| 文件只走原生 | CC、RSP 上 PDF/文档只在 `input_modalities` 含 `file` 时发送，否则报错；MSG 上 PDF 作为 document block 发送，其它文档报错。CC 上附 `file-parser` 的 `pdf.engine:"native"`，响应出现 `file` annotation 时提示"OR 自行解析了文件"（只在 CC 上检测）。纯文本文件作为独立 text 段内联，并在回答里注明。图片、音频、视频以 base64/data URL 发送；图片 `detail`：OpenAI 为 `original` 或 `high`，xAI 为 `high`，CC 不发；音频、视频和 YouTube 等远程视频链接只在 CC 上发送（RSP、MSG 上报错） | — | endpoint 不支持原生文件时 `engine:"native"` 的行为没有文档（bot 已先按模态拦截） |
+| 搜索只用原生 | `+s` → `openrouter:web_search` + `engine:"native"`；发送前检查所固定 endpoint 的 `native_tools`，没有原生搜索就报错（否则 OR 会静默改用 Exa） | —（不接 OR 的第三方搜索引擎） | endpoint 元数据不在缓存里时先取一次；所固定的 endpoint 都要有原生搜索，否则报错 |
+| 审计 | 配置 `echo_upstream_body`（默认开）→ CC/RSP 请求带 `debug.echo_upstream_body:true`，回显记入日志和 `/info`。总是发送 `X-OpenRouter-Metadata: enabled`，可看 `openrouter_metadata` 里的 pipeline、attempts | 配置关闭 | 回显只在流式 CC/RSP 上有（MSG 没有）；脱敏是 best effort |
 | 会话与用户标识 | `session_id = "tg-<对话根>"`，作为 OR 的 sticky 路由键；配置了 `user_id_salt` 时发 `user = sha256(salt + Telegram user id)` | 不配置 salt 就不发 `user` | OR 会把 `user` 再哈希一次才发往上游（§3） |
 | 费用与断流 | 记录 `X-Generation-Id`；没拿到用量的调用由后台查 `GET /api/v1/generation?id=` 补账；重启打断时用 `/generation/content` 取回断开前已送达的文本（需开启 Input & Output Logging）；Gemini 4 long decode 的 checkpoint 落盘，断流或重启后在原消息上接着写 | — | 其它模型断线后只能重新生成（缺口文档 §2） |
 
@@ -76,16 +76,16 @@ bot 经 OR 的请求目前只走 Chat Completions（CC，`/api/v1/chat/completio
 - glm-5.2 标为 `xhigh,high,none`、默认 `high`（官方默认 `max`）；
 - K3 提供 `none`（官方始终思考）；qwen3.8-max 标为 mandatory（官方是混合模式）；Nano Banana 2.1 缺 `medium`。
 
-bot 默认发最高档；用 `+pure` 比较各家默认行为时要注意这些差异。（OR§3.1, AN§11, GE§10, GKQ§5–7）
+bot 默认发这里列出的最高档，`e=` 的可选值也以这里为准，所以要注意这些差异。（OR§3.1, AN§11, GE§10, GKQ§5–7）
 
 **用户标识**：`user`/`safety_identifier` 被折进 OR 的哈希身份后才发往上游，从不原样转发。不传时 OR 用账户级身份，一个用户触发的策略封禁可能殃及整个账户。厂商按用户区分的功能（OpenAI 和 Kimi 的 `safety_identifier`、智谱的 `user_id`）因此只能看到 OR 的哈希；DeepSeek 的 `user_id` 见缺口文档疑似。（OR§2.1, OA§10.1, GKQ§4.5）
 
 ## 4. 只在 Responses / Messages 端点上有的功能
 
-bot 目前只走 CC，下面这些在 bot 里暂时用不到；改走对应端点就能用，所以不是缺口。
+这些功能在对应端点上都能用，所以不是缺口。bot 对 OpenAI、xAI 走 RSP，对 Anthropic 走 MSG，已用到其中的原样回放（RSP 的输出项含 `phase`，MSG 的 thinking block 与签名）、`thinking.display` 和 OpenAI 托管的 `code_interpreter`（`+c`），其余没有接；其它厂商走 CC，用不到这些。
 
 - **OpenAI（RSP）**：
-  - assistant 消息上的 `phase`（GPT-5.3-codex 起）：CC 无法表示，OR 称这会导致 "significant performance degradation … early stopping"，bot 受此影响；
+  - assistant 消息上的 `phase`（GPT-5.3-codex 起）：CC 无法表示，OR 称这会导致 "significant performance degradation … early stopping"；bot 走 RSP 并原样回放，不受影响；
   - GPT-6 的 async 工具（CC 上被剥离）；
   - OpenAI 托管工具：`code_interpreter`、hosted `shell`、`image_generation` 工具、`mcp`、`computer_use_preview`。CC 的 `tools[]` 只收 function、`openrouter:*` 和 web_search 简写；
   - `include`、`truncation`、`instructions`、`openrouter:apply_patch`。
@@ -190,7 +190,7 @@ bot 目前只走 CC，下面这些在 bot 里暂时用不到；改走对应端�
 
 ## 10. 待实测（非缺口）
 
-- OR 的 `: OPENROUTER PROCESSING` keep-alive 间隔，以及 bot 的 `idle_timeout_secs`（900 s）对长推理是否足够。（OR§9）
+- OR 的 `: OPENROUTER PROCESSING` keep-alive 间隔（bot 每个请求结束时在日志里记 `longest_gap_ms`），以及 bot 的 `idle_timeout_secs`（3600 s）对长推理是否足够。（OR§9）
 - CC 流式里 `url_citation` annotation 的 chunk 形状（是否为 `delta.annotations`），以及图片输出是否以 `delta.images` 流式返回。（OR§4.6, OR§5.4）
 - CC 上 Claude thinking block 与 `reasoning_details` 的映射细节，以及 `[REDACTED]` 出现的条件。（AN§10.2）
 - 用 OR 自己的 key 能否拿到 OpenAI 的推理摘要（组织验证）。（OA§10.1）
@@ -198,3 +198,11 @@ bot 目前只走 CC，下面这些在 bot 里暂时用不到；改走对应端�
 - Z.AI、Moonshot、Seed 断连后是否取消上游、怎样计费。（OR§6）
 - xAI 收到 webp/gif 图片时的结果。（XD§C3）
 - 缓存计费：Moonshot K3 的缓存写入、Qwen 的隐式命中、Seed 的缓存输入。（GKQ§6–7, DB§9.2 P6）
+
+### 实测发现的行为差异（2026-11-11）
+
+- **超过上限的 `max_tokens` 被悄悄接受**：Messages 接口给 Claude Haiku 5.5 发 `max_tokens: 500000`（官方上限 128K），OR 照常生成；官方 API 会返回 400。bot 自己从不发超过上限的值（fixture `msg_max_tokens_too_big`）。
+- **上下文超长在 OR 侧就被拒**：CC 和 MSG 都由 OR 先按 endpoint 的上下文长度检查，返回 400 "This endpoint's maximum context length is …"，请求不会到达提供方，也不计费（fixtures `cc_context_too_long`、`msg_context_too_long`）。
+- **余额检查按 max_tokens 预估**：可用余额付不起 `max_tokens` 的最大费用时直接 402 "requires more credits, or fewer max_tokens"，错误信息里带有 key 设置页的链接（fixtures `cc_cannot_afford`、`rsp_cannot_afford`）。
+- 各种出错情况的原始响应见 `crates/omni-llm/tests/fixtures/errors/`，录制脚本 `tools/record-openrouter-errors.py`。
+

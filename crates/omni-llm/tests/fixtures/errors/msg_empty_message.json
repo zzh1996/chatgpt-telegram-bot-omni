@@ -1,0 +1,40 @@
+{
+ "case": "msg_empty_message",
+ "endpoint": "messages",
+ "model": "anthropic/claude-haiku-5.5",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json"
+ },
+ "body": {
+  "type": "error",
+  "error": {
+   "type": "invalid_request_error",
+   "message": "Input must have at least 1 token.",
+   "error_type": "invalid_request"
+  },
+  "request_id": "gen-1794391020-gRgN423CTaDldickWgXJ",
+  "metadata": {
+   "provider_name": null
+  },
+  "openrouter_metadata": {
+   "requested": "anthropic/claude-haiku-5.5",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=1",
+   "attempt": 0,
+   "is_byok": false,
+   "endpoints": {
+    "total": 10,
+    "available": [
+     {
+      "provider": "Anthropic",
+      "model": "anthropic/claude-haiku-5.5-20261007",
+      "selected": false
+     }
+    ]
+   }
+  }
+ }
+}

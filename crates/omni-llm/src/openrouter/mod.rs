@@ -5,6 +5,8 @@ pub mod chat;
 pub mod messages;
 pub mod options;
 pub mod responses;
+#[cfg(test)]
+mod recorded;
 
 use std::time::Duration;
 

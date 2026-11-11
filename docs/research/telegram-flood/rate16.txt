@@ -1,0 +1,30 @@
+== pause (let the previous file's windows run out)
+
+== U1 edit 20000 cp, one paragraph
+  #0  H    send    20000 chars  30123 B  20098 cp mixed  at   0.00s start   0.002s wall 1794404274169 took  720ms  ok
+  #1  M    send    20000 chars  30017 B  20001 cp plain-mixed at   6.00s start   6.002s wall 1794404280169 took  825ms  ok
+  #2  H    edit    20000 chars  30123 B  20098 cp mixed  at   7.00s start   7.003s wall 1794404281170 took  253ms  FLOOD_WAIT 4
+  #3  M    edit    20000 chars  30017 B  20001 cp plain-mixed at  13.00s start  13.003s wall 1794404287170 took  326ms  ok
+  #4  H    edit    20000 chars  30123 B  20098 cp mixed  at  14.00s start  14.002s wall 1794404288169 took  234ms  ok
+  read H    20085 cp stored, 3 top-level blocks, ends "ars"
+  read M    20000 cp stored, 1 top-level blocks, ends " p3"
+
+== U2 edit 20000 cp in 5 paragraphs
+  #0  H    send    20000 chars  30124 B  20099 cp mixed  at   0.00s start   0.002s wall 1794404338024 took  811ms  ok
+  #1  M    send    20000 chars  30021 B  20005 cp para5-mixed at   6.00s start   6.009s wall 1794404344030 took  728ms  ok
+  #2  H    edit    20000 chars  30124 B  20099 cp mixed  at   7.00s start   7.003s wall 1794404345024 took  212ms  FLOOD_WAIT 4
+  #3  M    edit    20000 chars  30021 B  20005 cp para5-mixed at  13.00s start  13.002s wall 1794404351024 took  252ms  ok
+  #4  H    edit    20000 chars  30124 B  20099 cp mixed  at  14.00s start  14.005s wall 1794404352026 took  238ms  ok
+  read H    20086 cp stored, 3 top-level blocks, ends "ars"
+  read M    20000 cp stored, 5 top-level blocks, ends " p3"
+
+== U3 edit 20000 cp in 9 paragraphs
+  #0  H    send    20000 chars  30124 B  20099 cp mixed  at   0.00s start   0.002s wall 1794404401919 took  779ms  ok
+  #1  M    send    20000 chars  30025 B  20009 cp para9-mixed at   6.00s start   6.003s wall 1794404407920 took  830ms  ok
+  #2  H    edit    20000 chars  30124 B  20099 cp mixed  at   7.00s start   7.003s wall 1794404408920 took  236ms  FLOOD_WAIT 4
+  #3  M    edit    20000 chars  30025 B  20009 cp para9-mixed at  13.00s start  13.003s wall 1794404414920 took  309ms  ok
+  #4  H    edit    20000 chars  30124 B  20099 cp mixed  at  14.00s start  14.002s wall 1794404415919 took  251ms  ok
+  read H    20086 cp stored, 3 top-level blocks, ends "ars"
+  read M    20000 cp stored, 9 top-level blocks, ends " p3"
+
+DONE

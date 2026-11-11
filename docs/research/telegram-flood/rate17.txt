@@ -1,0 +1,27 @@
+== pause (let the previous file's windows run out)
+
+== J36 17 light, 36 s idle, 4 light (21st op of the minute?)
+  #0  s    send      500 chars    878 B    613 cp mixed  at   0.00s start   0.001s wall 1794404484880 took  740ms  ok
+  #1  s    edit      500 chars    878 B    613 cp mixed  at   1.25s start   1.251s wall 1794404486130 took  216ms  ok
+  #2  s    edit      500 chars    878 B    613 cp mixed  at   2.50s start   2.501s wall 1794404487380 took  244ms  ok
+  #3  s    edit      500 chars    878 B    613 cp mixed  at   3.75s start   3.752s wall 1794404488631 took  223ms  ok
+  #4  s    edit      500 chars    878 B    613 cp mixed  at   5.00s start   5.001s wall 1794404489880 took  243ms  ok
+  #5  s    edit      500 chars    878 B    613 cp mixed  at   6.25s start   6.251s wall 1794404491130 took  230ms  ok
+  #6  s    edit      500 chars    878 B    613 cp mixed  at   7.50s start   7.502s wall 1794404492381 took  228ms  ok
+  #7  s    edit      500 chars    878 B    613 cp mixed  at   8.75s start   8.751s wall 1794404493630 took  215ms  ok
+  #8  s    edit      500 chars    878 B    613 cp mixed  at  10.00s start  10.002s wall 1794404494881 took  246ms  ok
+  #9  s    edit      500 chars    878 B    613 cp mixed  at  11.25s start  11.251s wall 1794404496130 took  210ms  ok
+  #10 s    edit      500 chars    879 B    614 cp mixed  at  12.50s start  12.501s wall 1794404497380 took  218ms  ok
+  #11 s    edit      500 chars    879 B    614 cp mixed  at  13.75s start  13.752s wall 1794404498631 took  212ms  ok
+  #12 s    edit      500 chars    879 B    614 cp mixed  at  15.00s start  15.001s wall 1794404499880 took  245ms  ok
+  #13 s    edit      500 chars    879 B    614 cp mixed  at  16.25s start  16.252s wall 1794404501131 took  229ms  ok
+  #14 s    edit      500 chars    879 B    614 cp mixed  at  17.50s start  17.502s wall 1794404502381 took  243ms  ok
+  #15 s    edit      500 chars    879 B    614 cp mixed  at  18.75s start  18.752s wall 1794404503631 took  220ms  ok
+  #16 s    edit      500 chars    879 B    614 cp mixed  at  20.00s start  20.001s wall 1794404504880 took  231ms  ok
+  #17 s    edit      500 chars    879 B    614 cp mixed  at  56.00s start  56.002s wall 1794404540881 took  238ms  ok
+  #18 s    edit      500 chars    879 B    614 cp mixed  at  57.50s start  57.502s wall 1794404542381 took  211ms  ok
+  #19 s    edit      500 chars    879 B    614 cp mixed  at  59.00s start  59.001s wall 1794404543880 took  232ms  ok
+  #20 s    edit      500 chars    879 B    614 cp mixed  at  59.50s start  59.502s wall 1794404544381 took  195ms  FLOOD_WAIT 3
+  read s    610 cp stored, 3 top-level blocks, ends "ars"
+
+DONE

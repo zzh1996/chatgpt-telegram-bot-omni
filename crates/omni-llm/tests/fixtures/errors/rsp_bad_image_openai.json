@@ -1,0 +1,190 @@
+{
+ "case": "rsp_bad_image_openai",
+ "endpoint": "responses",
+ "model": "openai/gpt-6-luna",
+ "recorded": "2026-11-11",
+ "status": 200,
+ "sse": [
+  {
+   "type": "response.created",
+   "response": {
+    "id": "gen-1794391046-E2eEw6hu0ZzhMraTOeZ0",
+    "object": "response",
+    "created_at": 1794391046,
+    "model": "openai/gpt-6-luna",
+    "status": "in_progress",
+    "completed_at": null,
+    "output": [],
+    "error": null,
+    "incomplete_details": null,
+    "access_programs": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_output_tokens": null,
+    "temperature": 1,
+    "top_p": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "max_tool_calls": null,
+    "metadata": {},
+    "background": false,
+    "previous_response_id": null,
+    "service_tier": "auto",
+    "truncation": "disabled",
+    "store": false,
+    "instructions": null,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "reasoning": null,
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "prompt_cache_options": null,
+    "usage": null
+   },
+   "sequence_number": 0
+  },
+  {
+   "type": "response.in_progress",
+   "response": {
+    "id": "gen-1794391046-E2eEw6hu0ZzhMraTOeZ0",
+    "object": "response",
+    "created_at": 1794391046,
+    "model": "openai/gpt-6-luna",
+    "status": "in_progress",
+    "completed_at": null,
+    "output": [],
+    "error": null,
+    "incomplete_details": null,
+    "access_programs": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_output_tokens": null,
+    "temperature": 1,
+    "top_p": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "max_tool_calls": null,
+    "metadata": {},
+    "background": false,
+    "previous_response_id": null,
+    "service_tier": "auto",
+    "truncation": "disabled",
+    "store": false,
+    "instructions": null,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "reasoning": null,
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "prompt_cache_options": null,
+    "usage": null
+   },
+   "sequence_number": 1
+  },
+  {
+   "type": "response.debug",
+   "debug": {
+    "echo_upstream_body": {
+     "stream": true,
+     "model": "gpt-6-luna",
+     "input": [
+      {
+       "type": "message",
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "What is this?"
+        },
+        {
+         "type": "input_image",
+         "image_url": "data:image/png;base64,iVBORw0KGgpub3QgcmVhbGx5IGEgcG5n",
+         "detail": "low"
+        }
+       ]
+      }
+     ],
+     "max_output_tokens": 65536,
+     "user": "<included to upstream but not in debug info>",
+     "safety_identifier": "<included to upstream but not in debug info>",
+     "prompt_cache_key": "<included to upstream but not in debug info>",
+     "truncation": "disabled",
+     "store": false,
+     "text": {
+      "format": {
+       "type": "text"
+      }
+     },
+     "reasoning": {
+      "effort": "medium",
+      "summary": "detailed"
+     },
+     "include": [
+      "reasoning.encrypted_content"
+     ],
+     "access_programs": {
+      "cyber": "standard"
+     }
+    }
+   },
+   "sequence_number": 2
+  },
+  {
+   "type": "response.failed",
+   "response": {
+    "id": "gen-1794391046-E2eEw6hu0ZzhMraTOeZ0",
+    "object": "response",
+    "created_at": 1794391046,
+    "model": "openai/gpt-6-luna",
+    "status": "failed",
+    "completed_at": 1794391046,
+    "output": [],
+    "error": {
+     "code": "server_error",
+     "message": "Provider returned an empty response"
+    },
+    "incomplete_details": null,
+    "access_programs": null,
+    "tools": [],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "max_output_tokens": null,
+    "temperature": 1,
+    "top_p": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "top_logprobs": 0,
+    "max_tool_calls": null,
+    "metadata": {},
+    "background": false,
+    "previous_response_id": null,
+    "service_tier": "auto",
+    "truncation": "disabled",
+    "store": false,
+    "instructions": null,
+    "text": {
+     "format": {
+      "type": "text"
+     }
+    },
+    "reasoning": null,
+    "safety_identifier": null,
+    "prompt_cache_key": null,
+    "prompt_cache_options": null,
+    "usage": null,
+    "error_type": "provider_unavailable"
+   },
+   "sequence_number": 3
+  }
+ ]
+}

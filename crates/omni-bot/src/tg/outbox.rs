@@ -20,6 +20,8 @@ use tracing::{debug, info, warn};
 
 use super::bot::BotConn;
 use super::convert::{formatted_to_tl, sent_message_id};
+use super::flood::{self, Shape, Weight};
+use super::gate::{Ask, GatePermit};
 use super::rich::{RichMedia, input_rich_message};
 use crate::store::{Db, now_ms};
 
@@ -37,6 +39,38 @@ impl Content {
             Content::Text(f) => serde_json::to_string(f).unwrap_or_default(),
         };
         hex::encode(Sha256::digest(s.as_bytes()))
+    }
+}
+
+/// The inline keyboard under a reply that finally failed: one "🔁 Retry" button
+/// (callback data `retry:<turn id>`).
+pub fn retry_markup(turn_id: i64) -> tl::enums::ReplyMarkup {
+    let button = tl::types::KeyboardInlineButton {
+        style: None,
+        text: "🔁 Retry".into(),
+        r#type: tl::enums::InlineButtonType::Callback(tl::types::InlineButtonTypeCallback {
+            requires_password: false,
+            data: format!("retry:{turn_id}").into_bytes(),
+        }),
+    };
+    tl::types::ReplyInlineMarkup {
+        force_reply: false,
+        rows: vec![tl::enums::KeyboardInlineButtonRow::Row(tl::types::KeyboardInlineButtonRow {
+            buttons: vec![tl::enums::KeyboardInlineButton::Button(button)],
+        })],
+    }
+    .into()
+}
+
+/// What a message shows, buttons included (to know whether it must be edited).
+pub fn page_hash(content: &Content, markup: Option<&tl::enums::ReplyMarkup>) -> String {
+    match markup {
+        None => content.hash(),
+        Some(m) => {
+            let mut bytes = Vec::new();
+            grammers_tl_types::Serializable::serialize(m, &mut |b: &[u8]| bytes.extend_from_slice(b));
+            hex::encode(Sha256::digest(format!("{}+{}", content.hash(), hex::encode(bytes)).as_bytes()))
+        }
     }
 }
 
@@ -127,215 +161,248 @@ pub struct SendReq<'a> {
     pub media: Option<&'a RichMedia>,
 }
 
-/// Ensure the message for `link` exists in Telegram; returns its id.
-///
-/// If a send for this link was attempted before (possibly before a crash), the
-/// same random_id is reused, which returns the already-sent message.
-pub async fn send(db: &Db, bot: &BotConn, req: SendReq<'_>) -> Result<i32, SendError> {
-    let (random_id, existing) = reserve(db, &bot.name, &req).await.map_err(SendError::Other)?;
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-    let peer = bot.input_peer(req.chat_id).await.map_err(SendError::Other)?;
-    let gate = bot.gates.get(req.chat_id);
-    let mut reply_to = req.reply_to;
-    let mut tries = 0u32;
-    loop {
-        tries += 1;
-        let permit = gate.acquire().await;
-        let reply = reply_to.map(|id| {
-            tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
-                reply_to_msg_id: id,
-                top_msg_id: None,
-                reply_to_peer_id: None,
-                quote_text: None,
-                quote_entities: None,
-                quote_offset: None,
-                monoforum_peer_id: None,
-                todo_item_id: None,
-                poll_option: None,
-                quote_rich: None,
-            })
-        });
-        let (message, entities, rich_message) = match req.content {
-            Content::Rich(blocks) => {
-                (String::new(), None, Some(input_rich_message(blocks, req.media.unwrap_or(&RichMedia::default()))))
-            }
-            Content::Text(f) => {
-                let (t, e) = formatted_to_tl(f);
-                (t, if e.is_empty() { None } else { Some(e) }, None)
-            }
-        };
-        let call = tl::functions::messages::SendMessage {
-            no_webpage: true,
-            silent: false,
-            background: false,
-            clear_draft: false,
-            noforwards: false,
-            update_stickersets_order: false,
-            invert_media: false,
-            allow_paid_floodskip: false,
-            peer: peer.clone(),
-            reply_to: reply,
-            message,
-            random_id,
-            reply_markup: None,
-            entities,
-            schedule_date: None,
-            schedule_repeat_period: None,
-            send_as: None,
-            quick_reply_shortcut: None,
-            effect: None,
-            allow_paid_stars: None,
-            suggested_post: None,
-            rich_message,
-        };
-        match bot.invoke(&call).await {
-            Ok(updates) => {
-                drop(permit);
-                let Some(id) = sent_message_id(&updates, random_id) else {
-                    return Err(SendError::Other(anyhow!("sent message id not found in response")));
-                };
-                confirm(db, &bot.name, req.chat_id, random_id, id, req.link, &req.content.hash())
-                    .await
-                    .map_err(SendError::Other)?;
-                debug!(bot = %bot.name, chat = req.chat_id, msg = id, random_id, "message sent");
-                return Ok(id);
-            }
-            Err(e) => {
-                if let Some(s) = flood_secs(&e) {
-                    warn!(bot = %bot.name, chat = req.chat_id, secs = s, "flood wait on send");
-                    permit.flood_wait(Duration::from_secs(s as u64 + 1));
-                    continue;
-                }
-                drop(permit);
-                if e.is("REPLY_MESSAGE_ID_INVALID") || e.is("MESSAGE_ID_INVALID") && reply_to.is_some() {
-                    warn!(bot = %bot.name, chat = req.chat_id, "replied-to message is gone; sending without reply");
-                    reply_to = None;
-                    continue;
-                }
-                if is_content_error(&e)
-                    && let InvocationError::Rpc(r) = e
-                {
-                    return Err(SendError::Rejected(r));
-                }
-                if transient(&e) && tries < 30 {
-                    let wait = Duration::from_secs((2u64 << tries.min(5)).min(30));
-                    warn!(bot = %bot.name, chat = req.chat_id, error = %e, ?wait, "transient send error; retrying with the same random_id");
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
-                return Err(SendError::Other(anyhow!("send failed: {e}")));
-            }
+/// Why one attempt of a message operation did not succeed.
+#[derive(Debug)]
+pub enum OpError {
+    /// FLOOD_WAIT: the chat's gate is already blocked for this long. Try again
+    /// with a new permit (and the newest content).
+    Flood(Duration),
+    /// A network or server hiccup: worth another attempt.
+    Transient(String),
+    /// The replied-to message no longer exists.
+    ReplyGone,
+    /// Telegram rejected this content; the caller may retry with fallback content.
+    Rejected(grammers_mtsender::RpcError),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for OpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpError::Flood(d) => write!(f, "flood wait {}s", d.as_secs()),
+            OpError::Transient(e) => write!(f, "transient error: {e}"),
+            OpError::ReplyGone => write!(f, "the replied-to message is gone"),
+            OpError::Rejected(e) => write!(f, "rejected by Telegram: {e}"),
+            OpError::Other(e) => write!(f, "{e:#}"),
         }
     }
 }
 
-/// Edit a message's content. `MESSAGE_NOT_MODIFIED` counts as success.
-pub async fn edit(
+fn classify(e: InvocationError, permit: &GatePermit, has_reply: bool) -> OpError {
+    if let Some(s) = flood_secs(&e) {
+        let wait = Duration::from_secs(s as u64 + 1);
+        permit.flood_wait(wait);
+        return OpError::Flood(wait);
+    }
+    if has_reply && (e.is("REPLY_MESSAGE_ID_INVALID") || e.is("MESSAGE_ID_INVALID")) {
+        return OpError::ReplyGone;
+    }
+    if transient(&e) {
+        return OpError::Transient(e.to_string());
+    }
+    if is_content_error(&e)
+        && let InvocationError::Rpc(r) = e
+    {
+        return OpError::Rejected(r);
+    }
+    OpError::Other(anyhow!("{e}"))
+}
+
+fn reply_header(reply_to: Option<i32>) -> Option<tl::enums::InputReplyTo> {
+    reply_to.map(|id| {
+        tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
+            reply_to_msg_id: id,
+            top_msg_id: None,
+            reply_to_peer_id: None,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            monoforum_peer_id: None,
+            todo_item_id: None,
+            poll_option: None,
+            quote_rich: None,
+        })
+    })
+}
+
+/// One attempt to make the message for `req.link` exist, using a permit the
+/// caller already holds (so the caller chose the content after getting it).
+///
+/// Idempotent: a link that was sent before (possibly before a crash) reuses
+/// its random_id, which returns the already-sent message.
+pub async fn send_once(
     db: &Db,
     bot: &BotConn,
+    permit: &GatePermit,
+    req: &SendReq<'_>,
+    markup: Option<&tl::enums::ReplyMarkup>,
+) -> Result<i32, OpError> {
+    let (random_id, existing) = reserve(db, &bot.name, req).await.map_err(OpError::Other)?;
+    if let Some(id) = existing {
+        permit.unused();
+        return Ok(id);
+    }
+    let peer = bot.input_peer(req.chat_id).await.map_err(OpError::Other)?;
+    let (message, entities, rich_message) = match req.content {
+        Content::Rich(blocks) => {
+            (String::new(), None, Some(input_rich_message(blocks, req.media.unwrap_or(&RichMedia::default()))))
+        }
+        Content::Text(f) => {
+            let (t, e) = formatted_to_tl(f);
+            (t, if e.is_empty() { None } else { Some(e) }, None)
+        }
+    };
+    let call = tl::functions::messages::SendMessage {
+        no_webpage: true,
+        silent: false,
+        background: false,
+        clear_draft: false,
+        noforwards: false,
+        update_stickersets_order: false,
+        invert_media: false,
+        allow_paid_floodskip: false,
+        peer,
+        reply_to: reply_header(req.reply_to),
+        message,
+        random_id,
+        reply_markup: markup.cloned(),
+        entities,
+        schedule_date: None,
+        schedule_repeat_period: None,
+        send_as: None,
+        quick_reply_shortcut: None,
+        effect: None,
+        allow_paid_stars: None,
+        suggested_post: None,
+        rich_message,
+    };
+    match bot.invoke_once(&call).await {
+        Ok(updates) => {
+            let Some(id) = sent_message_id(&updates, random_id) else {
+                return Err(OpError::Other(anyhow!("sent message id not found in response")));
+            };
+            confirm(
+                db,
+                &bot.name,
+                req.chat_id,
+                random_id,
+                id,
+                req.link,
+                &page_hash(req.content, markup),
+                Shape::of(req.content),
+            )
+            .await
+            .map_err(OpError::Other)?;
+            debug!(bot = %bot.name, chat = req.chat_id, msg = id, random_id, "message sent");
+            Ok(id)
+        }
+        Err(e) => Err(classify(e, permit, req.reply_to.is_some())),
+    }
+}
+
+/// One attempt to edit a message, using a permit the caller already holds.
+/// `MESSAGE_NOT_MODIFIED` counts as success; a deleted message is skipped.
+pub async fn edit_once(
+    db: &Db,
+    bot: &BotConn,
+    permit: &GatePermit,
     chat_id: i64,
     msg_id: i32,
     content: &Content,
     media: Option<&RichMedia>,
-) -> Result<(), SendError> {
-    let peer = bot.input_peer(chat_id).await.map_err(SendError::Other)?;
-    let gate = bot.gates.get(chat_id);
-    let mut tries = 0u32;
-    loop {
-        tries += 1;
-        let permit = gate.acquire().await;
-        let (message, entities, rich_message) = match content {
-            Content::Rich(blocks) => {
-                (Some(String::new()), None, Some(input_rich_message(blocks, media.unwrap_or(&RichMedia::default()))))
-            }
-            Content::Text(f) => {
-                let (t, e) = formatted_to_tl(f);
-                (Some(t), Some(e), None)
-            }
-        };
-        let call = tl::functions::messages::EditMessage {
-            no_webpage: true,
-            invert_media: false,
-            peer: peer.clone(),
-            id: msg_id,
-            message,
-            media: None,
-            reply_markup: None,
-            entities,
-            schedule_date: None,
-            schedule_repeat_period: None,
-            quick_reply_shortcut_id: None,
-            rich_message,
-        };
-        match bot.invoke(&call).await {
-            Ok(_) => break,
-            Err(e) if e.is("MESSAGE_NOT_MODIFIED") => break,
-            Err(e) if e.is("MESSAGE_ID_INVALID") => {
-                // The message was deleted (e.g. by an admin): nothing to update.
-                warn!(bot = %bot.name, chat = chat_id, msg = msg_id, "message to edit no longer exists");
-                return Ok(());
-            }
-            Err(e) => {
-                if let Some(s) = flood_secs(&e) {
-                    warn!(bot = %bot.name, chat = chat_id, secs = s, "flood wait on edit");
-                    permit.flood_wait(Duration::from_secs(s as u64 + 1));
-                    continue;
-                }
-                drop(permit);
-                if is_content_error(&e)
-                    && let InvocationError::Rpc(r) = e
-                {
-                    return Err(SendError::Rejected(r));
-                }
-                if transient(&e) && tries < 20 {
-                    tokio::time::sleep(Duration::from_secs((2u64 << tries.min(4)).min(30))).await;
-                    continue;
-                }
-                return Err(SendError::Other(anyhow!("edit failed: {e}")));
-            }
+    markup: Option<&tl::enums::ReplyMarkup>,
+) -> Result<(), OpError> {
+    edit_once_status(db, bot, permit, chat_id, msg_id, content, media, markup).await.map(|_| ())
+}
+
+/// What an accepted edit did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edited {
+    Changed,
+    /// Telegram said `MESSAGE_NOT_MODIFIED`.
+    Unchanged,
+    /// The message no longer exists.
+    Gone,
+}
+
+/// [`edit_once`], telling what happened.
+#[allow(clippy::too_many_arguments)]
+pub async fn edit_once_status(
+    db: &Db,
+    bot: &BotConn,
+    permit: &GatePermit,
+    chat_id: i64,
+    msg_id: i32,
+    content: &Content,
+    media: Option<&RichMedia>,
+    markup: Option<&tl::enums::ReplyMarkup>,
+) -> Result<Edited, OpError> {
+    let peer = bot.input_peer(chat_id).await.map_err(OpError::Other)?;
+    let (message, entities, rich_message) = match content {
+        Content::Rich(blocks) => {
+            (Some(String::new()), None, Some(input_rich_message(blocks, media.unwrap_or(&RichMedia::default()))))
         }
-    }
-    let hash = content.hash();
+        Content::Text(f) => {
+            let (t, e) = formatted_to_tl(f);
+            (Some(t), Some(e), None)
+        }
+    };
+    let call = tl::functions::messages::EditMessage {
+        no_webpage: true,
+        invert_media: false,
+        peer,
+        id: msg_id,
+        message,
+        media: None,
+        // Without a markup Telegram removes the previous one (e.g. a Retry button).
+        reply_markup: markup.cloned(),
+        entities,
+        schedule_date: None,
+        schedule_repeat_period: None,
+        quick_reply_shortcut_id: None,
+        rich_message,
+    };
+    let outcome = match bot.invoke_once(&call).await {
+        Ok(_) => Edited::Changed,
+        Err(e) if e.is("MESSAGE_NOT_MODIFIED") => Edited::Unchanged,
+        Err(e) if e.is("MESSAGE_ID_INVALID") => {
+            // The message was deleted (e.g. by an admin): nothing to update.
+            warn!(bot = %bot.name, chat = chat_id, msg = msg_id, "message to edit no longer exists");
+            return Ok(Edited::Gone);
+        }
+        Err(e) => return Err(classify(e, permit, false)),
+    };
+    let hash = page_hash(content, markup);
+    let shape = Shape::of(content);
     let bot_name = bot.name.clone();
     db.call(move |c| {
         c.execute(
-            "UPDATE outbox SET content_hash = ?1, updated_at = ?2 WHERE bot = ?3 AND chat_id = ?4 AND msg_id = ?5",
-            params![hash, now_ms(), bot_name, chat_id, msg_id],
+            "UPDATE outbox SET content_hash = ?1, updated_at = ?2, shape_chars = ?6, shape_top = ?7
+             WHERE bot = ?3 AND chat_id = ?4 AND msg_id = ?5",
+            params![hash, now_ms(), bot_name, chat_id, msg_id, shape.chars as i64, shape.top_blocks as i64],
         )?;
         Ok(())
     })
     .await
-    .map_err(SendError::Other)?;
-    Ok(())
+    .map_err(OpError::Other)?;
+    Ok(outcome)
 }
 
-/// Delete messages (used when a reply shrinks to fewer messages).
-pub async fn delete(db: &Db, bot: &BotConn, chat_id: i64, ids: &[i32]) -> Result<()> {
+/// One attempt to delete messages, using a permit the caller already holds.
+pub async fn delete_once(db: &Db, bot: &BotConn, permit: &GatePermit, chat_id: i64, ids: &[i32]) -> Result<(), OpError> {
+    permit.set_weight(Weight::Free);
     if ids.is_empty() {
+        permit.unused();
         return Ok(());
     }
-    let gate = bot.gates.get(chat_id);
-    loop {
-        let permit = gate.acquire().await;
-        let res = if super::convert::chat_kind(chat_id) == super::convert::ChatKind::Channel {
-            let channel = bot.input_channel(chat_id).await?;
-            bot.invoke(&tl::functions::channels::DeleteMessages { channel, id: ids.to_vec() }).await.map(|_| ())
-        } else {
-            bot.invoke(&tl::functions::messages::DeleteMessages { revoke: true, id: ids.to_vec() }).await.map(|_| ())
-        };
-        match res {
-            Ok(()) => break,
-            Err(e) => {
-                if let Some(s) = flood_secs(&e) {
-                    permit.flood_wait(Duration::from_secs(s as u64 + 1));
-                    continue;
-                }
-                warn!(bot = %bot.name, chat = chat_id, error = %e, "delete failed");
-                break;
-            }
-        }
+    let res = if super::convert::chat_kind(chat_id) == super::convert::ChatKind::Channel {
+        let channel = bot.input_channel(chat_id).await.map_err(OpError::Other)?;
+        bot.invoke_once(&tl::functions::channels::DeleteMessages { channel, id: ids.to_vec() }).await.map(|_| ())
+    } else {
+        bot.invoke_once(&tl::functions::messages::DeleteMessages { revoke: true, id: ids.to_vec() }).await.map(|_| ())
+    };
+    if let Err(e) = res {
+        return Err(classify(e, permit, false));
     }
     let bot_name = bot.name.clone();
     let ids = ids.to_vec();
@@ -349,6 +416,63 @@ pub async fn delete(db: &Db, bot: &BotConn, chat_id: i64, ids: &[i32]) -> Result
         Ok(())
     })
     .await
+    .map_err(OpError::Other)
+}
+
+/// Back-off before retrying after a transient error.
+pub fn transient_backoff(tries: u32) -> Duration {
+    Duration::from_secs((2u64 << tries.min(4)).min(30))
+}
+
+/// Ensure the message for `link` exists in Telegram; returns its id. For
+/// complete content (command answers, notices): highest priority, retried.
+pub async fn send(db: &Db, bot: &BotConn, req: SendReq<'_>) -> Result<i32, SendError> {
+    let mut req = req;
+    let gate = bot.gates.get(req.chat_id);
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        let permit = gate.acquire(Ask::finals(flood::send_weight(Shape::of(req.content)))).await;
+        let res = send_once(db, bot, &permit, &req, None).await;
+        drop(permit);
+        match res {
+            Ok(id) => return Ok(id),
+            Err(OpError::Flood(wait)) => warn!(bot = %bot.name, chat = req.chat_id, ?wait, "flood wait on send"),
+            Err(OpError::ReplyGone) => {
+                warn!(bot = %bot.name, chat = req.chat_id, "replied-to message is gone; sending without reply");
+                req.reply_to = None;
+            }
+            Err(OpError::Rejected(r)) => return Err(SendError::Rejected(r)),
+            Err(OpError::Transient(e)) if tries < 30 => {
+                let wait = transient_backoff(tries);
+                warn!(bot = %bot.name, chat = req.chat_id, error = %e, ?wait, "transient send error; retrying with the same random_id");
+                tokio::time::sleep(wait).await;
+            }
+            Err(OpError::Transient(e)) => return Err(SendError::Other(anyhow!("send failed: {e}"))),
+            Err(OpError::Other(e)) => return Err(SendError::Other(e)),
+        }
+    }
+}
+
+/// Delete messages (highest priority, retried on flood waits).
+pub async fn delete(db: &Db, bot: &BotConn, chat_id: i64, ids: &[i32]) -> Result<()> {
+    let gate = bot.gates.get(chat_id);
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        let permit = gate.acquire(Ask::finals(Weight::Free)).await;
+        let res = delete_once(db, bot, &permit, chat_id, ids).await;
+        drop(permit);
+        match res {
+            Ok(()) => return Ok(()),
+            Err(OpError::Flood(_)) => {}
+            Err(OpError::Transient(_)) if tries < 10 => tokio::time::sleep(transient_backoff(tries)).await,
+            Err(e) => {
+                warn!(bot = %bot.name, chat = chat_id, error = %e, "delete failed");
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Reserve (or find) the outbox row for a link. Returns (random_id, already-sent msg id).
@@ -387,13 +511,24 @@ async fn reserve(db: &Db, bot: &str, req: &SendReq<'_>) -> Result<(i64, Option<i
     .context("reserve outbox row")
 }
 
-async fn confirm(db: &Db, bot: &str, chat: i64, random_id: i64, msg_id: i32, link: Link, hash: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn confirm(
+    db: &Db,
+    bot: &str,
+    chat: i64,
+    random_id: i64,
+    msg_id: i32,
+    link: Link,
+    hash: &str,
+    shape: Shape,
+) -> Result<()> {
     let (bot, hash) = (bot.to_string(), hash.to_string());
     db.call(move |c| {
         let tx = c.transaction()?;
         tx.execute(
-            "UPDATE outbox SET msg_id = ?1, state = 'sent', content_hash = ?2, updated_at = ?3 WHERE bot = ?4 AND random_id = ?5",
-            params![msg_id, hash, now_ms(), bot, random_id],
+            "UPDATE outbox SET msg_id = ?1, state = 'sent', content_hash = ?2, updated_at = ?3, shape_chars = ?6, shape_top = ?7
+             WHERE bot = ?4 AND random_id = ?5",
+            params![msg_id, hash, now_ms(), bot, random_id, shape.chars as i64, shape.top_blocks as i64],
         )?;
         // Notices (negative pseudo turn ids) are not part of any conversation.
         if link.turn_id > 0 {
@@ -462,10 +597,12 @@ pub async fn send_file(
         .into()
     };
     let gate = bot.gates.get(chat_id);
-    let mut tries = 0;
+    let mut tries = 0u32;
+    let mut reply_to = reply_to;
     loop {
         tries += 1;
-        let permit = gate.acquire().await;
+        // Photos and documents: their weight was not measured; assume heavy.
+        let permit = gate.acquire(Ask::finals(Weight::Heavy)).await;
         let call = tl::functions::messages::SendMedia {
             silent: false,
             background: false,
@@ -475,20 +612,7 @@ pub async fn send_file(
             invert_media: false,
             allow_paid_floodskip: false,
             peer: peer.clone(),
-            reply_to: reply_to.map(|id| {
-                tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
-                    reply_to_msg_id: id,
-                    top_msg_id: None,
-                    reply_to_peer_id: None,
-                    quote_text: None,
-                    quote_entities: None,
-                    quote_offset: None,
-                    monoforum_peer_id: None,
-                    todo_item_id: None,
-                    poll_option: None,
-                    quote_rich: None,
-                })
-            }),
+            reply_to: reply_header(reply_to),
             media: media.clone(),
             message: caption.to_string(),
             random_id,
@@ -502,32 +626,50 @@ pub async fn send_file(
             allow_paid_stars: None,
             suggested_post: None,
         };
-        match bot.invoke(&call).await {
+        let res = bot.invoke_once(&call).await;
+        let res = match res {
+            Ok(updates) => Ok(updates),
+            Err(e) if e.is("PHOTO_*") || e.is("IMAGE_PROCESS_FAILED") => match e {
+                InvocationError::Rpc(r) => return Err(SendError::Rejected(r)),
+                e => Err(OpError::Other(anyhow!("{e}"))),
+            },
+            Err(e) => Err(classify(e, &permit, reply_to.is_some())),
+        };
+        drop(permit);
+        match res {
             Ok(updates) => {
-                drop(permit);
                 let id =
                     sent_message_id(&updates, random_id).ok_or_else(|| SendError::Other(anyhow!("no message id")))?;
-                confirm(db, &bot.name, chat_id, random_id, id, link, "file").await.map_err(SendError::Other)?;
+                let shape = Shape { chars: caption.chars().count(), top_blocks: 1 };
+                confirm(db, &bot.name, chat_id, random_id, id, link, "file", shape).await.map_err(SendError::Other)?;
                 info!(bot = %bot.name, chat = chat_id, msg = id, filename, "file sent");
                 return Ok(id);
             }
-            Err(e) => {
-                if let Some(s) = flood_secs(&e) {
-                    permit.flood_wait(Duration::from_secs(s as u64 + 1));
-                    continue;
-                }
-                drop(permit);
-                if (is_content_error(&e) || e.is("PHOTO_*") || e.is("IMAGE_PROCESS_FAILED"))
-                    && let InvocationError::Rpc(r) = e
-                {
-                    return Err(SendError::Rejected(r));
-                }
-                if transient(&e) && tries < 10 {
-                    tokio::time::sleep(Duration::from_secs(3 * tries as u64)).await;
-                    continue;
-                }
-                return Err(SendError::Other(anyhow!("send media failed: {e}")));
-            }
+            Err(OpError::Flood(_)) => {}
+            Err(OpError::ReplyGone) => reply_to = None,
+            Err(OpError::Rejected(r)) => return Err(SendError::Rejected(r)),
+            Err(OpError::Transient(_)) if tries < 10 => tokio::time::sleep(Duration::from_secs(3 * tries as u64)).await,
+            Err(e) => return Err(SendError::Other(anyhow!("send media failed: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_button_changes_what_a_page_shows() {
+        let c = Content::Text(Formatted::plain("failed"));
+        let m = retry_markup(42);
+        assert_ne!(page_hash(&c, Some(&m)), page_hash(&c, None));
+        assert_eq!(page_hash(&c, None), c.hash());
+        assert_eq!(page_hash(&c, Some(&m)), page_hash(&c, Some(&retry_markup(42))));
+        assert_ne!(page_hash(&c, Some(&m)), page_hash(&c, Some(&retry_markup(43))));
+        let tl::enums::ReplyMarkup::ReplyInlineMarkup(k) = m else { panic!() };
+        let tl::enums::KeyboardInlineButtonRow::Row(row) = &k.rows[0];
+        let tl::enums::KeyboardInlineButton::Button(b) = &row.buttons[0];
+        assert_eq!(b.text, "🔁 Retry");
+        assert!(matches!(&b.r#type, tl::enums::InlineButtonType::Callback(c) if c.data == b"retry:42"));
     }
 }

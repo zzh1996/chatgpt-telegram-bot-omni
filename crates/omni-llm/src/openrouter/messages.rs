@@ -211,6 +211,15 @@ impl EventParser {
                 let model = m.and_then(|m| m.get("model")).and_then(Value::as_str).map(str::to_string);
                 evs.push(StreamEvent::Meta { upstream_id: id, provider: None, model });
                 self.input_usage = m.and_then(|m| m.get("usage")).cloned();
+                if let Some(u) = &self.input_usage {
+                    // Input counts are final already: show them while the answer streams.
+                    let mut live = usage_from_anthropic(u);
+                    live.output_tokens = None;
+                    live.reasoning_tokens = None;
+                    live.cost_usd = None;
+                    live.cost_source = omni_core::usage::CostSource::Unknown;
+                    evs.push(StreamEvent::LiveUsage(live));
+                }
             }
             "content_block_start" => {
                 let cb = v.get("content_block").cloned().unwrap_or(Value::Null);
@@ -315,11 +324,15 @@ impl EventParser {
                     // input counts arrive in message_start; output (and OpenRouter's cost) here.
                     let mut merged = self.input_usage.clone().unwrap_or_else(|| json!({}));
                     if let (Some(m), Some(o)) = (merged.as_object_mut(), u.as_object()) {
-                        for (k, val) in o {
+                        // OpenRouter sends `null` for counts it does not repeat: keep message_start's.
+                        for (k, val) in o.iter().filter(|(_, v)| !v.is_null()) {
                             m.insert(k.clone(), val.clone());
                         }
                     }
                     evs.push(StreamEvent::Usage(usage_from_anthropic(&merged)));
+                }
+                if let Some(d) = v.pointer("/delta/stop_details").filter(|d| !d.is_null()) {
+                    evs.push(StreamEvent::FinishDetails(d.clone()));
                 }
                 if let Some(sr) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     let reason = match sr {
@@ -359,7 +372,9 @@ pub fn usage_from_anthropic(u: &Value) -> omni_core::Usage {
     omni_core::Usage {
         input_tokens: input,
         output_tokens: g("output_tokens"),
-        reasoning_tokens: None,
+        // Billed thinking (the full thinking, whatever `display` shows); only in the
+        // final `message_delta` when streaming.
+        reasoning_tokens: u.pointer("/output_tokens_details/thinking_tokens").and_then(Value::as_u64),
         cached_input_tokens: cache_read,
         cache_write_tokens: cache_write,
         cost_usd: u.get("cost").and_then(Value::as_f64),
@@ -395,6 +410,26 @@ mod tests {
         assert!(!has_display_option("anthropic/claude-sonnet-4.6"));
     }
 
+    /// Recorded 2026-11-11: Claude Fable 5.2 refused (Anthropic's cyber
+    /// classifier); a "successful" stream with `stop_reason: refusal`.
+    #[test]
+    fn recorded_refusal_keeps_the_providers_details() {
+        let mut p = EventParser::default();
+        let mut evs = Vec::new();
+        for e in crate::fixtures::sse("messages_refusal_fable52.sse") {
+            evs.extend(p.event(None, &e).unwrap());
+        }
+        assert!(p.finished);
+        let details = evs.iter().find_map(|e| if let StreamEvent::FinishDetails(d) = e { Some(d) } else { None });
+        let d = details.expect("stop_details");
+        assert_eq!((d["type"].as_str(), d["category"].as_str()), (Some("refusal"), Some("cyber")));
+        assert!(d["explanation"].as_str().unwrap().contains("Usage Policy"));
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Finish { reason: Some(r), native: Some(n) } if r == "content_filter" && n == "refusal")));
+        // The input count from message_start survives the nulls of message_delta.
+        let u = evs.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(u) } else { None }).unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens, u.cost_usd), (Some(25), Some(0), None));
+    }
+
     #[test]
     fn parses_thinking_text_and_search() {
         let mut p = EventParser::default();
@@ -411,7 +446,7 @@ mod tests {
             json!({"type": "content_block_start", "index": 3, "content_block": {"type": "text", "text": ""}}),
             json!({"type": "content_block_delta", "index": 3, "delta": {"type": "text_delta", "text": "Rust is"}}),
             json!({"type": "content_block_delta", "index": 3, "delta": {"type": "citations_delta", "citation": {"type": "web_search_result_location", "url": "https://rust-lang.org", "title": "Rust", "cited_text": "Rust"}}}),
-            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 20, "cost": 0.002}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 20, "output_tokens_details": {"thinking_tokens": 12}, "cost": 0.002}}),
             json!({"type": "message_stop"}),
         ];
         let mut acc = crate::Accumulator::new();
@@ -427,8 +462,14 @@ mod tests {
             matches!(&parts[1], Part::ToolCall(t) if t.name == "web_search" && t.status.as_deref() == Some("completed") && t.input.is_some())
         );
         assert!(matches!(&parts[2], Part::Text { text, citations } if text == "Rust is" && citations.len() == 1));
+        // Input tokens are shown as soon as the stream starts (display only).
+        let start = EventParser::default().event(None, &evs[0]).unwrap();
+        assert!(
+            matches!(&start[1], StreamEvent::LiveUsage(u) if u.input_tokens == Some(15) && u.output_tokens.is_none() && u.cost_usd.is_none())
+        );
         let u = acc.usage.clone().unwrap();
         assert_eq!((u.input_tokens, u.output_tokens, u.cost_usd), (Some(15), Some(20), Some(0.002)));
+        assert_eq!(u.reasoning_tokens, Some(12));
         let native = p.native_payload();
         assert_eq!(native["content"][0]["signature"], "sig");
         assert_eq!(native["content"][1]["input"]["query"], "rust");

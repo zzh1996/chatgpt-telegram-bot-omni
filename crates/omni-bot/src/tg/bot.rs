@@ -22,8 +22,9 @@ use crate::config::BotConfig;
 use crate::store::Db;
 use crate::store::session::BotSession;
 
-/// Library-level retry: short flood waits and transient I/O errors.
-/// Longer flood waits are surfaced to callers (the outbox handles them).
+/// Library-level retry for everything except message operations (which use
+/// [`BotConn::invoke_once`]): short flood waits and transient I/O errors.
+/// Longer flood waits are surfaced to callers.
 struct Policy;
 
 impl RetryPolicy for Policy {
@@ -106,6 +107,16 @@ impl BotConn {
 
     pub async fn invoke<R: tl::RemoteCall>(&self, req: &R) -> Result<R::Return, InvocationError> {
         self.client.invoke(req).await
+    }
+
+    /// One attempt, without the library's retries. Message operations handle
+    /// FLOOD_WAIT themselves (through the chat gate), so that what they send
+    /// after the wait is the newest content rather than a stale request.
+    pub async fn invoke_once<R: tl::RemoteCall>(&self, req: &R) -> Result<R::Return, InvocationError> {
+        use grammers_tl_types::Deserializable;
+        let dc = self.session.home_dc_id().map_err(|_| InvocationError::Dropped("no home datacenter"))?;
+        let body = self.handle.raw_invoke_in_dc(dc, req.to_bytes()).await?;
+        R::Return::from_bytes(&body).map_err(Into::into)
     }
 
     /// Resolve a marked chat id to a peer reference, using cached access hashes.

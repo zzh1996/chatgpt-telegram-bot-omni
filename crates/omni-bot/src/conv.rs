@@ -205,6 +205,26 @@ pub async fn set_turn_status(db: &Db, id: i64, status: TurnStatus) -> Result<()>
     .await
 }
 
+/// Claim a failed turn for a manual retry: atomically flip it from failed to
+/// pending, and mark its failed attempts superseded (the automatic retry count
+/// starts afresh). `false` if it is not failed (any more): when several people
+/// send /retry or press Retry at once, exactly one of them gets the retry.
+pub async fn claim_retry(db: &Db, turn_id: i64) -> Result<bool> {
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        let n = tx.execute(
+            "UPDATE turns SET status = 'pending', updated_at = ?1 WHERE id = ?2 AND status IN ('failed', 'cancelled')",
+            params![now_ms(), turn_id],
+        )?;
+        if n == 1 {
+            tx.execute("UPDATE attempts SET status = 'superseded' WHERE turn_id = ?1 AND status = 'failed'", params![turn_id])?;
+        }
+        tx.commit()?;
+        Ok(n == 1)
+    })
+    .await
+}
+
 /// Assistant turns that still need (or were in the middle of) generation.
 pub async fn unfinished_turns(db: &Db) -> Result<Vec<i64>> {
     db.call(|c| {
@@ -318,20 +338,85 @@ pub async fn attempts_of(db: &Db, turn_id: i64) -> Result<Vec<AttemptRow>> {
     .await
 }
 
-/// Messages already sent for an attempt: (part_index, msg_id, content_hash).
-pub async fn attempt_messages(db: &Db, bot: &str, attempt_id: i64) -> Result<Vec<(i64, i32, Option<String>)>> {
+/// Whether an attempt continues a finished answer (`/continue`): it has its own messages.
+fn is_continuation_sql() -> &'static str {
+    "COALESCE(json_extract(a.request, '$.continue'), 0) = 1"
+}
+
+/// The Telegram messages showing a reply, in order: (msg_id, content_hash).
+///
+/// All attempts of a reply share its messages (each new attempt re-renders
+/// them with the earlier attempts folded above); a `/continue` attempt has its
+/// own messages after the answer.
+pub async fn reply_messages(
+    db: &Db,
+    bot: &str,
+    turn_id: i64,
+    attempt_id: i64,
+) -> Result<Vec<(i32, Option<String>, Option<crate::tg::flood::Shape>)>> {
     let bot = bot.to_string();
     db.call(move |c| {
-        let mut s = c.prepare(
-            "SELECT part_index, msg_id, content_hash FROM outbox
-             WHERE bot = ?1 AND attempt_id = ?2 AND state = 'sent' AND part_index < 1000 ORDER BY part_index",
+        let cont: bool = c.query_row(
+            &format!("SELECT {} FROM attempts a WHERE a.id = ?1", is_continuation_sql()),
+            params![attempt_id],
+            |r| r.get(0),
         )?;
+        let (filter, key) = if cont {
+            ("o.attempt_id = ?2".to_string(), attempt_id)
+        } else {
+            (format!("o.turn_id = ?2 AND NOT {}", is_continuation_sql()), turn_id)
+        };
+        let mut s = c.prepare(&format!(
+            "SELECT o.msg_id, o.content_hash, o.shape_chars, o.shape_top FROM outbox o JOIN attempts a ON a.id = o.attempt_id
+             WHERE o.bot = ?1 AND {filter} AND o.state = 'sent' AND o.part_index < 1000 ORDER BY o.msg_id"
+        ))?;
         let v = s
-            .query_map(params![bot, attempt_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map(params![bot, key], |r| {
+                let (chars, top): (Option<i64>, Option<i64>) = (r.get(2)?, r.get(3)?);
+                let shape = chars.zip(top).map(|(c, t)| crate::tg::flood::Shape { chars: c as usize, top_blocks: t as usize });
+                Ok((r.get(0)?, r.get(1)?, shape))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(v)
     })
     .await
+}
+
+/// Earlier attempts of a reply that did not succeed (failed, interrupted), oldest
+/// first, as shown above the current attempt. `/continue` attempts are separate.
+pub async fn prior_attempts(db: &Db, turn_id: i64, before_n: i64) -> Result<Vec<crate::compose::PriorAttempt>> {
+    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, i64, Option<i64>)> = db
+        .call(move |c| {
+            let mut s = c.prepare(&format!(
+                "SELECT a.n, a.status, a.output, a.error, a.usage, a.started_at, a.finished_at FROM attempts a
+                 WHERE a.turn_id = ?1 AND a.n < ?2 AND a.status IN ('failed', 'interrupted', 'superseded', 'cancelled')
+                   AND NOT {} ORDER BY a.n",
+                is_continuation_sql()
+            ))?;
+            let v = s
+                .query_map(params![turn_id, before_n], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(v)
+        })
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(n, status, out, err, usage, started, finished)| crate::compose::PriorAttempt {
+            n,
+            parts: out
+                .and_then(|o| serde_json::from_str::<omni_core::Turn>(&o).ok())
+                .map(|t| t.parts)
+                .unwrap_or_default(),
+            error: err.and_then(|e| serde_json::from_str::<omni_llm::LlmError>(&e).ok()),
+            interrupted: status == "interrupted",
+            usage: usage.and_then(|u| serde_json::from_str(&u).ok()),
+            elapsed: finished
+                .filter(|f| *f >= started)
+                .map(|f| std::time::Duration::from_millis((f - started) as u64)),
+        })
+        .collect())
 }
 
 pub async fn attempt_json(
@@ -529,5 +614,58 @@ mod tests {
         link_message(&db, "b", 1, 77, b, Some(at.id), 0).await.unwrap();
         assert_eq!(turn_for_message(&db, "b", 1, 77).await.unwrap(), Some((b, Some(at.id))));
         assert_eq!(turn_for_message(&db, "other", 1, 77).await.unwrap(), None);
+
+        // Retries share the reply's messages; `/continue` has its own; earlier
+        // failed attempts are listed in order with their output and error.
+        let e = omni_llm::LlmError::request("boom");
+        update_attempt(
+            &db,
+            at.id,
+            AttemptUpdate {
+                status: "failed",
+                output: serde_json::to_value(Turn::assistant_text("partial")).ok(),
+                error: serde_json::to_value(&e).ok(),
+                upstream_id: None,
+                usage: Some(serde_json::json!({"output_tokens": 3})),
+                finished: true,
+            },
+        )
+        .await
+        .unwrap();
+        let cont = start_attempt(&db, b, &serde_json::json!({"continue": true})).await.unwrap();
+        let (a1, a2, a3) = (at.id, at2.id, cont.id);
+        db.call(move |c| {
+            let row = |attempt: i64, part: i64, msg: i32, state: &str| {
+                c.execute(
+                    "INSERT INTO outbox(bot, chat_id, turn_id, attempt_id, part_index, random_id, state, msg_id, content_hash, created_at, updated_at)
+                     VALUES ('b', 1, ?1, ?2, ?3, ?4, ?5, ?6, 'h', 0, 0)",
+                    params![b, attempt, part, msg as i64 * 7, state, msg],
+                )
+            };
+            row(a1, 0, 100, "sent")?;
+            row(a1, 1, 101, "deleted")?;
+            row(a2, 1, 105, "sent")?;
+            row(a3, 0, 200, "sent")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let ids = |v: Vec<(i32, Option<String>, Option<crate::tg::flood::Shape>)>| v.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>();
+        assert_eq!(ids(reply_messages(&db, "b", b, a2).await.unwrap()), vec![100, 105]);
+        assert_eq!(ids(reply_messages(&db, "b", b, a1).await.unwrap()), vec![100, 105]);
+        assert_eq!(ids(reply_messages(&db, "b", b, a3).await.unwrap()), vec![200]);
+        // Concurrent manual retries: only the first claim wins.
+        set_turn_status(&db, b, TurnStatus::Failed).await.unwrap();
+        assert!(claim_retry(&db, b).await.unwrap());
+        assert!(!claim_retry(&db, b).await.unwrap());
+        assert_eq!(get_turn(&db, b).await.unwrap().status, TurnStatus::Pending);
+        let st: String = db.call(move |c| Ok(c.query_row("SELECT status FROM attempts WHERE id = ?1", params![a1], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(st, "superseded");
+        let prior = prior_attempts(&db, b, 4).await.unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].n, 1);
+        assert_eq!(prior[0].error.as_ref().map(|e| e.message.as_str()), Some("boom"));
+        assert_eq!(prior[0].usage.as_ref().and_then(|u| u.output_tokens), Some(3));
+        assert!(matches!(&prior[0].parts[..], [omni_core::Part::Text { text, .. }] if text == "partial"));
     }
 }

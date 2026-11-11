@@ -336,6 +336,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         native_finish_reason: None,
         notes: Vec::new(),
         started: Instant::now(),
+        as_of: Instant::now(),
         elapsed_override: None,
         hops: 0,
         continuation: false,
@@ -343,6 +344,8 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         settings: Vec::new(),
         show_usage: true,
         mode: app.cfg.render.markdown,
+        prior: Vec::new(),
+        retry_button: false,
         done: false,
     };
     let hist = match wait_for_ancestors(app, row.id).await? {
@@ -448,7 +451,7 @@ async fn run_turn(app: Arc<App>, turn_id: i64) -> Result<()> {
         let mut shrinks = 0;
         let mut override_max = None;
         loop {
-            if let Err(msg) = crate::access::check_quota(&app, ctx.chat_id, ctx.user_id).await? {
+            if let Err(msg) = crate::access::check_quota(&app, &ctx.bot.name, ctx.chat_id, ctx.user_id).await? {
                 fail_without_attempt(&ctx, LlmError::request(msg)).await?;
                 return Ok(());
             }
@@ -501,7 +504,7 @@ async fn run_continue(app: Arc<App>, turn_id: i64, command_msg: i32) -> Result<(
     let Some(cp) = load_checkpoint(&app, last_done.id).await.filter(|c| c.at_budget) else { return Ok(()) };
     let span = info_span!("conv", bot = %ctx.bot.name, chat = ctx.chat_id, user = ctx.user_id, model = %ctx.spec.model);
     async move {
-        if let Err(msg) = crate::access::check_quota(&app, ctx.chat_id, ctx.user_id).await? {
+        if let Err(msg) = crate::access::check_quota(&app, &ctx.bot.name, ctx.chat_id, ctx.user_id).await? {
             crate::reply::notice(&app, &ctx.bot, ctx.chat_id, command_msg, &format!("⚠️ {msg}")).await;
             return Ok(());
         }
@@ -570,20 +573,19 @@ async fn mark_interrupted(ctx: &Ctx, last: &AttemptRow, appending: bool) -> Resu
         },
     )
     .await?;
+    if !appending {
+        // The next attempt shows this one (folded, with its output) in the same messages.
+        return Ok(());
+    }
     let view =
         ReplyView::start(app.clone(), ctx.bot.clone(), ctx.chat_id, ctx.reply_to, ctx.turn_id, last.id, Duration::ZERO);
     let mut st = ctx.base_state.clone();
     st.parts = parts;
     st.attempt = last.n;
     st.elapsed_override = Some(Duration::ZERO);
-    if appending {
-        st.status = Status::Failed;
-        st.error = Some(LlmError::request(
-            "interrupted by a bot restart; reply /continue to the previous message to try again",
-        ));
-    } else {
-        st.status = Status::Interrupted;
-    }
+    st.status = Status::Failed;
+    st.error =
+        Some(LlmError::request("interrupted by a bot restart; reply /continue to the previous message to try again"));
     view.finish(st).await;
     Ok(())
 }
@@ -617,10 +619,31 @@ async fn recover_delivered(app: &App, gen_id: &str) -> Option<Vec<Part>> {
     None
 }
 
+/// An answer the provider stopped abnormally (refusal / content filter, or an
+/// error finish): a failure, with the provider's own details. Not retried
+/// automatically: it would most likely end the same way.
+fn abnormal_stop(acc: &Accumulator) -> Option<LlmError> {
+    let fr = acc.finish_reason.as_deref()?;
+    let what = match fr {
+        "content_filter" => "stopped by the provider's content filter",
+        "error" => "the provider stopped the generation with an error",
+        _ => return None,
+    };
+    let native = acc.native_finish_reason.as_deref().map(|n| format!(" / {n}")).unwrap_or_default();
+    let mut e = LlmError::new(
+        omni_llm::ErrorKind::InBand,
+        omni_llm::Retry::Never,
+        format!("{what} (finish_reason: {fr}{native})"),
+    );
+    e.error_type = Some(fr.to_string());
+    e.details = acc.finish_details.clone();
+    e.partial_output = acc.has_output();
+    Some(e)
+}
+
+/// Wait before retrying after `failed` failed attempts (`None`: do not retry).
 fn backoff(app: &App, failed: u32, e: &LlmError) -> Option<Duration> {
-    let base = app.cfg.retry.base_delay_secs * 2f64.powi(failed.saturating_sub(1) as i32);
-    let base = Duration::from_secs_f64(base.min(app.cfg.retry.max_delay_secs));
-    e.retry_delay(base)
+    e.retry_delay(app.cfg.retry.delay(failed))
 }
 
 fn add_usage(a: &Option<Usage>, b: &Usage) -> Usage {
@@ -656,13 +679,16 @@ struct Sink<'a> {
     acc: Accumulator,
     view: &'a ReplyView,
     state: RenderState,
+    /// Usage, provider, finish reason or notices changed since the last publish.
+    meta_dirty: bool,
     last_save: Instant,
-    last_push: Instant,
     app: &'a App,
     attempt_id: i64,
     /// Usage of completed hops; the current hop's usage is added on top.
     usage_done: Option<Usage>,
     hop_usage: Option<Usage>,
+    /// Display-only usage of the current hop until its final usage arrives.
+    live_usage: Option<Usage>,
     first_prompt: Option<u64>,
     hops: u32,
     natives: Vec<Value>,
@@ -684,7 +710,7 @@ impl Sink<'_> {
     fn render(&self) -> RenderState {
         let mut s = self.state.clone();
         s.parts = self.acc.parts().to_vec();
-        s.usage = self.total_usage();
+        s.usage = self.display_usage();
         s.provider = self.acc.provider.clone();
         s.finish_reason = self.acc.finish_reason.clone();
         s.native_finish_reason = self.acc.native_finish_reason.clone();
@@ -697,6 +723,46 @@ impl Sink<'_> {
         s
     }
 
+    /// Bring the view's newest-version buffer up to date. Called for every
+    /// event; copies only what changed (usually the text just appended).
+    fn publish(&mut self) {
+        let meta = std::mem::take(&mut self.meta_dirty);
+        let usage = if meta { self.display_usage() } else { None };
+        let (acc, hops) = (&mut self.acc, self.hops);
+        self.view.modify(|s| {
+            acc.sync_parts(&mut s.parts);
+            if meta {
+                s.usage = usage;
+                s.provider = acc.provider.clone();
+                s.finish_reason = acc.finish_reason.clone();
+                s.native_finish_reason = acc.native_finish_reason.clone();
+                s.hops = hops;
+                for n in &acc.notices {
+                    if !s.notes.contains(n) {
+                        s.notes.push(n.clone());
+                    }
+                }
+            }
+        });
+    }
+
+    /// Replace the view's buffer with a full render (after changes outside the stream).
+    fn publish_full(&mut self) {
+        self.acc.mark_synced();
+        self.meta_dirty = false;
+        self.view.update(self.render());
+    }
+
+    /// What to show: like [`Self::total_usage`], with the current hop's usage so
+    /// far when its final usage has not arrived yet.
+    fn display_usage(&self) -> Option<Usage> {
+        match (&self.usage_done, self.hop_usage.as_ref().or(self.live_usage.as_ref())) {
+            (u, Some(h)) => Some(add_usage(u, h)),
+            (u, None) => u.clone(),
+        }
+    }
+
+    /// Billed usage: completed hops plus the current hop's final usage.
     fn total_usage(&self) -> Option<Usage> {
         match (&self.usage_done, &self.hop_usage) {
             (u, Some(h)) => Some(add_usage(u, h)),
@@ -706,7 +772,9 @@ impl Sink<'_> {
 
     /// Close the current hop: fold its usage (if it arrived) into the total.
     fn end_hop(&mut self) -> Option<Usage> {
+        self.live_usage = None;
         let h = self.hop_usage.take()?;
+        self.meta_dirty = true;
         if self.first_prompt.is_none() {
             self.first_prompt = h.input_tokens;
         }
@@ -736,6 +804,14 @@ impl EventSink for Sink<'_> {
         match &ev {
             StreamEvent::Usage(u) => {
                 self.hop_usage = Some(u.clone());
+                self.meta_dirty = true;
+                self.publish();
+                return;
+            }
+            StreamEvent::LiveUsage(u) => {
+                self.live_usage = Some(u.clone());
+                self.meta_dirty = true;
+                self.publish();
                 return;
             }
             StreamEvent::Meta { upstream_id: Some(id), .. }
@@ -766,6 +842,9 @@ impl EventSink for Sink<'_> {
             _ => {}
         }
         let is_image = matches!(ev, StreamEvent::Image { .. });
+        if !matches!(ev, StreamEvent::Text(_) | StreamEvent::Reasoning { .. }) {
+            self.meta_dirty = true;
+        }
         self.acc.apply(ev);
         if is_image {
             for (data, mime) in self.acc.take_pending_images() {
@@ -775,10 +854,7 @@ impl EventSink for Sink<'_> {
                 }
             }
         }
-        if self.last_push.elapsed() >= Duration::from_millis(250) {
-            self.last_push = Instant::now();
-            self.view.update(self.render());
-        }
+        self.publish();
         if self.last_save.elapsed() > Duration::from_secs(10) {
             self.last_save = Instant::now();
             let (db, id, out) = (self.app.db.clone(), self.attempt_id, serde_json::to_value(self.acc.turn()).ok());
@@ -876,6 +952,9 @@ async fn run_attempt(
             (None, ctx.reply_to)
         };
         state.continuation = append_mode;
+        if !append_mode {
+            state.prior = conv::prior_attempts(&app.db, ctx.turn_id, attempt.n).await.unwrap_or_default();
+        }
         state.settings = omni_llm::settings::describe(prepared);
         let first_delay = Duration::from_secs_f64(app.cfg.render.first_flush_delay_secs);
         let view =
@@ -884,12 +963,13 @@ async fn run_attempt(
             acc: Accumulator::new(),
             view: &view,
             state: state.clone(),
+            meta_dirty: false,
             last_save: Instant::now(),
-            last_push: Instant::now() - Duration::from_secs(1),
             app,
             attempt_id: attempt.id,
             usage_done: None,
             hop_usage: None,
+            live_usage: None,
             first_prompt: None,
             hops: 0,
             natives: vec![],
@@ -926,13 +1006,14 @@ async fn run_attempt(
                 hop_req = prepared.with_continuation(&cp.item);
             }
         }
-        view.update(sink.render());
+        sink.publish_full();
         let rawlog = RawLog { blobs: app.blobs.clone() };
         let mut resumes = 0u32;
         let mut upstream_ids: Vec<String> = Vec::new();
         let result: Result<bool, LlmError> = loop {
             sink.acc.finish_reason = None;
             sink.acc.native_finish_reason = None;
+            sink.acc.finish_details = None;
             sink.acc.upstream_id = None;
             let cancel = CancellationToken::new();
             let (result, call) = tokio::select! {
@@ -977,6 +1058,12 @@ async fn run_attempt(
                     warn!(error = %format!("{e:#}"), "failed to record usage");
                 }
             }
+            // A stream that ended "normally" but was stopped by the provider (refusal,
+            // content filter, error finish) is a failure, shown with the provider's details.
+            let result = match result {
+                Ok(_) if let Some(e) = abnormal_stop(&sink.acc) => Err(e),
+                r => r,
+            };
             match result {
                 Ok(native) => {
                     sink.natives.push(native);
@@ -993,7 +1080,7 @@ async fn run_attempt(
                         sink.checkpoint = Some((item.clone(), sink.acc.parts().to_vec()));
                         info!(hop = sink.hops, "long decode: continuing");
                         hop_req = prepared.with_continuation(&item);
-                        sink.view.update(sink.render());
+                        sink.publish_full();
                         continue;
                     }
                     // Done. Remember the final continuation item when stopped at the budget (`/continue`).
@@ -1144,6 +1231,8 @@ async fn run_attempt(
                     (true, Some(d)) => Status::Retrying { in_secs: d.as_secs() },
                     _ => Status::Failed,
                 };
+                // The turn fails for good (a `/continue` failure leaves the answer before it).
+                final_state.retry_button = final_state.status == Status::Failed && !append_mode;
                 final_state.done = true;
                 view.finish(final_state).await;
                 if will_retry { Outcome::Retry(delay.unwrap()) } else { Outcome::Failed }
@@ -1204,8 +1293,10 @@ async fn fail_without_attempt(ctx: &Ctx, err: LlmError) -> Result<()> {
     .await?;
     let mut st = ctx.base_state.clone();
     st.attempt = attempt.n;
+    st.prior = conv::prior_attempts(&app.db, ctx.turn_id, attempt.n).await.unwrap_or_default();
     st.error = Some(err);
     st.status = Status::Failed;
+    st.retry_button = true;
     st.elapsed_override = Some(Duration::ZERO);
     let view = ReplyView::start(
         app.clone(),
@@ -1224,6 +1315,22 @@ async fn fail_without_attempt(ctx: &Ctx, err: LlmError) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_stops_are_failures_with_the_providers_details() {
+        let mut acc = Accumulator::new();
+        acc.apply(StreamEvent::FinishDetails(json!({"type": "refusal", "category": "cyber"})));
+        acc.apply(StreamEvent::Finish { reason: Some("content_filter".into()), native: Some("refusal".into()) });
+        let e = abnormal_stop(&acc).unwrap();
+        assert_eq!(e.retry, omni_llm::Retry::Never);
+        assert_eq!(e.details.unwrap()["category"], "cyber");
+        assert!(e.message.contains("refusal"));
+        for normal in ["stop", "length", "tool_calls"] {
+            let mut ok = Accumulator::new();
+            ok.apply(StreamEvent::Finish { reason: Some(normal.into()), native: None });
+            assert!(abnormal_stop(&ok).is_none(), "{normal}");
+        }
+    }
 
     #[test]
     fn usage_sums_across_hops() {

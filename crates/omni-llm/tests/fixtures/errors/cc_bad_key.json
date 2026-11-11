@@ -1,0 +1,17 @@
+{
+ "case": "cc_bad_key",
+ "endpoint": "chat",
+ "model": "deepseek/deepseek-v4.1-flash-1017",
+ "recorded": "2026-11-11",
+ "status": 401,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "client"
+ },
+ "body": {
+  "error": {
+   "message": "User not found.",
+   "code": 401
+  }
+ }
+}

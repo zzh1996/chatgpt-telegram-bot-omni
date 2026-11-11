@@ -46,6 +46,7 @@
 | 服务端上下文压缩 | OpenAI 的 `context_management` 自动压缩、`POST /v1/responses/compact`；xAI 的 `POST /v1/responses/compact` | OR schema 没有 `context_management`，也没有 compact 路由；OR 的 `context-compression` plugin 是从中间删消息，不是同一功能（OpenAI 显式的 `compaction_trigger` 见 §3 疑似） | OA§2.4, OA§10.1, XD§A1, XD§D1 |
 | OR 的输入审核 | 官方没有这一层，内容只受厂商自己的政策约束 | `top_provider.is_moderated:true` 的 endpoint（几乎所有 OpenAI、Anthropic 模型，以及 Amazon、Cohere、Meta）先过 OR 的审核，命中返回 403（`reasons`、`flagged_input`）；没有文档化的关闭方式（BYOK 是否例外也没写），所用分类器未公开 | OR§7, OR§11.2 #10 |
 | 厂商 Files API 与大文件 | 上传到厂商存储后按 id/URI 引用，从而发送超过内联上限的媒体：Gemini Files API（2 GB/文件，保留 48 h；内联 ≤100 MB）、方舟 Files API（≤512 MB，视频经自有 TOS ≤2 GB；内联图片 ≤10 MB、视频/PDF ≤50 MB）、Kimi `ms://` 与 `purpose:"video"`、Qwen-Long `fileid://`、智谱 `file_id`、DeepSeek 图片 `file_id`（≤64 MiB，内联 ≤32 MiB） | OR 的 Files API 只能存到 OR 自己、`openai` 或 `anthropic`（后两者需 BYOK，所以 OpenAI、Anthropic 不算缺口）；`or_file_…` 是 OR 自己的 id。其它厂商只能收到内联或 URL 输入 | OR§4.2, GE§5, GKQ§1.4, GKQ§2.5, GKQ§3.4, XD§B6, DB§9.1 G8 |
+| 流式过程中的用量 | Gemini 原生流每个 chunk 都带累计的 `usageMetadata`（旧版 bot 据此实时更新 token 数和费用），xAI CC 每个 chunk 带 `usage`，方舟可开 `chunk_include_usage` | 经 OR 的 CC 和 RSP 流只有最后一个事件带 usage（实测 2026-11-11，Gemini 3.8 Flash / 3.5 Flash-Lite / NB 2.1 / 3 Pro Image），中途用量被丢掉；MSG 只有 `message_start` 的输入数和结尾的完整用量 | 实测 2026-11-11 |
 | 厂商的非推理接口 | token 计数（Anthropic `count_tokens`、OpenAI `/responses/input_tokens`、方舟 `tokenization`、Moonshot `estimate-token-count`）；Moonshot `file-extract`（文档转 Markdown）；独立的搜索、抓取、阅读接口（DeepSeek `/v1/tools/search` 与 `/fetch`、Moonshot `/v1/tools/*` 与 Formula 工具、智谱 Web Search / Reader） | OR 只代理推理请求（外加它自己的 images、audio、videos、batches、files 接口），没有这些路由 | OA§10.0, AN§10.2, XD§B1, GKQ§1.1, GKQ§2.1, DB§2 |
 
 **疑似缺口（待实测）**
@@ -56,7 +57,7 @@
   - Qwen3.8：默认 `preserve_thinking:true`，历史推理要放在 `reasoning_content` 字段，缺了不报错、只降质；
   - 智谱：回传 `reasoning_content`，并且要 `clear_thinking:false`（见 §8）；
   - 豆包 2.1 Turbo、2.0-lite-260428：回传 `encrypted_content`；OR `reasoning_details` 的 `format` 枚举里没有字节系的值；
-  - Gemini：文本、图片 part 上的 `thoughtSignature`，以及带签名的多轮图片编辑（函数调用 part 的签名已有文档）。
+  - Gemini：图片 part 上的 `thoughtSignature`（带签名的多轮图片编辑）。文本 part 已实测：经 CC 回放 `reasoning_details` 时，OR 会把签名放回模型文本 part 的 `thoughtSignature`；经 RSP 回放 reasoning 项时签名被丢掉（放在 message 前后各测一次），所以 Gemini 只走 CC（实测 2026-11-11）。图像模型的签名每轮 0.75–1.9 MB，回放的计费未测。
 
   测：两轮对话（DeepSeek、豆包用一个工具回合），看第二轮 echo 里的 assistant 消息。（OR§3.3, XD§C2, GKQ§4.6, GE§3.1, DB§9.2 P1）
 - **prefill 映射到厂商的续写模式**：OR 把末尾的 assistant 消息当作 prefill，但没写是否映射成以下几种：DeepSeek 的 `prefix:true`（官方要走 beta base URL，思考模式可带 `reasoning_content` 前缀）；Kimi、Qwen 的 `partial:true`（Kimi 可带 `reasoning_content`，Qwen 只限非思考模型）；Seed 的 prefill 续写（方舟支持）。测：末尾放 assistant 消息，看 echo 和输出是否接着写。（OR§2.1, XD§D2, GKQ§6, GKQ§7, DB§9.2 P9）
@@ -76,6 +77,7 @@
 |---|---|---|---|
 | `web_search` 的部分参数 | `filters.blocked_domains`、`external_web_access`（只用缓存/离线）、`return_token_budget`、图片搜索（`search_content_types` + `image_settings`） | 任何 `web_search`/`web_search_preview` 工具都会被提升为 `openrouter:web_search`，只带 OR 自己的参数：后三者没有，`excluded_domains` 对 OpenAI 原生搜索被静默忽略 | OA§3.1, OA§10.2, OR§5.1–5.2 |
 | `image_generation` 托管工具 | 聊天模型在回答中调用 OpenAI 自己的出图工具（gpt-image 系列），结果为 `image_generation_call` 项 | RSP 实测发送 `{"type":"image_generation"}` 后，返回的是 `openrouter:image_generation` 项：被替换成 OR 自己执行的出图工具，不是 OpenAI 的 | 实测 2026-11-11（`gpt-6-luna`） |
+| 错误原因 | 坏图片等请求错误由 OpenAI 返回明确的 400 | RSP 实测：损坏的 PNG 返回 HTTP 200 后 `response.failed`，`code: server_error`、`error_type: provider_unavailable`、"Provider returned an empty response"——真实原因被替换，看起来像临时故障，bot 无法区分而会自动重试 | 实测 2026-11-11（`gpt-6-luna`；fixture `rsp_bad_image_openai`） |
 | `code_interpreter` 的执行输出和生成的文件 | `include: ["code_interpreter_call.outputs"]` 返回执行日志和图片输出；生成的文件（图表等）经 `container_file_citation` + 容器文件接口下载 | 工具本身能透传并执行，但：CC 的流里没有任何 `code_interpreter_call` 项（只有加密推理，index 中间有缺口）；RSP 能看到 `code` 和 `container_id`，带了 `include` 后 `outputs` 仍是 `null`；回答里只有 `sandbox:/mnt/data/…` 链接，没有可下载的途径 | 实测 2026-11-11（`gpt-6-luna`，CC 与 RSP 各一次） |
 
 **疑似缺口（待实测）**
@@ -95,7 +97,7 @@
 
 ## 4. Anthropic
 
-第一方 `anthropic`、`anthropic/fast`。原生 block 在 MSG 上保留（bot 目前走 CC，见 fidelity 文档）。除 §2 外：
+第一方 `anthropic`、`anthropic/fast`。原生 block 在 MSG 上保留（bot 对 Claude 走 MSG，见 fidelity 文档）。除 §2 外：
 
 | 功能 | 官方 API 能做什么 | 为什么 OpenRouter 做不到 | 来源 |
 |---|---|---|---|
@@ -116,7 +118,7 @@
 |---|---|---|---|
 | 托管 agent | Interactions API 的 `agent`（Deep Research 等） | OR 没有 Interactions 或 agent 接口 | GE§2.2, GE§10 |
 | 其它内置工具 | URL context、代码执行、Google Maps grounding、File Search、Computer Use、MCP，以及与函数工具组合（`includeServerSideToolInvocations`） | endpoint 的 `native_tools` 只有 `google_search`；`openrouter:web_fetch`、`shell` 是 OR 自己执行的 | GE§1.8, GE§10, GE§11 |
-| 图像模型的"思考草稿图" | Gemini 3 图像模型在思考中生成最多两张中间草稿图（`thought: true` 的 inline image part），`includeThoughts` 时随思考一起返回 | 两次实测（`gemini-nano-banana-2.1`，effort low 和默认 high）流里只有推理文字和最终图片，没有任何思考阶段的图片；OR 文档也没有返回它们的方式 | GE§1.3, 实测 2026-11-11 |
+| 图像模型的"思考草稿图" | Gemini 3 图像模型在思考中生成最多两张中间草稿图（`thought: true` 的 inline image part），`includeThoughts` 时随思考一起返回 | CC 两次、RSP 两次实测（`gemini-nano-banana-2.1`、`gemini-3-pro-image`）：流里只有思考文字和最终图片；NB 2.1 的思考里写着在检查已生成图片的箭头方向并改了一版，说明草稿确实生成过。reasoning 项末尾有 1.5–1.9 MB 的加密签名（与普通签名同一格式，无法解码），草稿可能封在里面 | GE§1.3, 实测 2026-11-11 |
 | Google Search 的时间范围与图片搜索 | `googleSearch.timeRangeFilter`、`searchTypes.imageSearch` | 只能经 `openrouter:web_search`（原生映射为 `google_search`），它的参数里没有这两项 | GE§1.8, GE§10, OR§5.1 |
 | 显式缓存 `cachedContents` | 创建命名缓存、自定义 TTL（默认 1 h）、跨请求复用（Gemini 4 本身不支持显式缓存） | 只有 `cache_control` 断点：只用最后一个，第一条 system 不可变，TTL 固定 5 分钟；没有 `cachedContents` API | GE§1.2, GE§9, GE§10, OR§10 |
 
@@ -129,9 +131,9 @@
   - 3.8/4 的 endpoint 不列 `top_k`、penalty、logprobs。Google 在 3.6+ 上本来就忽略 `topK`；logprobs 和 penalty 在新模型上是否生效，官方也没写。
 
   测：`provider.options["google-ai-studio"]`，看 echo。（GE§1.4, GE§1.7, GE§10, 实测 2026-11-11）
-- **媒体 part 字段**：`videoMetadata`（`fps`、起止 offset）、逐 part 的 `mediaResolution`（含 `ULTRA_HIGH`）。OR 的 `video_url` 只有 `url` 和 `processing`；图片的 `detail` 如何映射到 `mediaResolution`，没写。测：发 `detail:"low"`、`"original"` 的图片，看 echo。（GE§1.3, GE§1.6, GE§10）
+- **媒体 part 字段**：`videoMetadata`（`fps`、起止 offset），以及视频、PDF part 的 `mediaResolution`：OR 的 `video_url`、`file` 没有对应字段。（图片已实测可以：CC 和 RSP 都把 `detail` 映射成逐 part 的 `mediaResolution`，`low`→LOW、`high`→HIGH、`original`→ULTRA_HIGH，`auto` 不发；实测 2026-11-11。）测：视频带 `detail` 看 echo。（GE§1.3, GE§1.6, GE§10）
 - **Office 文档**：Gemini 原生读 docx/pptx/xlsx；经 OR 的 `file` part 是否原样交给 Gemini，未知。测：发 docx，看 echo 以及是否出现 `file` annotation。（GE§5, GE§10）
-- **图片输出的尺寸与宽高比**：官方有 `imageSize` 512/1K/2K/4K 和 14 种宽高比（含 1:4、4:1、1:8、8:1）。CC 的 `image_config` 是无类型 map，Gemini 的 key 能否透传未测（bot 的 `1k`/`2k`/`4k`、`ar=` 依赖它）；Images API 有 `resolution` 和 `aspect_ratio`。测：`+4k+ar=1:8`，看 echo。（GE§1.6, GE§10）
+- **图片输出的尺寸与宽高比**：官方有 `imageSize` 512/1K/2K/4K 和 14 种宽高比（含 1:4、4:1、1:8、8:1）。CC 的 `image_config` 是无类型 map，Gemini 的 key 能否透传未测（bot 的 `1`/`2`/`4`、`ar=` 依赖它）；Images API 有 `resolution` 和 `aspect_ratio`。测：`gi+4+ar=1:8`，看 echo。（GE§1.6, GE§10）
 - **TTS 输出格式**：OR 的 `/api/v1/audio/speech` 只给 `pcm`（请求 mp3 → 400）。文档说 TTS 的 `provider.options["google-ai-studio"]` 会并入 generationConfig，但 `responseFormat`（MP3、OGG_OPUS、WAV）能否生效未知。测：带上它请求，看返回格式。（GE§6, GE§10）
 
 ## 6. xAI Grok
@@ -146,7 +148,7 @@
 **疑似缺口（待实测）**
 
 - **其它托管工具**：`code_interpreter`、`file_search`（collections）、远程 `mcp`、`image_generation` 工具。endpoint 的 `native_tools` 只有 web search，但 OR 对 OpenAI 会原样透传托管工具，而 xAI 的上游正是 Responses。测：RSP 固定 `xai`，发 `{"type":"code_interpreter"}`，看 echo 和输出项。（XD§A5, XD§D1, OA§10.2）
-- **文件 / PDF**：官方的 `input_file` 会触发 `attachment_search`；经 OR 是原样交给 xAI，还是被 OR 解析，未知。测：发 PDF，看是否出现 `file` annotation（bot 会提示）。（XD§A6, XD§C3）
+- **文件 / PDF**：官方的 `input_file` 会触发 `attachment_search`；经 OR 是原样交给 xAI，还是被 OR 解析，未知。测：发 PDF，看原始响应里是否出现 `file` annotation（bot 只在 CC 上检测它并提示，xAI 走 RSP）。（XD§A6, XD§C3）
 - **引用**：默认返回的 `citations[]`（全部来源），以及 Responses 默认的内联 `[[N]](url)` 与 `include:["no_inline_citations"]`，经 OR 是否保留、转发。测：`+s` 后看原始响应。（XD§A5, XD§D1）
 - **缓存路由**：`prompt_cache_key`（xAI 强烈建议设置，也可用 `x-grok-conv-id` 头）是否转发；不转发会降低缓存命中。测：看 echo，并对比连续两轮的 `cached_tokens`。（XD§A3, XD§C3）
 - **参数**：

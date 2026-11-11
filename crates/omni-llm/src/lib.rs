@@ -14,6 +14,8 @@ pub mod budget;
 pub mod chatstream;
 pub mod error;
 pub mod event;
+#[cfg(test)]
+mod fixtures;
 pub mod openrouter;
 pub mod request;
 pub mod settings;

@@ -1,0 +1,58 @@
+== Y1 grow plain 8000->12500 (+4500, x1.56)
+  #0  H    send    20000 chars  30132 B  20107 cp mixed  at   0.00s start   0.002s wall 1794400856065 took  202ms  FLOOD_WAIT 3
+  #0  H    send    20000 chars  30132 B  20107 cp mixed  at   0.00s start   4.205s wall 1794400860268 took  291ms  FLOOD_WAIT 3
+  #0  H    send    20000 chars  30132 B  20107 cp mixed  at   0.00s start   8.498s wall 1794400864560 took  758ms  ok
+  #1  M    send     8000 chars  12001 B   8001 cp plain-mixed at   6.00s start   9.256s wall 1794400865319 took  252ms  FLOOD_WAIT 4
+  #1  M    send     8000 chars  12001 B   8001 cp plain-mixed at   6.00s start  14.510s wall 1794400870573 took  715ms  ok
+  #2  H    edit    20000 chars  30132 B  20107 cp mixed  at   7.00s start  15.227s wall 1794400871290 took  281ms  FLOOD_WAIT 4
+  #3  M    edit    12500 chars  18773 B  12501 cp plain-mixed at  13.00s start  20.509s wall 1794400876571 took  250ms  ok
+  #4  H    edit    20000 chars  30132 B  20107 cp mixed  at  14.00s start  20.760s wall 1794400876823 took  225ms  ok
+  read H    20094 cp stored, 3 top-level blocks, ends "ars"
+  read M    12500 cp stored, 1 top-level blocks, ends "t 3"
+
+== Y2 grow plain 300->3000 (+2700, x10)
+  #0  H    send    20000 chars  30128 B  20103 cp mixed  at   0.00s start   0.002s wall 1794400926752 took  797ms  ok
+  #1  M    send      300 chars    461 B    301 cp plain-mixed at   6.00s start   6.009s wall 1794400932758 took  699ms  ok
+  #2  H    edit    20000 chars  30128 B  20103 cp mixed  at   7.00s start   7.002s wall 1794400933751 took  243ms  ok
+  #3  M    edit     3000 chars   4505 B   3001 cp plain-mixed at  13.00s start  13.001s wall 1794400939751 took  231ms  ok
+  #4  H    edit    20000 chars  30128 B  20103 cp mixed  at  14.00s start  14.002s wall 1794400940751 took  197ms  FLOOD_WAIT 4
+  read H    20090 cp stored, 3 top-level blocks, ends "ars"
+  read M    3000 cp stored, 1 top-level blocks, ends "at3"
+
+== Y3 grow plain 3000->6100 (x2.03, old 3000)
+  #0  H    send    20000 chars  30134 B  20109 cp mixed  at   0.00s start   0.002s wall 1794400990547 took  741ms  ok
+  #1  M    send     3000 chars   4505 B   3001 cp plain-mixed at   6.00s start   6.002s wall 1794400996547 took  705ms  ok
+  #2  H    edit    20000 chars  30134 B  20109 cp mixed  at   7.00s start   7.002s wall 1794400997547 took  200ms  FLOOD_WAIT 4
+  #3  M    edit     6100 chars   9173 B   6101 cp plain-mixed at  13.00s start  13.002s wall 1794401003547 took  220ms  ok
+  #4  H    edit    20000 chars  30134 B  20109 cp mixed  at  14.00s start  14.003s wall 1794401004548 took  202ms  FLOOD_WAIT 4
+  read H    20096 cp stored, 3 top-level blocks, ends "ars"
+  read M    6100 cp stored, 1 top-level blocks, ends "t 3"
+
+== Y4 grow plain 3000->5800 (x1.93, old 3000)
+  #0  H    send    20000 chars  30134 B  20109 cp mixed  at   0.00s start   0.002s wall 1794401054335 took  714ms  ok
+  #1  M    send     3000 chars   4505 B   3001 cp plain-mixed at   6.00s start   6.002s wall 1794401060335 took  709ms  ok
+  #2  H    edit    20000 chars  30134 B  20109 cp mixed  at   7.00s start   7.002s wall 1794401061336 took  201ms  FLOOD_WAIT 4
+  #3  M    edit     5800 chars   8713 B   5801 cp plain-mixed at  13.00s start  13.001s wall 1794401067335 took  230ms  ok
+  #4  H    edit    20000 chars  30134 B  20109 cp mixed  at  14.00s start  14.003s wall 1794401068336 took  205ms  FLOOD_WAIT 4
+  read H    20096 cp stored, 3 top-level blocks, ends "ars"
+  read M    5800 cp stored, 1 top-level blocks, ends "el3"
+
+== Y5 grow plain 1500->3100 (x2.07, old 1500)
+  #0  H    send    20000 chars  30134 B  20109 cp mixed  at   0.00s start   0.002s wall 1794401118154 took  702ms  ok
+  #1  M    send     1500 chars   2269 B   1501 cp plain-mixed at   6.00s start   6.002s wall 1794401124154 took  703ms  ok
+  #2  H    edit    20000 chars  30134 B  20109 cp mixed  at   7.00s start   7.003s wall 1794401125155 took  236ms  ok
+  #3  M    edit     3100 chars   4669 B   3101 cp plain-mixed at  13.00s start  13.001s wall 1794401131154 took  265ms  ok
+  #4  H    edit    20000 chars  30134 B  20109 cp mixed  at  14.00s start  14.003s wall 1794401132155 took  326ms  ok
+  read H    20096 cp stored, 3 top-level blocks, ends "ars"
+  read M    3100 cp stored, 1 top-level blocks, ends "d 3"
+
+== Y6 grow plain 1000->2900 (x2.9, old 1000)
+  #0  H    send    20000 chars  30133 B  20108 cp mixed  at   0.00s start   0.002s wall 1794401182210 took  765ms  ok
+  #1  M    send     1000 chars   1513 B   1001 cp plain-mixed at   6.00s start   6.001s wall 1794401188208 took  697ms  ok
+  #2  H    edit    20000 chars  30133 B  20108 cp mixed  at   7.00s start   7.002s wall 1794401189210 took  237ms  ok
+  #3  M    edit     2900 chars   4373 B   2901 cp plain-mixed at  13.00s start  13.002s wall 1794401195210 took  245ms  ok
+  #4  H    edit    20000 chars  30133 B  20108 cp mixed  at  14.00s start  14.002s wall 1794401196210 took  287ms  ok
+  read H    20095 cp stored, 3 top-level blocks, ends "ars"
+  read M    2900 cp stored, 1 top-level blocks, ends "t 3"
+
+DONE

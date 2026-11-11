@@ -69,13 +69,17 @@ s                 the provider's own web search
 c                 the provider's own code execution
 u                 let the model read URLs from the prompt (provider's own tool)
 e=<level>         reasoning effort, from the levels the model supports; e=none turns reasoning off
+                  (Volcengine Ark: e=minimal turns thinking off too)
 budget=<n>        reasoning token budget (models with budget-based thinking)
 v=<level>         verbosity (low|medium|high; OpenAI)
 1 2 4             image size 1K / 2K / 4K (image models)
 S W H w h         image aspect ratio 1:1 / 16:9 / 9:16 / 4:3 / 3:4;  ar=<w:h> for any ratio the model supports
-p=<slug>          another official provider of the model (e.g. p=google-vertex)
-tier=<tier>       service tier (flex; higher tiers only for users on the priority list)
-Letters can be combined: g+s4W$ = search, 4K, 16:9.";
+p=<slug>          another official provider of the model (e.g. p=google-vertex); p=a|b: any of these
+                  (OpenRouter only)
+tier=<tier>       service tier (flex; higher tiers only for users on the priority list;
+                  default / auto change nothing)
+Letters can be combined: gi+4W$ = 4K, 16:9.
+Anything else is an error: there are no free-form request fields.";
 
 fn set<T: PartialEq + std::fmt::Debug>(slot: &mut Option<T>, v: T, what: &str) -> Result<(), String> {
     match slot {

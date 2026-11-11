@@ -1,0 +1,12 @@
+== I36 light, 36 s idle, then 6 heavy ops
+  #0  s    send      500 chars    859 B    594 cp mixed  at   0.00s start   0.001s wall 1794404143823 took  715ms  ok
+  #1  H    send    20000 chars  30130 B  20105 cp mixed  at  36.00s start  36.002s wall 1794404179824 took  725ms  ok
+  #2  H    edit    20000 chars  30130 B  20105 cp mixed  at  41.10s start  41.105s wall 1794404184927 took  437ms  ok
+  #3  H    edit    20000 chars  30130 B  20105 cp mixed  at  46.20s start  46.202s wall 1794404190024 took  204ms  FLOOD_WAIT 3
+  #4  H    edit    20000 chars  30130 B  20105 cp mixed  at  51.30s start  51.302s wall 1794404195123 took  277ms  ok
+  #5  H    edit    20000 chars  30130 B  20105 cp mixed  at  56.40s start  56.401s wall 1794404200223 took  252ms  ok
+  #6  H    edit    20000 chars  30130 B  20105 cp mixed  at  61.50s start  61.502s wall 1794404205323 took  240ms  ok
+  read H    20092 cp stored, 3 top-level blocks, ends "ars"
+  read s    590 cp stored, 3 top-level blocks, ends "ars"
+
+DONE

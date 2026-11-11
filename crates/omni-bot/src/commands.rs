@@ -3,13 +3,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use omni_core::content::{Part, ReasoningKind};
+use omni_core::content::Part;
 use omni_core::trigger;
 use omni_markdown::rich::{CellAlign, RBlock, RCell, RItem, RText};
 use rusqlite::params;
 use serde_json::json;
 
-use crate::access::{self, Access, Rule};
+use crate::access::{self, Access};
 use crate::app::App;
 use crate::compose::fmt_cost;
 use crate::conv::{self, Inbound, TurnStatus};
@@ -18,13 +18,39 @@ use crate::reply;
 use crate::store::now_ms;
 use crate::tg::bot::BotConn;
 use crate::tg::upload::{Source, Want};
+use grammers_tl_types as tl;
 
-pub const HINT: &str = "Start a conversation with a prefix such as `$hello` (default model) or `alias$question`, or reply to one of my messages to continue. /help for details.";
+/// The hint for messages that are neither a prefix nor a reply, with `marker`.
+pub fn hint(marker: &str) -> String {
+    with_marker(HINT, marker)
+}
+
+/// `$` in these texts always stands for the configured trigger marker (and is
+/// always inside a code span, so any marker keeps the Markdown intact).
+fn with_marker(text: &str, marker: &str) -> String {
+    text.replace('$', marker)
+}
+
+/// How model ids can be typed directly as prefixes, from the providers that
+/// allow it (`allow_unlisted_models`); `None` if none does.
+pub fn direct_ids(app: &App) -> Option<String> {
+    let m = app.marker();
+    let mut forms = Vec::new();
+    if app.unlisted_models_allowed("openrouter") {
+        forms.push(format!("an OpenRouter model id (`author/model{m}`)"));
+    }
+    if app.unlisted_models_allowed("ark") {
+        forms.push(format!("a Volcengine Ark model id (`ark:model{m}`)"));
+    }
+    (!forms.is_empty()).then(|| forms.join(" or "))
+}
+
+const HINT: &str = "Start a conversation with `prefix$question` (the prefixes are listed by /models), or reply to one of my messages to continue. /help for details.";
 
 const HELP: &str = r#"**Start a conversation**: `prefix$text`
-- `$text` uses this bot's default model; `alias$text` uses an alias (see /models); `author/model$text` uses any OpenRouter model id directly (new models work without any config change). Everything after `$` is sent exactly as typed, including a leading space.
-- Several models at once: `c,g,openai/gpt-6$ compare these`.
-- Options after `+`: `c+s$` web search, `c+e=low$` reasoning effort, `+max=2000`, `+t=0.7`, `+p=any` (let OpenRouter pick the provider), `+pure` (no automatic max-capability presets), `+debug`, or a raw JSON patch `+{"temperature":0.2}`. Full list: /help options.
+- PREFIXES Everything after `$` is sent exactly as typed, including a leading space.
+- Several models at once: `c,g$compare these`. (Examples use prefixes of the default configuration; /models lists this bot's.)
+- Options after `+`: `c+s$` the provider's own web search, `c+e=low$` reasoning effort (`e=none` turns reasoning off), `gi+4W$` image size and aspect ratio, `+p=<provider>` another official provider of the model. The full (closed) list: /help options; anything else is an error.
 - Define a system prompt and fake history with marker lines:
 ```
 c$::system
@@ -36,17 +62,26 @@ Arr!
 ::user
 who are you?
 ```
-A line that literally is `::user` can be sent by escaping it as `\::user`.
+Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::user` is sent by writing `\::user` (one backslash is removed).
 
-**Continue**: reply to any of my messages. The whole reply is sent verbatim (a leading `\` is removed, so `\/raw` sends the text `/raw`). Replying to a failed message is rejected; use /retry on it.
+**Continue**: reply to any of my messages. The whole reply is the next message, exactly as typed (marker lines are plain text there), except that a leading `\` is removed, so `\/raw` sends the text `/raw`. Replying to a failed message is rejected; use /retry on it.
 
-**Commands (reply to a bot message)**: /m `spec$ text` continue with another model · /raw original Markdown and files · /info request details · /retry regenerate a failed answer · /continue keep writing an answer that stopped at the long-decode budget.
+**Commands (reply to a bot message)**: /m `prefix$text` continue with another model · /raw original Markdown and files · /dump the whole conversation up to that message as a JSON file · /info request details · /retry regenerate a failed answer · /continue keep writing an answer that stopped at the long-decode budget.
 
-**Other**: /models [search] · /model `id` · /stats [today|7d|30d|all] · /usage · /whoami · /ping
+**Other**: /models [search] · /model `prefix` · /stats [today|7d|30d|all] this chat's usage (calendar days in the bot's time zone, today since 00:00, default 30d; in a group also one member: `/stats user_id`, or reply /stats to their message) · /usage · /whoami · /ping
 
 By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. In a reply, the first line names the model; everything else the bot adds (reasoning, sources, errors, notes, usage) is in collapsible blocks or small text, so the model's answer is always unambiguous."#;
 
-const ADMIN_HELP: &str = r#"**Admin**: /allow [chat_id] · /deny [chat_id] · /allow_user `id` · /deny_user `id` · /ban `id` · /unban `id` · /acl · /quota `user|chat` `id|default` `capacity_usd` `refill_usd_per_day` (or `off`) · /alias `name` `spec` · /unalias `name` · /credits · /stats all"#;
+/// Commands only administrators may run: in their private chat for anything of
+/// this bot, inside a group only those in [`GROUP_ADMIN_COMMANDS`], for that group.
+const ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota", "alias", "unalias", "credits"];
+/// Admin commands that work inside a group; they only see and change that group,
+/// never anything about other chats.
+const GROUP_ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota"];
+
+const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [`chat_id`] [`user_id`] [period] (default: every chat) · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
+
+const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person). Everything else in private chat."#;
 
 fn label(s: &str) -> RText {
     RText::bold(RText::plain(s))
@@ -90,9 +125,10 @@ async fn say(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, text: &str) {
 pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, args: &str) -> Result<()> {
     let user = ib.sender_id.unwrap_or(0);
     let admin = app.is_admin(user);
-    let access = access::check(app, ib.chat_id, user).await?;
+    let access = access::check(app, &bot.name, ib.chat_id, user).await?;
     let allowed = access == Access::Allowed;
-    // Commands that work for everyone (useful to get ids for the admin).
+    // `/ping` and `/whoami` work for everyone everywhere: they show the ids an
+    // administrator needs to allow a chat or user.
     match name {
         "ping" => {
             let a = match &access {
@@ -132,9 +168,28 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         }
         _ => {}
     }
-    if !allowed && !admin {
+    let is_admin_command = ADMIN_COMMANDS.contains(&name);
+    // Everything else only where the bot may be used, except that administrators
+    // may run admin commands anywhere (e.g. `/allow` inside a group to authorize it).
+    if !(allowed || admin && is_admin_command) {
         if let Access::Denied(msg) = access {
             say(app, bot, ib, &format!("⛔ {msg}")).await;
+        }
+        return Ok(());
+    }
+    if is_admin_command {
+        if !admin {
+            say(app, bot, ib, "⛔ admin only").await;
+        } else if ib.chat_id < 0 && !GROUP_ADMIN_COMMANDS.contains(&name) {
+            say(
+                app,
+                bot,
+                ib,
+                &format!("⛔ In a group, admin commands only act on that group. Use /{name} in private chat."),
+            )
+            .await;
+        } else {
+            admin_command(app, bot, ib, name, args, user).await?;
         }
         return Ok(());
     }
@@ -146,13 +201,21 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
                     bot,
                     ib,
                     "Options",
-                    vec![RBlock::Pre { text: omni_llm::request::HELP.into(), language: String::new() }],
+                    vec![RBlock::Pre { text: with_marker(omni_llm::request::HELP, app.marker()), language: String::new() }],
                 )
                 .await;
             } else {
-                let mut b = md(HELP);
+                let prefixes = match direct_ids(app) {
+                    Some(ids) => format!(
+                        "The prefix is one of those listed by /models, or a model id typed directly: {ids}, for any model \
+                         this bot has, so new models need no config change."
+                    ),
+                    None => "The prefix is one of those listed by /models.".to_string(),
+                };
+                let mut b = md(&with_marker(HELP, app.marker()).replacen("PREFIXES", &prefixes, 1));
                 if admin {
-                    b.extend(md(ADMIN_HELP));
+                    let admin_help = if ib.chat_id < 0 { ADMIN_HELP_GROUP } else { ADMIN_HELP_PRIVATE };
+                    b.extend(md(&with_marker(admin_help, app.marker())));
                 }
                 send(app, bot, ib, "Help", b).await;
             }
@@ -161,82 +224,194 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         "model" => cmd_model(app, bot, ib, args.trim()).await?,
         "raw" => cmd_raw(app, bot, ib).await?,
         "info" => cmd_info(app, bot, ib).await?,
+        "dump" => cmd_dump(app, bot, ib).await?,
         "retry" => cmd_retry(app, bot, ib).await?,
         "continue" => cmd_continue(app, bot, ib).await?,
         "m" => cmd_m(app, bot, ib, args).await?,
         "stats" => cmd_stats(app, bot, ib, args.trim(), admin).await?,
         "usage" => cmd_usage(app, bot, ib).await?,
-        _ if !admin => say(app, bot, ib, "⛔ admin only").await,
+        _ => {}
+    }
+    Ok(())
+}
+
+/// How a chat id reads: a group, or a user's private chat.
+fn place_label(chat_id: i64) -> String {
+    if chat_id > 0 { format!("private chat {chat_id}") } else { format!("group {chat_id}") }
+}
+
+/// The sender of the message `ib` replies to (for `/ban` as a reply).
+async fn replied_sender(app: &App, bot: &BotConn, ib: &Inbound) -> Option<i64> {
+    let rt = ib.reply_to_msg_id?;
+    let msg = bot.get_messages(ib.chat_id, &[rt]).await.ok()?.into_iter().next()?;
+    let tl::enums::Message::Message(m) = msg else { return None };
+    let tl::enums::Peer::User(u) = m.from_id? else { return None };
+    (!app.our_bot_ids().contains(&u.user_id)).then_some(u.user_id)
+}
+
+/// A prefix as typed in `/alias`, `/unalias`, `/model`: `name$` or `name`
+/// (the empty prefix is `$`).
+fn prefix_name<'a>(arg: &'a str, marker: &str) -> &'a str {
+    arg.strip_suffix(marker).unwrap_or(arg)
+}
+
+/// Admin commands. In a group they only see and change that group.
+async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, args: &str, by: i64) -> Result<()> {
+    let group = ib.chat_id < 0;
+    let here = ib.chat_id;
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let marker = app.marker();
+    match name {
         "allow" | "deny" => {
-            let id = args.trim().parse::<i64>().unwrap_or(ib.chat_id);
-            let status = if name == "allow" { Some("allow") } else { None };
-            access::acl_set(&app.db, if id > 0 { "user" } else { "chat" }, id, status, user, None).await?;
-            say(
-                app,
-                bot,
-                ib,
-                &format!("{} {id}", if name == "allow" { "✅ allowed" } else { "❎ removed from allow list:" }),
-            )
-            .await;
+            let target = match words.first() {
+                None => here,
+                Some(w) => match w.parse::<i64>() {
+                    Ok(id) if id != 0 => id,
+                    _ => {
+                        say(app, bot, ib, &format!("usage: /{name} [chat_id]")).await;
+                        return Ok(());
+                    }
+                },
+            };
+            if group && target != here {
+                say(app, bot, ib, &format!("⛔ In a group, /{name} only acts on this group. Use private chat for others."))
+                    .await;
+                return Ok(());
+            }
+            let allow = name == "allow";
+            let changed = access::set_place(&app.db, &bot.name, target, allow, by).await?;
+            let what = if target == here && group { "this group".to_string() } else { place_label(target) };
+            let text = match (allow, changed) {
+                (true, true) => format!("✅ allowed: {what}"),
+                (true, false) => format!("already allowed: {what}"),
+                (false, true) => format!("❎ removed from the allow list: {what}"),
+                (false, false) => format!("not on the allow list: {what}"),
+            };
+            say(app, bot, ib, &text).await;
         }
-        "allow_user" | "deny_user" | "ban" | "unban" => {
-            let Ok(id) = args.trim().parse::<i64>() else {
-                say(app, bot, ib, "usage: /allow_user <user_id>").await;
+        "ban" | "unban" => {
+            // A ban lives in one group: this one, or the one named in private chat.
+            let usage = if group {
+                format!("usage: /{name} <user_id>, or reply /{name} to their message")
+            } else {
+                format!("usage: /{name} <user_id> <group_id>")
+            };
+            let user = match words.first() {
+                Some(w) => w.parse::<i64>().ok(),
+                None => replied_sender(app, bot, ib).await,
+            };
+            let Some(user) = user.filter(|u| *u > 0) else {
+                say(app, bot, ib, &usage).await;
                 return Ok(());
             };
-            let status = match name {
-                "allow_user" => Some("allow"),
-                "ban" => Some("deny"),
-                _ => None,
+            let place = if group {
+                here
+            } else {
+                match words.get(1).map(|w| w.parse::<i64>()) {
+                    Some(Ok(g)) if g < 0 => g,
+                    _ => {
+                        say(app, bot, ib, &usage).await;
+                        return Ok(());
+                    }
+                }
             };
-            access::acl_set(&app.db, "user", id, status, user, None).await?;
-            say(app, bot, ib, &format!("✅ user {id}: {}", status.unwrap_or("removed"))).await;
+            let ban = name == "ban";
+            if ban && app.is_admin(user) {
+                say(app, bot, ib, "administrators cannot be banned").await;
+                return Ok(());
+            }
+            let changed = access::set_ban(&app.db, &bot.name, place, user, ban, by).await?;
+            let scope = if group { "in this group".to_string() } else { format!("in group {place}") };
+            let text = match (ban, changed) {
+                (true, true) => format!("🚫 user {user} banned {scope}"),
+                (true, false) => format!("user {user} was already banned {scope}"),
+                (false, true) => format!("✅ user {user} no longer banned {scope}"),
+                (false, false) => format!("user {user} was not banned {scope}"),
+            };
+            say(app, bot, ib, &text).await;
         }
         "acl" => {
-            let rows = access::acl_list(&app.db).await?;
-            let rows = rows
+            let rows = access::rules(&app.db, &bot.name, group.then_some(here)).await?;
+            let rows: Vec<Vec<String>> = rows
                 .into_iter()
-                .map(|(scope, id, status, name)| vec![scope, id.to_string(), status, name.unwrap_or_default()])
+                .map(|r| {
+                    let rule = if r.status == "allow" { "allowed" } else { "banned" };
+                    let place = if group { "this group".to_string() } else { place_label(r.chat_id) };
+                    let who = if r.user_id == 0 { "everyone".to_string() } else { r.user_id.to_string() };
+                    let names = [r.place.filter(|_| !group), r.user].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                    vec![rule.to_string(), place, who, names]
+                })
                 .collect();
-            send(app, bot, ib, "Access list", vec![table(&["scope", "id", "status", "name"], rows)]).await;
+            let title = if group { "Access rules of this group" } else { "Access rules" };
+            let mut blocks = vec![table(&["rule", "where", "who", "names"], rows.clone())];
+            if rows.is_empty() {
+                blocks = vec![RBlock::Paragraph(RText::plain(if group {
+                    "This group is not allowed and nobody is banned here."
+                } else {
+                    "No chat is allowed: only administrators can use this bot (in their private chats)."
+                }))];
+            }
+            send(app, bot, ib, title, blocks).await;
         }
-        "quota" => cmd_quota(app, bot, ib, args, user).await?,
+        "quota" => cmd_quota(app, bot, ib, &words, by).await?,
         "alias" => {
             let mut it = args.trim().splitn(2, char::is_whitespace);
             let (Some(n), Some(spec)) = (it.next(), it.next()) else {
-                say(app, bot, ib, "usage: /alias <name> <spec>, e.g. /alias g5 openrouter:google/gemini-5+e=high")
-                    .await;
+                say(
+                    app,
+                    bot,
+                    ib,
+                    &with_marker(
+                        "usage: /alias <prefix$> <spec>, e.g. /alias g5$ openrouter:google/gemini-5+e=high (the empty prefix is `$`)",
+                        marker,
+                    ),
+                )
+                .await;
                 return Ok(());
             };
-            if trigger::parse_spec(spec.trim()).is_err() || n.contains(['$', ',', '+', '{']) {
-                say(app, bot, ib, "⚠️ invalid alias name or spec").await;
+            let n = prefix_name(n, marker);
+            let spec = spec.trim();
+            if let Err(e) = trigger::parse_spec(spec) {
+                say(app, bot, ib, &format!("⚠️ invalid spec: {e}")).await;
                 return Ok(());
             }
-            let (n2, s2) = (n.to_string(), spec.trim().to_string());
+            if !trigger::alias_name_ok(n, marker) {
+                say(app, bot, ib, "⚠️ invalid prefix: no whitespace, `,+{}` or the marker inside").await;
+                return Ok(());
+            }
+            let (b2, n2, s2) = (bot.name.clone(), n.to_string(), spec.to_string());
             app.db
                 .call(move |c| {
                     c.execute(
-                        "INSERT INTO aliases(name, spec, created_by, created_at) VALUES (?1, ?2, ?3, ?4)
-                         ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, created_by = excluded.created_by, created_at = excluded.created_at",
-                        params![n2, s2, user, now_ms()],
+                        "INSERT INTO aliases(bot, name, spec, created_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(bot, name) DO UPDATE SET spec = excluded.spec, created_by = excluded.created_by, created_at = excluded.created_at",
+                        params![b2, n2, s2, by, now_ms()],
                     )?;
                     Ok(())
                 })
                 .await?;
-            app.aliases.write().insert(n.to_string(), spec.trim().to_string());
-            say(app, bot, ib, &format!("✅ alias {n} = {}", spec.trim())).await;
+            app.set_runtime_alias(&bot.name, n, Some(spec.to_string()));
+            say(app, bot, ib, &format!("✅ {n}{marker} = {spec}")).await;
         }
         "unalias" => {
-            let n = args.trim().to_string();
-            let n2 = n.clone();
-            app.db.call(move |c| Ok(c.execute("DELETE FROM aliases WHERE name = ?1", params![n2])?)).await?;
-            app.aliases.write().remove(&n);
-            if let Some(a) = app.cfg.aliases.iter().find(|a| a.name == n) {
-                app.aliases.write().insert(n.clone(), a.spec.clone());
-                say(app, bot, ib, &format!("runtime alias removed; config alias {n} = {} remains", a.spec)).await;
-            } else {
-                say(app, bot, ib, &format!("✅ alias {n} removed")).await;
-            }
+            let Some(arg) = words.first() else {
+                say(app, bot, ib, &with_marker("usage: /unalias <prefix$> (the empty prefix is `$`)", marker)).await;
+                return Ok(());
+            };
+            let n = prefix_name(arg, marker).to_string();
+            let (b2, n2) = (bot.name.clone(), n.clone());
+            let removed = app
+                .db
+                .call(move |c| Ok(c.execute("DELETE FROM aliases WHERE bot = ?1 AND name = ?2", params![b2, n2])?))
+                .await?;
+            app.set_runtime_alias(&bot.name, &n, None);
+            let text = match (removed > 0, app.cfg.aliases.iter().find(|a| a.name == n)) {
+                (true, Some(a)) => format!("runtime prefix {n}{marker} removed; the config's {n}{marker} = {} remains", a.spec),
+                (true, None) => format!("✅ {n}{marker} removed"),
+                (false, Some(_)) => format!("{n}{marker} comes from the config file; change it there"),
+                (false, None) => format!("there is no prefix {n}{marker}"),
+            };
+            say(app, bot, ib, &text).await;
         }
         "credits" => match app.openrouter.key_info().await {
             Ok(v) => {
@@ -256,60 +431,84 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     Ok(())
 }
 
+/// `/models`: this bot's prefixes, in config order. `/models <text>`: the
+/// prefixes whose name or spec contains the text, and the model ids that work
+/// as prefixes (providers with `allow_unlisted_models`).
 async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &str) -> Result<()> {
+    let Some(cfg) = app.bot_cfg(&bot.name) else { return Ok(()) };
+    let marker = app.marker();
+    let prefixes: Vec<(String, String)> = app
+        .aliases_in_order(&bot.name)
+        .into_iter()
+        .filter(|(_, spec)| app.served_canonical(cfg, spec).is_some())
+        .collect();
     if !query.is_empty() {
-        let found = app.openrouter.catalog.search(query, 40);
-        let rows = found
+        let q = query.to_lowercase();
+        let mut blocks = Vec::new();
+        let matching: Vec<Vec<String>> = prefixes
             .iter()
-            .map(|m| {
-                let effort = m.max_effort().unwrap_or("-").to_string();
-                vec![m.id.clone(), m.architecture.input_modalities.join(","), effort]
-            })
+            .filter(|(n, s)| n.to_lowercase().contains(&q) || s.to_lowercase().contains(&q))
+            .map(|(n, s)| vec![format!("{n}{marker}"), s.clone()])
             .collect();
-        send(
-            app,
-            bot,
-            ib,
-            &format!("OpenRouter models matching `{query}`"),
-            vec![table(&["model id", "input", "max effort"], rows)],
-        )
-        .await;
+        if !matching.is_empty() {
+            blocks.push(table(&["prefix", "spec"], matching));
+        }
+        if app.unlisted_models_allowed("openrouter") {
+            let ids: Vec<Vec<String>> = app
+                .openrouter
+                .catalog
+                .search(query, 200)
+                .iter()
+                .filter(|m| cfg.serves(&format!("openrouter:{}", m.id)))
+                .take(40)
+                .map(|m| {
+                    let effort = m.max_effort().unwrap_or("-").to_string();
+                    vec![format!("{}{marker}", m.id), m.architecture.input_modalities.join(","), effort]
+                })
+                .collect();
+            if !ids.is_empty() {
+                blocks.push(table(&["model id", "input", "max effort"], ids));
+            }
+        }
+        if blocks.is_empty() {
+            blocks.push(RBlock::Paragraph(RText::plain(format!("Nothing matches `{query}`."))));
+        }
+        send(app, bot, ib, &format!("Models matching `{query}`"), blocks).await;
         return Ok(());
     }
-    let cfg = app.bot_cfg(&bot.name);
-    let aliases = app.aliases.read().clone();
-    let rows: Vec<Vec<String>> = aliases
-        .iter()
-        .filter(|(_, spec)| {
-            let canonical = trigger::parse_spec(spec)
-                .map(|s| if s.model.contains(':') { s.model } else { format!("openrouter:{}", s.model) })
-                .unwrap_or_default();
-            app.responsible_bot(ib.chat_id, &canonical, &bot.name).as_deref() == Some(bot.name.as_str())
-        })
-        .map(|(n, s)| vec![format!("{n}$"), s.clone()])
-        .collect();
+    let rows: Vec<Vec<String>> = prefixes.into_iter().map(|(n, s)| vec![format!("{n}{marker}"), s]).collect();
     let mut blocks = vec![table(&["prefix", "spec"], rows)];
-    if let Some(d) = cfg.and_then(|c| c.default_model.clone()) {
-        blocks.push(RBlock::Paragraph(RText::plain(format!("Bare `$` uses: {d}"))));
-    }
-    blocks.push(RBlock::Paragraph(RText::plain(
-        "Any OpenRouter model id works as a prefix too, e.g. openai/gpt-6$ — search with /models <text>.",
-    )));
+    let tail = match direct_ids(app) {
+        Some(ids) => format!("{ids} works as a prefix too. Search: /models <text>."),
+        None => "Search: /models <text>.".to_string(),
+    };
+    blocks.push(RBlock::Paragraph(RText::plain(tail.replace('`', ""))));
     send(app, bot, ib, "Models", blocks).await;
     Ok(())
 }
 
 async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) -> Result<()> {
     let Some(cfg) = app.bot_cfg(&bot.name) else { return Ok(()) };
-    let token = trigger::parse_spec(if arg.is_empty() { "" } else { arg }).ok();
+    let marker = app.marker();
+    let usage = format!("usage: /model <prefix>, e.g. /model c{marker} (the empty prefix is {marker})");
+    if arg.is_empty() {
+        say(app, bot, ib, &usage).await;
+        return Ok(());
+    }
+    let token = trigger::parse_spec(prefix_name(arg, marker)).ok();
     let spec = match token {
         Some(t) => app.resolve_spec(&t, cfg, false).await.ok().flatten(),
         None => None,
     };
     let Some(spec) = spec else {
-        say(app, bot, ib, "usage: /model <alias or model id>").await;
+        say(app, bot, ib, &format!("unknown prefix `{arg}`. {usage}")).await;
         return Ok(());
     };
+    if spec.provider != "openrouter" {
+        let title = format!("{}{marker} → {}:{}{}", spec.label, spec.provider, spec.model, spec.options_syntax());
+        send(app, bot, ib, &title, vec![RBlock::Paragraph(RText::plain("served directly by this provider"))]).await;
+        return Ok(());
+    }
     let info = app.openrouter.model_info(&spec.model).await;
     let mut blocks = vec![];
     match info {
@@ -339,7 +538,7 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
             blocks.push(RBlock::Paragraph(RText::plain(format!("{} is not in the OpenRouter catalog", spec.model))))
         }
     }
-    send(app, bot, ib, &format!("{} → {}{}", spec.label, spec.model, spec.options_syntax()), blocks).await;
+    send(app, bot, ib, &format!("{}{marker} → {}{}", spec.label, spec.model, spec.options_syntax()), blocks).await;
     Ok(())
 }
 
@@ -363,67 +562,82 @@ const RAW_INLINE_MAX: usize = 2000;
 /// an attached `.md`) and every original image/file of the answer attached.
 async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
-    let mut md = String::new();
-    let mut reasoning = String::new();
-    let mut answer = String::new();
-    for p in &t.turn.parts {
-        match p {
-            Part::Reasoning(r) => {
-                if let Some(text) = &r.text {
-                    let kind = if r.kind == ReasoningKind::Summary { "reasoning summary" } else { "reasoning" };
-                    md.push_str(&format!("<!-- {kind} -->\n{text}\n<!-- end {kind} -->\n\n"));
-                    if !reasoning.is_empty() {
-                        reasoning.push_str("\n\n");
-                    }
-                    reasoning.push_str(text);
-                }
-            }
-            Part::Text { text, .. } => {
-                md.push_str(text);
-                answer.push_str(text);
-            }
-            Part::Refusal { text } => {
-                md.push_str(&format!("<!-- refusal -->\n{text}\n"));
-                answer.push_str(text);
-            }
-            _ => {}
-        }
-    }
-    let mut blocks = Vec::new();
-    let mut sources = Vec::new();
+    let parts = &t.turn.parts;
     // Telegram turns tabs, CRs and other control characters into spaces: then only a file is exact.
     let altered = |s: &str| s.chars().any(|c| (c as u32) < 0x20 && c != '\n' || matches!(c, '\u{2028}' | '\u{2029}'));
-    let inline = answer.chars().count() <= RAW_INLINE_MAX
-        && reasoning.chars().count() <= 28_000
-        && !altered(&answer)
-        && !altered(&reasoning);
-    if inline {
-        if !reasoning.is_empty() {
-            blocks.push(RBlock::Details {
-                open: false,
-                title: RText::plain("💭 Reasoning (raw)"),
-                blocks: vec![RBlock::Pre { text: reasoning, language: "markdown".into() }],
-            });
+    let (mut reasoning_len, mut answer_len, mut any_altered) = (0usize, 0usize, false);
+    for p in parts {
+        let (text, is_reasoning) = match p {
+            Part::Reasoning(r) => (r.text.as_deref().unwrap_or(""), true),
+            Part::Text { text, .. } | Part::Refusal { text } => (text.as_str(), false),
+            _ => continue,
+        };
+        any_altered |= altered(text);
+        if is_reasoning { reasoning_len += text.chars().count() } else { answer_len += text.chars().count() }
+    }
+    let inline = answer_len <= RAW_INLINE_MAX && reasoning_len <= 28_000 && !any_altered;
+    let mut blocks = Vec::new();
+    let mut sources = Vec::new();
+    let mut files = 0;
+    let mut file_block = |p: &Part, blocks: &mut Vec<RBlock>, sources: &mut Vec<Source>| {
+        if let Part::Image { blob, filename, .. } | Part::File { blob, filename, .. } = p {
+            files += 1;
+            let ext = blob.mime.rsplit('/').next().unwrap_or("bin");
+            let name = filename.clone().unwrap_or_else(|| format!("file-{}-{files}.{ext}", t.id));
+            let key = format!("{}/{name}", blob.sha256);
+            blocks.push(RBlock::Document { key: key.clone(), caption: RText::plain("") });
+            sources.push(Source { key, blob: blob.clone(), filename: name, want: Want::Document });
         }
-        if !answer.is_empty() {
-            blocks.push(RBlock::Pre { text: answer, language: "markdown".into() });
+    };
+    if inline {
+        // In the order the model produced it; adjacent parts of one kind together.
+        let mut i = 0;
+        while i < parts.len() {
+            match &parts[i] {
+                Part::Reasoning(_) => {
+                    let mut text = String::new();
+                    while let Some(Part::Reasoning(r)) = parts.get(i) {
+                        if let Some(t) = r.text.as_deref().filter(|t| !t.is_empty()) {
+                            if !text.is_empty() {
+                                text.push_str("\n\n");
+                            }
+                            text.push_str(t);
+                        }
+                        i += 1;
+                    }
+                    if !text.is_empty() {
+                        blocks.push(RBlock::Details {
+                            open: false,
+                            title: RText::plain("💭 Reasoning (raw)"),
+                            blocks: vec![RBlock::Pre { text, language: "markdown".into() }],
+                        });
+                    }
+                }
+                Part::Text { .. } | Part::Refusal { .. } => {
+                    let mut text = String::new();
+                    while let Some(Part::Text { text: t, .. } | Part::Refusal { text: t }) = parts.get(i) {
+                        text.push_str(t);
+                        i += 1;
+                    }
+                    if !text.is_empty() {
+                        blocks.push(RBlock::Pre { text, language: "markdown".into() });
+                    }
+                }
+                p => {
+                    file_block(p, &mut blocks, &mut sources);
+                    i += 1;
+                }
+            }
         }
     } else {
         let name = format!("answer-{}.md", t.id);
+        let md = crate::compose::raw_markdown(parts);
         let blob = app.blobs.put(md.into_bytes(), "text/markdown".into()).await?;
         let key = format!("{}/{name}", blob.sha256);
         blocks.push(RBlock::Document { key: key.clone(), caption: RText::plain("") });
         sources.push(Source { key, blob, filename: name, want: Want::Document });
-    }
-    let mut i = 0;
-    for p in &t.turn.parts {
-        if let Part::Image { blob, filename, .. } | Part::File { blob, filename, .. } = p {
-            i += 1;
-            let ext = blob.mime.rsplit('/').next().unwrap_or("bin");
-            let name = filename.clone().unwrap_or_else(|| format!("file-{}-{i}.{ext}", t.id));
-            let key = format!("{}/{name}", blob.sha256);
-            blocks.push(RBlock::Document { key: key.clone(), caption: RText::plain("") });
-            sources.push(Source { key, blob: blob.clone(), filename: name, want: Want::Document });
+        for p in parts {
+            file_block(p, &mut blocks, &mut sources);
         }
     }
     if blocks.is_empty() {
@@ -434,6 +648,109 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
         say(app, bot, ib, &format!("⚠️ {e:#}")).await;
     }
     Ok(())
+}
+
+/// `/dump`: the whole conversation up to the replied message as one JSON file:
+/// every turn of the chain in order, as stored (all parts: text, reasoning with
+/// signatures, tool calls, images, files; the provider's exact output), with
+/// its model and options, status and attempts (outcome, usage, error), and
+/// every image or file embedded once as base64. Request bodies: /info.
+async fn cmd_dump(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
+    use base64::Engine;
+    let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    let chain = conv::history(&app.db, t.id).await?;
+    let iso = |ms: i64| jiff::Timestamp::from_millisecond(ms).map(|t| t.to_string()).unwrap_or_default();
+    let mut turns = Vec::new();
+    let mut blobs = std::collections::BTreeMap::new();
+    for row in &chain {
+        let mut v = json!({
+            "id": row.id,
+            "parent_id": row.parent_id,
+            "role": row.turn.role,
+            "origin": row.turn.origin,
+            "status": row.status.as_str(),
+            "created_at": iso(row.created_at),
+            "user_id": row.user_id,
+        });
+        if let Some(s) = &row.spec {
+            v["model"] = json!({
+                "provider": s.provider,
+                "model": s.model,
+                "options": s.options.iter().map(|o| o.to_syntax()).collect::<Vec<_>>(),
+                "typed": s.raw,
+            });
+        }
+        v["parts"] = serde_json::to_value(&row.turn.parts)?;
+        if let Some(n) = &row.turn.native {
+            v["native"] = serde_json::to_value(n)?;
+        }
+        if row.turn.role == omni_core::content::Role::Assistant {
+            let mut attempts = Vec::new();
+            for a in conv::attempts_of(&app.db, row.id).await? {
+                let (_request, _output, error, upstream_id, usage) = conv::attempt_json(&app.db, a.id).await?;
+                attempts.push(json!({
+                    "n": a.n, "status": a.status, "upstream_id": upstream_id, "usage": usage, "error": error,
+                }));
+            }
+            v["attempts"] = json!(attempts);
+        }
+        collect_blobs(&v, &mut blobs);
+        turns.push(v);
+    }
+    let mut media = serde_json::Map::new();
+    for (sha, r) in &blobs {
+        let entry = match app.blobs.get(r).await {
+            Ok(bytes) => json!({
+                "mime": r.mime, "size": r.size, "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            }),
+            Err(e) => json!({"mime": r.mime, "size": r.size, "error": format!("{e:#}")}),
+        };
+        media.insert(sha.clone(), entry);
+    }
+    let n_turns = turns.len();
+    let dump = json!({
+        "format": "omni-conversation/1",
+        "bot": bot.name,
+        "chat_id": ib.chat_id,
+        "exported_at": jiff::Timestamp::now().to_string(),
+        "turns": turns,
+        "blobs": media,
+    });
+    let name = format!("conversation-{}.json", t.id);
+    let blob = app.blobs.put(serde_json::to_vec_pretty(&dump)?, "application/json".into()).await?;
+    let key = format!("{}/{name}", blob.sha256);
+    let blocks = vec![
+        RBlock::Paragraph(RText::concat(vec![RText::plain("🤖 "), label("Conversation")])),
+        RBlock::Paragraph(RText::plain(format!(
+            "{n_turns} turns · {} images/files embedded · {}",
+            blobs.len(),
+            crate::compose::fmt_bytes(blob.size)
+        ))),
+        RBlock::Document { key: key.clone(), caption: RText::plain("") },
+    ];
+    let sources = [Source { key, blob, filename: name, want: Want::Document }];
+    if let Err(e) = reply::send_blocks_with_media(app, bot, ib.chat_id, ib.msg_id, blocks, &sources).await {
+        say(app, bot, ib, &format!("⚠️ {e:#}")).await;
+    }
+    Ok(())
+}
+
+/// Every blob reference (`{"sha256", "size", "mime"}`) anywhere in a value.
+fn collect_blobs(v: &serde_json::Value, out: &mut std::collections::BTreeMap<String, omni_core::blob::BlobRef>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Ok(r) = serde_json::from_value::<omni_core::blob::BlobRef>(v.clone())
+                && m.len() == 3
+                && r.sha256.len() == 64
+            {
+                out.insert(r.sha256.clone(), r);
+                return;
+            }
+            m.values().for_each(|x| collect_blobs(x, out));
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_blobs(x, out)),
+        _ => {}
+    }
 }
 
 async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
@@ -481,20 +798,68 @@ async fn cmd_retry(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
             .await;
         return Ok(());
     }
-    // Reset the failure count by marking old failed attempts as "superseded".
-    let id = t.id;
-    app.db
-        .call(move |c| {
-            c.execute(
-                "UPDATE attempts SET status = 'superseded' WHERE turn_id = ?1 AND status = 'failed'",
-                params![id],
-            )?;
-            c.execute("UPDATE turns SET status = 'pending', updated_at = ?1 WHERE id = ?2", params![now_ms(), id])?;
-            Ok(())
-        })
-        .await?;
-    jobs::spawn_turn(app.clone(), id);
+    if !retry_turn(app, t.id).await? {
+        say(app, bot, ib, "this answer is already being retried").await;
+    }
     Ok(())
+}
+
+/// The "🔁 Retry" button under a reply that finally failed (callback data
+/// `retry:<turn id>`). Anyone allowed to use the bot in the chat may press it,
+/// like replying `/retry`; the retry runs (and is charged) as the original request.
+pub async fn on_callback(app: &Arc<App>, bot: &Arc<BotConn>, q: tl::types::UpdateBotCallbackQuery) -> Result<()> {
+    let chat_id = crate::tg::convert::marked_peer_id(&q.peer);
+    let answer = |text: Option<&str>| {
+        let call = tl::functions::messages::SetBotCallbackAnswer {
+            alert: text.is_some(),
+            query_id: q.query_id,
+            message: text.map(str::to_string),
+            url: None,
+            cache_time: 0,
+        };
+        let bot = bot.clone();
+        async move {
+            if let Err(e) = bot.invoke(&call).await {
+                tracing::warn!(error = %e, "answering a button press failed");
+            }
+        }
+    };
+    let data = q.data.as_deref().and_then(|d| std::str::from_utf8(d).ok()).unwrap_or_default();
+    let Some(turn_id) = data.strip_prefix("retry:").and_then(|s| s.parse::<i64>().ok()) else {
+        answer(None).await;
+        return Ok(());
+    };
+    // The button must belong to a message of that reply, in this chat, sent by this bot.
+    let shown = conv::turn_for_message(&app.db, &bot.name, chat_id, q.msg_id).await?.map(|(t, _)| t);
+    if shown != Some(turn_id) {
+        answer(Some("This button does not belong to this message.")).await;
+        return Ok(());
+    }
+    if !matches!(access::check(app, &bot.name, chat_id, q.user_id).await?, Access::Allowed) {
+        answer(Some("You are not allowed to use this bot here.")).await;
+        return Ok(());
+    }
+    let t = conv::get_turn(&app.db, turn_id).await?;
+    if t.status != TurnStatus::Failed {
+        answer(Some("This answer is not failed (any more).")).await;
+        return Ok(());
+    }
+    if retry_turn(app, turn_id).await? {
+        answer(None).await;
+    } else {
+        answer(Some("Someone else just retried it.")).await;
+    }
+    Ok(())
+}
+
+/// Generate a failed reply again, in the same messages (earlier attempts stay
+/// visible above). `false` if someone else claimed the retry first.
+async fn retry_turn(app: &Arc<App>, id: i64) -> Result<bool> {
+    if !conv::claim_retry(&app.db, id).await? {
+        return Ok(false);
+    }
+    jobs::spawn_turn(app.clone(), id);
+    Ok(true)
 }
 
 async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
@@ -504,8 +869,8 @@ async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Resul
             app,
             bot,
             ib,
-            "only answers that stopped at the long-decode output budget can be continued (a model with long decode, \
-             footer shows finish: length (MAX_TOKENS))",
+            "only answers that stopped at the long-decode output budget can be continued (their note says \
+             \"reached the long-decode output budget\" and suggests /continue)",
         )
         .await;
         return Ok(());
@@ -518,13 +883,14 @@ async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Resul
 
 async fn cmd_m(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str) -> Result<()> {
     if ib.reply_to_msg_id.is_none() {
-        say(app, bot, ib, "reply to one of my messages: /m spec$ text").await;
+        say(app, bot, ib, &with_marker("reply to one of my messages: /m prefix$text", app.marker())).await;
         return Ok(());
     }
-    let t = match trigger::parse_trigger(args) {
+    let t = match trigger::parse_trigger(args, app.marker()) {
         Ok(Some(t)) => t,
         Ok(None) => {
-            say(app, bot, ib, "usage: /m spec$ text (e.g. /m g+s$ what do you think?)").await;
+            say(app, bot, ib, &with_marker("usage: /m prefix$text (e.g. /m g+s$what do you think?)", app.marker()))
+                .await;
             return Ok(());
         }
         Err(e) => {
@@ -532,7 +898,7 @@ async fn cmd_m(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str) -> 
             return Ok(());
         }
     };
-    let specs = match crate::handler::resolve_specs(app, bot, ib.chat_id, &t.specs).await {
+    let specs = match crate::handler::resolve_specs(app, bot, ib.chat_id, &t.specs, true).await {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => {
             say(app, bot, ib, "⚠️ none of these models is served by this bot here").await;
@@ -546,58 +912,91 @@ async fn cmd_m(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str) -> 
     crate::handler::continue_conversation(app, bot, ib, Some((specs, t.text))).await
 }
 
-fn period_start(app: &App, p: &str) -> (i64, &'static str) {
-    let tz = jiff::tz::TimeZone::get(&app.cfg.general.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
-    let now = jiff::Timestamp::now().to_zoned(tz);
-    let day_start = now.start_of_day().map(|z| z.timestamp().as_millisecond()).unwrap_or(0);
-    match p {
-        "today" => (day_start, "today"),
-        "7d" => (day_start - 6 * 86_400_000, "last 7 days"),
-        "all" => (0, "all time"),
-        _ => (day_start - 29 * 86_400_000, "last 30 days"),
+/// The start of a stats period in calendar days of `general.timezone`: `today`
+/// is since 00:00 local time, `7d` and `30d` include today, `all` everything
+/// (not rolling 24-hour windows). Also how the period reads, with its start.
+fn period_start(app: &App, p: &str) -> (i64, String) {
+    let tz_name = &app.cfg.general.timezone;
+    let tz = jiff::tz::TimeZone::get(tz_name).unwrap_or(jiff::tz::TimeZone::UTC);
+    let (days, label) = match p {
+        "today" => (0, "today"),
+        "7d" => (6, "7 days"),
+        "all" => return (0, "all time".into()),
+        _ => (29, "30 days"),
+    };
+    let start = jiff::Timestamp::now()
+        .to_zoned(tz)
+        .start_of_day()
+        .and_then(|d| d.checked_sub(jiff::Span::new().days(days)))
+        .ok();
+    match start {
+        Some(s) => (s.timestamp().as_millisecond(), format!("{label} (since {} {tz_name})", s.strftime("%Y-%m-%d %H:%M"))),
+        None => (0, "all time".into()),
     }
 }
 
+/// `/stats [period]`, along the tree bot → chat → person: in a chat, that chat
+/// (in a group also one member: `/stats <user_id>` or as a reply); in an
+/// administrator's private chat the whole bot, `<chat_id>` one chat, or
+/// `<chat_id> <user_id>` one person in it. Always this bot's usage only.
 async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str, admin: bool) -> Result<()> {
     let mut words = args.split_whitespace().collect::<Vec<_>>();
-    let global = admin && words.first() == Some(&"all") && ib.chat_id > 0;
-    if global {
-        words.remove(0);
-    }
-    let (since, period) = period_start(app, words.first().copied().unwrap_or("30d"));
     let chat = ib.chat_id;
-    let user = ib.sender_id.unwrap_or(0);
-    // Scope: in a group -> this group; in private -> the user's own usage everywhere; admin `all` -> everything.
-    let (where_sql, scope_desc): (&str, String) = if global {
-        ("1 = 1", "all chats".into())
-    } else if chat < 0 {
-        ("chat_id = ?2", "this chat".into())
-    } else {
-        ("user_id = ?3", "your usage in all chats".into())
+    let take_id = |words: &mut Vec<&str>| -> Option<i64> {
+        let i = words.iter().position(|w| w.parse::<i64>().is_ok())?;
+        words.remove(i).parse().ok()
     };
+    // Scope: (chat filter, user filter, description).
+    let (chat_f, user_f, scope_desc): (Option<i64>, Option<i64>, String) = if chat < 0 {
+        let member = match take_id(&mut words) {
+            Some(u) => Some(u),
+            None if words.is_empty() && ib.reply_to_msg_id.is_some() => replied_sender(app, bot, ib).await,
+            None => None,
+        };
+        match member {
+            Some(u) => (Some(chat), Some(u), format!("user {u} in this group")),
+            None => (Some(chat), None, "this group".into()),
+        }
+    } else if admin {
+        // An administrator's private chat, along the tree: the whole bot, one chat
+        // (a private chat's id is its user's), or one person in one chat.
+        let mut ids = Vec::new();
+        while let Some(id) = take_id(&mut words) {
+            ids.push(id);
+        }
+        match ids[..] {
+            [] => (None, None, "every chat".into()),
+            [c] => (Some(c), None, place_label(c)),
+            [c, u, ..] => (Some(c), Some(u), format!("user {u} in {}", place_label(c))),
+        }
+    } else {
+        (Some(chat), None, "this chat".into())
+    };
+    let (since, period) = period_start(app, words.first().copied().unwrap_or("30d"));
+    let bot_name = bot.name.clone();
+    let per_chat = chat_f.is_none();
     let (by_model, by_who) = app
         .db
         .call(move |c| {
+            let filter = "bot = ?2 AND ts >= ?1 AND (?3 IS NULL OR chat_id = ?3) AND (?4 IS NULL OR user_id = ?4)";
             let q = |group: &str| {
                 format!(
                     "SELECT {group}, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0)
-                     FROM usage_ledger WHERE ts >= ?1 AND {where_sql} AND (?2 = ?2) AND (?3 = ?3) GROUP BY 1 ORDER BY 5 DESC LIMIT 30"
+                     FROM usage_ledger WHERE {filter} GROUP BY 1 ORDER BY 5 DESC LIMIT 30"
                 )
             };
             let run = |sql: String| -> rusqlite::Result<Vec<(String, i64, i64, i64, f64)>> {
                 let mut s = c.prepare(&sql)?;
-                s.query_map(params![since, chat, user], |r| {
+                s.query_map(params![since, bot_name, chat_f, user_f], |r| {
                     Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect()
             };
             let by_model = run(q("model"))?;
-            let who = if global {
+            let who = if per_chat {
                 "COALESCE((SELECT title FROM chats WHERE chats.chat_id = usage_ledger.chat_id), CAST(chat_id AS TEXT))"
-            } else if chat < 0 {
-                "COALESCE((SELECT TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) FROM users WHERE users.user_id = usage_ledger.user_id), CAST(user_id AS TEXT))"
             } else {
-                "COALESCE((SELECT title FROM chats WHERE chats.chat_id = usage_ledger.chat_id), CAST(chat_id AS TEXT))"
+                "COALESCE((SELECT TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) FROM users WHERE users.user_id = usage_ledger.user_id), CAST(user_id AS TEXT))"
             };
             let by_who = run(q(who))?;
             Ok((by_model, by_who))
@@ -608,31 +1007,38 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
             .map(|(k, n, i, o, c)| vec![k, n.to_string(), i.to_string(), o.to_string(), fmt_cost(c)])
             .collect()
     };
-    let total: f64 = by_model.iter().map(|r| r.4).sum();
-    let who_header = if chat < 0 && !global { "user" } else { "chat" };
-    let blocks = vec![
-        RBlock::Paragraph(RText::plain(format!("{scope_desc} · {period} · total {}", fmt_cost(total)))),
-        table(&["model", "calls", "in", "out", "cost"], fmt(by_model)),
-        table(&[who_header, "calls", "in", "out", "cost"], fmt(by_who)),
-    ];
+    let total = by_model.iter().fold(0.0, |a, r| a + r.4);
+    let who_header = if per_chat { "chat" } else { "user" };
+    let mut blocks = vec![RBlock::Paragraph(RText::plain(format!("{scope_desc} · {period} · total {}", fmt_cost(total))))];
+    if by_model.is_empty() {
+        blocks.push(RBlock::Paragraph(RText::plain("No usage in this period.")));
+    } else {
+        blocks.push(table(&["model", "calls", "in", "out", "cost"], fmt(by_model)));
+        if user_f.is_none() || per_chat {
+            blocks.push(table(&[who_header, "calls", "in", "out", "cost"], fmt(by_who)));
+        }
+    }
     send(app, bot, ib, "Usage stats", blocks).await;
     Ok(())
 }
 
+/// `/usage`: this chat's spend limit and your own limit in this chat.
 async fn cmd_usage(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let user = ib.sender_id.unwrap_or(0);
     let mut lines = Vec::new();
-    for (scope, id) in [("user", user), ("chat", ib.chat_id)] {
-        if scope == "chat" && ib.chat_id > 0 {
-            continue;
-        }
-        match access::level(&app.db, scope, id).await? {
-            Some((lvl, r)) => lines.push(format!(
-                "{scope} {id}: {lvl:.4} / {:.2} USD, refills {:.2} USD/day",
-                r.capacity, r.refill_per_day
-            )),
-            None => lines.push(format!("{scope} {id}: no limit")),
-        }
+    for (what, target) in [("this chat", access::Target::Chat), ("you here", access::Target::Member(user))] {
+        lines.push(match access::level(&app.db, &bot.name, ib.chat_id, target).await? {
+            Some((lvl, r)) => format!(
+                "{what}: balance {} of {} USD, refills {} USD/day",
+                fmt_cost(lvl).trim_start_matches('$'),
+                r.capacity,
+                r.refill_per_day
+            ),
+            None => format!("{what}: no limit"),
+        });
+    }
+    if app.is_admin(user) {
+        lines.push("administrators are not limited (their spending still counts)".into());
     }
     let items =
         lines.into_iter().map(|l| RItem { checkbox: None, blocks: vec![RBlock::Paragraph(RText::plain(l))] }).collect();
@@ -640,35 +1046,103 @@ async fn cmd_usage(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
     Ok(())
 }
 
-async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str, by: i64) -> Result<()> {
-    let w: Vec<&str> = args.split_whitespace().collect();
-    let usage = "usage: /quota user|chat <id|default> <capacity_usd> <refill_usd_per_day>  — or: /quota user|chat <id|default> off";
-    let scope = match w.first() {
-        Some(&"user") => "user",
-        Some(&"chat") => "chat",
-        _ => {
-            say(app, bot, ib, usage).await;
-            return Ok(());
+/// `/quota`: spend limits, which live inside one chat: the chat as a whole
+/// (`chat`), each member by default (`members`), or one member (`<user_id>`,
+/// or as a reply). In a group it acts on that group; in an administrator's
+/// private chat the chat id comes first. Without numbers it shows them.
+async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str], by: i64) -> Result<()> {
+    use access::Target;
+    let group = ib.chat_id < 0;
+    let usage = if group {
+        "usage in a group: /quota [chat|members|<user_id> [<capacity_usd> <refill_usd_per_day> | off]]; as a reply: /quota [<capacity_usd> <refill_usd_per_day> | off] for that person"
+    } else {
+        "usage: /quota [<chat_id> [chat|members|<user_id> [<capacity_usd> <refill_usd_per_day> | off]]]"
+    };
+    let mut w: Vec<&str> = w.to_vec();
+    let chat = if group {
+        ib.chat_id
+    } else {
+        match w.first().map(|x| x.parse::<i64>()) {
+            None => {
+                send(app, bot, ib, "Spend limits", quota_blocks(app, &bot.name, None).await?).await;
+                return Ok(());
+            }
+            Some(Ok(c)) if c != 0 => {
+                w.remove(0);
+                c
+            }
+            Some(_) => {
+                say(app, bot, ib, usage).await;
+                return Ok(());
+            }
         }
     };
-    let id = match w.get(1) {
-        Some(&"default") => 0,
-        Some(s) => match s.parse::<i64>() {
-            Ok(i) => i,
-            Err(_) => {
+    // The target: a keyword, a user id, the replied person, or (none) the whole list.
+    let target = match w.first().copied() {
+        Some("chat") => Some(Target::Chat),
+        Some("members") => Some(Target::Members),
+        Some(x) if x.parse::<i64>().is_ok_and(|u| u > 0) && w.len() != 2 => Some(Target::Member(x.parse().unwrap())),
+        _ => None,
+    };
+    if target.is_some() {
+        w.remove(0);
+    }
+    let target = match target {
+        Some(t) => t,
+        None if w.is_empty() && !group => {
+            send(app, bot, ib, "Spend limits", quota_blocks(app, &bot.name, Some(chat)).await?).await;
+            return Ok(());
+        }
+        None if w.is_empty() && ib.reply_to_msg_id.is_none() => {
+            send(app, bot, ib, "Spend limits of this group", quota_blocks(app, &bot.name, Some(chat)).await?).await;
+            return Ok(());
+        }
+        None => match replied_sender(app, bot, ib).await {
+            Some(u) if group => Target::Member(u),
+            _ => {
                 say(app, bot, ib, usage).await;
                 return Ok(());
             }
         },
-        None => {
-            say(app, bot, ib, usage).await;
+    };
+    let who = match target {
+        Target::Chat if group => "this group".to_string(),
+        Target::Chat => place_label(chat),
+        Target::Members if group => "each member of this group".to_string(),
+        Target::Members => format!("each member of {}", place_label(chat)),
+        Target::Member(u) if group => format!("user {u} in this group"),
+        Target::Member(u) => format!("user {u} in {}", place_label(chat)),
+    };
+    let rule = match (w.first(), w.get(1)) {
+        (None, None) => {
+            // Show it.
+            let text = match (target, access::level(&app.db, &bot.name, chat, target).await?) {
+                (Target::Members, _) => match access::rule_for(&app.db, &bot.name, chat, Target::Members).await? {
+                    Some(r) => format!("{who}: {} USD capacity, refills {} USD/day", r.capacity, r.refill_per_day),
+                    None => format!("{who}: no limit"),
+                },
+                (_, Some((lvl, r))) => {
+                    let default = match target {
+                        Target::Member(_) if !access::has_own_rule(&app.db, &bot.name, chat, target).await? => {
+                            " (the default for members)"
+                        }
+                        _ => "",
+                    };
+                    format!(
+                        "{who}: balance {} of {} USD, refills {} USD/day{default}",
+                        fmt_cost(lvl).trim_start_matches('$'),
+                        r.capacity,
+                        r.refill_per_day
+                    )
+                }
+                (_, None) => format!("{who}: no limit"),
+            };
+            say(app, bot, ib, &text).await;
             return Ok(());
         }
-    };
-    let rule = match (w.get(2), w.get(3)) {
-        (Some(&"off"), _) => None,
-        (Some(c), Some(r)) => match (c.parse::<f64>(), r.parse::<f64>()) {
-            (Ok(c), Ok(r)) => Some(Rule { capacity: c, refill_per_day: r }),
+        (Some(&"off"), None) => None,
+        (Some(c), Some(r)) if w.len() == 2 => match (c.parse::<f64>(), r.parse::<f64>()) {
+            (Ok(c), Ok(r)) if c >= 0.0 && r >= 0.0 => Some(access::Rule { capacity: c, refill_per_day: r }),
             _ => {
                 say(app, bot, ib, usage).await;
                 return Ok(());
@@ -679,20 +1153,40 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
             return Ok(());
         }
     };
-    access::set_rule(&app.db, scope, id, rule, by).await.context("set quota")?;
-    say(
-        app,
-        bot,
-        ib,
-        &format!(
-            "✅ {scope} {} quota: {}",
-            if id == 0 { "default".to_string() } else { id.to_string() },
-            match rule {
-                Some(r) => format!("{} USD capacity, {} USD/day", r.capacity, r.refill_per_day),
-                None => "off".into(),
-            }
-        ),
-    )
-    .await;
+    access::set_rule(&app.db, &bot.name, chat, target, rule, by).await.context("set quota")?;
+    let text = match rule {
+        Some(r) => format!("✅ {who}: {} USD capacity, refills {} USD/day", r.capacity, r.refill_per_day),
+        None => format!("✅ {who}: no limit"),
+    };
+    say(app, bot, ib, &text).await;
     Ok(())
 }
+
+/// The spend-limit rules of a bot (every chat, or one), with balances.
+async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Vec<RBlock>> {
+    use access::Target;
+    let mut rows = Vec::new();
+    for q in access::quota_rules(&app.db, bot, only_chat).await? {
+        let (target, balance) = match q.target {
+            Target::Chat => ("whole chat".to_string(), access::level(&app.db, bot, q.chat_id, q.target).await?),
+            Target::Members => ("each member".to_string(), None),
+            Target::Member(u) => (format!("user {u}"), access::level(&app.db, bot, q.chat_id, q.target).await?),
+        };
+        let balance = balance.map(|(l, _)| fmt_cost(l).trim_start_matches('$').to_string()).unwrap_or("-".into());
+        let mut row = vec![target, format!("{}", q.rule.capacity), format!("{}", q.rule.refill_per_day), balance];
+        if only_chat.is_none() {
+            row.insert(0, place_label(q.chat_id));
+        }
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Ok(vec![RBlock::Paragraph(RText::plain("No spend limits."))]);
+    }
+    let header: &[&str] = if only_chat.is_none() {
+        &["chat", "applies to", "capacity", "refill/day", "balance"]
+    } else {
+        &["applies to", "capacity", "refill/day", "balance"]
+    };
+    Ok(vec![table(header, rows)])
+}
+

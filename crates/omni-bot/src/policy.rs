@@ -1,5 +1,5 @@
-//! Request policy, checked on the final request body (so JSON patches, model
-//! suffixes and provider slugs cannot get around it):
+//! Request policy, checked on the final request body (so options, presets,
+//! model suffixes and provider slugs cannot get around it):
 //!
 //! - **Providers**: a model may only be served by its vendor's own endpoint or
 //!   by official clouds listed for that vendor (`allowed_providers`, e.g.

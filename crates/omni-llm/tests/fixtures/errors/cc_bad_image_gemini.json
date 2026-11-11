@@ -1,0 +1,95 @@
+{
+ "case": "cc_bad_image_gemini",
+ "endpoint": "chat",
+ "model": "google/gemini-3.5-flash-lite",
+ "recorded": "2026-11-11",
+ "status": 400,
+ "headers": {
+  "Content-Type": "application/json",
+  "x-openrouter-error-origin": "provider"
+ },
+ "body": {
+  "error": {
+   "message": "Provider returned error",
+   "code": 400,
+   "metadata": {
+    "raw": "{\n  \"error\": {\n    \"code\": 400,\n    \"message\": \"Unable to process input image. Please retry or report in https://developers.generativeai.google/guide/troubleshooting\",\n    \"status\": \"INVALID_ARGUMENT\"\n  }\n}\n",
+    "provider_name": "Google AI Studio",
+    "is_byok": false,
+    "provider_error_code": "400",
+    "debug": {
+     "echo_upstream_body": {
+      "contents": [
+       {
+        "role": "user",
+        "parts": [
+         {
+          "text": "What is this?"
+         },
+         {
+          "inlineData": {
+           "mimeType": "image/png",
+           "data": "iVBORw0KGgpub3QgcmVhbGx5IGEgcG5n"
+          }
+         }
+        ]
+       }
+      ],
+      "safetySettings": [
+       {
+        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "threshold": "OFF"
+       },
+       {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "OFF"
+       },
+       {
+        "category": "HARM_CATEGORY_HATE_SPEECH",
+        "threshold": "OFF"
+       },
+       {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "threshold": "OFF"
+       },
+       {
+        "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
+        "threshold": "OFF"
+       }
+      ],
+      "labels": {
+       "safety_identifier": "REDACTED"
+      },
+      "generationConfig": {
+       "thinkingConfig": {
+        "includeThoughts": true
+       },
+       "candidateCount": 1,
+       "maxOutputTokens": 65536
+      }
+     }
+    }
+   }
+  },
+  "user_id": "user_REDACTED",
+  "openrouter_metadata": {
+   "requested": "google/gemini-3.5-flash-lite",
+   "strategy": "direct",
+   "region": "HEL",
+   "summary": "available=1",
+   "attempt": 1,
+   "is_byok": false,
+   "endpoints": {
+    "total": 8,
+    "available": [
+     {
+      "provider": "Google AI Studio",
+      "model": "google/gemini-3.5-flash-lite-20260721",
+      "selected": false
+     }
+    ]
+   },
+   "generation_time": 152
+  }
+ }
+}

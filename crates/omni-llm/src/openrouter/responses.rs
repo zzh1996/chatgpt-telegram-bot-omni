@@ -367,6 +367,9 @@ impl EventParser {
                 if let Some(out) = r.get("output").and_then(Value::as_array) {
                     self.final_output = Some(out.clone());
                 }
+                if let Some(d) = r.get("incomplete_details").filter(|d| !d.is_null()) {
+                    evs.push(StreamEvent::FinishDetails(d.clone()));
+                }
                 let (reason, native) = if ty == "response.incomplete" {
                     let why = r.pointer("/incomplete_details/reason").and_then(Value::as_str).unwrap_or("incomplete");
                     let norm = match why {

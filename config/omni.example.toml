@@ -5,6 +5,8 @@
 [general]
 data_dir = "data"              # database, blobs, logs (mounted as a volume in Docker)
 timezone = "Asia/Shanghai"     # displayed times and daily stats boundaries
+trigger_marker = "$"           # what ends the model prefix: `c$hello`; e.g. "%" or "¥" or ">>" (no letters,
+                               # digits, whitespace or ,+{}"=/-.:_\@`); help texts and /models follow it
 max_parallel_specs = 20        # max models in one `a,b,c$` trigger
 max_file_mb = 50               # max Telegram file size forwarded to a model
 
@@ -18,38 +20,50 @@ keep_days = 0                  # daily log files to keep (0 = keep all)
 api_id = "${TELEGRAM_API_ID}"
 api_hash = "${TELEGRAM_API_HASH}"
 
-# Several bots can run in one process (separate rate limits, isolation).
-# For each request, the first bot in this list that is a member of the chat and
-# whose `models` patterns match the model handles it: put specific bots first,
-# catch-alls last. Patterns match canonical ids like `openrouter:anthropic/claude-opus-5.5`.
+# Several bots can run in one process (separate rate limits, isolation). Every
+# bot is independent, like a separate instance: its own allow list, bans, spend
+# limits and runtime prefixes; in a group each bot answers the prefixes it has
+# and ignores the others.
+# `models`: the models a bot has, as patterns over `provider:author/model`. A
+# model no pattern matches does not exist for that bot (not listed, unknown as a
+# prefix); neither do models of providers that are not configured.
 [[bots]]
 name = "main"                  # stable internal name (database key) — do not rename casually
 token = "${TELEGRAM_BOT_TOKEN}"
-models = ["*"]
-default_model = "gpt"          # used by a bare `$text`
-# chats = [-1001234567890]     # optional: restrict this bot to these chats
+models = [
+    "openrouter:openai/*", "openrouter:anthropic/*", "openrouter:google/*", "openrouter:x-ai/*",
+    "openrouter:deepseek/*", "openrouter:z-ai/*", "openrouter:moonshotai/*", "openrouter:qwen/*", "ark:*",
+]
 
-# Example: a dedicated Claude bot in the same groups.
+# Example: a second, independent bot that has only Claude.
 # [[bots]]
 # name = "claude"
 # token = "${TELEGRAM_BOT_TOKEN_CLAUDE}"
 # models = ["openrouter:anthropic/*"]
-# default_model = "c"
 
 [access]
 admins = []                    # your Telegram user id(s); /whoami shows it
-allowed_chats = []             # seeded into the ACL at start; manage at runtime with /allow, /deny
-allowed_users = []             # private-chat users; manage with /allow_user
+allowed_chats = []             # chats (groups, or user ids for private chats) allowed for every bot once,
+                               # at the first start after an id is added; removing one revokes nothing (/deny)
 priority_users = []            # may request higher-priority (pricier) tiers: +tier=priority, fast modes.
                                # Nobody (admins included) gets them by default.
 
 [providers.openrouter]
 api_key = "${OPENROUTER_API_KEY}"
+# The id of any model the bot has ([[bots]].models) may be typed directly as a prefix
+# (`openai/gpt-6.1-sol$`), even one that also has a prefix: new models need no config
+# change. false (the default): only the prefixes below and /alias reach OpenRouter.
+allow_unlisted_models = true
 # base_url = "https://openrouter.ai/api/v1"
-# Fidelity defaults (see docs/openrouter-fidelity.md). Per request: `+p=<slug>` / `+p=any`.
-pin_first_party = true         # provider.only = [model creator's own endpoint], no fallbacks
+# http_referer = "…"           # optional app attribution headers
+# x_title = "…"
+# connect_timeout_secs = 15
+# idle_timeout_secs = 3600     # silence in a stream after which the attempt counts as stalled
+# Every request is pinned to the model vendor's own endpoint without fallbacks, unless
+# it names other official providers with `+p=` (allowed_providers below); OpenRouter's
+# free routing is never used. See docs/openrouter-fidelity.md.
 require_parameters = true      # never let OpenRouter silently drop parameters
-echo_upstream_body = true      # log the exact upstream request (also in /info)
+echo_upstream_body = true      # log the exact upstream request (also in /info; OpenRouter does not echo Claude requests)
 max_tokens_cap = 393216        # cap for the automatic max_tokens (0 = model maximum)
 # Gemini long decode: models answering past the per-request output limit in
 # several continuation hops. Their max_tokens is a total budget across hops;
@@ -69,33 +83,41 @@ user_id_salt = "${OPENROUTER_USER_SALT:-}"
 # [providers.openrouter.first_party]
 # google = "google-vertex"
 
+# Volcengine Ark (火山方舟): Doubao directly (`ark:` models), OpenAI-compatible
+# Chat API. Without a key the provider and its models do not exist.
+[providers.ark]
+api_key = "${ARK_API_KEY:-}"
+allow_unlisted_models = false  # only the `db…` prefixes below; true: any `ark:<model id>$`
+# base_url = "https://ark.cn-beijing.volces.com/api/v3"
+# connect_timeout_secs = 15
+# idle_timeout_secs = 1800     # summary-mode models can pause long between chunks
+# max_tokens_cap = 65536       # cap for the automatic max_tokens (Ark reserves quota by it)
+# cny_per_usd = 7.1            # for cost estimates (Ark prices are in CNY)
+
 [render]
 markdown = "clean"             # clean | raw (raw = the model's exact Markdown source)
-min_edit_interval_secs = 3.0   # per bot and group chat (private chats: 1s)
-first_flush_delay_secs = 1.0
-max_messages_per_reply = 30
+first_flush_delay_secs = 1.0   # wait before a new reply's first message, to batch the first tokens
 show_usage = "always"          # always | never | USD threshold such as "0.05"
 
 [retry]
 max_attempts = 4               # including the first; only retryable errors are retried
-base_delay_secs = 10
-max_delay_secs = 120
+delays_secs = [2, 10, 30, 60]  # wait before retry 1, 2, 3, …; the last value repeats (longer waits the upstream asks for win)
 
-# ------------------------------------------------------------------ aliases
-# Any OpenRouter model id also works directly as a prefix (`openai/gpt-6$ hi`),
-# so new models need no config change. Aliases are shortcuts (the old prefixes).
-# Runtime aliases can be added by admins with /alias.
+# ------------------------------------------------------------------ prefixes
+# `name$text` sends the text to the spec's model with the spec's options; the
+# empty name is the prefix `$text`. /models lists them in this order. Where a
+# provider has `allow_unlisted_models = true`, the id of any model the bot has works
+# as a prefix too (`openai/gpt-6.1-sol$`). Administrators can add prefixes per bot
+# with /alias. Kept: the two latest generations each vendor still serves.
 
-# OpenAI
+# OpenAI: GPT-6 and GPT-5 (old `dev` branch; `$` is its bare prefix, ChatGPT's current
+# Instant model)
 [[aliases]]
-name = "gpt"
-spec = "openrouter:openai/gpt-6.1-sol"
+name = ""
+spec = "openrouter:openai/gpt-chat-latest"
 [[aliases]]
 name = "61s"
 spec = "openrouter:openai/gpt-6.1-sol"
-[[aliases]]
-name = "61t"
-spec = "openrouter:openai/gpt-6.1-terra"
 [[aliases]]
 name = "6"
 spec = "openrouter:openai/gpt-6-astra"
@@ -121,10 +143,38 @@ spec = "openrouter:openai/gpt-5.5"
 name = "54"
 spec = "openrouter:openai/gpt-5.4"
 [[aliases]]
-name = "chat"
-spec = "openrouter:openai/gpt-chat-latest"
+name = "54m"
+spec = "openrouter:openai/gpt-5.4-mini"
+[[aliases]]
+name = "54n"
+spec = "openrouter:openai/gpt-5.4-nano"
+[[aliases]]
+name = "52pro"
+spec = "openrouter:openai/gpt-5.2-pro"
+[[aliases]]
+name = "52"
+spec = "openrouter:openai/gpt-5.2"
+[[aliases]]
+name = "51"
+spec = "openrouter:openai/gpt-5.1"
+[[aliases]]
+name = "5"
+spec = "openrouter:openai/gpt-5"
+[[aliases]]
+name = "5m"
+spec = "openrouter:openai/gpt-5-mini"
+[[aliases]]
+name = "5n"
+spec = "openrouter:openai/gpt-5-nano"
+[[aliases]]
+name = "gpt-5-pro"
+spec = "openrouter:openai/gpt-5-pro"
+[[aliases]]
+name = "gpt-5-pro-2025-10-06"
+spec = "openrouter:openai/gpt-5-pro"
 
-# Anthropic
+# Anthropic: Claude 5 and Claude 4 (old `claude` branch). Every model thinks at the
+# highest effort by default, so the old `…t` prefixes equal the plain ones.
 [[aliases]]
 name = "c"
 spec = "openrouter:anthropic/claude-opus-5.5"
@@ -138,8 +188,14 @@ spec = "openrouter:anthropic/claude-fable-5.2"
 name = "cf51"
 spec = "openrouter:anthropic/claude-fable-5.1"
 [[aliases]]
+name = "cf5"
+spec = "openrouter:anthropic/claude-fable-5"
+[[aliases]]
 name = "cs"
 spec = "openrouter:anthropic/claude-sonnet-5.5"
+[[aliases]]
+name = "cs5"
+spec = "openrouter:anthropic/claude-sonnet-5"
 [[aliases]]
 name = "ch"
 spec = "openrouter:anthropic/claude-haiku-5.5"
@@ -147,10 +203,28 @@ spec = "openrouter:anthropic/claude-haiku-5.5"
 name = "c48"
 spec = "openrouter:anthropic/claude-opus-4.8"
 [[aliases]]
+name = "c47"
+spec = "openrouter:anthropic/claude-opus-4.7"
+[[aliases]]
+name = "c46"
+spec = "openrouter:anthropic/claude-opus-4.6"
+[[aliases]]
+name = "c45"
+spec = "openrouter:anthropic/claude-opus-4.5"
+[[aliases]]
+name = "c45s"
+spec = "openrouter:anthropic/claude-sonnet-4.5"
+[[aliases]]
 name = "c46s"
 spec = "openrouter:anthropic/claude-sonnet-4.6"
+[[aliases]]
+name = "c45t"
+spec = "openrouter:anthropic/claude-opus-4.5"
+[[aliases]]
+name = "c45st"
+spec = "openrouter:anthropic/claude-sonnet-4.5"
 
-# Google
+# Google: Gemini 4 and Gemini 3 (old `gemini` branch)
 [[aliases]]
 name = "g"
 spec = "openrouter:google/gemini-4-carbon"
@@ -164,16 +238,37 @@ spec = "openrouter:google/gemini-3.1-pro-preview"
 name = "gf"
 spec = "openrouter:google/gemini-3.8-flash"
 [[aliases]]
+name = "g38f"
+spec = "openrouter:google/gemini-3.8-flash"
+[[aliases]]
+name = "g37f"
+spec = "openrouter:google/gemini-3.7-flash"
+[[aliases]]
+name = "g36f"
+spec = "openrouter:google/gemini-3.6-flash"
+[[aliases]]
+name = "g35f"
+spec = "openrouter:google/gemini-3.5-flash"
+[[aliases]]
+name = "g3f"
+spec = "openrouter:google/gemini-3-flash-preview"
+[[aliases]]
 name = "gi"
 spec = "openrouter:google/gemini-nano-banana-2.1"
 [[aliases]]
 name = "gi31"
-spec = "openrouter:google/gemini-3.1-flash-image"
+spec = "openrouter:google/gemini-3.1-flash-image-preview"
 [[aliases]]
 name = "gi3"
-spec = "openrouter:google/gemini-3-pro-image"
+spec = "openrouter:google/gemini-3-pro-image-preview"
+[[aliases]]
+name = "gemini-3.1-pro-preview"
+spec = "openrouter:google/gemini-3.1-pro-preview"
+[[aliases]]
+name = "gemini-3-flash-preview"
+spec = "openrouter:google/gemini-3-flash-preview"
 
-# xAI
+# xAI: Grok 4, the only generation xAI still serves (old `grok` branch)
 [[aliases]]
 name = "x"
 spec = "openrouter:x-ai/grok-4.7"
@@ -181,10 +276,17 @@ spec = "openrouter:x-ai/grok-4.7"
 name = "x46"
 spec = "openrouter:x-ai/grok-4.6"
 [[aliases]]
+name = "x45"
+spec = "openrouter:x-ai/grok-4.5"
+[[aliases]]
 name = "x43"
 spec = "openrouter:x-ai/grok-4.3"
+[[aliases]]
+name = "x42"
+spec = "openrouter:x-ai/grok-4.20"
 
-# DeepSeek (the dated slugs are the ones served by DeepSeek itself)
+# DeepSeek: V4, the only generation DeepSeek still serves (old `deepseek` branch; its
+# `deepseek-v4-pro` and `deepseek-flash` are these dated releases)
 [[aliases]]
 name = "d"
 spec = "openrouter:deepseek/deepseek-v4-pro-0813"
@@ -192,15 +294,33 @@ spec = "openrouter:deepseek/deepseek-v4-pro-0813"
 name = "df"
 spec = "openrouter:deepseek/deepseek-v4.1-flash-1017"
 
-# Zhipu GLM
+# Zhipu: GLM-5 and GLM-4 (old `glm` branch)
 [[aliases]]
 name = "z"
 spec = "openrouter:z-ai/glm-5.3"
 [[aliases]]
 name = "zf"
 spec = "openrouter:z-ai/glm-5.3-flash"
+[[aliases]]
+name = "z52"
+spec = "openrouter:z-ai/glm-5.2"
+[[aliases]]
+name = "z51"
+spec = "openrouter:z-ai/glm-5.1"
+[[aliases]]
+name = "z5"
+spec = "openrouter:z-ai/glm-5"
+[[aliases]]
+name = "z47"
+spec = "openrouter:z-ai/glm-4.7"
+[[aliases]]
+name = "z46"
+spec = "openrouter:z-ai/glm-4.6"
+[[aliases]]
+name = "z45"
+spec = "openrouter:z-ai/glm-4.5"
 
-# Moonshot Kimi
+# Moonshot: Kimi K3 and K2 (old `moonshot` branch)
 [[aliases]]
 name = "k"
 spec = "openrouter:moonshotai/kimi-k3"
@@ -208,7 +328,8 @@ spec = "openrouter:moonshotai/kimi-k3"
 name = "k26"
 spec = "openrouter:moonshotai/kimi-k2.6"
 
-# Alibaba Qwen
+# Alibaba: Qwen3.x, the only generation Alibaba still serves (old `qwen` branch; its
+# `qwen3.8-max` is this dated release)
 [[aliases]]
 name = "q"
 spec = "openrouter:qwen/qwen3.8-max-0902"
@@ -218,22 +339,25 @@ spec = "openrouter:qwen/qwen3.7-max"
 [[aliases]]
 name = "qp"
 spec = "openrouter:qwen/qwen3.6-plus"
-
-# ByteDance Doubao — direct on Volcengine Ark ([providers.ark], needs ARK_API_KEY),
-# like the old bot's prefixes. (The few Seed models on OpenRouter are served by
-# BytePlus; use their ids directly, e.g. `bytedance-seed/seed-2.0-mini$`.)
 [[aliases]]
-name = "db"
-spec = "ark:doubao-seed-2-1-pro-260915"
+name = "qf"
+spec = "openrouter:qwen/qwen3.6-flash"
+[[aliases]]
+name = "q35"
+spec = "openrouter:qwen/qwen3.5-397b-a17b"
+
+# ByteDance: Doubao Seed 2.1 and 2.0, directly on Volcengine Ark (old `doubao` branch;
+# needs [providers.ark]). The 2.0 lite/mini 260215 builds reached end of service on
+# 2026-10-22; Ark moved them to 260428.
 [[aliases]]
 name = "dbe"
 spec = "ark:doubao-seed-evolving"
 [[aliases]]
+name = "db"
+spec = "ark:doubao-seed-2-1-pro-260915"
+[[aliases]]
 name = "db21"
 spec = "ark:doubao-seed-2-1-pro-260628"
-[[aliases]]
-name = "dbl"
-spec = "ark:doubao-seed-2-1-lite-260915"
 [[aliases]]
 name = "dbt"
 spec = "ark:doubao-seed-2-1-turbo-260628"
@@ -263,3 +387,7 @@ options = "4"
 match = "openrouter:google/gemini-nano-banana*"
 note = "largest image size"
 options = "4"
+
+# ------------------------------------------------------------------ dev
+# [dev]
+# inject_dir = "data/inject"   # simulated user messages for end-to-end tests (never in production)

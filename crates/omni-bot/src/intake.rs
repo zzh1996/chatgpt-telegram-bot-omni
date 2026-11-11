@@ -39,6 +39,7 @@ pub const COMMANDS: &[&str] = &[
     "models",
     "model",
     "raw",
+    "dump",
     "retry",
     "continue",
     "m",
@@ -47,8 +48,6 @@ pub const COMMANDS: &[&str] = &[
     "usage",
     "allow",
     "deny",
-    "allow_user",
-    "deny_user",
     "ban",
     "unban",
     "acl",
@@ -139,6 +138,7 @@ async fn on_update(app: &Arc<App>, bot: &Arc<BotConn>, update: tl::enums::Update
             }
             return Ok(());
         }
+        tl::enums::Update::BotCallbackQuery(q) => return crate::commands::on_callback(app, bot, q).await,
         tl::enums::Update::ChannelParticipant(u) => {
             if u.user_id == bot.user_id {
                 let member = matches!(
@@ -320,18 +320,16 @@ pub fn parse_command<'a>(text: &'a str, our_username: &str) -> Option<(String, &
 async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::types::Message) -> Option<Kind> {
     let text = m.message.as_str();
     if let Some((name, _, addressed)) = parse_command(text, &bot.username) {
-        // Un-addressed commands in groups are answered by one bot only.
-        if addressed || chat_id > 0 || app.primary_bot(chat_id, &bot.name) == bot.name {
-            // `/m`, `/raw`, `/retry`, `/continue`, `/info` in replies are handled by the bot that owns the replied message.
-            if matches!(name.as_str(), "m" | "raw" | "retry" | "continue" | "info")
-                && !addressed
-                && let Some(rt) = reply_target(m)
-            {
-                crate::conv::turn_for_message(&app.db, &bot.name, chat_id, rt).await.ok().flatten()?;
-            }
-            return Some(Kind::Command(name));
+        // Every bot answers commands addressed to it or to everyone, like an
+        // independent instance; `/m`, `/raw`, `/dump`, `/retry`, `/continue`,
+        // `/info` in replies only the bot that owns the replied message.
+        if matches!(name.as_str(), "m" | "raw" | "dump" | "retry" | "continue" | "info")
+            && !addressed
+            && let Some(rt) = reply_target(m)
+        {
+            crate::conv::turn_for_message(&app.db, &bot.name, chat_id, rt).await.ok().flatten()?;
         }
-        return None;
+        return Some(Kind::Command(name));
     }
     if let Some(rt) = reply_target(m)
         && crate::conv::turn_for_message(&app.db, &bot.name, chat_id, rt).await.ok().flatten().is_some()
@@ -339,12 +337,21 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
         return Some(Kind::Reply);
     }
     let bot_cfg = app.bot_cfg(&bot.name)?;
-    if let Ok(Some(t)) = omni_core::trigger::parse_trigger(text) {
+    if let Ok(Some(t)) = omni_core::trigger::parse_trigger(text, app.marker()) {
         let strict = chat_id < 0;
+        // An empty spec (`$text`, `,c$`, `c,,g$`) is the alias with the empty
+        // name; next to other specs it only counts as a prefix if those look
+        // like model names, so that prose such as ", costs 5$" does not trigger
+        // in groups.
+        if strict
+            && t.specs.len() > 1
+            && t.specs.iter().any(|s| s.raw.is_empty())
+            && !t.specs.iter().all(|s| s.raw.is_empty() || looks_like_spec(s))
+        {
+            return None;
+        }
         for s in &t.specs {
-            if let Ok(Some(spec)) = app.resolve_spec(s, bot_cfg, strict).await
-                && app.responsible_bot(chat_id, &spec.canonical(), &bot.name).as_deref() == Some(bot.name.as_str())
-            {
+            if let Ok(Some(_)) = app.resolve_spec(s, bot_cfg, strict).await {
                 return Some(Kind::Trigger);
             }
         }
@@ -353,14 +360,10 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
         }
         // Possibly a model newer than the cached catalog: the handler checks it
         // against a fresh catalog (never blocking this loop).
-        if t.specs.iter().any(|s| app.plausible_model_id(s)) {
+        if t.specs.iter().any(|s| app.plausible_model_id(bot_cfg, s)) {
             return Some(Kind::Trigger);
         }
-        // A prefix nobody knows: the primary bot reports it (all our bots are in
-        // this process, so "maybe another bot handles it" cannot happen).
-        if t.specs.iter().all(looks_like_spec) && app.primary_bot(chat_id, &bot.name) == bot.name {
-            return Some(Kind::Trigger);
-        }
+        // A prefix this bot does not know: ignored in groups (another bot may know it).
         return None;
     }
     if chat_id > 0 && m.media.is_none() {
@@ -370,8 +373,8 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
 }
 
 /// Whether a parsed spec is plausibly meant as a model prefix (`c`, `5`,
-/// `openai/gpt-6`, `ark:x`), rather than prose that happens to contain `$`
-/// (`it costs 5$`).
+/// `openai/gpt-6`, `ark:x`), rather than prose that happens to contain the
+/// marker (`it costs 5$`).
 fn looks_like_spec(s: &omni_core::trigger::SpecToken) -> bool {
     !s.model.is_empty() && s.model.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
 }
