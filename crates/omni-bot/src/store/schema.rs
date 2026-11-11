@@ -406,4 +406,17 @@ INSERT INTO quota_buckets_v7(bot, chat_id, target, user_id, level_usd, updated_a
 DROP TABLE quota_buckets;
 ALTER TABLE quota_buckets_v7 RENAME TO quota_buckets;
 "#,
+    // ---- v8: chat prefixes, custom chatbots members define for one chat
+    r#"
+CREATE TABLE chat_prefixes (
+    bot TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,                -- lowercase letters and digits
+    spec TEXT NOT NULL,                -- the model with all its options, resolved at creation
+    turns TEXT NOT NULL,               -- JSON [Turn]: system prompt and history before each new message
+    created_by INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (bot, chat_id, name)
+);
+"#,
 ];

@@ -20,7 +20,7 @@ docker compose logs -f
 ```
 
 - `api_id`/`api_hash` 来自 <https://my.telegram.org/apps>；bot token 来自 @BotFather。
-- 群里使用需要在 @BotFather 关闭 bot 的 privacy mode，然后管理员在群里发 `/allow`（每个 bot 分别授权）。
+- 群里使用需要在 @BotFather 关闭 bot 的 privacy mode；在群里发 `/ping` 看群 id，然后管理员在和 bot 的私聊里发 `/allow <群 id>`（每个 bot 分别授权）。
 - 数据（SQLite、图片等 blob、日志）都在 `./data`；配置在 `./config`。
 - 不用 Docker：`cargo run --release -p omni-bot -- --config config/omni.toml`，校验配置：`omni check-config`。
 

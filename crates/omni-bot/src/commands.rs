@@ -45,8 +45,9 @@ pub fn direct_ids(app: &App) -> Option<String> {
     (!forms.is_empty()).then(|| forms.join(" or "))
 }
 
-/// Commands that start requests that cost money; every other non-admin command
-/// only shows information and is answered for anyone, anywhere.
+/// Commands that start requests that cost money. Every other non-admin command
+/// only shows information: answered for everyone in an allowed chat, people
+/// banned there included. Where the chat is not allowed only /ping is answered.
 const PAID_COMMANDS: &[&str] = &["m", "retry", "continue"];
 
 /// The answer to a paid request from someone banned in the chat.
@@ -73,11 +74,13 @@ Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::u
 
 **Continue**: reply to any of my messages. The whole reply is the next message, exactly as typed (marker lines are plain text there), except that a leading `\` is removed, so `\/raw` sends the text `/raw`. Replying to a failed message is rejected; use /retry on it.
 
+**Prefixes of this chat**: anyone allowed here (and not banned) can make a custom chatbot for this chat: a model with its options, a system prompt and a history put before every new message. `/prefix name prefix$::system …` (with `::user` / `::assistant` lines for the history) creates `name$`; or reply `/prefix name` to one of my answers to turn that conversation into one. Names: 3–16 letters and digits, not taken. Anyone here can use it; replies, billing and stats are the model's own. /prefix lists this chat's, /prefix `name` shows one, /unprefix `name` deletes one (its creator or an admin; replies to its answers keep working).
+
 **Commands (reply to a bot message)**: /m `prefix$text` continue with another model · /raw original Markdown and files · /dump the whole conversation up to that message as a JSON file · /info request details · /retry regenerate a failed answer · /continue keep writing an answer that stopped at the long-decode budget.
 
 **Other**: /models [search] · /model `prefix` · /stats [today|7d|30d|all] this chat's usage (calendar days in the bot's time zone, today since 00:00, default 30d; in a group also one member: `/stats user_id`, or reply /stats to their message) · /usage · /ping (ids and access here)
 
-Commands that only show information work everywhere. Requests that cost money need an allowed chat; someone banned in it is told so.
+Where the bot is not allowed, only /ping is answered. Where it is, commands that only show information work for everyone, also for people banned there; requests that cost money tell banned people that they are banned.
 
 By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. In a reply, the first line names the model; everything else the bot adds (reasoning, sources, errors, notes, usage) is in collapsible blocks or small text, so the model's answer is always unambiguous."#;
 
@@ -88,9 +91,9 @@ const ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota
 /// never anything about other chats.
 const GROUP_ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota"];
 
-const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [period] (every chat: rankings by model, chat, user and chat · user; one of them, longer: /stats `model|chat|user|chat-user` [period]) · /stats `chat_id` [`user_id`] [period] · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
+const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [period] (every chat: rankings by model, chat, user and chat · user; one of them, longer: /stats `model|chat|user|chat-user` [period]) · /stats `chat_id` [`user_id`] [period] · /prefix `chat_id` (a chat's own prefixes) · /unprefix `chat_id` `name` · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
 
-const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person). Everything else in private chat."#;
+const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person) · /unprefix `name` (anyone's). Everything else in private chat."#;
 
 fn label(s: &str) -> RText {
     RText::bold(RText::plain(s))
@@ -160,13 +163,14 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         .await;
         return Ok(());
     }
+    // Where the chat is not allowed, only /ping is answered (owner's rule).
+    if access == Access::NotAllowed {
+        return Ok(());
+    }
     if ADMIN_COMMANDS.contains(&name) {
-        // Administrators may manage from anywhere (e.g. `/allow` inside a group to
-        // authorize it), scoped to the group when sent in one.
+        // In a group scoped to that group; everything else from the private chat.
         if !admin {
-            if access != Access::NotAllowed {
-                say(app, bot, ib, "⛔ admin only").await;
-            }
+            say(app, bot, ib, "⛔ admin only").await;
         } else if ib.chat_id < 0 && !GROUP_ADMIN_COMMANDS.contains(&name) {
             say(
                 app,
@@ -180,16 +184,10 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         }
         return Ok(());
     }
-    // Paid requests: only in allowed chats (else not a word), not when banned there.
-    if PAID_COMMANDS.contains(&name) {
-        match access {
-            Access::Allowed => {}
-            Access::Banned => {
-                say(app, bot, ib, BANNED).await;
-                return Ok(());
-            }
-            Access::NotAllowed => return Ok(()),
-        }
+    // Paid requests: not when banned here (queries are answered even then).
+    if PAID_COMMANDS.contains(&name) && access == Access::Banned {
+        say(app, bot, ib, BANNED).await;
+        return Ok(());
     }
     match name {
         "start" | "help" => {
@@ -223,6 +221,8 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         "raw" => cmd_raw(app, bot, ib).await?,
         "info" => cmd_info(app, bot, ib).await?,
         "dump" => cmd_dump(app, bot, ib).await?,
+        "prefix" => cmd_prefix(app, bot, ib, args, access, admin).await?,
+        "unprefix" => cmd_unprefix(app, bot, ib, args, admin).await?,
         "retry" => cmd_retry(app, bot, ib).await?,
         "continue" => cmd_continue(app, bot, ib).await?,
         "m" => cmd_m(app, bot, ib, args).await?,
@@ -501,6 +501,15 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
         if !matching.is_empty() {
             blocks.push(table(&["prefix", "spec"], matching));
         }
+        let own: Vec<Vec<String>> = app
+            .chat_prefixes_of(&bot.name, ib.chat_id)
+            .into_iter()
+            .filter(|(n, p)| n.contains(&q) || p.spec.to_lowercase().contains(&q))
+            .map(|(n, p)| vec![format!("{n}{marker}"), p.spec.clone()])
+            .collect();
+        if !own.is_empty() {
+            blocks.push(table(&["this chat's prefix", "spec"], own));
+        }
         if app.unlisted_models_allowed("openrouter") {
             let ids: Vec<Vec<String>> = app
                 .openrouter
@@ -526,6 +535,15 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
     }
     let rows: Vec<Vec<String>> = prefixes.into_iter().map(|(n, s)| vec![format!("{n}{marker}"), s]).collect();
     let mut blocks = vec![table(&["prefix", "spec"], rows)];
+    let own: Vec<Vec<String>> = app
+        .chat_prefixes_of(&bot.name, ib.chat_id)
+        .into_iter()
+        .filter(|(_, p)| app.served_canonical(cfg, &p.spec).is_some())
+        .map(|(n, p)| vec![format!("{n}{marker}"), p.spec.clone()])
+        .collect();
+    if !own.is_empty() {
+        blocks.push(table(&["this chat's prefix", "spec"], own));
+    }
     let tail = match direct_ids(app) {
         Some(ids) => format!("{ids} works as a prefix too. Search: /models <text>."),
         None => "Search: /models <text>.".to_string(),
@@ -545,7 +563,7 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
     }
     let token = trigger::parse_spec(prefix_name(arg, marker)).ok();
     let spec = match token {
-        Some(t) => app.resolve_spec(&t, cfg, false).await.ok().flatten(),
+        Some(t) => app.resolve_spec(&t, cfg, ib.chat_id, false).await.ok().flatten(),
         None => None,
     };
     let Some(spec) = spec else {
@@ -801,6 +819,237 @@ fn collect_blobs(v: &serde_json::Value, out: &mut std::collections::BTreeMap<Str
     }
 }
 
+/// A person's display name with id, from what the bot has seen.
+async fn user_label(app: &App, id: i64) -> String {
+    let name: Option<String> = app
+        .db
+        .call(move |c| {
+            use rusqlite::OptionalExtension;
+            Ok(c.query_row(
+                "SELECT NULLIF(TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')), '') FROM users WHERE user_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten())
+        })
+        .await
+        .ok()
+        .flatten();
+    match name {
+        Some(n) => format!("{n} ({id})"),
+        None => id.to_string(),
+    }
+}
+
+/// `/prefix`: this chat's own prefixes (custom chatbots). Without arguments
+/// the list; `/prefix <name>` shows one, or, as a reply to one of the bot's
+/// answers, turns that conversation into a new one; `/prefix <name> <spec>$…`
+/// creates one from marker lines. Administrators in their private chat may
+/// list another chat's with `/prefix <chat_id>`.
+async fn cmd_prefix(
+    app: &Arc<App>,
+    bot: &Arc<BotConn>,
+    ib: &Inbound,
+    args: &str,
+    access: Access,
+    admin: bool,
+) -> Result<()> {
+    use crate::prefixes;
+    let Some(cfg) = app.bot_cfg(&bot.name) else { return Ok(()) };
+    let marker = app.marker();
+    let user = ib.sender_id.unwrap_or(0);
+    let args = args.trim_start();
+    let (first, rest) = match args.split_once(char::is_whitespace) {
+        Some((f, r)) => (f, r.trim_start()),
+        None => (args, ""),
+    };
+    let mut chat = ib.chat_id;
+    if first.is_empty() || admin && chat > 0 && rest.is_empty() && first.parse::<i64>().is_ok_and(|c| c != 0) {
+        if !first.is_empty() {
+            chat = first.parse().unwrap_or(chat);
+        }
+        let mut rows = Vec::new();
+        for (n, p) in app.chat_prefixes_of(&bot.name, chat) {
+            let history = p.turns.iter().filter(|t| t.role != omni_core::content::Role::System).count();
+            let system = if p.turns.iter().any(|t| t.role == omni_core::content::Role::System) { "yes" } else { "-" };
+            rows.push(vec![format!("{n}{marker}"), p.spec.clone(), system.into(), history.to_string(), user_label(app, p.created_by).await]);
+        }
+        let blocks = if rows.is_empty() {
+            vec![RBlock::Paragraph(RText::plain(with_marker(
+                "No prefixes in this chat yet. Create one: /prefix name prefix$::system …",
+                marker,
+            )))]
+        } else {
+            vec![table(&["prefix", "spec", "system", "history", "by"], rows)]
+        };
+        let title = if chat == ib.chat_id { "Prefixes of this chat".to_string() } else { format!("Prefixes of {}", place_label(chat)) };
+        send(app, bot, ib, &title, blocks).await;
+        return Ok(());
+    }
+    let name = match prefixes::check_name(prefix_name(first, marker)) {
+        Ok(n) => n,
+        Err(e) => {
+            say(app, bot, ib, &format!("⚠️ {e}")).await;
+            return Ok(());
+        }
+    };
+    // Show one.
+    if rest.is_empty() && ib.reply_to_msg_id.is_none() {
+        let Some(p) = app.chat_prefix(&bot.name, chat, &name) else {
+            say(app, bot, ib, &format!("there is no prefix {name}{marker} in this chat")).await;
+            return Ok(());
+        };
+        let mut blocks = vec![RBlock::Paragraph(RText::plain(format!(
+            "{name}{marker} → {} · by {}",
+            p.spec,
+            user_label(app, p.created_by).await
+        )))];
+        for t in p.turns.iter() {
+            let text: String = t
+                .parts
+                .iter()
+                .map(|x| match x {
+                    Part::Text { text, .. } => text.clone(),
+                    Part::Image { .. } => "[image]".into(),
+                    Part::File { .. } => "[file]".into(),
+                    _ => String::new(),
+                })
+                .filter(|x| !x.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            blocks.push(RBlock::Details {
+                open: false,
+                title: RText::plain(format!("::{}", t.role.as_str())),
+                blocks: vec![RBlock::Pre { text, language: String::new() }],
+            });
+        }
+        send(app, bot, ib, "Prefix", blocks).await;
+        return Ok(());
+    }
+    // Create one: members allowed here and not banned.
+    if access == Access::Banned {
+        say(app, bot, ib, BANNED).await;
+        return Ok(());
+    }
+    if app.prefix_taken(&bot.name, chat, &name) {
+        say(app, bot, ib, &format!("⚠️ {name}{marker} is taken: pick another name")).await;
+        return Ok(());
+    }
+    let (spec, turns) = if rest.is_empty() {
+        // From the conversation up to the replied answer.
+        let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+        if t.turn.role != omni_core::content::Role::Assistant || t.status != TurnStatus::Done {
+            say(app, bot, ib, "⚠️ reply to an answer that finished normally").await;
+            return Ok(());
+        }
+        let Some(spec) = t.spec.clone() else { return Ok(()) };
+        let chain = conv::history(&app.db, t.id).await?;
+        match prefixes::turns_from_chain(&chain) {
+            Ok(turns) => (spec, turns),
+            Err(e) => {
+                say(app, bot, ib, &format!("⚠️ {e}")).await;
+                return Ok(());
+            }
+        }
+    } else {
+        // From marker lines after a model prefix.
+        let usage = with_marker(
+            "usage: /prefix name prefix$::system\n…\n::user\n…\n::assistant\n… (the history is optional; it ends with ::assistant)",
+            marker,
+        );
+        let t = match trigger::parse_trigger(rest, marker) {
+            Ok(Some(t)) if t.specs.len() == 1 => t,
+            Ok(_) => {
+                say(app, bot, ib, &usage).await;
+                return Ok(());
+            }
+            Err(e) => {
+                say(app, bot, ib, &format!("⚠️ {e}")).await;
+                return Ok(());
+            }
+        };
+        let spec = match app.resolve_spec(&t.specs[0], cfg, chat, false).await {
+            Ok(Some(s)) if s.template.is_none() => s,
+            Ok(Some(_)) => {
+                say(app, bot, ib, "⚠️ a prefix of this chat cannot be built on another one; use a model prefix").await;
+                return Ok(());
+            }
+            Ok(None) => {
+                say(app, bot, ib, &format!("⚠️ unknown prefix `{}{marker}`", t.specs[0].raw)).await;
+                return Ok(());
+            }
+            Err(e) => {
+                say(app, bot, ib, &format!("⚠️ {e}")).await;
+                return Ok(());
+            }
+        };
+        match prefixes::turns_from_text(&t.text) {
+            Ok(turns) => (spec, turns),
+            Err(e) => {
+                say(app, bot, ib, &format!("⚠️ {e}. {usage}")).await;
+                return Ok(());
+            }
+        }
+    };
+    // Options are validated when the prefix is used, like any other prefix's.
+    let p = prefixes::ChatPrefix {
+        spec: format!("{}{}", spec.canonical(), spec.options_syntax()),
+        turns: Arc::new(turns),
+        created_by: user,
+        created_at: now_ms(),
+    };
+    if !prefixes::insert(&app.db, &bot.name, chat, &name, &p).await? {
+        say(app, bot, ib, &format!("⚠️ {name}{marker} is taken: pick another name")).await;
+        return Ok(());
+    }
+    let (history, system) = (
+        p.turns.iter().filter(|t| t.role != omni_core::content::Role::System).count(),
+        p.turns.iter().any(|t| t.role == omni_core::content::Role::System),
+    );
+    let text = format!(
+        "✅ {name}{marker} → {} · {} · {history} history turns. Anyone in this chat can use it; /unprefix {name} deletes it.",
+        p.spec,
+        if system { "with a system prompt" } else { "no system prompt" },
+    );
+    app.chat_prefixes.write().entry((bot.name.clone(), chat)).or_default().insert(name, Arc::new(p));
+    say(app, bot, ib, &text).await;
+    Ok(())
+}
+
+/// `/unprefix <name>`: delete a prefix of this chat (its creator, or an
+/// administrator; in their private chat also `/unprefix <chat_id> <name>`).
+/// Replies to its earlier answers keep working: they use the model directly.
+async fn cmd_unprefix(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str, admin: bool) -> Result<()> {
+    use crate::prefixes;
+    let marker = app.marker();
+    let user = ib.sender_id.unwrap_or(0);
+    let words: Vec<&str> = args.split_whitespace().collect();
+    let (chat, name) = match words[..] {
+        [n] => (ib.chat_id, n),
+        [c, n] if admin && ib.chat_id > 0 && c.parse::<i64>().is_ok() => (c.parse().unwrap_or(0), n),
+        _ => {
+            say(app, bot, ib, "usage: /unprefix <name>").await;
+            return Ok(());
+        }
+    };
+    let name = prefix_name(name, marker).to_ascii_lowercase();
+    let Some(p) = app.chat_prefix(&bot.name, chat, &name) else {
+        say(app, bot, ib, &format!("there is no prefix {name}{marker} there")).await;
+        return Ok(());
+    };
+    if p.created_by != user && !admin {
+        say(app, bot, ib, "⛔ only its creator or an administrator can delete it").await;
+        return Ok(());
+    }
+    prefixes::delete(&app.db, &bot.name, chat, &name).await?;
+    if let Some(m) = app.chat_prefixes.write().get_mut(&(bot.name.clone(), chat)) {
+        m.remove(&name);
+    }
+    say(app, bot, ib, &format!("✅ {name}{marker} deleted; replies to its earlier answers keep working")).await;
+    Ok(())
+}
+
 async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
     let attempts = conv::attempts_of(&app.db, t.id).await?;
@@ -955,6 +1204,12 @@ async fn cmd_m(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str) -> 
         }
     };
     let specs = match crate::handler::resolve_specs(app, bot, ib.chat_id, &t.specs, true).await {
+        Ok(s) if s.iter().any(|x| x.template.is_some()) => {
+            let msg = "⚠️ a prefix of this chat brings its own history, so it starts new conversations only; \
+                       /m continues with a model prefix";
+            say(app, bot, ib, msg).await;
+            return Ok(());
+        }
         Ok(s) if !s.is_empty() => s,
         Ok(_) => {
             say(app, bot, ib, "⚠️ none of these models is served by this bot here").await;
@@ -1188,9 +1443,6 @@ async fn cmd_usage(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
             ),
             None => format!("{what}: no limit"),
         });
-    }
-    if app.is_admin(user) {
-        lines.push("administrators are not limited (their spending still counts)".into());
     }
     let items =
         lines.into_iter().map(|l| RItem { checkbox: None, blocks: vec![RBlock::Paragraph(RText::plain(l))] }).collect();

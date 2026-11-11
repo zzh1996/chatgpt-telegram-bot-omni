@@ -14,7 +14,7 @@ use tracing::{Instrument, info, info_span, warn};
 use crate::access::{self, Access};
 use crate::app::App;
 use crate::conv::{self, Inbound, NewTurn, ResolvedSpec, TurnStatus};
-use crate::intake::{Kind, parse_command, reply_target};
+use crate::intake::{Kind, parse_command};
 use crate::jobs;
 use crate::media;
 use crate::reply;
@@ -133,11 +133,11 @@ pub async fn resolve_specs(
     let mut out = Vec::new();
     let mut unknown = Vec::new();
     for s in specs {
-        let mut resolved = app.resolve_spec(s, cfg, strict).await?;
+        let mut resolved = app.resolve_spec(s, cfg, chat_id, strict).await?;
         if resolved.is_none() && strict && app.plausible_model_id(cfg, s) {
             // Maybe a brand-new model: check a fresh catalog before giving up.
             app.refresh_catalog_if_older(std::time::Duration::from_secs(20)).await;
-            resolved = app.resolve_spec(s, cfg, strict).await?;
+            resolved = app.resolve_spec(s, cfg, chat_id, strict).await?;
         }
         match resolved {
             Some(spec) => out.push(spec),
@@ -289,6 +289,13 @@ async fn new_conversation(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> R
             return Ok(());
         }
     };
+    // A chat prefix brings its own system prompt: the message cannot add another.
+    let has_system = |ts: &[Turn]| ts.iter().any(|t| t.role == Role::System);
+    if has_system(&turns) && specs.iter().any(|s| s.template.as_ref().is_some_and(|t| has_system(t))) {
+        let msg = "⚠️ this prefix already has a system prompt; leave out ::system";
+        reply::notice(app, bot, ib.chat_id, ib.msg_id, msg).await;
+        return Ok(());
+    }
     create_and_start(app, bot, ib, None, turns, specs).await
 }
 
@@ -355,47 +362,45 @@ async fn create_and_start(
     turns: Vec<Turn>,
     specs: Vec<ResolvedSpec>,
 ) -> Result<()> {
-    let (bot_name, chat, user, inbound, msg) = (bot.name.clone(), ib.chat_id, ib.sender_id, ib.id, ib.msg_id);
+    let (bot_name, chat, user, inbound) = (bot.name.clone(), ib.chat_id, ib.sender_id, ib.id);
     let assistant_ids = app
         .db
         .call(move |c| {
             let tx = c.transaction()?;
-            let mut prev = parent;
-            for t in &turns {
-                let id = conv::insert_turn_sync(
-                    &tx,
-                    &NewTurn {
-                        parent_id: prev,
-                        turn: t.clone(),
-                        spec: None,
-                        status: TurnStatus::Done,
-                        bot: Some(bot_name.clone()),
-                        chat_id: Some(chat),
-                        user_id: user,
-                        inbound_id: Some(inbound),
-                    },
-                )?;
-                prev = Some(id);
-            }
+            let new = |parent: Option<i64>, turn: Turn, spec: Option<ResolvedSpec>, status: TurnStatus| NewTurn {
+                parent_id: parent,
+                turn,
+                spec,
+                status,
+                bot: Some(bot_name.clone()),
+                chat_id: Some(chat),
+                user_id: user,
+                inbound_id: Some(inbound),
+            };
+            // Insert turns one after the other below `parent`; the last one's id.
+            let chain = |tx: &rusqlite::Transaction, parent: Option<i64>, ts: &mut dyn Iterator<Item = &Turn>| {
+                let mut prev = parent;
+                for t in ts {
+                    prev = Some(conv::insert_turn_sync(tx, &new(prev, t.clone(), None, TurnStatus::Done))?);
+                }
+                prev.context("no user turn")
+            };
             // Only bot messages are mapped to turns: replies to the user's own message
             // are not continuations (same as the old bot).
-            let last = prev.context("no user turn")?;
-            let _ = msg;
+            let mut shared: Option<i64> = None;
             let mut ids = Vec::new();
             for s in &specs {
-                ids.push(conv::insert_turn_sync(
-                    &tx,
-                    &NewTurn {
-                        parent_id: Some(last),
-                        turn: Turn { role: Role::Assistant, origin: Origin::Live, parts: vec![], native: None },
-                        spec: Some(s.clone()),
-                        status: TurnStatus::Pending,
-                        bot: Some(bot_name.clone()),
-                        chat_id: Some(chat),
-                        user_id: user,
-                        inbound_id: Some(inbound),
+                let last = match &s.template {
+                    // The message's turns, shared by every model without a chat prefix.
+                    None => match shared {
+                        Some(id) => id,
+                        None => *shared.insert(chain(&tx, parent, &mut turns.iter())?),
                     },
-                )?);
+                    // A chat prefix: its system prompt and history first, in its own chain.
+                    Some(tpl) => chain(&tx, parent, &mut tpl.iter().chain(turns.iter()))?,
+                };
+                let answer = Turn { role: Role::Assistant, origin: Origin::Live, parts: vec![], native: None };
+                ids.push(conv::insert_turn_sync(&tx, &new(Some(last), answer, Some(s.clone()), TurnStatus::Pending))?);
             }
             tx.commit()?;
             Ok(ids)
@@ -405,7 +410,6 @@ async fn create_and_start(
     for id in assistant_ids {
         jobs::spawn_turn(app.clone(), id);
     }
-    let _ = reply_target;
     Ok(())
 }
 

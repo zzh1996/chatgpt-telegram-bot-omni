@@ -39,6 +39,8 @@ pub const COMMANDS: &[&str] = &[
     "model",
     "raw",
     "dump",
+    "prefix",
+    "unprefix",
     "retry",
     "continue",
     "m",
@@ -321,8 +323,8 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
     if let Some((name, _, addressed)) = parse_command(text, &bot.username) {
         // Every bot answers commands addressed to it or to everyone, like an
         // independent instance; `/m`, `/raw`, `/dump`, `/retry`, `/continue`,
-        // `/info` in replies only the bot that owns the replied message.
-        if matches!(name.as_str(), "m" | "raw" | "dump" | "retry" | "continue" | "info")
+        // `/info`, `/prefix` in replies only the bot that owns the replied message.
+        if matches!(name.as_str(), "m" | "raw" | "dump" | "retry" | "continue" | "info" | "prefix")
             && !addressed
             && let Some(rt) = reply_target(m)
         {
@@ -350,7 +352,7 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
             return None;
         }
         for s in &t.specs {
-            if let Ok(Some(_)) = app.resolve_spec(s, bot_cfg, strict).await {
+            if let Ok(Some(_)) = app.resolve_spec(s, bot_cfg, chat_id, strict).await {
                 return Some(Kind::Trigger);
             }
         }

@@ -1,7 +1,7 @@
 //! Shared application state and model resolution. Every bot is independent:
 //! it answers the prefixes it serves, with its own aliases and access rules.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -36,6 +36,8 @@ pub struct App {
     /// Per bot: the config's aliases overlaid with the bot's runtime ones
     /// (`/alias`): bot -> name (may be empty) -> spec string.
     pub aliases: RwLock<BTreeMap<String, BTreeMap<String, String>>>,
+    /// Chat prefixes: (bot, chat) -> name -> prefix.
+    pub chat_prefixes: RwLock<HashMap<(String, i64), BTreeMap<String, Arc<crate::prefixes::ChatPrefix>>>>,
     /// Assistant turns currently being generated (dedupe of job runners).
     pub running: Mutex<HashSet<i64>>,
     /// Fires with a turn id whenever an assistant turn finishes.
@@ -93,6 +95,11 @@ impl App {
             }
         }
         *self.aliases.write() = aliases;
+        let mut prefixes: HashMap<(String, i64), BTreeMap<String, Arc<crate::prefixes::ChatPrefix>>> = HashMap::new();
+        for (bot, chat, name, p) in crate::prefixes::load_all(&self.db).await? {
+            prefixes.entry((bot, chat)).or_default().insert(name, Arc::new(p));
+        }
+        *self.chat_prefixes.write() = prefixes;
         self.membership.lock().extend(members);
         Ok(())
     }
@@ -118,6 +125,26 @@ impl App {
                 .await?;
         }
         Ok(())
+    }
+
+    /// A chat's own prefix (names are lowercase letters and digits).
+    pub fn chat_prefix(&self, bot: &str, chat_id: i64, name: &str) -> Option<Arc<crate::prefixes::ChatPrefix>> {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        self.chat_prefixes.read().get(&(bot.to_string(), chat_id))?.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// A chat's own prefixes, by name.
+    pub fn chat_prefixes_of(&self, bot: &str, chat_id: i64) -> BTreeMap<String, Arc<crate::prefixes::ChatPrefix>> {
+        self.chat_prefixes.read().get(&(bot.to_string(), chat_id)).cloned().unwrap_or_default()
+    }
+
+    /// Whether a name is already a prefix for this chat: the bot's (any case) or the chat's own.
+    pub fn prefix_taken(&self, bot: &str, chat_id: i64, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.aliases_of(bot).keys().any(|k| k.to_ascii_lowercase() == lower)
+            || self.chat_prefix(bot, chat_id, name).is_some()
     }
 
     /// A bot's alias (the empty name is the `$text` prefix).
@@ -192,7 +219,9 @@ impl App {
         ok.then_some(canonical)
     }
 
-    /// Resolve a typed spec into provider + model + options, for one bot.
+    /// Resolve a typed spec into provider + model + options, for one bot in one
+    /// chat: the bot's prefixes first, then the chat's own ones (which carry a
+    /// system prompt and history), then model ids.
     /// `None`: not a model this bot knows (no such alias or model, a provider
     /// that is not configured, a model the bot does not have, or a model id
     /// typed directly where the provider does not allow unlisted models).
@@ -203,18 +232,23 @@ impl App {
         &self,
         token: &SpecToken,
         bot: &BotConfig,
+        chat_id: i64,
         strict: bool,
     ) -> Result<Option<ResolvedSpec>, String> {
         let mut model_token = token.model.clone();
         let mut options: Vec<OptionToken> = Vec::new();
         let mut label = token.model.clone();
-        // Alias expansion (one level). The empty name is an alias like any other.
-        let via_alias = self.alias(&bot.name, &model_token).is_some();
-        if let Some(spec) = self.alias(&bot.name, &model_token) {
+        let mut template = None;
+        // Prefix expansion (one level). The empty name is an alias like any other.
+        let alias = self.alias(&bot.name, &model_token);
+        let chat_prefix = if alias.is_none() { self.chat_prefix(&bot.name, chat_id, &model_token) } else { None };
+        let via_alias = alias.is_some() || chat_prefix.is_some();
+        if let Some(spec) = alias.or_else(|| chat_prefix.as_ref().map(|p| p.spec.clone())) {
             let parsed = parse_spec(&spec)
-                .map_err(|e| format!("alias `{model_token}{}` has an invalid spec `{spec}`: {e}", self.marker()))?;
+                .map_err(|e| format!("prefix `{model_token}{}` has an invalid spec `{spec}`: {e}", self.marker()))?;
             model_token = parsed.model;
             options.extend(parsed.options);
+            template = chat_prefix.map(|p| p.turns.clone());
         } else if model_token.is_empty() {
             return Ok(None);
         }
@@ -243,7 +277,7 @@ impl App {
         if label.contains(':') && label == model_token {
             label = model.clone();
         }
-        Ok(Some(ResolvedSpec { provider, model, label, options, raw: token.raw.clone() }))
+        Ok(Some(ResolvedSpec { provider, model, label, options, raw: token.raw.clone(), template }))
     }
 
     /// Whether `token` looks like a full OpenRouter model id (`author/model`)

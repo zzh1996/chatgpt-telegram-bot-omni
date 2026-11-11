@@ -24,6 +24,10 @@ pub struct ResolvedSpec {
     /// The spec as typed by the user.
     #[serde(default)]
     pub raw: String,
+    /// A chat prefix's system prompt and history, put before the new message
+    /// when a conversation starts (never stored with the turn: the turns are).
+    #[serde(skip)]
+    pub template: Option<std::sync::Arc<Vec<Turn>>>,
 }
 
 impl ResolvedSpec {
@@ -591,6 +595,7 @@ mod tests {
                             label: "y".into(),
                             options: vec![],
                             raw: "y".into(),
+                            template: None,
                         }),
                         status: TurnStatus::Pending,
                         bot: Some("b".into()),

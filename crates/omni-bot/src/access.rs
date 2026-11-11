@@ -5,11 +5,12 @@
 //! spend limit, its members' limits. Nothing set or counted in one chat ever
 //! affects another.
 //!
-//! Queries (commands that only show information) are answered for anyone,
-//! anywhere. Paid requests need an allowed chat (otherwise they are ignored
-//! without a word) and a sender who is not banned there (otherwise they are
-//! told). Nobody is special: the administrators' private chats are allowed once
-//! at the first start, and they can remove them or ban themselves like anyone.
+//! Where a chat is not allowed, only /ping is answered. In an allowed chat,
+//! queries (commands that only show information) are answered for everyone,
+//! people banned there included, and paid requests for everyone not banned
+//! there (banned people are told). Nobody is special: the administrators'
+//! private chats are allowed once at the first start, and they can remove them
+//! or ban themselves like anyone.
 //! Administrators manage this with commands: in their private chat for every
 //! chat of the bot, inside a group for that group only (see `commands`).
 
@@ -27,7 +28,7 @@ pub enum Access {
     Allowed,
     /// The chat is allowed, but the person is banned there: told so.
     Banned,
-    /// The chat is not allowed: paid requests are ignored without a word.
+    /// The chat is not allowed: only /ping is answered.
     NotAllowed,
 }
 
@@ -350,11 +351,9 @@ pub async fn charge(db: &Db, bot: &str, chat_id: i64, user_id: i64, cost: f64) -
     Ok(())
 }
 
-/// `Err(message)` if this chat's bucket or the member's bucket in it is exhausted.
+/// `Err(message)` if this chat's bucket or the member's bucket in it is
+/// exhausted (for everyone, administrators included).
 pub async fn check_quota(app: &App, bot: &str, chat_id: i64, user_id: i64) -> Result<Result<(), String>> {
-    if app.is_admin(user_id) {
-        return Ok(Ok(()));
-    }
     for (what, target) in [("this chat's", Target::Chat), ("your", Target::Member(user_id))] {
         if let Some((lvl, rule)) = level(&app.db, bot, chat_id, target).await?
             && lvl <= 0.0

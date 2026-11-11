@@ -15,6 +15,7 @@ mod ledger;
 mod logging;
 mod media;
 mod policy;
+mod prefixes;
 mod rawlog;
 mod reply;
 mod store;
@@ -174,6 +175,7 @@ async fn run(cfg: Config) -> Result<()> {
         bots: bots.clone(),
         membership: Mutex::new(HashSet::new()),
         aliases: RwLock::new(BTreeMap::new()),
+        chat_prefixes: RwLock::new(Default::default()),
         running: Mutex::new(HashSet::new()),
         turn_done,
         shutdown: CancellationToken::new(),
@@ -288,6 +290,8 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("m", continue_with.as_str()),
         ("raw", "Reply: get the original Markdown and files"),
         ("dump", "Reply: the whole conversation as a JSON file"),
+        ("prefix", "This chat's own prefixes: list, show, create"),
+        ("unprefix", "Delete a prefix of this chat (its creator or an admin)"),
         ("info", "Reply: show request details"),
         ("retry", "Reply: retry a failed answer"),
         ("continue", "Reply: keep writing an answer that hit its long-decode budget"),
