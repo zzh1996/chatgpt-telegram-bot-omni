@@ -208,12 +208,46 @@ fn flush_answer(out: &mut Vec<RBlock>, answer: &mut String, citations: &mut Vec<
 /// kind are joined into a block; nothing is moved past anything else. Sources
 /// follow the answer text they belong to. `depth`: nesting of the output
 /// (0 at the top of the message, 1 inside an earlier attempt's block).
+/// A stretch of reasoning and tool calls that no answer text interrupts.
+#[derive(Default)]
+struct Stretch {
+    blocks: Vec<RBlock>,
+    reasoning: usize,
+    tool_calls: usize,
+}
+
+impl Stretch {
+    /// Its blocks, into `out`: one block as it is; several in one fold titled
+    /// with what they are (owner's choice: "💭 3 · 🔧 2"), open if one inside is.
+    fn flush(&mut self, out: &mut Vec<RBlock>) {
+        let s = std::mem::take(self);
+        if s.blocks.len() < 2 {
+            out.extend(s.blocks);
+            return;
+        }
+        let open = s.blocks.iter().any(|b| matches!(b, RBlock::Details { open: true, .. }));
+        let mut title = Vec::new();
+        if s.reasoning > 0 {
+            title.push(format!("💭 {}", s.reasoning));
+        }
+        if s.tool_calls > 0 {
+            title.push(format!("🔧 {}", s.tool_calls));
+        }
+        out.push(RBlock::Details { open, title: RText::sub(RText::plain(title.join(" · "))), blocks: s.blocks });
+    }
+}
+
 /// `open_thinking`: open the reasoning fold that nothing follows yet (the model
 /// is still thinking and `render.reasoning_open` is on).
+///
+/// Strictly in production order. Each uninterrupted stretch of reasoning and
+/// tool calls with more than one fold is put in one outer fold, so that models
+/// that think and call tools many times do not flood the chat.
 fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -> Vec<RBlock> {
     let mut out = Vec::new();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
+    let mut stretch = Stretch::default();
     let mut i = 0;
     while i < parts.len() {
         match &parts[i] {
@@ -236,10 +270,12 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
                     flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
                     // Open only while the model is thinking: nothing has come after it yet.
                     let open = open_thinking && !parts[i..].iter().any(visible);
-                    out.push(RBlock::Details {
+                    stretch.reasoning += 1;
+                    // One level more for the outer fold it may end up in.
+                    stretch.blocks.push(RBlock::Details {
                         open,
                         title: RText::sub(RText::plain("💭")),
-                        blocks: ai_blocks(&text, raw, depth + 1),
+                        blocks: ai_blocks(&text, raw, depth + 2),
                     });
                 }
             }
@@ -250,24 +286,31 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
                     items.push(tool_item(t));
                     i += 1;
                 }
-                out.push(RBlock::Details {
+                stretch.tool_calls += items.len();
+                stretch.blocks.push(RBlock::Details {
                     open: false,
                     title: RText::plain(format!("🔧 Tool calls · {}", items.len())),
                     blocks: vec![RBlock::List { items }],
                 });
             }
             Part::Text { text, citations: c } => {
+                // Answer text ends a stretch (whitespace between tool calls does not).
+                if !text.trim().is_empty() {
+                    stretch.flush(&mut out);
+                }
                 answer.push_str(text);
                 citations.extend(c.iter().cloned());
                 i += 1;
             }
             Part::Image { blob, generated: true, dims, .. } => {
                 flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                stretch.flush(&mut out);
                 out.push(RBlock::Photo { key: blob.sha256.clone(), caption: RText::plain(image_caption(blob, *dims)) });
                 i += 1;
             }
             Part::Refusal { text } => {
                 flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                stretch.flush(&mut out);
                 out.push(RBlock::Details {
                     open: true,
                     title: RText::plain("⛔ Refusal"),
@@ -278,6 +321,7 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
             _ => i += 1,
         }
     }
+    stretch.flush(&mut out);
     flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
     out
 }
@@ -753,6 +797,10 @@ mod tests {
         }
     }
 
+    fn tool_call() -> Part {
+        Part::ToolCall(ToolCall { id: Some("t".into()), name: "web_search".into(), ..Default::default() })
+    }
+
     #[test]
     fn output_is_shown_in_the_order_it_was_produced() {
         let reasoning =
@@ -782,18 +830,28 @@ mod tests {
         ];
         let blocks = compose(&input(&parts, Status::Done));
         let kinds: Vec<String> = blocks.iter().map(kind).collect();
-        assert_eq!(
-            kinds,
-            vec!["header", "💭", "🔧", "💭", "p:first", "📚", "photo", "p:second", "🔧", "footer"],
-            "{blocks:#?}"
-        );
+        // The stretch of reasoning and tool calls before the answer is one fold;
+        // the lone tool call after the second text stays as it is.
+        assert_eq!(kinds, vec!["header", "💭", "p:first", "📚", "photo", "p:second", "🔧", "footer"], "{blocks:#?}");
+        let RBlock::Details { title, blocks: inner, .. } = &blocks[1] else { panic!("{:?}", blocks[1]) };
+        assert_eq!(title.to_plain(), "💭 2 · 🔧 1");
+        assert_eq!(inner.iter().map(kind).collect::<Vec<_>>(), vec!["💭", "🔧", "💭"]);
         // Adjacent reasoning parts form one block, in order.
-        assert!(format!("{:?}", blocks[1]).contains("plan") && format!("{:?}", blocks[1]).contains("more plan"));
+        assert!(format!("{:?}", inner[0]).contains("plan") && format!("{:?}", inner[0]).contains("more plan"));
 
-        // While generating, only reasoning with nothing after it yet is open.
+        // While generating, only reasoning with nothing after it yet is open
+        // (with `render.reasoning_open`), and the fold around it.
         let parts = vec![reasoning("a"), Part::text("x"), reasoning("b")];
         let kinds: Vec<String> = compose(&input(&parts, Status::Generating)).iter().map(kind).collect();
         assert_eq!(kinds, vec!["header", "💭", "p:x", "💭+", "footer"]);
+        let parts = vec![reasoning("a"), tool_call(), reasoning("b")];
+        let kinds: Vec<String> = compose(&input(&parts, Status::Generating)).iter().map(kind).collect();
+        assert_eq!(kinds, vec!["header", "💭+", "footer"]);
+        // Whitespace between tool calls does not split a stretch.
+        let parts = vec![tool_call(), Part::text("\n\n"), reasoning("a"), Part::text("done")];
+        let blocks = compose(&input(&parts, Status::Done));
+        assert!(matches!(&blocks[1], RBlock::Details { title, .. } if title.to_plain() == "💭 1 · 🔧 1"), "{blocks:#?}");
+        assert_eq!(blocks.len(), 4, "{blocks:#?}");
     }
 
     #[test]

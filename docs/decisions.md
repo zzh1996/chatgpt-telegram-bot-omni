@@ -59,6 +59,7 @@
 | D50 | 前缀清单由作者从旧 bot 的前缀里逐个勾选（2026-11-12）：OpenAI `$` 61s 61t 6 6s 6l 56 56t 56l 55 54 54m 54n；Claude c c5 cf cf51 cf5 cs cs5 ch；Gemini g g4 g31 gf g38f g37f g36f g35f gi；Grok x x46 x45；DeepSeek d df；GLM z zf；Kimi k k26；Qwen q q37；示例配置另有豆包 dbe db。取代 D44 的"最近两代"。 | 作者逐项选择。 |
 | D51 | 推理折叠块默认一直收起：流式刷新每次都会重发它的开合状态，展开着会把读者手动收起的块重新打开（群友反馈很烦）。`[render] reasoning_open = true` 恢复"模型思考时展开"。 | 作者要求（2026-11-12）。 |
 | D52 | Markdown 用 pulldown-cmark 0.13.6 的打了补丁的副本（`vendor/pulldown-cmark`，经 `[patch.crates-io]` 引入）：加上"CJK 友好"的强调规则，`*`/`~~` 贴着标点时，另一侧是中日韩字符也能开/闭合（`**注意：**内容`）；其余规则不变，pulldown-cmark 自带的 CommonMark 测试全部通过。 | 作者反馈：中文加粗不生效。 |
+| D53 | 一串没有被正文打断的推理和工具调用（不止一个折叠时）放进一个外层折叠，标题小字写"💭 N · 🔧 M"；正文穿插时每串一个，顺序不变（D30）；只有一项时不加外层。Telegram 支持折叠嵌套（实测）。 | 作者要求（2026-11-12）：推理和工具调用穿插很多次时会刷屏。 |
 
 ## 假设（可推翻）
 
