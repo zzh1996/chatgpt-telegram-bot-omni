@@ -60,6 +60,8 @@
 | D51 | 推理折叠块默认一直收起：流式刷新每次都会重发它的开合状态，展开着会把读者手动收起的块重新打开（群友反馈很烦）。`[render] reasoning_open = true` 恢复"模型思考时展开"。 | 作者要求（2026-11-12）。 |
 | D52 | Markdown 用 pulldown-cmark 0.13.6 的打了补丁的副本（`vendor/pulldown-cmark`，经 `[patch.crates-io]` 引入）：加上"CJK 友好"的强调规则，`*`/`~~` 贴着标点时，另一侧是中日韩字符也能开/闭合（`**注意：**内容`）；其余规则不变，pulldown-cmark 自带的 CommonMark 测试全部通过。 | 作者反馈：中文加粗不生效。 |
 | D53 | 一串没有被正文打断的推理和工具调用（不止一个折叠时）放进一个外层折叠，标题小字写"💭 N · 🔧 M"；正文穿插时每串一个，顺序不变（D30）；只有一项时不加外层。Telegram 支持折叠嵌套（实测）。 | 作者要求（2026-11-12）：推理和工具调用穿插很多次时会刷屏。 |
+| D54 | 用户的输入（2026-11-12）：**富消息**按 Markdown 交给模型（结构就是内容：标题、列表、表格、代码、引用、公式；其中的图片和文件作附件放在正文前，地图块作位置）。**相册**是一条消息：Telegram 每张一条，bot 等 1.5 秒后由第一条被记录的处理、其它的跳过，所有图片按顺序附上，其它张的说明文字接在正文后（回复 bot 的回答发相册只继续一次）。**位置**（定位、地点、实时位置的当前位置）作为位置附件（`Part::Location`），和图片、文件一样来自消息本身或被回复的消息；只有 Gemini API 的 Google Maps（`+m`）用它（对话里最新的位置作为用户位置），其它 API 和经 OpenRouter 都报错，不改写成文字。 | 作者要求：支持 rich message 和相册；Google Maps 需要坐标，"跟图片和文件相同的处理方式"。 |
+| D55 | 各平台的官方 API 都实现为 provider（2026-11-12）：`openai`（Responses）、`anthropic`（Messages）、`google`（Gemini API，generateContent）、`xai`（Responses）、`deepseek`（Chat Completions；`+s` 走它的 Anthropic 兼容接口）、`zhipu`、`moonshot`（`+s` 走它的 Responses API）、`alibaba`（`+c` 走它的 Responses API）、`ark`。配了 key 才存在（D43），模型写成 `<id>:<模型 ID>`，回复第一行和统计也这样显示。国内四家接国内官网/官方云，地址与旧版相同（智谱用文档里的 Bearer key，不再自己签 JWT；百炼默认旧版的 `dashscope.aliyuncs.com`，可配工作空间域名）。每家：选项按官方能力校验、默认拉满（D3），只发官方文档有的字段；用量没有费用时按带日期的价目表估算（含缓存读写、长上下文倍率、峰谷价、工具按次费用）；更贵的等级（`service_tier`、Anthropic `speed`、Moonshot `-highspeed`）只给 priority 名单（D24）。不给 DeepSeek 发 `user_id`（它按用户隔离 KV 缓存，群里共用的对话会失去缓存命中）。用了服务端工具的回合不记录上下文 token 数（报告的输入是多次内部调用之和，会把下一轮的输出预算压到最低）。 | 作者要求："把所有的官方 provider 都实现一遍"；"四个中国的模型供应商都是接他们的国内官网或者官方的云……跟旧仓库里面是一样的"。 |
 
 ## 假设（可推翻）
 
@@ -69,7 +71,7 @@
 | A2 | 自动 `max_tokens` = min(第一方 endpoint 的最大输出, 393216, 上下文 − 估算 prompt − 余量)。prompt 用上一轮同模型回答报告的精确 token 数（`context_tokens`）+ 之后新消息的保守估算；endpoint 限额缓存、启动预取，不增加延迟；仍超上下文时解析报错里的数字（或减半）立即重发，不计失败次数。方舟另有 65536 上限（按 max_tokens 预扣 TPM）。 | 尽量长、不截断、不超限、不加延迟。注意 OpenRouter 按 max_tokens 冻结在途额度：额度很小的 key 上并发多个贵模型请求可能 402（可重试）。 |
 | A3 | `+s` 只用厂商原生搜索；endpoint 没有原生搜索时报错（不用 OpenRouter 的第三方搜索）。 | 不接入额外工具、不静默替换（原则）。 |
 | A4 | 不默认设置 `verbosity`。 | 它改变回答风格（Claude 上还会覆盖 effort），不属于"能力"。 |
-| A5 | 带引用（quote）的回复忽略（同旧版）；用户消息中的 Telegram 格式不转为 Markdown（同旧版，发送纯文本）。 | 保持旧行为。 |
+| A5 | 带引用（quote）的回复忽略（同旧版）；普通消息中的 Telegram 格式（粗体等 entities）不转为 Markdown（同旧版，发送纯文本）；富消息除外，见 D54。 | 保持旧行为。 |
 | A6 | （已由 D38 取代：按实测模型限速。）`render.min_edit_interval_secs` 已删除。 | |
 | A7 | 只重试可重试错误（429、5xx、超时、断流），400/401/402/403/404 等不重试，间隔见 D34。重启中断不计入次数。 | 用户反馈过"不可能成功也在重试"。 |
 | A8 | （已由 D19 取代：图片嵌在富消息里。）原图用 /raw 以文件形式获取。 | |
@@ -80,8 +82,8 @@
 
 ## 已知限制 / 待办（按优先级）
 
-1. **重启时的续流**：OpenRouter 无状态，除 Gemini 4 long decode（已实现：checkpoint 落盘，重启后在原消息上接着写）外，重启只能重试；`/generation/content` 只能补回断开前已送达的文本（已用于填充被打断的那条消息）。（不做 relay 进程，D18。）
-2. **方舟 provider 未经真实请求验证**（等 `ARK_API_KEY`）：`max_tokens` 的真实上限、`encrypted_content` 回传、`detail:"xhigh"`、错误码。
+1. **重启时的续流**：OpenRouter 无状态，除 Gemini 4 long decode（已实现：checkpoint 落盘，重启后在原消息上接着写）外，重启只能重试；`/generation/content` 只能补回断开前已送达的文本（已用于填充被打断的那条消息）。（不做 relay 进程，D18。） 直连官方 API 时相同：只有 Gemini 4 long decode 能接着写；OpenAI 的 background 模式（流可续接，需要服务端暂存）、Gemini 的 Interactions API 能做到，尚未实现。
+2. **官方直连 provider 都未经真实请求验证**（等各平台的测试 key）：请求格式、事件格式、错误体、计费字段都只按文档和无 key 的探测实现；每个模块的文档注释和测试里列出了待实测的点（如方舟的 `max_tokens` 上限、`encrypted_content` 回传；OpenAI `chat-latest` 是否接受推理摘要；xAI 的事件类型）。
 3. 私聊使用 Telegram live draft 流式（仅私聊可用，群里只能 send+edit）。
 4. 群内 per-user 提示用 ephemeral message（bot 需是管理员或 15 秒窗口）。
 5. 测试工具：`[dev] inject_dir` 可注入模拟用户消息、导出 bot 发出的消息结构、探测富消息规则（bot 收不到其它 bot 的消息，测试不需要用户账号）；注入时可带文件（`file` 字段），所以媒体消息也能端到端测试。

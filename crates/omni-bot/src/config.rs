@@ -146,45 +146,74 @@ pub struct Access {
 #[serde(deny_unknown_fields, default)]
 pub struct Providers {
     pub openrouter: Option<OpenRouterConfig>,
-    /// Volcengine Ark (火山方舟, Doubao); disabled when `api_key` is empty.
-    pub ark: Option<ArkConfig>,
+    // The platforms' own APIs (`omni_llm::provider::PROVIDERS`). Each exists
+    // only when its `api_key` is set.
+    pub openai: Option<DirectProviderConfig>,
+    pub anthropic: Option<DirectProviderConfig>,
+    pub google: Option<DirectProviderConfig>,
+    pub xai: Option<DirectProviderConfig>,
+    pub deepseek: Option<DirectProviderConfig>,
+    pub zhipu: Option<DirectProviderConfig>,
+    pub moonshot: Option<DirectProviderConfig>,
+    pub alibaba: Option<DirectProviderConfig>,
+    /// Volcengine Ark (火山方舟, Doubao).
+    pub ark: Option<DirectProviderConfig>,
 }
 
+impl Providers {
+    /// The section of a direct provider, by id.
+    pub fn direct(&self, id: &str) -> Option<&DirectProviderConfig> {
+        match id {
+            "openai" => self.openai.as_ref(),
+            "anthropic" => self.anthropic.as_ref(),
+            "google" => self.google.as_ref(),
+            "xai" => self.xai.as_ref(),
+            "deepseek" => self.deepseek.as_ref(),
+            "zhipu" => self.zhipu.as_ref(),
+            "moonshot" => self.moonshot.as_ref(),
+            "alibaba" => self.alibaba.as_ref(),
+            "ark" => self.ark.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// `[providers.<id>]` of a platform's own API.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ArkConfig {
+pub struct DirectProviderConfig {
+    /// Empty: the provider and its models do not exist.
     #[serde(default)]
     pub api_key: String,
     /// Whether users may type the id of a model of this provider that no prefix
-    /// names, as a prefix of its own (`author/model$`, `ark:model$`). Off: only
-    /// the prefixes of `[[aliases]]` and `/alias` reach this provider.
+    /// names, as a prefix of its own (`openai:gpt-6.1-sol$`). Off: only the
+    /// prefixes of `[[aliases]]` and `/alias` reach this provider.
     #[serde(default)]
     pub allow_unlisted_models: bool,
-    #[serde(default = "default_ark_base")]
-    pub base_url: String,
+    /// The platform's API base URL (default: its official one; the Chinese
+    /// platforms' domestic sites, as in the old bot).
+    #[serde(default)]
+    pub base_url: Option<String>,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
-    /// Ark summary-mode models can pause long between chunks (Ark suggests ≥1800 s).
-    #[serde(default = "default_ark_idle_timeout")]
-    pub idle_timeout_secs: u64,
-    /// Cap for the automatic max_tokens (answer only). Ark reserves TPM quota
-    /// by prompt + max_tokens, so very large values throttle concurrency.
-    #[serde(default = "default_ark_max_tokens_cap")]
-    pub max_tokens_cap: u64,
-    /// CNY per USD for cost estimates (Ark prices are in CNY; responses carry no cost).
+    /// Silence in a stream after which the attempt counts as stalled
+    /// (default 3600 s; Ark 1800 s).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// Cap for the automatic output budget (0 = the model's maximum, the
+    /// default; Ark: 65536, because it reserves TPM quota by it).
+    #[serde(default)]
+    pub max_tokens_cap: Option<u64>,
+    /// CNY per USD, for the cost estimates of platforms that bill in CNY
+    /// (DeepSeek, Zhipu, Moonshot, Alibaba, Ark).
     #[serde(default = "default_cny_per_usd")]
     pub cny_per_usd: f64,
+    /// Gemini 4 long decode (`google`): total output budget of an answer across
+    /// continuation hops; `/continue` extends an answer that hit it.
+    #[serde(default = "default_max_tokens_cap")]
+    pub long_decode_budget: u64,
 }
 
-fn default_ark_base() -> String {
-    omni_llm::ark::DEFAULT_BASE_URL.into()
-}
-fn default_ark_idle_timeout() -> u64 {
-    1800
-}
-fn default_ark_max_tokens_cap() -> u64 {
-    65_536
-}
 fn default_cny_per_usd() -> f64 {
     7.1
 }
@@ -457,7 +486,8 @@ impl Config {
             if !omni_core::trigger::alias_name_ok(&a.name, marker) {
                 bail!("alias {:?} contains the trigger marker {marker:?}, whitespace or one of `,+{{}}`", a.name);
             }
-            omni_core::trigger::parse_spec(&a.spec).map_err(|e| anyhow::anyhow!("alias {:?}: spec {:?}: {e}", a.name, a.spec))?;
+            omni_core::trigger::parse_spec(&a.spec)
+                .map_err(|e| anyhow::anyhow!("alias {:?}: spec {:?}: {e}", a.name, a.spec))?;
         }
         for p in &self.presets {
             p.requested().with_context(|| format!("preset {:?}", p.pattern))?;

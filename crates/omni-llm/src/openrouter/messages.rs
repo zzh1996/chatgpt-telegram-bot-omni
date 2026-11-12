@@ -116,6 +116,7 @@ pub async fn convert_history(
                         Part::RemoteMedia { url, .. } => {
                             return Err(LlmError::request(format!("{model} cannot read remote media ({url})")));
                         }
+                        Part::Location { .. } => return Err(LlmError::request(super::NO_LOCATION)),
                         Part::Reasoning(_) | Part::ToolCall(_) | Part::Refusal { .. } => {}
                     }
                 }
@@ -161,7 +162,7 @@ pub fn body(model: &str, system: Option<Value>, messages: Vec<Value>, plan: &Pla
         .filter_map(|t| match t {
             Tool::Search => Some(search_tool()),
             Tool::Fetch => Some(fetch_tool()),
-            Tool::Code => None, // rejected by validation
+            Tool::Code | Tool::Maps => None, // rejected by validation
         })
         .collect();
     if !tools.is_empty() {

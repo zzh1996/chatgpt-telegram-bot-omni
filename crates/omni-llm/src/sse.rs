@@ -16,6 +16,9 @@ pub enum SseItem {
     Event(SseEvent),
     /// A comment line (without the leading `:`), e.g. OpenRouter's `OPENROUTER PROCESSING` keep-alive.
     Comment(String),
+    /// A line that is not SSE but a bare JSON object (`{"error":…}` instead of
+    /// an event, as Zhipu has sent inside HTTP-200 streams).
+    Json(String),
 }
 
 #[derive(Debug, Default)]
@@ -76,6 +79,10 @@ impl SseParser {
             out.push(SseItem::Comment(c.strip_prefix(' ').unwrap_or(c).to_string()));
             return;
         }
+        if line.starts_with('{') {
+            out.push(SseItem::Json(line.to_string()));
+            return;
+        }
         let (field, value) = match line.find(':') {
             Some(i) => {
                 let v = &line[i + 1..];
@@ -114,6 +121,14 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_json_lines_are_kept() {
+        let mut p = SseParser::new();
+        let items = p.feed(b"data: {\"a\":1}\n\n{\"error\":{\"code\":\"1113\",\"message\":\"x\"}}\n");
+        assert_eq!(data(&items), vec!["{\"a\":1}".to_string()]);
+        assert!(matches!(&items[1], SseItem::Json(l) if l.starts_with("{\"error\"")));
+    }
 
     fn data(items: &[SseItem]) -> Vec<String> {
         items

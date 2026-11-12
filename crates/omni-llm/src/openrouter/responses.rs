@@ -110,6 +110,7 @@ pub async fn convert_history(
                         Part::RemoteMedia { url, .. } => {
                             return Err(LlmError::request(format!("{model} cannot read remote media ({url})")));
                         }
+                        Part::Location { .. } => return Err(LlmError::request(super::NO_LOCATION)),
                         Part::Reasoning(_) | Part::ToolCall(_) | Part::Refusal { .. } => {}
                     }
                 }
@@ -150,10 +151,11 @@ pub fn body(model: &str, input: Vec<Value>, plan: &Plan) -> Value {
     let tools: Vec<Value> = plan
         .tools
         .iter()
-        .map(|t| match t {
-            Tool::Search => search_tool(),
-            Tool::Code => json!({"type": "code_interpreter", "container": {"type": "auto"}}),
-            Tool::Fetch => fetch_tool(),
+        .filter_map(|t| match t {
+            Tool::Search => Some(search_tool()),
+            Tool::Code => Some(json!({"type": "code_interpreter", "container": {"type": "auto"}})),
+            Tool::Fetch => Some(fetch_tool()),
+            Tool::Maps => None, // rejected by validation
         })
         .collect();
     if !tools.is_empty() {

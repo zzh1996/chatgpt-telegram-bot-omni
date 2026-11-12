@@ -57,6 +57,19 @@ struct Injected {
     /// Probe: keep the sent messages (to read them back) instead of deleting them.
     #[serde(default)]
     keep: bool,
+    /// Post these local images as one album (the first item carries the
+    /// caption) and record its items as Telegram delivers them: only the
+    /// captioned item of a new conversation, every item of a reply to an answer.
+    #[serde(default)]
+    album: Vec<PathBuf>,
+    /// Post a location message (latitude, longitude; no text) instead.
+    #[serde(default)]
+    location: Option<(f64, f64)>,
+    /// Post `text` as a rich message (Markdown rendered like an answer) and
+    /// record what Telegram stored, read back and converted like any incoming
+    /// rich message.
+    #[serde(default)]
+    rich: bool,
     /// Instead of injecting: measure Telegram's edit rate limit. Each series sends
     /// one reply-like rich message and edits it through `sizes` (characters of
     /// its reasoning-like body), with the same gate and single-attempt calls as
@@ -145,7 +158,8 @@ pub(crate) fn script_content(label: &str, n: usize, chars: usize, script: &str) 
     let split = layouts.iter().find_map(|l| {
         let rest = script.strip_prefix(l)?;
         let (k, script) = rest.split_once('-')?;
-        let k = if *l == "plain" { (k.is_empty()).then_some(1)? } else { k.parse::<usize>().ok().filter(|k| *k > 0)? };
+        let k =
+            if *l == "plain" { (k.is_empty()).then_some(1)? } else { k.parse::<usize>().ok().filter(|k| *k > 0)? };
         Some((*l, k, script))
     });
     if let Some((layout, k, script)) = split {
@@ -224,56 +238,59 @@ async fn run_rate_tests(
                 }
                 Content::Text(f) => (f.text.len(), f.text.chars().count()),
             };
-          loop {
-            let permit = gate.acquire(crate::tg::gate::Ask::finals(crate::tg::flood::Weight::Light)).await;
-            let wall_ms = now_ms();
-            let start = t0.elapsed();
-            let begun = std::time::Instant::now();
-            let mut unchanged = None;
-            let res = match (st.op.as_str(), slots.get(&st.slot)) {
-                ("send", _) => {
-                    let link = Link {
-                        turn_id: -4,
-                        attempt_id: None,
-                        part_index: (now_ms() & 0x3fff_ffff_ffff) * 64 + (n as i64 % 64),
-                    };
-                    let req = SendReq { chat_id, reply_to: None, content: &content, link, media: None };
-                    outbox::send_once(&app.db, bot, &permit, &req, None).await.map(Some)
-                }
-                ("edit", Some(id)) => {
-                    match outbox::edit_once_status(&app.db, bot, &permit, chat_id, *id, &content, None, None).await {
-                        Ok(outbox::Edited::Changed) => Ok(None),
-                        Ok(other) => {
-                            unchanged = Some(other);
-                            Ok(None)
+            loop {
+                let permit = gate.acquire(crate::tg::gate::Ask::finals(crate::tg::flood::Weight::Light)).await;
+                let wall_ms = now_ms();
+                let start = t0.elapsed();
+                let begun = std::time::Instant::now();
+                let mut unchanged = None;
+                let res = match (st.op.as_str(), slots.get(&st.slot)) {
+                    ("send", _) => {
+                        let link = Link {
+                            turn_id: -4,
+                            attempt_id: None,
+                            part_index: (now_ms() & 0x3fff_ffff_ffff) * 64 + (n as i64 % 64),
+                        };
+                        let req = SendReq { chat_id, reply_to: None, content: &content, link, media: None };
+                        outbox::send_once(&app.db, bot, &permit, &req, None).await.map(Some)
+                    }
+                    ("edit", Some(id)) => {
+                        match outbox::edit_once_status(&app.db, bot, &permit, chat_id, *id, &content, None, None).await
+                        {
+                            Ok(outbox::Edited::Changed) => Ok(None),
+                            Ok(other) => {
+                                unchanged = Some(other);
+                                Ok(None)
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     }
-                }
-                ("delete", Some(id)) => outbox::delete_once(&app.db, bot, &permit, chat_id, &[*id]).await.map(|_| None),
-                (op, _) => Err(OpError::Other(anyhow!("bad step {op} on {}", st.slot))),
-            };
-            let took = begun.elapsed();
-            drop(permit);
-            let verdict = match &res {
-                Ok(Some(id)) => {
-                    slots.insert(st.slot.clone(), *id);
-                    "ok".to_string()
-                }
-                Ok(None) => {
-                    if st.op == "delete" {
-                        slots.remove(&st.slot);
+                    ("delete", Some(id)) => {
+                        outbox::delete_once(&app.db, bot, &permit, chat_id, &[*id]).await.map(|_| None)
                     }
-                    match unchanged {
-                        Some(outbox::Edited::Unchanged) => "ok NOT_MODIFIED".to_string(),
-                        Some(outbox::Edited::Gone) => "ok GONE".to_string(),
-                        _ => "ok".to_string(),
+                    (op, _) => Err(OpError::Other(anyhow!("bad step {op} on {}", st.slot))),
+                };
+                let took = begun.elapsed();
+                drop(permit);
+                let verdict = match &res {
+                    Ok(Some(id)) => {
+                        slots.insert(st.slot.clone(), *id);
+                        "ok".to_string()
                     }
-                }
-                Err(OpError::Flood(w)) => format!("FLOOD_WAIT {}", w.as_secs().saturating_sub(1)),
-                Err(e) => format!("ERROR {e}"),
-            };
-            report.push_str(&format!(
+                    Ok(None) => {
+                        if st.op == "delete" {
+                            slots.remove(&st.slot);
+                        }
+                        match unchanged {
+                            Some(outbox::Edited::Unchanged) => "ok NOT_MODIFIED".to_string(),
+                            Some(outbox::Edited::Gone) => "ok GONE".to_string(),
+                            _ => "ok".to_string(),
+                        }
+                    }
+                    Err(OpError::Flood(w)) => format!("FLOOD_WAIT {}", w.as_secs().saturating_sub(1)),
+                    Err(e) => format!("ERROR {e}"),
+                };
+                report.push_str(&format!(
                 "  #{n:<2} {:<4} {:<6} {:>6} chars {:>6} B {:>6} cp {top:>2} top {:<6} at {:>6.2}s start {:>7.3}s wall {wall_ms} took {:>4}ms  {verdict}\n",
                 st.slot,
                 st.op,
@@ -285,10 +302,10 @@ async fn run_rate_tests(
                 start.as_secs_f64(),
                 took.as_millis()
             ));
-            if !(st.retry && matches!(res, Err(OpError::Flood(_)))) {
-                break;
+                if !(st.retry && matches!(res, Err(OpError::Flood(_)))) {
+                    break;
+                }
             }
-          }
         }
         // What Telegram stored, read back once after the timed steps.
         for (slot, id) in &slots {
@@ -297,7 +314,8 @@ async fn run_rate_tests(
                     Some(grammers_tl_types::enums::Message::Message(m)) => match &m.rich_message {
                         Some(grammers_tl_types::enums::RichMessage::Message(rm)) => {
                             let got = crate::tg::rich::received_text(&rm.blocks);
-                            let tail: String = got.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+                            let tail: String =
+                                got.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
                             format!(
                                 "{} cp stored, {} top-level blocks, ends {tail:?}{}",
                                 got.chars().filter(|c| *c != '\u{1}').count(),
@@ -325,7 +343,13 @@ async fn run_rate_tests(
 }
 
 /// Run edit series one after another; returns the report.
-async fn run_edit_series(app: &Arc<App>, bot: &Arc<crate::tg::bot::BotConn>, chat_id: i64, series: &[EditSeries], keep: bool) -> String {
+async fn run_edit_series(
+    app: &Arc<App>,
+    bot: &Arc<crate::tg::bot::BotConn>,
+    chat_id: i64,
+    series: &[EditSeries],
+    keep: bool,
+) -> String {
     use crate::tg::flood::{self, Shape};
     use crate::tg::gate::{Ask, Class};
     use crate::tg::outbox::OpError;
@@ -359,7 +383,9 @@ async fn run_edit_series(app: &Arc<App>, bot: &Arc<crate::tg::bot::BotConn>, cha
                 )
                 .await
                 .map(Some),
-                Some(id) => outbox::edit_once(&app.db, bot, &permit, chat_id, id, &content, None, None).await.map(|_| None),
+                Some(id) => {
+                    outbox::edit_once(&app.db, bot, &permit, chat_id, id, &content, None, None).await.map(|_| None)
+                }
             };
             let took = begun.elapsed();
             drop(permit);
@@ -570,6 +596,9 @@ async fn inject(app: &Arc<App>, path: &Path) -> Result<i32> {
         std::fs::write(out_dir.join(format!("{name}.txt")), text)?;
         return Ok(0);
     }
+    if !req.album.is_empty() || req.location.is_some() || req.rich {
+        return inject_media(app, &bot, &req, &raw).await;
+    }
     let content = Content::Rich(vec![
         RBlock::Paragraph(RText::concat(vec![
             RText::plain("🧪 "),
@@ -634,4 +663,193 @@ async fn inject(app: &Arc<App>, path: &Path) -> Result<i32> {
         crate::handler::dispatch(app.clone(), id);
     }
     Ok(msg_id)
+}
+
+/// Simulated albums, locations and rich messages: posted by the bot, read back,
+/// and recorded as Telegram delivers them (an album as one message per item).
+async fn inject_media(app: &Arc<App>, bot: &Arc<crate::tg::bot::BotConn>, req: &Injected, raw: &[u8]) -> Result<i32> {
+    use grammers_tl_types as tl;
+    let peer = bot.input_peer(req.chat_id).await?;
+    let label = format!("🧪 simulated message from user {}:\n{}", req.user_id, req.text);
+    let random = || -> i64 { rand::random::<i64>() };
+    let ids: Vec<i32> = if !req.album.is_empty() {
+        let mut items = Vec::new();
+        for (i, f) in req.album.iter().enumerate() {
+            let bytes = std::fs::read(f).with_context(|| format!("read {}", f.display()))?;
+            let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "photo.jpg".into());
+            let size = bytes.len();
+            let uploaded = bot
+                .client
+                .upload_stream(&mut std::io::Cursor::new(bytes), size, name)
+                .await
+                .map_err(|e| anyhow!("upload: {e}"))?;
+            let media = bot
+                .invoke(&tl::functions::messages::UploadMedia {
+                    business_connection_id: None,
+                    peer: peer.clone(),
+                    media: tl::types::InputMediaUploadedPhoto {
+                        spoiler: false,
+                        live_photo: false,
+                        file: uploaded.raw.clone(),
+                        stickers: None,
+                        ttl_seconds: None,
+                        video: None,
+                    }
+                    .into(),
+                })
+                .await
+                .map_err(|e| anyhow!("uploadMedia: {e}"))?;
+            let tl::enums::MessageMedia::Photo(tl::types::MessageMediaPhoto {
+                photo: Some(tl::enums::Photo::Photo(photo)),
+                ..
+            }) = media
+            else {
+                anyhow::bail!("uploadMedia returned no photo");
+            };
+            let random_id = random();
+            let single: tl::enums::InputSingleMedia = tl::types::InputSingleMedia {
+                media: tl::types::InputMediaPhoto {
+                    spoiler: false,
+                    live_photo: false,
+                    id: tl::types::InputPhoto {
+                        id: photo.id,
+                        access_hash: photo.access_hash,
+                        file_reference: photo.file_reference.clone(),
+                    }
+                    .into(),
+                    ttl_seconds: None,
+                    video: None,
+                }
+                .into(),
+                random_id,
+                message: if i == 0 { label.clone() } else { String::new() },
+                entities: None,
+            }
+            .into();
+            items.push((random_id, single));
+        }
+        let updates = bot
+            .invoke(&tl::functions::messages::SendMultiMedia {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.clone(),
+                reply_to: outbox::reply_header(req.reply_to),
+                multi_media: items.iter().map(|(_, m)| m.clone()).collect(),
+                schedule_date: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+            })
+            .await
+            .map_err(|e| anyhow!("sendMultiMedia: {e}"))?;
+        items.iter().filter_map(|(r, _)| crate::tg::convert::sent_message_id(&updates, *r)).collect()
+    } else if let Some((lat, long)) = req.location {
+        let random_id = random();
+        let updates = bot
+            .invoke(&tl::functions::messages::SendMedia {
+                silent: false,
+                background: false,
+                clear_draft: false,
+                noforwards: false,
+                update_stickersets_order: false,
+                invert_media: false,
+                allow_paid_floodskip: false,
+                peer: peer.clone(),
+                reply_to: outbox::reply_header(req.reply_to),
+                media: tl::types::InputMediaGeoPoint {
+                    geo_point: tl::types::InputGeoPoint { lat, long, accuracy_radius: None }.into(),
+                }
+                .into(),
+                message: String::new(),
+                random_id,
+                reply_markup: None,
+                entities: None,
+                schedule_date: None,
+                schedule_repeat_period: None,
+                send_as: None,
+                quick_reply_shortcut: None,
+                effect: None,
+                allow_paid_stars: None,
+                suggested_post: None,
+            })
+            .await
+            .map_err(|e| anyhow!("sendMedia: {e}"))?;
+        crate::tg::convert::sent_message_id(&updates, random_id).into_iter().collect()
+    } else {
+        // A labelled rich message: the label paragraph, then the content.
+        let mut blocks = vec![RBlock::Paragraph(RText::concat(vec![
+            RText::plain("🧪 "),
+            RText::bold(RText::plain("simulated rich message")),
+            RText::plain(format!(" from user {}:", req.user_id)),
+        ]))];
+        blocks.extend(omni_markdown::rich::sanitize(omni_markdown::rich::markdown_to_blocks(
+            &req.text,
+            0,
+            omni_markdown::rich::RichLimits::TELEGRAM,
+        )));
+        let h = Sha256::digest(raw);
+        let tag = i64::from_be_bytes(h[..8].try_into().unwrap()) & 0x3fff_ffff_ffff_ffff;
+        let link = Link { turn_id: -1, attempt_id: None, part_index: tag };
+        let content = Content::Rich(blocks);
+        let id = outbox::send(
+            &app.db,
+            bot,
+            SendReq { chat_id: req.chat_id, reply_to: req.reply_to, content: &content, link, media: None },
+        )
+        .await
+        .map_err(|e| anyhow!("send: {e}"))?;
+        vec![id]
+    };
+    let first = *ids.first().ok_or_else(|| anyhow!("nothing was sent"))?;
+    let replying_to_answer = match req.reply_to {
+        Some(rt) => crate::conv::turn_for_message(&app.db, &bot.name, req.chat_id, rt).await?.is_some(),
+        None => false,
+    };
+    let msgs = bot.get_messages(req.chat_id, &ids).await?;
+    for (i, m) in msgs.iter().enumerate() {
+        let grammers_tl_types::enums::Message::Message(m) = m else { continue };
+        // A new conversation's album: only its captioned item carries the prefix.
+        if i > 0 && !replying_to_answer {
+            continue;
+        }
+        let text = match &m.rich_message {
+            Some(grammers_tl_types::enums::RichMessage::Message(rm)) if req.rich => {
+                crate::tg::richin::convert(rm.blocks.get(1..).unwrap_or(&[])).markdown
+            }
+            _ if i == 0 => req.text.clone(),
+            _ => String::new(),
+        };
+        let payload = InboundPayload {
+            sender_name: Some("simulated".into()),
+            media: crate::media::media_of(m),
+            locations: crate::media::locations_of(m),
+            rich: req.rich,
+            ..Default::default()
+        };
+        let payload = serde_json::to_string(&payload)?;
+        let (b, chat, user, reply_to, grouped, msg_id) =
+            (bot.name.clone(), req.chat_id, req.user_id, req.reply_to, m.grouped_id, m.id);
+        let id: Option<i64> = app
+            .db
+            .call(move |c| {
+                let n = c.execute(
+                    "INSERT OR IGNORE INTO inbound(bot, chat_id, msg_id, sender_id, date, text, reply_to_msg_id, grouped_id, payload, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'new', ?10)",
+                    params![b, chat, msg_id, user, now_ms() / 1000, text, reply_to, grouped, payload, now_ms()],
+                )?;
+                Ok((n > 0).then(|| c.last_insert_rowid()))
+            })
+            .await?;
+        if let Some(id) = id {
+            info!(msg = msg_id, inbound = id, "recorded simulated media message");
+            crate::handler::dispatch(app.clone(), id);
+        }
+    }
+    Ok(first)
 }

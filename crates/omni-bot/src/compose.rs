@@ -803,8 +803,9 @@ mod tests {
 
     #[test]
     fn output_is_shown_in_the_order_it_was_produced() {
-        let reasoning =
-            |t: &str| Part::Reasoning(Reasoning { kind: ReasoningKind::Summary, text: Some(t.into()), ..Default::default() });
+        let reasoning = |t: &str| {
+            Part::Reasoning(Reasoning { kind: ReasoningKind::Summary, text: Some(t.into()), ..Default::default() })
+        };
         let tool = Part::ToolCall(ToolCall {
             id: Some("1".into()),
             name: "web_search".into(),
@@ -850,21 +851,30 @@ mod tests {
         // Whitespace between tool calls does not split a stretch.
         let parts = vec![tool_call(), Part::text("\n\n"), reasoning("a"), Part::text("done")];
         let blocks = compose(&input(&parts, Status::Done));
-        assert!(matches!(&blocks[1], RBlock::Details { title, .. } if title.to_plain() == "💭 1 · 🔧 1"), "{blocks:#?}");
+        assert!(
+            matches!(&blocks[1], RBlock::Details { title, .. } if title.to_plain() == "💭 1 · 🔧 1"),
+            "{blocks:#?}"
+        );
         assert_eq!(blocks.len(), 4, "{blocks:#?}");
     }
 
     #[test]
     fn earlier_attempts_are_folded_above_in_order() {
         let mut e = LlmError::request("boom");
-        e.details = Some(serde_json::json!({"error": {"message": "boom", "metadata": {"provider_name": "X"}}, "user_id": "u"}));
+        e.details =
+            Some(serde_json::json!({"error": {"message": "boom", "metadata": {"provider_name": "X"}}, "user_id": "u"}));
         let prior = vec![
             PriorAttempt {
                 n: 1,
                 parts: vec![Part::text("partial answer")],
                 error: Some(e),
                 interrupted: false,
-                usage: Some(Usage { input_tokens: Some(5), output_tokens: Some(7), cost_usd: Some(0.001), ..Default::default() }),
+                usage: Some(Usage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(7),
+                    cost_usd: Some(0.001),
+                    ..Default::default()
+                }),
                 elapsed: Some(Duration::from_millis(2500)),
             },
             PriorAttempt { n: 2, parts: vec![], error: None, interrupted: true, usage: None, elapsed: None },
@@ -879,9 +889,15 @@ mod tests {
         let RBlock::Details { title, blocks: inner, .. } = &blocks[1] else { unreachable!() };
         assert!(title.to_plain().starts_with("⚠️ Attempt 1 failed: "), "{}", title.to_plain());
         let inner_dbg = format!("{inner:?}");
-        assert!(inner_dbg.contains("partial answer") && inner_dbg.contains("provider_name") && !inner_dbg.contains("user_id"));
+        assert!(
+            inner_dbg.contains("partial answer")
+                && inner_dbg.contains("provider_name")
+                && !inner_dbg.contains("user_id")
+        );
         assert!(inner_dbg.contains("out 7") && inner_dbg.contains("2.5s"), "{inner_dbg}");
-        assert!(matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "⚠️ Attempt 2 interrupted by a bot restart"));
+        assert!(
+            matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "⚠️ Attempt 2 interrupted by a bot restart")
+        );
         assert!(matches!(blocks.last(), Some(RBlock::Footer(t)) if t.to_plain().contains("attempt 3/4")));
     }
 
@@ -919,8 +935,6 @@ mod tests {
         let blocks = compose(&input(&parts, Status::Done));
         let pages = paginate("anthropic/claude-opus-5.5", blocks);
         assert!(pages.len() >= 2);
-        assert!(
-            matches!(&pages[1][0], RBlock::Footer(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5 · part 2")
-        );
+        assert!(matches!(&pages[1][0], RBlock::Footer(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5 · part 2"));
     }
 }

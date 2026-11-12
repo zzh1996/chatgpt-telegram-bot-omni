@@ -37,12 +37,12 @@ pub fn direct_ids(app: &App) -> Option<String> {
     let m = app.marker();
     let mut forms = Vec::new();
     if app.unlisted_models_allowed("openrouter") {
-        forms.push(format!("an OpenRouter model id (`author/model{m}`)"));
+        forms.push(format!("`author/model{m}` on OpenRouter"));
     }
-    if app.unlisted_models_allowed("ark") {
-        forms.push(format!("a Volcengine Ark model id (`ark:model{m}`)"));
+    for p in omni_llm::provider::PROVIDERS.iter().filter(|p| app.unlisted_models_allowed(p.id)) {
+        forms.push(format!("`{}:model{m}` on {}", p.id, p.name));
     }
-    (!forms.is_empty()).then(|| forms.join(" or "))
+    (!forms.is_empty()).then(|| forms.join(", "))
 }
 
 /// Commands that start requests that cost money. Every other non-admin command
@@ -72,6 +72,8 @@ Arr!
 who are you?
 ```
 Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::user` is sent by writing `\::user` (one backslash is removed).
+
+**Attachments**: photos, files or an album with the prefix in the caption, or a prefixed reply to a photo, file, album or location message, go to the model with the text. A location is the user's position for Gemini's Google Maps (`google:` models with `+m`); other models reject it.
 
 **Continue**: reply to any of my messages. The whole reply is the next message, exactly as typed (marker lines are plain text there), except that a leading `\` is removed, so `\/raw` sends the text `/raw`. Replying to a failed message is rejected; use /retry on it.
 
@@ -200,14 +202,17 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
                     bot,
                     ib,
                     "Options",
-                    vec![RBlock::Pre { text: with_marker(omni_llm::request::HELP, app.marker()), language: String::new() }],
+                    vec![RBlock::Pre {
+                        text: with_marker(omni_llm::request::HELP, app.marker()),
+                        language: String::new(),
+                    }],
                 )
                 .await;
             } else {
                 let prefixes = match direct_ids(app) {
                     Some(ids) => format!(
-                        "The prefix is one of those listed by /models, or a model id typed directly: {ids}, for any model \
-                         this bot has, so new models need no config change."
+                        "The prefix is one of those listed by /models, or a model id typed directly ({ids}), for any \
+                         model this bot has, so new models need no config change."
                     ),
                     None => "The prefix is one of those listed by /models.".to_string(),
                 };
@@ -236,6 +241,52 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     Ok(())
 }
 
+/// A platform's balance (`/credits`): the amounts readable (DeepSeek's
+/// `balance_infos`, Moonshot's `data`), the full response folded underneath.
+fn balance_blocks(v: &serde_json::Value) -> Vec<RBlock> {
+    use serde_json::Value;
+    let s = |x: Option<&Value>| match x {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => "-".into(),
+    };
+    let mut lines = Vec::new();
+    for b in v.get("balance_infos").and_then(Value::as_array).into_iter().flatten() {
+        lines.push(format!(
+            "{} {} (granted {}, topped up {})",
+            s(b.get("currency")),
+            s(b.get("total_balance")),
+            s(b.get("granted_balance")),
+            s(b.get("topped_up_balance"))
+        ));
+    }
+    if let Some(d) = v.get("data").filter(|d| d.get("available_balance").is_some()) {
+        lines.push(format!(
+            "available {} (cash {}, vouchers {})",
+            s(d.get("available_balance")),
+            s(d.get("cash_balance")),
+            s(d.get("voucher_balance"))
+        ));
+    }
+    let mut out: Vec<RBlock> = Vec::new();
+    if !lines.is_empty() {
+        let items = lines
+            .into_iter()
+            .map(|l| RItem { checkbox: None, blocks: vec![RBlock::Paragraph(RText::plain(l))] })
+            .collect();
+        out.push(RBlock::List { items });
+    }
+    out.push(RBlock::Details {
+        open: false,
+        title: RText::plain("full response"),
+        blocks: vec![RBlock::Pre {
+            text: serde_json::to_string_pretty(v).unwrap_or_default(),
+            language: "json".into(),
+        }],
+    });
+    out
+}
+
 /// `/credits`: the OpenRouter key's limit and spending, readable, with the full
 /// response folded underneath (without the key's masked label).
 fn credits_blocks(v: &serde_json::Value) -> Result<Vec<RBlock>> {
@@ -245,7 +296,8 @@ fn credits_blocks(v: &serde_json::Value) -> Result<Vec<RBlock>> {
     let mut lines = Vec::new();
     match num("limit") {
         Some(limit) => {
-            let reset = d.get("limit_reset").and_then(|x| x.as_str()).map(|r| format!(" · resets {r}")).unwrap_or_default();
+            let reset =
+                d.get("limit_reset").and_then(|x| x.as_str()).map(|r| format!(" · resets {r}")).unwrap_or_default();
             lines.push(format!(
                 "limit {} · used {} · remaining {}{reset}",
                 usd(Some(limit)),
@@ -272,7 +324,8 @@ fn credits_blocks(v: &serde_json::Value) -> Result<Vec<RBlock>> {
         ));
     }
     if let Some(f) = d.get("free_model_daily_requests")
-        && let (Some(used), Some(limit)) = (f.get("used").and_then(|x| x.as_i64()), f.get("limit").and_then(|x| x.as_i64()))
+        && let (Some(used), Some(limit)) =
+            (f.get("used").and_then(|x| x.as_i64()), f.get("limit").and_then(|x| x.as_i64()))
     {
         lines.push(format!("free models: {used} of {limit} requests today"));
     }
@@ -320,7 +373,14 @@ fn prefix_name<'a>(arg: &'a str, marker: &str) -> &'a str {
 }
 
 /// Admin commands. In a group they only see and change that group.
-async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, args: &str, by: i64) -> Result<()> {
+async fn admin_command(
+    app: &Arc<App>,
+    bot: &Arc<BotConn>,
+    ib: &Inbound,
+    name: &str,
+    args: &str,
+    by: i64,
+) -> Result<()> {
     let group = ib.chat_id < 0;
     let here = ib.chat_id;
     let words: Vec<&str> = args.split_whitespace().collect();
@@ -338,8 +398,13 @@ async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &
                 },
             };
             if group && target != here {
-                say(app, bot, ib, &format!("⛔ In a group, /{name} only acts on this group. Use private chat for others."))
-                    .await;
+                say(
+                    app,
+                    bot,
+                    ib,
+                    &format!("⛔ In a group, /{name} only acts on this group. Use private chat for others."),
+                )
+                .await;
                 return Ok(());
             }
             let allow = name == "allow";
@@ -398,7 +463,8 @@ async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &
                     let rule = if r.status == "allow" { "allowed" } else { "banned" };
                     let place = if group { "this group".to_string() } else { place_label(r.chat_id) };
                     let who = if r.user_id == 0 { "everyone".to_string() } else { r.user_id.to_string() };
-                    let names = [r.place.filter(|_| !group), r.user].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                    let names =
+                        [r.place.filter(|_| !group), r.user].into_iter().flatten().collect::<Vec<_>>().join(" · ");
                     vec![rule.to_string(), place, who, names]
                 })
                 .collect();
@@ -466,17 +532,35 @@ async fn admin_command(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &
                 .await?;
             app.set_runtime_alias(&bot.name, &n, None);
             let text = match (removed > 0, app.cfg.aliases.iter().find(|a| a.name == n)) {
-                (true, Some(a)) => format!("runtime prefix {n}{marker} removed; the config's {n}{marker} = {} remains", a.spec),
+                (true, Some(a)) => {
+                    format!("runtime prefix {n}{marker} removed; the config's {n}{marker} = {} remains", a.spec)
+                }
                 (true, None) => format!("✅ {n}{marker} removed"),
                 (false, Some(_)) => format!("{n}{marker} comes from the config file; change it there"),
                 (false, None) => format!("there is no prefix {n}{marker}"),
             };
             say(app, bot, ib, &text).await;
         }
-        "credits" => match app.openrouter.key_info().await {
-            Ok(v) => send(app, bot, ib, "OpenRouter key", credits_blocks(&v)?).await,
-            Err(e) => say(app, bot, ib, &format!("⚠️ {e:#}")).await,
-        },
+        "credits" => {
+            let mut blocks = vec![RBlock::Paragraph(RText::bold(RText::plain("OpenRouter key")))];
+            match app.openrouter.key_info().await {
+                Ok(v) => blocks.extend(credits_blocks(&v)?),
+                Err(e) => blocks.push(RBlock::Paragraph(RText::plain(format!("⚠️ {e:#}")))),
+            }
+            // The platforms' own APIs that have a balance endpoint.
+            let balances = futures::future::join_all(
+                app.direct.values().map(|p| async move { p.balance().await.map(|b| (p.name(), b)) }),
+            )
+            .await;
+            for (name, b) in balances.into_iter().flatten() {
+                blocks.push(RBlock::Paragraph(RText::bold(RText::plain(format!("{name} balance")))));
+                match b {
+                    Ok(v) => blocks.extend(balance_blocks(&v)),
+                    Err(e) => blocks.push(RBlock::Paragraph(RText::plain(format!("⚠️ {e:#}")))),
+                }
+            }
+            send(app, bot, ib, "Credits", blocks).await
+        }
         _ => {}
     }
     Ok(())
@@ -548,7 +632,7 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
         blocks.push(table(&["this chat's prefix", "spec"], own));
     }
     let tail = match direct_ids(app) {
-        Some(ids) => format!("{ids} works as a prefix too. Search: /models <text>."),
+        Some(ids) => format!("A model id ({ids}) works as a prefix too. Search: /models <text>."),
         None => "Search: /models <text>.".to_string(),
     };
     blocks.push(RBlock::Paragraph(RText::plain(tail.replace('`', ""))));
@@ -575,7 +659,12 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
     };
     if spec.provider != "openrouter" {
         let title = format!("{}{marker} → {}:{}{}", spec.label, spec.provider, spec.model, spec.options_syntax());
-        send(app, bot, ib, &title, vec![RBlock::Paragraph(RText::plain("served directly by this provider"))]).await;
+        let name = omni_llm::provider::info(&spec.provider).map(|i| i.name).unwrap_or(spec.provider.as_str());
+        let mut text = format!("served by the {name} API directly");
+        if app.direct(&spec.provider).is_some_and(|p| !p.knows(&spec.model)) {
+            text.push_str("; not in the bot's model table for it (limits and price unknown)");
+        }
+        send(app, bot, ib, &title, vec![RBlock::Paragraph(RText::plain(text))]).await;
         return Ok(());
     }
     let info = app.openrouter.model_info(&spec.model).await;
@@ -901,7 +990,13 @@ async fn cmd_prefix(
         for (n, p) in app.chat_prefixes_of(&bot.name, chat) {
             let history = p.turns.iter().filter(|t| t.role != omni_core::content::Role::System).count();
             let system = if p.turns.iter().any(|t| t.role == omni_core::content::Role::System) { "yes" } else { "-" };
-            rows.push(vec![format!("{n}{marker}"), p.spec.clone(), system.into(), history.to_string(), user_label(app, p.created_by).await]);
+            rows.push(vec![
+                format!("{n}{marker}"),
+                p.spec.clone(),
+                system.into(),
+                history.to_string(),
+                user_label(app, p.created_by).await,
+            ]);
         }
         let blocks = if rows.is_empty() {
             vec![RBlock::Paragraph(RText::plain(with_marker(
@@ -911,7 +1006,11 @@ async fn cmd_prefix(
         } else {
             vec![table(&["prefix", "spec", "system", "history", "by"], rows)]
         };
-        let title = if chat == ib.chat_id { "Prefixes of this chat".to_string() } else { format!("Prefixes of {}", place_label(chat)) };
+        let title = if chat == ib.chat_id {
+            "Prefixes of this chat".to_string()
+        } else {
+            format!("Prefixes of {}", place_label(chat))
+        };
         send(app, bot, ib, &title, blocks).await;
         return Ok(());
     }
@@ -1289,7 +1388,9 @@ fn period_start(app: &App, p: &str) -> (i64, String) {
         .and_then(|d| d.checked_sub(jiff::Span::new().days(days)))
         .ok();
     match start {
-        Some(s) => (s.timestamp().as_millisecond(), format!("{label} (since {} {tz_name})", s.strftime("%Y-%m-%d %H:%M"))),
+        Some(s) => {
+            (s.timestamp().as_millisecond(), format!("{label} (since {} {tz_name})", s.strftime("%Y-%m-%d %H:%M")))
+        }
         None => (0, "all time".into()),
     }
 }
@@ -1338,7 +1439,11 @@ impl Dim {
         );
         let user = format!("{} || ' (' || l.user_id || ')'", name("l.user_id"));
         match self {
-            Dim::Model => ("l.model".into(), "l.model"),
+            // As shown in replies: OpenRouter ids as they are, the platforms' own APIs as `provider:model`.
+            Dim::Model => (
+                "CASE WHEN COALESCE(l.provider, 'openrouter') = 'openrouter' THEN l.model ELSE l.provider || ':' || l.model END".into(),
+                "COALESCE(l.provider, 'openrouter'), l.model",
+            ),
             Dim::Chat => (chat, "l.chat_id"),
             Dim::User => (user, "l.user_id"),
             Dim::ChatUser => (format!("{chat} || ' · ' || {user}"), "l.chat_id, l.user_id"),
@@ -1641,4 +1746,3 @@ async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Ve
     };
     Ok(vec![table(header, rows)])
 }
-

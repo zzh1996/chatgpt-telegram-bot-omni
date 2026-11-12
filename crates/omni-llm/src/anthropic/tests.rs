@@ -1,0 +1,1387 @@
+//! Request building, stream parsing (synthetic event sequences written per the
+//! documented formats, plus recorded Anthropic event shapes), cost and error
+//! classification of the Anthropic provider. No real API is called; the HTTP
+//! tests use a local fake server.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use omni_core::content::{Citation, NativeOutput, Part, ReasoningKind, Role, ToolCall, Turn};
+use omni_core::trigger::OptionToken;
+use omni_core::usage::CostSource;
+use omni_core::{BlobRef, Origin};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+use super::stream::{Parser, error_from_json};
+use super::*;
+use crate::chatstream::http_error;
+use crate::error::{ErrorKind, Retry};
+use crate::{Accumulator, BoxFuture, NullObserver};
+
+// ------------------------------------------------------------------ helpers
+
+#[derive(Default)]
+struct Blobs(HashMap<String, Vec<u8>>);
+
+impl Blobs {
+    fn add(&mut self, bytes: &[u8], mime: &str) -> BlobRef {
+        let r = BlobRef::for_bytes(bytes, mime);
+        self.0.insert(r.sha256.clone(), bytes.to_vec());
+        r
+    }
+}
+
+impl BlobLoader for Blobs {
+    fn load<'a>(&'a self, r: &'a BlobRef) -> BoxFuture<'a, anyhow::Result<Vec<u8>>> {
+        Box::pin(async move { self.0.get(&r.sha256).cloned().ok_or_else(|| anyhow::anyhow!("no blob {r}")) })
+    }
+}
+
+fn provider_at(base_url: &str, cap: Option<u64>) -> Anthropic {
+    Anthropic::new(DirectConfig {
+        api_key: "sk-ant-test".into(),
+        base_url: base_url.into(),
+        connect_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(5),
+        max_tokens_cap: cap,
+        cny_per_usd: 7.1,
+        long_decode_budget: 393_216,
+    })
+    .unwrap()
+}
+
+fn provider() -> Anthropic {
+    provider_at("https://api.anthropic.com/v1", None)
+}
+
+fn opts(s: &[&str]) -> Vec<OptionToken> {
+    s.iter()
+        .map(|o| match o.split_once('=') {
+            Some((k, v)) => OptionToken::KeyValue(k.into(), v.into()),
+            None => OptionToken::Flag(o.to_string()),
+        })
+        .collect()
+}
+
+fn input<'a>(model: &'a str, options: &'a [OptionToken], history: &'a [Turn]) -> CallInput<'a> {
+    CallInput {
+        model,
+        options,
+        history,
+        session_id: Some("tg-1".into()),
+        user: None,
+        known_context: None,
+        max_tokens_override: None,
+    }
+}
+
+async fn prep(model: &str, o: &[&str], history: &[Turn]) -> Result<Prepared, LlmError> {
+    let o = opts(o);
+    provider().prepare(&input(model, &o, history), &[], &Blobs::default()).await
+}
+
+async fn prep_ok(model: &str, o: &[&str]) -> Prepared {
+    prep(model, o, &[Turn::user_text("hi")]).await.unwrap_or_else(|e| panic!("{model} {o:?}: {e}"))
+}
+
+async fn prep_err(model: &str, o: &[&str]) -> String {
+    match prep(model, o, &[Turn::user_text("hi")]).await {
+        Ok(p) => panic!("{model} {o:?}: expected an error, got {}", p.body),
+        Err(e) => {
+            assert_eq!(e.retry, Retry::Never);
+            e.message
+        }
+    }
+}
+
+fn assistant(model: &str, payload: Value, text: &str) -> Turn {
+    Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![Part::text(text)],
+        native: Some(NativeOutput { dialect: DIALECT.into(), model: model.into(), payload, context_tokens: None }),
+    }
+}
+
+fn system(text: &str) -> Turn {
+    Turn { role: Role::System, origin: Origin::Synthetic, parts: vec![Part::text(text)], native: None }
+}
+
+fn feed(p: &mut Parser, events: &[Value]) -> Vec<StreamEvent> {
+    let mut out = Vec::new();
+    for e in events {
+        out.extend(p.event(None, e).unwrap_or_else(|err| panic!("{e}: {err}")));
+    }
+    out
+}
+
+fn accumulate(events: &[StreamEvent]) -> Accumulator {
+    let mut acc = Accumulator::new();
+    for e in events {
+        acc.apply(e.clone());
+    }
+    acc
+}
+
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-12
+}
+
+fn message_start(model: &str, usage: Value) -> Value {
+    json!({"type": "message_start", "message": {
+        "id": "msg_01XFDUDYJgAACzvnptvVoYEL", "type": "message", "role": "assistant", "model": model,
+        "content": [], "stop_reason": null, "stop_sequence": null, "usage": usage
+    }})
+}
+
+fn delta_end(stop_reason: &str, usage: Value) -> Value {
+    json!({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": null}, "usage": usage})
+}
+
+fn stop() -> Value {
+    json!({"type": "message_stop"})
+}
+
+// ------------------------------------------------------------------ requests
+
+#[tokio::test]
+async fn defaults_are_the_highest_the_model_offers() {
+    // Claude 5.x and Opus 4.7/4.8: adaptive thinking, the top effort, summaries
+    // instead of the hidden (`omitted`) default.
+    for model in [
+        "claude-fable-5-2",
+        "claude-mythos-5-2",
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-5-5",
+        "claude-sonnet-5",
+        "claude-haiku-5-5",
+    ] {
+        let p = prep_ok(model, &[]).await;
+        assert_eq!(p.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(p.dialect, DIALECT);
+        assert_eq!(p.body["model"], model);
+        assert_eq!(p.body["stream"], true);
+        assert_eq!(p.body["thinking"], json!({"type": "adaptive", "display": "summarized"}), "{model}");
+        assert_eq!(p.body["output_config"], json!({"effort": "max"}), "{model}");
+        assert_eq!(p.body["max_tokens"], 128_000, "{model}");
+        assert_eq!(p.auto_max_tokens, Some(128_000));
+        assert_eq!(p.body["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(p.body["messages"], json!([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]));
+        for absent in ["tools", "speed", "metadata", "system", "service_tier", "temperature", "container"] {
+            assert!(p.body.get(absent).is_none(), "{model}: {absent}");
+        }
+        assert_eq!(p.settings, vec!["effort max"], "{model}");
+        assert!(p.warnings.is_empty() && p.notes.is_empty(), "{model}");
+        assert!(betas(model, &p.body).is_empty(), "{model}");
+        assert!(!p.long_decode);
+        assert_eq!(p.applied[0].patch, json!({"anthropic-version": "2026-10-21"}));
+        let reasoning = p.applied.iter().find(|a| a.patch.get("thinking").is_some()).unwrap();
+        assert_eq!(reasoning.source, "default");
+    }
+    // 4.6: `summarized` is already the default; no `xhigh`, so `max` is the top.
+    for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+        let p = prep_ok(model, &[]).await;
+        assert_eq!(p.body["thinking"], json!({"type": "adaptive"}), "{model}");
+        assert_eq!(p.body["output_config"], json!({"effort": "max"}));
+    }
+    // 4.5 generation: manual thinking with the largest valid budget.
+    let p = prep_ok("claude-opus-4-5", &[]).await;
+    assert_eq!(p.body["max_tokens"], 64_000);
+    assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}));
+    assert_eq!(p.body["output_config"], json!({"effort": "high"}));
+    assert_eq!(p.settings, vec!["effort high", "thinking budget 63999"]);
+    for model in ["claude-sonnet-4-5", "claude-haiku-4-5-20251001"] {
+        let p = prep_ok(model, &[]).await;
+        assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}), "{model}");
+        assert!(p.body.get("output_config").is_none(), "{model}: no effort parameter");
+        assert_eq!(p.settings, vec!["thinking budget 63999"]);
+    }
+}
+
+#[tokio::test]
+async fn end_user_id_goes_to_metadata() {
+    let h = [Turn::user_text("hi")];
+    let o = opts(&[]);
+    let mut i = input("claude-opus-5-5", &o, &h);
+    i.user = Some("8f14e45fceea167a5a36dedd4bea2543".into());
+    let p = provider().prepare(&i, &[], &Blobs::default()).await.unwrap();
+    assert_eq!(p.body["metadata"], json!({"user_id": "8f14e45fceea167a5a36dedd4bea2543"}));
+    // The conversation key has no documented field on this API.
+    assert!(!p.body.to_string().contains("tg-1"));
+}
+
+#[tokio::test]
+async fn effort_and_thinking_options() {
+    let p = prep_ok("claude-opus-5-5", &["e=low"]).await;
+    assert_eq!(p.body["output_config"], json!({"effort": "low"}));
+    assert_eq!(p.body["thinking"], json!({"type": "adaptive", "display": "summarized"}));
+    assert_eq!(p.settings, vec!["effort low"]);
+    assert_eq!(p.applied.iter().find(|a| a.patch.get("thinking").is_some()).unwrap().source, "option");
+
+    let e = prep_err("claude-opus-4-6", &["e=xhigh"]).await;
+    assert!(e.contains("levels: max, high, medium, low"), "{e}");
+    let e = prep_err("claude-opus-4-5", &["e=max"]).await;
+    assert!(e.contains("levels: high, medium, low"), "{e}");
+    let e = prep_err("claude-sonnet-4-5", &["e=high"]).await;
+    assert!(e.contains("has no reasoning effort levels"), "{e}");
+
+    // Thinking off: impossible on always-thinking models.
+    for model in ["claude-opus-5-5", "claude-fable-5-2", "claude-fable-5-1", "claude-mythos-5"] {
+        let e = prep_err(model, &["e=none"]).await;
+        assert!(e.contains("cannot turn reasoning off"), "{model}: {e}");
+    }
+    // Sonnet 5.5: its documented off setting, which takes no other field.
+    let p = prep_ok("claude-sonnet-5-5", &["e=none"]).await;
+    assert_eq!(p.body["thinking"], json!({"type": "between_tools"}));
+    assert!(p.body.get("output_config").is_none(), "effort stays at the API default (high), as between_tools needs");
+    assert_eq!(p.settings, vec!["thinking between_tools (no up-front thinking)"]);
+    // `disabled` elsewhere; the effort is left at the API default (high or below, as Opus 5 and Haiku 5.5 need).
+    for model in ["claude-haiku-5-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-4-5"] {
+        let p = prep_ok(model, &["e=none"]).await;
+        assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
+        assert!(p.body.get("output_config").is_none(), "{model}");
+        assert_eq!(p.settings, vec!["thinking off"]);
+    }
+    // Opus 4.5: effort composes with the largest budget.
+    let p = prep_ok("claude-opus-4-5", &["e=low"]).await;
+    assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}));
+    assert_eq!(p.body["output_config"], json!({"effort": "low"}));
+}
+
+#[tokio::test]
+async fn thinking_budget_option() {
+    let p = prep_ok("claude-sonnet-4-5", &["budget=20000"]).await;
+    assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 20_000}));
+    assert_eq!(p.settings, vec!["thinking budget 20000"]);
+    // Opus 4.5 keeps its (highest) effort alongside the budget.
+    let p = prep_ok("claude-opus-4-5", &["budget=8000"]).await;
+    assert_eq!(p.body["output_config"], json!({"effort": "high"}));
+    // Deprecated but still accepted on 4.6.
+    let p = prep_ok("claude-sonnet-4-6", &["budget=4096"]).await;
+    assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 4096}));
+    assert!(prep_err("claude-sonnet-4-5", &["budget=500"]).await.contains("at least 1024"));
+    assert!(prep_err("claude-sonnet-4-5", &["budget=64000"]).await.contains("below max_tokens (64000)"));
+    for model in ["claude-opus-5-5", "claude-opus-4-8", "claude-sonnet-5-5", "claude-haiku-5-5"] {
+        let e = prep_err(model, &["budget=4096"]).await;
+        assert!(e.contains("has no reasoning token budget"), "{model}: {e}");
+    }
+}
+
+#[tokio::test]
+async fn options_the_api_does_not_have_are_errors() {
+    let e = prep_err("claude-opus-5-5", &["m"]).await;
+    assert_eq!(e, "`claude-opus-5-5` has no Google Maps (`+m`)");
+    assert!(prep_err("claude-opus-5-5", &["v=high"]).await.contains("has no verbosity setting"));
+    assert!(prep_err("claude-opus-5-5", &["4W"]).await.contains("has no image size/aspect options"));
+    assert_eq!(
+        prep_err("claude-opus-5-5", &["p=anthropic"]).await,
+        "`p=` (provider choice) does not apply to Anthropic"
+    );
+    assert!(prep_err("claude-opus-5-5", &["tier=priority"]).await.contains("tiers: fast"));
+    assert!(prep_err("claude-opus-5-5", &["tier=flex"]).await.contains("tiers: fast"));
+    let e = prep_err("claude-sonnet-5-5", &["tier=fast"]).await;
+    assert!(e.contains("has no service tiers"), "{e}");
+    assert!(prep_err("claude-opus-5-5", &["temperature=0"]).await.contains("unknown option"));
+}
+
+#[tokio::test]
+async fn fast_mode_and_tiers() {
+    let p = prep_ok("claude-opus-5-5", &["tier=fast"]).await;
+    assert_eq!(p.body["speed"], "fast");
+    assert_eq!(p.settings, vec!["effort max", "tier fast"]);
+    assert!(betas("claude-opus-5-5", &p.body).is_empty(), "GA on Opus 5.5");
+    let p = prep_ok("claude-fable-5-2", &["tier=fast"]).await;
+    assert!(betas("claude-fable-5-2", &p.body).is_empty());
+    for model in ["claude-opus-5", "claude-opus-4-8"] {
+        let p = prep_ok(model, &["tier=fast"]).await;
+        assert_eq!(betas(model, &p.body), vec![FAST_MODE_BETA], "{model}");
+        assert!(p.applied.iter().any(|a| a.patch == json!({"anthropic-beta": "fast-mode-2026-02-01"})));
+    }
+    // The platform defaults change nothing.
+    for t in ["tier=auto", "tier=default"] {
+        let p = prep_ok("claude-opus-5-5", &[t]).await;
+        assert!(p.body.get("speed").is_none() && p.body.get("service_tier").is_none());
+    }
+}
+
+#[tokio::test]
+async fn server_tools_at_their_current_versions() {
+    let p = prep_ok("claude-opus-5-5", &["s"]).await;
+    assert_eq!(p.body["tools"], json!([{"type": "web_search_20260318", "name": "web_search"}]));
+    assert_eq!(p.settings, vec!["effort max", "web search"]);
+    assert!(p.notes.is_empty(), "code execution behind dynamic filtering is free");
+    // A fixed order whatever the option order (the tool list is part of the replay prefix).
+    let p = prep_ok("claude-opus-5-5", &["cus"]).await;
+    assert_eq!(
+        p.body["tools"],
+        json!([
+            {"type": "web_search_20260318", "name": "web_search"},
+            {"type": "web_fetch_20260318", "name": "web_fetch"},
+            {"type": "code_execution_20260521", "name": "code_execution"}
+        ])
+    );
+    assert_eq!(p.settings, vec!["effort max", "web search", "URL fetching", "code execution"]);
+    // Code execution alone is billed by container time, which the estimate leaves out.
+    let p = prep_ok("claude-haiku-5-5", &["c"]).await;
+    assert_eq!(p.body["tools"], json!([{"type": "code_execution_20260521", "name": "code_execution"}]));
+    assert!(p.notes.iter().any(|n| n.contains("not in the cost estimate")), "{:?}", p.notes);
+    // Before Claude 4.6: the basic web tools, and interleaved thinking with a manual budget.
+    let p = prep_ok("claude-opus-4-5", &["su"]).await;
+    assert_eq!(
+        p.body["tools"],
+        json!([{"type": "web_search_20250305", "name": "web_search"}, {"type": "web_fetch_20250910", "name": "web_fetch"}])
+    );
+    assert_eq!(betas("claude-opus-4-5", &p.body), vec![INTERLEAVED_THINKING_BETA]);
+    assert_eq!(
+        p.settings,
+        vec!["effort high", "thinking budget 63999", "interleaved thinking", "web search", "URL fetching"]
+    );
+    let p = prep_ok("claude-sonnet-4-5", &["s", "e=none"]).await;
+    assert!(betas("claude-sonnet-4-5", &p.body).is_empty(), "no manual thinking, no interleaving header");
+    let p = prep_ok("claude-haiku-4-5", &["s"]).await;
+    assert!(betas("claude-haiku-4-5", &p.body).is_empty(), "Haiku 4.5 has no interleaved thinking");
+    // Adaptive thinking interleaves on its own.
+    assert!(betas("claude-sonnet-4-6", &prep_ok("claude-sonnet-4-6", &["s"]).await.body).is_empty());
+    assert_eq!(
+        betas("claude-sonnet-4-6", &prep_ok("claude-sonnet-4-6", &["s", "budget=9000"]).await.body),
+        vec![INTERLEAVED_THINKING_BETA]
+    );
+}
+
+#[tokio::test]
+async fn unknown_models_get_the_api_defaults_and_a_warning() {
+    let p = prep_ok("claude-opus-6", &[]).await;
+    assert!(p.body.get("thinking").is_none() && p.body.get("output_config").is_none());
+    assert_eq!(p.body["max_tokens"], UNKNOWN_MODEL_MAX_TOKENS);
+    assert_eq!(p.settings, vec!["thinking: API default"]);
+    assert!(p.warnings[0].contains("not in the bot's Anthropic model table"), "{:?}", p.warnings);
+    assert!(!provider().knows("claude-opus-6") && provider().knows("claude-opus-5-5"));
+    // Options go to the API unchecked.
+    let p = prep_ok("claude-opus-6", &["e=xhigh", "s", "tier=fast"]).await;
+    assert_eq!(p.body["thinking"], json!({"type": "adaptive", "display": "summarized"}));
+    assert_eq!(p.body["output_config"], json!({"effort": "xhigh"}));
+    assert_eq!(p.body["tools"][0]["type"], "web_search_20260318");
+    assert_eq!(p.body["speed"], "fast");
+    let h = [Turn::user_text("hi")];
+    let o = opts(&[]);
+    let p = provider_at("https://api.anthropic.com/v1", Some(32_000))
+        .prepare(&input("claude-opus-6", &o, &h), &[], &Blobs::default())
+        .await
+        .unwrap();
+    assert_eq!(p.body["max_tokens"], 32_000);
+}
+
+#[tokio::test]
+async fn output_budget_follows_context_cap_and_overrides() {
+    // The configured cap.
+    let h = [Turn::user_text("hi")];
+    let o = opts(&[]);
+    let p = provider_at("https://api.anthropic.com/v1", Some(50_000))
+        .prepare(&input("claude-opus-5-5", &o, &h), &[], &Blobs::default())
+        .await
+        .unwrap();
+    assert_eq!(p.body["max_tokens"], 50_000);
+    // After a context overflow: the bot's smaller value, and the budget below it.
+    let mut i = input("claude-sonnet-4-5", &o, &h);
+    i.max_tokens_override = Some(5000);
+    let p = provider().prepare(&i, &[], &Blobs::default()).await.unwrap();
+    assert_eq!(p.body["max_tokens"], 5000);
+    assert_eq!(p.body["thinking"]["budget_tokens"], 4999);
+    assert_eq!(p.auto_max_tokens, Some(5000));
+    // A long conversation on a 200K model leaves less room for output.
+    let long = [Turn::user_text("a".repeat(480_000))];
+    let p = prep("claude-haiku-4-5", &[], &long).await.unwrap();
+    let m = p.body["max_tokens"].as_u64().unwrap();
+    assert!(m < 64_000 && m > 30_000, "{m}");
+    assert_eq!(p.body["thinking"]["budget_tokens"], m - 1);
+    // No room for the minimum budget: say so instead of sending a request that cannot work.
+    let mut i = input("claude-haiku-4-5", &o, &h);
+    i.max_tokens_override = Some(1024);
+    let e = provider().prepare(&i, &[], &Blobs::default()).await.unwrap_err();
+    assert!(e.message.contains("no room for a thinking budget"), "{e}");
+}
+
+// ------------------------------------------------------------------ history
+
+/// What a web-search answer from Opus 5.5 looks like in the stored payload
+/// (the docs' example: empty thinking under `display: omitted` with its
+/// signature, a search and its encrypted results, cited text).
+fn searched_payload(tools: Value) -> Value {
+    json!({"role": "assistant", "tools": tools, "content": [
+        {"type": "thinking", "thinking": "", "signature": "EosnCkYICxIMMb3LzNrMu"},
+        {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix/LafPsn4a"},
+        {"type": "server_tool_use", "id": "srvtoolu_01WYG3ziw53XMcoyKL4XcZmE", "name": "web_search", "input": {"query": "claude shannon birth date"}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_01WYG3ziw53XMcoyKL4XcZmE", "content": [
+            {"type": "web_search_result", "url": "https://en.wikipedia.org/wiki/Claude_Shannon", "title": "Claude Shannon - Wikipedia",
+             "encrypted_content": "EqgfCioIARgBIiQ3YTAwMjY1Mi1mZjM5", "page_age": "April 30, 2025"}]},
+        {"type": "text", "text": "Claude Shannon was born on April 30, 1916", "citations": [
+            {"type": "web_search_result_location", "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+             "title": "Claude Shannon - Wikipedia", "encrypted_index": "Eo8BCioIAhgBIiQyYjQ0OWJmZi1lNm", "cited_text": "Claude Elwood Shannon (April 30, 1916 –"}]}
+    ]})
+}
+
+#[tokio::test]
+async fn native_turns_replay_verbatim_with_the_same_model_and_tools() {
+    let search = json!([{"type": "web_search_20260318", "name": "web_search"}]);
+    let payload = searched_payload(search.clone());
+    let history = vec![
+        system("Answer briefly."),
+        Turn::user_text("When was Claude Shannon born?"),
+        assistant("claude-opus-5-5", payload.clone(), "Claude Shannon was born on April 30, 1916"),
+        Turn::user_text("And where?"),
+    ];
+    let p = prep("claude-opus-5-5", &["s"], &history).await.unwrap();
+    assert_eq!(p.body["system"], json!([{"type": "text", "text": "Answer briefly."}]));
+    let msgs = p.body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs[1], json!({"role": "assistant", "content": payload["content"]}), "every block as received");
+    // A cache breakpoint where the previous request's prompt ended; the newest
+    // turn is left to automatic caching.
+    assert_eq!(msgs[0]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+    assert!(msgs[2]["content"][0].get("cache_control").is_none());
+    assert!(p.applied.iter().any(|a| a.patch.get("messages[0].content[0].cache_control").is_some()));
+    assert!(p.notes.is_empty());
+
+    // Without web search now: the tool list changed, so the answer goes back as text.
+    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    assert_eq!(
+        p.body["messages"][1],
+        json!({"role": "assistant", "content": [{"type": "text", "text": "Claude Shannon was born on April 30, 1916"}]})
+    );
+    assert!(p.notes[0].contains("other tools"), "{:?}", p.notes);
+    // Another model: text only, no note (that is what switching models means).
+    let p = prep("claude-sonnet-5-5", &["s"], &history).await.unwrap();
+    assert_eq!(
+        p.body["messages"][1]["content"],
+        json!([{"type": "text", "text": "Claude Shannon was born on April 30, 1916"}])
+    );
+    assert!(p.notes.is_empty());
+    // Same model and tools from OpenRouter's Messages skin: another dialect, text only.
+    let mut or = history.clone();
+    or[2].native.as_mut().unwrap().dialect = "openrouter.messages".into();
+    let p = prep("claude-opus-5-5", &["s"], &or).await.unwrap();
+    assert_eq!(p.body["messages"][1]["content"][0]["type"], "text");
+    // A payload whose blocks were replaced by the answer text (as omni-bot's
+    // long-decode merge does today) can only go back as text.
+    let mut merged = history.clone();
+    merged[2].native.as_mut().unwrap().payload["content"] = json!("Claude Shannon was born on April 30, 1916");
+    let p = prep("claude-opus-5-5", &["s"], &merged).await.unwrap();
+    assert_eq!(
+        p.body["messages"][1]["content"],
+        json!([{"type": "text", "text": "Claude Shannon was born on April 30, 1916"}])
+    );
+}
+
+#[tokio::test]
+async fn a_paused_and_continued_turn_replays_as_its_requests() {
+    let payload = json!({"role": "assistant", "hops": [2, 1], "content": [
+        {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "a"}},
+        {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+        {"type": "text", "text": "done"}
+    ]});
+    let history = vec![Turn::user_text("q"), assistant("claude-haiku-5-5", payload, "done"), Turn::user_text("more")];
+    let p = prep("claude-haiku-5-5", &[], &history).await.unwrap();
+    let msgs = p.body["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 4);
+    assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(msgs[2], json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}));
+}
+
+#[tokio::test]
+async fn system_turns_and_answers_without_text() {
+    // A system turn after the start stays where it is, on models that take it.
+    let history = vec![Turn::user_text("hi"), system("Be terse.")];
+    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    assert!(p.body.get("system").is_none());
+    assert_eq!(p.body["messages"][1], json!({"role": "system", "content": [{"type": "text", "text": "Be terse."}]}));
+    let e = prep("claude-sonnet-5", &[], &history).await.unwrap_err();
+    assert!(e.message.contains("only at the start"), "{e}");
+    // An answer whose only output was thinking cannot be given to another model.
+    let thought = assistant(
+        "claude-opus-5-5",
+        json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "x"}]}),
+        "",
+    );
+    let history = vec![Turn::user_text("q"), thought, Turn::user_text("go on")];
+    let e = prep("claude-sonnet-5-5", &[], &history).await.unwrap_err();
+    assert!(e.message.contains("no text to give"), "{e}");
+    // The same model takes it back as it was.
+    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    assert_eq!(p.body["messages"][1]["content"][0]["signature"], "x");
+}
+
+#[tokio::test]
+async fn user_media_is_sent_natively() {
+    let mut blobs = Blobs::default();
+    let jpg = blobs.add(b"\xff\xd8\xff jpeg", "image/jpeg");
+    let jpg_label = blobs.add(b"\xff\xd8\xff other", "image/jpg");
+    let pdf = blobs.add(b"%PDF-1.7 doc", "application/pdf");
+    let txt = blobs.add("第一行\nline 2".as_bytes(), "text/plain");
+    let code = blobs.add(b"fn main() {}", "application/octet-stream");
+    let turn = Turn {
+        role: Role::User,
+        origin: Origin::Live,
+        parts: vec![
+            Part::Image { blob: jpg.clone(), filename: None, generated: false, dims: Some((10, 10)) },
+            Part::File { blob: jpg_label, filename: Some("scan.jpg".into()), generated: false },
+            Part::File { blob: pdf, filename: Some("paper.pdf".into()), generated: false },
+            Part::File { blob: txt, filename: Some("notes.txt".into()), generated: false },
+            Part::File { blob: code, filename: Some("main.rs".into()), generated: false },
+            Part::text("Compare them."),
+        ],
+        native: None,
+    };
+    let o = opts(&[]);
+    let h = [turn];
+    let p = provider().prepare(&input("claude-opus-5-5", &o, &h), &[], &blobs).await.unwrap();
+    let c = &p.body["messages"][0]["content"];
+    let b64 = crate::provider::b64;
+    assert_eq!(
+        c[0],
+        json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(b"\xff\xd8\xff jpeg")}})
+    );
+    assert_eq!(c[1]["source"]["media_type"], "image/jpeg");
+    assert_eq!(
+        c[2],
+        json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64(b"%PDF-1.7 doc")}, "title": "paper.pdf"})
+    );
+    assert_eq!(
+        c[3],
+        json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "第一行\nline 2"}, "title": "notes.txt"})
+    );
+    assert_eq!(c[4]["source"]["data"], "fn main() {}");
+    assert_eq!(c[5], json!({"type": "text", "text": "Compare them."}));
+    assert!(p.notes.is_empty(), "text files are native documents, nothing is inlined");
+    assert!(!p.body.to_string().contains("citations"), "document citations stay off (the API default)");
+
+    let one = |part: Part| vec![Turn { role: Role::User, origin: Origin::Live, parts: vec![part], native: None }];
+    let mut blobs = Blobs::default();
+    let cases = [
+        (
+            Part::Image { blob: blobs.add(b"heic", "image/heic"), filename: None, generated: false, dims: None },
+            "image/heic images",
+        ),
+        (
+            Part::File {
+                blob: blobs.add(b"\xff\xfe", "text/plain"),
+                filename: Some("bad.txt".into()),
+                generated: false,
+            },
+            "not UTF-8",
+        ),
+        (
+            Part::File { blob: blobs.add(b"ID3", "audio/mpeg"), filename: Some("a.mp3".into()), generated: false },
+            "audio/mpeg files",
+        ),
+        (
+            Part::File {
+                blob: blobs.add(b"PK", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                filename: Some("a.docx".into()),
+                generated: false,
+            },
+            "officedocument",
+        ),
+        (
+            Part::RemoteMedia { url: "https://youtu.be/x".into(), kind: omni_core::content::RemoteMediaKind::YouTube },
+            "remote media",
+        ),
+        (
+            Part::Location { latitude: 1.0, longitude: 2.0, accuracy_m: None, title: None, address: None },
+            "does not take a location via Anthropic",
+        ),
+    ];
+    for (part, needle) in cases {
+        let h = one(part);
+        let e = provider().prepare(&input("claude-opus-5-5", &o, &h), &[], &blobs).await.unwrap_err();
+        assert!(e.message.contains(needle), "{needle}: {e}");
+        assert!(e.message.contains("claude-opus-5-5"), "{e}");
+    }
+}
+
+#[tokio::test]
+async fn generated_images_of_other_models_are_noted() {
+    let mut blobs = Blobs::default();
+    let png = blobs.add(b"png", "image/png");
+    let answer = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![Part::text("Here it is."), Part::Image { blob: png, filename: None, generated: true, dims: None }],
+        native: None,
+    };
+    let history = vec![Turn::user_text("draw"), answer, Turn::user_text("describe it")];
+    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    assert_eq!(p.body["messages"][1]["content"], json!([{"type": "text", "text": "Here it is."}]));
+    assert!(p.notes[0].contains("images in earlier answers are not sent"), "{:?}", p.notes);
+}
+
+// ------------------------------------------------------------------ stream
+
+fn spec(model: &str) -> Option<&'static models::ModelSpec> {
+    models::model_spec(model)
+}
+
+#[test]
+fn summarized_thinking_and_text() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start(
+                "claude-opus-5-5",
+                json!({"input_tokens": 1200, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 800, "output_tokens": 1}),
+            ),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The user asks "}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "for the GCD."}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3h"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "ping"}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "The GCD is 21."}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            delta_end("end_turn", json!({"output_tokens": 300, "output_tokens_details": {"thinking_tokens": 250}})),
+            stop(),
+        ],
+    );
+    assert!(crate::chatstream::EventParser::finished(&p) && !p.paused());
+    // The message id is not the upstream id (the request-id header is).
+    assert_eq!(evs[0], StreamEvent::Meta { upstream_id: None, provider: None, model: Some("claude-opus-5-5".into()) });
+    let StreamEvent::LiveUsage(live) = &evs[1] else { panic!("{:?}", evs[1]) };
+    assert_eq!((live.input_tokens, live.output_tokens, live.cost_usd), (Some(2000), None, None));
+    let acc = accumulate(&evs);
+    let parts = acc.parts();
+    assert!(
+        matches!(&parts[0], Part::Reasoning(r) if r.kind == ReasoningKind::Summary && r.text.as_deref() == Some("The user asks for the GCD."))
+    );
+    assert_eq!(parts[1], Part::text("The GCD is 21."));
+    assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(acc.native_finish_reason.as_deref(), Some("end_turn"));
+    let u = acc.usage.unwrap();
+    assert_eq!(
+        (u.input_tokens, u.cached_input_tokens, u.output_tokens, u.reasoning_tokens),
+        (Some(2000), Some(800), Some(300), Some(250))
+    );
+    // 1200 × $4 + 800 × $0.20 + 300 × $20, per million.
+    assert!(close(u.cost_usd.unwrap(), (1200.0 * 4.0 + 800.0 * 0.20 + 300.0 * 20.0) / 1e6));
+    assert_eq!(u.cost_source, CostSource::Estimated);
+    let native = p.native_payload(None);
+    assert_eq!(
+        native,
+        json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "The user asks for the GCD.", "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3h"},
+            {"type": "text", "text": "The GCD is 21."}
+        ]})
+    );
+}
+
+/// The docs' trace under `display: "omitted"`: the block is kept (empty
+/// thinking, signature) for replay, nothing is shown.
+#[test]
+fn omitted_thinking_is_kept_but_not_shown() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 10, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "EosnCkYICxIMMb3LzNrMu"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "redacted_thinking", "data": "EmwKAhgB"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "12,231"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            delta_end("end_turn", json!({"output_tokens": 40})),
+            stop(),
+        ],
+    );
+    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Reasoning { .. })));
+    assert!(evs.iter().any(|e| matches!(e, StreamEvent::OpaqueReasoning { kind: ReasoningKind::Redacted })));
+    let native = p.native_payload(None);
+    assert_eq!(native["content"][0], json!({"type": "thinking", "thinking": "", "signature": "EosnCkYICxIMMb3LzNrMu"}));
+    assert_eq!(native["content"][1], json!({"type": "redacted_thinking", "data": "EmwKAhgB"}));
+}
+
+/// The docs' web search stream (Streaming messages): a server tool call whose
+/// input streams, a result block that arrives whole, cited text.
+#[test]
+fn web_search_stream() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start(
+                "claude-opus-5-5",
+                json!({"input_tokens": 2679, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 3}),
+            ),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I'll check the current weather in New York City for you."}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "server_tool_use", "id": "srvtoolu_014hJH82Qum7Td6UV8gDXThB", "name": "web_search", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"query"}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "\": \"weather NYC today\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_014hJH82Qum7Td6UV8gDXThB", "content": [
+                {"type": "web_search_result", "title": "Weather in New York City", "url": "https://world-weather.info/forecast/usa/new_york/", "encrypted_content": "Ev0DCioIAxgCIiQ3NmU4ZmI4OC1k", "page_age": null}
+            ]}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "content_block_start", "index": 3, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 3, "delta": {"type": "text_delta", "text": "It is 18°C and sunny."}}),
+            json!({"type": "content_block_delta", "index": 3, "delta": {"type": "citations_delta", "citation": {
+            "type": "web_search_result_location", "url": "https://world-weather.info/forecast/usa/new_york/",
+            "title": "Weather in New York City", "encrypted_index": "Eo8BCioIAhgBIiQyYjQ0", "cited_text": "18°C, sunny"}}}),
+            json!({"type": "content_block_stop", "index": 3}),
+            delta_end(
+                "end_turn",
+                json!({"input_tokens": 10682, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 510, "server_tool_use": {"web_search_requests": 1}}),
+            ),
+            stop(),
+        ],
+    );
+    let tools: Vec<&ToolCall> =
+        evs.iter().filter_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None }).collect();
+    assert_eq!(tools.len(), 3);
+    assert_eq!((tools[0].status.as_deref(), tools[0].input.as_ref()), (Some("in_progress"), None));
+    assert_eq!(tools[1].input, Some(json!({"query": "weather NYC today"})));
+    assert_eq!(tools[2].status.as_deref(), Some("completed"));
+    assert_eq!(
+        tools[2].output,
+        Some(
+            json!([{"type": "web_search_result", "title": "Weather in New York City", "url": "https://world-weather.info/forecast/usa/new_york/", "page_age": null}])
+        ),
+        "results without the encrypted content"
+    );
+    let acc = accumulate(&evs);
+    let parts = acc.parts();
+    assert!(matches!(&parts[0], Part::Text { text, .. } if text.starts_with("I'll check")));
+    assert!(
+        matches!(&parts[1], Part::ToolCall(t) if t.name == "web_search" && t.status.as_deref() == Some("completed") && t.input.is_some() && t.output.is_some())
+    );
+    let Part::Text { text, citations } = &parts[2] else { panic!("{:?}", parts[2]) };
+    assert_eq!(text, "It is 18°C and sunny.");
+    assert_eq!(
+        citations[0],
+        Citation {
+            url: Some("https://world-weather.info/forecast/usa/new_york/".into()),
+            title: Some("Weather in New York City".into()),
+            cited_text: Some("18°C, sunny".into()),
+            ..Default::default()
+        }
+    );
+    // Tokens plus $10 per 1,000 searches.
+    let u = acc.usage.unwrap();
+    assert!(close(u.cost_usd.unwrap(), (10682.0 * 4.0 + 510.0 * 20.0) / 1e6 + 0.01));
+    // Replay needs every block exactly as received, encrypted content included.
+    let native = p.native_payload(Some(&json!([{"type": "web_search_20260318", "name": "web_search"}])));
+    assert_eq!(native["content"][1]["input"], json!({"query": "weather NYC today"}));
+    assert_eq!(native["content"][2]["content"][0]["encrypted_content"], "Ev0DCioIAxgCIiQ3NmU4ZmI4OC1k");
+    assert_eq!(native["content"][3]["citations"][0]["encrypted_index"], "Eo8BCioIAhgBIiQyYjQ0");
+    assert_eq!(native["tools"][0]["type"], "web_search_20260318");
+}
+
+/// A tool input whose chunks are all empty stays the block start's `{}`:
+/// replay needs an object, never the unparsable "".
+#[test]
+fn empty_tool_input_chunks_keep_an_object() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 10, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_e", "name": "web_search", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": ""}}),
+            json!({"type": "content_block_stop", "index": 0}),
+        ],
+    );
+    assert_eq!(p.content()[0]["input"], json!({}));
+    assert!(evs.iter().all(|e| !matches!(e, StreamEvent::Tool(t) if t.input == Some(json!("")))));
+}
+
+#[test]
+fn code_execution_and_fetch_results() {
+    let mut p = Parser::new(spec("claude-sonnet-5-5"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-sonnet-5-5", json!({"input_tokens": 100, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_b", "name": "bash_code_execution"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"python analyze.py\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_b", "content": {
+            "type": "bash_code_execution_result", "stdout": "   A  B\n0  1  2", "stderr": "", "return_code": 0,
+            "content": [{"type": "bash_code_execution_output", "file_id": "file_011CNha8iCJcU1wXNR6q4V8w"}]}}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "server_tool_use", "id": "srvtoolu_t", "name": "text_editor_code_execution", "input": {"command": "view", "path": "config.json"}}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "content_block_start", "index": 3, "content_block": {"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_t", "content": {
+            "type": "text_editor_code_execution_tool_result_error", "error_code": "file_not_found"}}}),
+            json!({"type": "content_block_stop", "index": 3}),
+            // Dynamic filtering: code that called web search returns its stdout encrypted.
+            json!({"type": "content_block_start", "index": 4, "content_block": {"type": "server_tool_use", "id": "srvtoolu_c", "name": "code_execution", "input": {"code": "r = await web_search({'query': 'x'})"}}}),
+            json!({"type": "content_block_stop", "index": 4}),
+            json!({"type": "content_block_start", "index": 5, "content_block": {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_c", "content": {
+            "type": "encrypted_code_execution_result", "encrypted_stdout": "EuQJCioIDhgC", "stderr": "", "return_code": 0, "content": []}}}),
+            json!({"type": "content_block_stop", "index": 5}),
+            json!({"type": "content_block_start", "index": 6, "content_block": {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f", "content": {
+            "type": "web_fetch_result", "url": "https://example.com/article", "retrieved_at": "2025-08-25T10:30:00Z",
+            "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Full text content of the article..."}, "title": "Article Title"}}}}),
+            json!({"type": "content_block_stop", "index": 6}),
+            delta_end("end_turn", json!({"output_tokens": 50})),
+            stop(),
+        ],
+    );
+    let tools: Vec<&ToolCall> =
+        evs.iter().filter_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None }).collect();
+    let by = |id: &str, status: &str| {
+        tools.iter().find(|t| t.id.as_deref() == Some(id) && t.status.as_deref() == Some(status)).copied()
+    };
+    assert_eq!(by("srvtoolu_b", "in_progress").unwrap().input, None);
+    assert_eq!(tools[1].input, Some(json!({"command": "python analyze.py"})));
+    assert_eq!(
+        by("srvtoolu_b", "completed").unwrap().output,
+        Some(
+            json!({"type": "bash_code_execution_result", "stdout": "   A  B\n0  1  2", "stderr": "", "return_code": 0,
+            "content": [{"type": "bash_code_execution_output", "file_id": "file_011CNha8iCJcU1wXNR6q4V8w"}]})
+        )
+    );
+    // An input that arrives whole in the block start is shown too.
+    assert_eq!(by("srvtoolu_t", "in_progress").unwrap().input, Some(json!({"command": "view", "path": "config.json"})));
+    let failed = by("srvtoolu_t", "failed").unwrap();
+    assert_eq!(
+        failed.output,
+        Some(json!({"type": "text_editor_code_execution_tool_result_error", "error_code": "file_not_found"}))
+    );
+    assert_eq!(failed.name, "text_editor_code_execution");
+    assert_eq!(
+        by("srvtoolu_c", "completed").unwrap().output,
+        Some(json!({"type": "encrypted_code_execution_result", "stderr": "", "return_code": 0, "content": []}))
+    );
+    assert_eq!(
+        by("srvtoolu_f", "completed").unwrap().output,
+        Some(
+            json!({"url": "https://example.com/article", "title": "Article Title", "media_type": "text/plain", "retrieved_at": "2025-08-25T10:30:00Z"})
+        )
+    );
+    let acc = accumulate(&evs);
+    let calls: Vec<&ToolCall> =
+        acc.parts().iter().filter_map(|p| if let Part::ToolCall(t) = p { Some(t) } else { None }).collect();
+    assert_eq!(calls.len(), 4, "a call and its result are one part");
+    // The fetched document stays in the payload for replay.
+    assert_eq!(
+        p.native_payload(None)["content"][6]["content"]["content"]["source"]["data"],
+        "Full text content of the article..."
+    );
+}
+
+#[test]
+fn refusals_are_content_filter_stops_with_details() {
+    // Before any output, cyber: not billed.
+    let mut p = Parser::new(spec("claude-fable-5-2"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-fable-5-2", json!({"input_tokens": 412, "output_tokens": 0})),
+            json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_sequence": null, "stop_details": {
+            "type": "refusal", "category": "cyber", "explanation": "This request was declined because it could enable cyber harm."}},
+            "usage": {"output_tokens": 0}}),
+            stop(),
+        ],
+    );
+    let acc = accumulate(&evs);
+    assert_eq!(
+        (acc.finish_reason.as_deref(), acc.native_finish_reason.as_deref()),
+        (Some("content_filter"), Some("refusal"))
+    );
+    assert_eq!(acc.finish_details.as_ref().unwrap()["category"], "cyber");
+    let u = acc.usage.unwrap();
+    assert_eq!((u.input_tokens, u.cost_usd, u.cost_source), (Some(412), Some(0.0), CostSource::Estimated));
+    // `bio` is billed even before any output.
+    let mut p = Parser::new(spec("claude-fable-5-2"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-fable-5-2", json!({"input_tokens": 1000, "output_tokens": 0})),
+            json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_details": {"type": "refusal", "category": "bio", "explanation": null}}, "usage": {"output_tokens": 0}}),
+            stop(),
+        ],
+    );
+    assert!(close(accumulate(&evs).usage.unwrap().cost_usd.unwrap(), 1000.0 * 8.0 / 1e6));
+    // Mid-stream: input and the streamed output are billed.
+    let mut p = Parser::new(spec("claude-fable-5-2"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-fable-5-2", json!({"input_tokens": 1000, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Sure, first"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_details": {"type": "refusal", "category": "general_harms", "explanation": "x"}}, "usage": {"output_tokens": 30}}),
+            stop(),
+        ],
+    );
+    let acc = accumulate(&evs);
+    assert_eq!(acc.finish_reason.as_deref(), Some("content_filter"));
+    assert!(close(acc.usage.unwrap().cost_usd.unwrap(), (1000.0 * 8.0 + 30.0 * 40.0) / 1e6));
+}
+
+/// Recorded 2026-11-11 (Fable 5.2 through OpenRouter's Messages skin, which
+/// passes Anthropic's events through): a cyber refusal before any output.
+#[test]
+fn recorded_refusal_is_free() {
+    let mut p = Parser::new(spec("claude-fable-5-2"));
+    let evs = feed(&mut p, &crate::fixtures::sse("messages_refusal_fable52.sse"));
+    let acc = accumulate(&evs);
+    assert_eq!(acc.finish_reason.as_deref(), Some("content_filter"));
+    assert!(acc.finish_details.unwrap()["explanation"].as_str().unwrap().contains("Usage Policy"));
+    let u = acc.usage.unwrap();
+    assert_eq!((u.input_tokens, u.output_tokens, u.cost_usd), (Some(25), Some(0), Some(0.0)));
+}
+
+#[test]
+fn stop_reasons() {
+    for (native, normalized) in [
+        ("end_turn", "stop"),
+        ("stop_sequence", "stop"),
+        ("max_tokens", "length"),
+        ("model_context_window_exceeded", "length"),
+    ] {
+        let mut p = Parser::new(spec("claude-haiku-5-5"));
+        let evs = feed(
+            &mut p,
+            &[
+                message_start("claude-haiku-5-5", json!({"input_tokens": 5, "output_tokens": 1})),
+                delta_end(native, json!({"output_tokens": 7})),
+                stop(),
+            ],
+        );
+        let acc = accumulate(&evs);
+        assert_eq!(
+            (acc.finish_reason.as_deref(), acc.native_finish_reason.as_deref()),
+            (Some(normalized), Some(native))
+        );
+        assert!(acc.finish_details.is_none());
+    }
+    // A recorded max_tokens stop (through OpenRouter, Anthropic's events).
+    let c = crate::fixtures::case("msg_length");
+    let mut p = Parser::new(spec("claude-haiku-5-5"));
+    let evs = feed(&mut p, c["sse"].as_array().unwrap());
+    let acc = accumulate(&evs);
+    assert_eq!(acc.finish_reason.as_deref(), Some("length"));
+    assert_eq!(acc.parts(), &[Part::text("1 2 3 4 5 6 7 8 ")]);
+}
+
+#[test]
+fn in_band_errors_are_classified() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 5, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Partial"}}),
+        ],
+    );
+    let ev = json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}});
+    let e = p.event(Some("error"), &ev).unwrap_err();
+    assert_eq!((e.kind, e.retry, e.status), (ErrorKind::InBand, Retry::Backoff, None));
+    assert_eq!(e.error_type.as_deref(), Some("overloaded_error"));
+    assert_eq!(e.message, "Overloaded");
+    assert_eq!(e.details, Some(ev));
+    assert!(e.partial_output);
+    let ev = json!({"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}});
+    assert_eq!(Parser::new(None).event(None, &ev).unwrap_err().retry, Retry::Never);
+}
+
+#[test]
+fn a_paused_turn_continues_in_the_same_parser() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    let first = feed(
+        &mut p,
+        &[
+            message_start(
+                "claude-opus-5-5",
+                json!({"input_tokens": 1000, "output_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+            ),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Search first."}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "s1"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"query\":\"q\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "pause_turn", "stop_sequence": null,
+            "container": {"id": "container_011CZ", "expires_at": "2026-11-12T08:00:00Z"}},
+            "usage": {"output_tokens": 100, "server_tool_use": {"web_search_requests": 1}}}),
+            stop(),
+        ],
+    );
+    assert!(p.paused());
+    assert_eq!(p.container(), Some("container_011CZ"));
+    assert!(!first.iter().any(|e| matches!(e, StreamEvent::Finish { .. })), "pause_turn is not the end of the turn");
+    assert_eq!(p.content().len(), 2);
+    p.next_request();
+    let second = feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 1500, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Found it."}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "s2"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Answer."}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            delta_end("end_turn", json!({"output_tokens": 50})),
+            stop(),
+        ],
+    );
+    assert!(!p.paused());
+    let StreamEvent::LiveUsage(live) = &second[1] else { panic!("{:?}", second[1]) };
+    assert_eq!((live.input_tokens, live.output_tokens), (Some(2500), Some(100)), "both requests so far");
+    let mut all = first.clone();
+    all.extend(second);
+    let acc = accumulate(&all);
+    // The two thinking blocks stay two parts (block indices are offset).
+    let reasoning: Vec<_> = acc.parts().iter().filter(|p| matches!(p, Part::Reasoning(_))).collect();
+    assert_eq!(reasoning.len(), 2);
+    let u = acc.usage.unwrap();
+    assert_eq!((u.input_tokens, u.output_tokens), (Some(2500), Some(150)));
+    assert!(close(
+        u.cost_usd.unwrap(),
+        (1000.0 * 4.0 + 100.0 * 20.0) / 1e6 + 0.01 + (1500.0 * 4.0 + 50.0 * 20.0) / 1e6
+    ));
+    assert_eq!(u.raw.as_array().unwrap().len(), 2, "both usage objects, in order");
+    assert_eq!(acc.native_finish_reason.as_deref(), Some("end_turn"));
+    let native = p.native_payload(None);
+    assert_eq!(native["hops"], json!([2, 2]));
+    assert_eq!(native["content"].as_array().unwrap().len(), 4);
+    assert_eq!(native["content"][1]["input"], json!({"query": "q"}));
+    assert_eq!(native["content"][2]["signature"], "s2");
+}
+
+// ------------------------------------------------------------------ errors
+
+fn http(status: u16, retry_after: Option<u64>, body: &str) -> LlmError {
+    http_error(status, retry_after, body, error_from_json)
+}
+
+#[test]
+fn http_errors_are_classified() {
+    // Recorded 2026-11-12 from the API without a key.
+    let body = r#"{"type":"error","error":{"type":"authentication_error","message":"x-api-key header is required"},"request_id":"req_011CgxXdube14Bw3iW6aszXK"}"#;
+    let e = http(401, None, body);
+    assert_eq!((e.kind, e.retry, e.status), (ErrorKind::Http, Retry::Never, Some(401)));
+    assert_eq!(e.error_type.as_deref(), Some("authentication_error"));
+    assert_eq!(e.message, "x-api-key header is required");
+    assert_eq!(e.details.unwrap(), serde_json::from_str::<Value>(body).unwrap(), "the whole body, request_id included");
+
+    let err = |ty: &str, msg: &str| {
+        format!(r#"{{"type":"error","error":{{"type":"{ty}","message":"{msg}"}},"request_id":"req_1"}}"#)
+    };
+    assert_eq!(
+        http(
+            429,
+            Some(7),
+            &err("rate_limit_error", "Number of request tokens has exceeded your per-minute rate limit")
+        )
+        .retry,
+        Retry::After(7)
+    );
+    assert_eq!(http(429, None, &err("rate_limit_error", "rate limited")).retry, Retry::After(20));
+    // The tier spend cap: a 429 that fails until next month.
+    let cap = r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have reached your API usage limits: your organization has crossed its monthly API usage threshold, set based on your organization's API tier. You will regain access on 2026-12-01 at 00:00 UTC.","details":{"error_code":"enforced_spend_limit_reached"}},"request_id":"req_018EeWyXxfu5pfWkrYcMdjWG"}"#;
+    let e = http(429, None, cap);
+    assert_eq!(e.retry, Retry::Never);
+    assert_eq!(e.error_type.as_deref(), Some("enforced_spend_limit_reached"));
+    assert_eq!(http(529, None, &err("overloaded_error", "Overloaded")).retry, Retry::Backoff);
+    assert_eq!(http(529, Some(30), &err("overloaded_error", "Overloaded")).retry, Retry::After(30));
+    assert_eq!(http(500, None, &err("api_error", "Internal server error")).retry, Retry::Backoff);
+    assert_eq!(http(504, None, &err("timeout_error", "Request timed out")).retry, Retry::Backoff);
+    for (status, ty) in [
+        (400, "invalid_request_error"),
+        (402, "billing_error"),
+        (403, "permission_error"),
+        (404, "not_found_error"),
+        (413, "request_too_large"),
+    ] {
+        let e = http(status, None, &err(ty, "no"));
+        assert_eq!(e.retry, Retry::Never, "{ty}");
+        assert!(!e.is_context_overflow(), "{ty}");
+    }
+    // A spend limit you set is a 400.
+    let e = http(
+        400,
+        None,
+        &err(
+            "invalid_request_error",
+            "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.",
+        ),
+    );
+    assert_eq!(e.retry, Retry::Never);
+    // Anthropic's own message for an oversized image (recorded through OpenRouter, `metadata.raw`).
+    let raw = crate::fixtures::case("msg_bad_image_claude")["body"]["metadata"]["raw"].as_str().unwrap().to_string();
+    let e = http(400, None, &raw);
+    assert!(e.message.contains("8000 pixels") && e.retry == Retry::Never && !e.is_context_overflow());
+    // Unknown types: by status.
+    assert_eq!(http(503, None, &err("mystery_error", "x")).retry, Retry::Backoff);
+    assert_eq!(http(418, None, &err("mystery_error", "x")).retry, Retry::Never);
+    // A non-JSON body (Cloudflare's 413 page).
+    let e = http(413, None, "<html>413 Request Entity Too Large</html>");
+    assert_eq!(
+        (e.retry, e.details),
+        (Retry::Never, Some(Value::String("<html>413 Request Entity Too Large</html>".into())))
+    );
+}
+
+#[test]
+fn context_overflows_are_recognized() {
+    let e = http(
+        400,
+        None,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1048576 tokens > 1000000 maximum"},"request_id":"req_1"}"#,
+    );
+    assert!(e.is_context_overflow());
+    assert_eq!(e.error_type.as_deref(), Some("context_length_exceeded"));
+    // The prompt alone does not fit: shrinking the output budget cannot help.
+    assert_eq!(crate::budget::shrink_after_overflow(128_000, &e.message), None);
+    // max_tokens above the model's limit (an unknown model): the bot retries with less.
+    let e = http(
+        400,
+        None,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 128000 > 64000, which is the maximum allowed number of output tokens for claude-sonnet-4-5-20250929"},"request_id":"req_1"}"#,
+    );
+    assert!(e.is_context_overflow());
+    assert_eq!(e.error_type.as_deref(), Some("max_tokens_exceeded"));
+    assert_eq!(crate::budget::shrink_after_overflow(128_000, &e.message), Some(64_000));
+    let e = error_from_json(
+        &json!({"type": "invalid_request_error", "message": "max_tokens: Field required"}),
+        Some(400),
+        None,
+        ErrorKind::Http,
+    );
+    assert_eq!(e.error_type.as_deref(), Some("invalid_request_error"));
+}
+
+// ------------------------------------------------------------------ HTTP
+
+struct Seen {
+    head: String,
+    body: Value,
+}
+
+/// One response of the fake API: status, extra headers, body.
+type Response = (u16, Vec<(&'static str, String)>, String);
+
+fn sse(events: &[Value]) -> String {
+    events.iter().map(|e| format!("event: {}\ndata: {}\n\n", e["type"].as_str().unwrap(), e)).collect()
+}
+
+/// A fake API: answers each request in turn (`status`, extra headers, body),
+/// one connection each, and records what was sent.
+async fn serve(responses: Vec<Response>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        for (status, headers, body) in responses {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 16384];
+            let (head, req) = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < pos + 4 + len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                break (head, serde_json::from_slice(&buf[pos + 4..pos + 4 + len]).unwrap_or(Value::Null));
+            };
+            log.lock().unwrap().push(Seen { head, body: req });
+            let ctype = if status == 200 { "text/event-stream" } else { "application/json" };
+            let mut resp = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                body.len()
+            );
+            for (k, v) in headers {
+                resp.push_str(&format!("{k}: {v}\r\n"));
+            }
+            resp.push_str("\r\n");
+            resp.push_str(&body);
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        }
+    });
+    (format!("http://{addr}/v1"), seen)
+}
+
+async fn run(p: &Anthropic, prepared: &Prepared) -> (Result<Value, LlmError>, CallOutcome, Vec<StreamEvent>) {
+    let mut events = Vec::new();
+    let (r, o) = {
+        let mut sink = |e: StreamEvent| events.push(e);
+        p.stream(prepared, &mut sink, &NullObserver, &CancellationToken::new()).await
+    };
+    (r, o, events)
+}
+
+#[tokio::test]
+async fn streams_with_the_documented_headers() {
+    let events = [
+        message_start("claude-opus-5", json!({"input_tokens": 10, "output_tokens": 1})),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        delta_end("end_turn", json!({"output_tokens": 2})),
+        stop(),
+    ];
+    let (url, seen) = serve(vec![(200, vec![("request-id", "req_011CA".into())], sse(&events))]).await;
+    let p = provider_at(&url, None);
+    let o = opts(&["tier=fast"]);
+    let h = [Turn::user_text("hi")];
+    let prepared = p.prepare(&input("claude-opus-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, outcome, evs) = run(&p, &prepared).await;
+    assert_eq!(r.unwrap(), json!({"role": "assistant", "content": [{"type": "text", "text": "Hi"}]}));
+    assert_eq!(outcome.upstream_id.as_deref(), Some("req_011CA"));
+    assert!(evs.contains(&StreamEvent::Meta { upstream_id: Some("req_011CA".into()), provider: None, model: None }));
+    let seen = seen.lock().unwrap();
+    let head = seen[0].head.to_ascii_lowercase();
+    assert!(head.starts_with("post /v1/messages "), "{head}");
+    assert!(head.contains("x-api-key: sk-ant-test"));
+    assert!(head.contains("anthropic-version: 2026-10-21"));
+    assert!(head.contains("anthropic-beta: fast-mode-2026-02-01"), "{head}");
+    assert_eq!(seen[0].body, prepared.body, "the body exactly as prepared");
+}
+
+#[tokio::test]
+async fn a_paused_turn_is_continued_as_documented() {
+    let first = [
+        message_start("claude-sonnet-5-5", json!({"input_tokens": 100, "output_tokens": 1})),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_1", "name": "code_execution", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"code\":\"print(1)\"}"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "pause_turn", "container": {"id": "container_abc", "expires_at": "2026-11-12T08:00:00Z"}}, "usage": {"output_tokens": 20}}),
+        stop(),
+    ];
+    let second = [
+        message_start("claude-sonnet-5-5", json!({"input_tokens": 130, "output_tokens": 1})),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_1", "content": {"type": "code_execution_result", "stdout": "1\n", "stderr": "", "return_code": 0, "content": []}}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "It printed 1."}}),
+        json!({"type": "content_block_stop", "index": 1}),
+        delta_end("end_turn", json!({"output_tokens": 10})),
+        stop(),
+    ];
+    let (url, seen) = serve(vec![
+        (200, vec![("request-id", "req_1".into())], sse(&first)),
+        (200, vec![("request-id", "req_2".into())], sse(&second)),
+    ])
+    .await;
+    let p = provider_at(&url, None);
+    let o = opts(&["c"]);
+    let h = [Turn::user_text("run it")];
+    let prepared = p.prepare(&input("claude-sonnet-5-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, outcome, evs) = run(&p, &prepared).await;
+    let native = r.unwrap();
+    assert_eq!(native["hops"], json!([1, 2]));
+    assert_eq!(native["tools"], prepared.body["tools"]);
+    assert_eq!(outcome.upstream_id.as_deref(), Some("req_1,req_2"));
+    assert!(evs.iter().any(|e| matches!(e, StreamEvent::Notice(n) if n.contains("pause_turn"))));
+    let acc = accumulate(&evs);
+    assert_eq!(acc.upstream_id.as_deref(), Some("req_1,req_2"));
+    assert_eq!(acc.native_finish_reason.as_deref(), Some("end_turn"));
+    let u = acc.usage.unwrap();
+    assert_eq!((u.input_tokens, u.output_tokens), (Some(230), Some(30)));
+    let again = {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        seen[1].body.clone()
+    };
+    // Same request, the paused content appended as an assistant message, the container kept.
+    assert_eq!(again["tools"], prepared.body["tools"]);
+    assert_eq!(again["container"], "container_abc");
+    let msgs = again["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(
+        msgs[1],
+        json!({"role": "assistant", "content": [{"type": "server_tool_use", "id": "srvtoolu_1", "name": "code_execution", "input": {"code": "print(1)"}}]})
+    );
+    // The next turn replays the two requests as they were sent.
+    let turn = assistant("claude-sonnet-5-5", native, "It printed 1.");
+    let history = vec![Turn::user_text("run it"), turn, Turn::user_text("again")];
+    let next = p.prepare(&input("claude-sonnet-5-5", &o, &history), &[], &Blobs::default()).await.unwrap();
+    let m = next.body["messages"].as_array().unwrap();
+    assert_eq!(m.len(), 4);
+    assert_eq!(m[1], msgs[1]);
+    assert_eq!(m[2]["content"][1]["text"], "It printed 1.");
+}
+
+#[tokio::test]
+async fn the_pause_continuations_are_capped() {
+    let paused = sse(&[
+        message_start("claude-opus-5-5", json!({"input_tokens": 10, "output_tokens": 1})),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_x", "name": "web_search", "input": {"query": "q"}}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "pause_turn"}, "usage": {"output_tokens": 5}}),
+        stop(),
+    ]);
+    let (url, seen) = serve((0..MAX_REQUESTS).map(|_| (200, vec![], paused.clone())).collect()).await;
+    let p = provider_at(&url, None);
+    let o = opts(&["s"]);
+    let h = [Turn::user_text("q")];
+    let prepared = p.prepare(&input("claude-opus-5-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, _, evs) = run(&p, &prepared).await;
+    assert!(r.is_ok());
+    assert_eq!(seen.lock().unwrap().len(), MAX_REQUESTS);
+    let acc = accumulate(&evs);
+    assert_eq!(
+        (acc.finish_reason.as_deref(), acc.native_finish_reason.as_deref()),
+        (Some("pause_turn"), Some("pause_turn"))
+    );
+    assert!(
+        acc.notices.iter().any(|n| n.contains("after 5 request(s)") && n.contains("may be incomplete")),
+        "{:?}",
+        acc.notices
+    );
+}
+
+#[tokio::test]
+async fn http_errors_over_the_wire() {
+    let body = r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your per-minute rate limit"},"request_id":"req_9"}"#;
+    let (url, _) =
+        serve(vec![(429, vec![("retry-after", "12".into()), ("request-id", "req_9".into())], body.into())]).await;
+    let p = provider_at(&url, None);
+    let o = opts(&[]);
+    let h = [Turn::user_text("hi")];
+    let prepared = p.prepare(&input("claude-opus-5-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, outcome, _) = run(&p, &prepared).await;
+    let e = r.unwrap_err();
+    assert_eq!((e.status, e.retry), (Some(429), Retry::After(12)));
+    assert_eq!(outcome.upstream_id.as_deref(), Some("req_9"));
+    // A stream that stops without message_stop is a dropped connection (retried).
+    let cut = sse(&[message_start("claude-opus-5-5", json!({"input_tokens": 1, "output_tokens": 1}))]);
+    let (url, _) = serve(vec![(200, vec![], cut)]).await;
+    let p = provider_at(&url, None);
+    let (r, _, _) = run(&p, &prepared).await;
+    let e = r.unwrap_err();
+    assert_eq!((e.kind, e.retry), (ErrorKind::Network, Retry::Backoff));
+}

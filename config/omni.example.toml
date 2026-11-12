@@ -24,15 +24,17 @@ api_hash = "${TELEGRAM_API_HASH}"
 # bot is independent, like a separate instance: its own allow list, bans, spend
 # limits and runtime prefixes; in a group each bot answers the prefixes it has
 # and ignores the others.
-# `models`: the models a bot has, as patterns over `provider:author/model`. A
-# model no pattern matches does not exist for that bot (not listed, unknown as a
-# prefix); neither do models of providers that are not configured.
+# `models`: the models a bot has, as patterns over canonical ids
+# (`openrouter:author/model`, `<provider>:<model>` for the platforms' own APIs).
+# A model no pattern matches does not exist for that bot (not listed, unknown as
+# a prefix); neither do models of providers that are not configured.
 [[bots]]
 name = "main"                  # stable internal name (database key) — do not rename casually
 token = "${TELEGRAM_BOT_TOKEN}"
 models = [
     "openrouter:openai/*", "openrouter:anthropic/*", "openrouter:google/*", "openrouter:x-ai/*",
-    "openrouter:deepseek/*", "openrouter:z-ai/*", "openrouter:moonshotai/*", "openrouter:qwen/*", "ark:*",
+    "openrouter:deepseek/*", "openrouter:z-ai/*", "openrouter:moonshotai/*", "openrouter:qwen/*",
+    "openai:*", "anthropic:*", "google:*", "xai:*", "deepseek:*", "zhipu:*", "moonshot:*", "alibaba:*", "ark:*",
 ]
 
 # Example: a second, independent bot that has only Claude.
@@ -83,16 +85,40 @@ user_id_salt = "${OPENROUTER_USER_SALT:-}"
 # [providers.openrouter.first_party]
 # google = "google-vertex"
 
-# Volcengine Ark (火山方舟): Doubao directly (`ark:` models), OpenAI-compatible
-# Chat API. Without a key the provider and its models do not exist.
-[providers.ark]
+# The platforms' own APIs. Each exists only when its key is set; its models are
+# then `<provider>:<model id>` (`openai:gpt-6.1-sol`). The Chinese platforms are
+# their domestic sites (as in the old bot). Keys every section accepts, with
+# their defaults:
+#   allow_unlisted_models = false # true: any `<provider>:<model id>$` works as a prefix
+#   base_url = "…"               # the platform's official API
+#   connect_timeout_secs = 15
+#   idle_timeout_secs = 3600     # Ark: 1800
+#   max_tokens_cap = 0           # cap for the automatic output budget (0 = the model's
+#                                # maximum); Ark: 65536 (it reserves TPM quota by it)
+#   cny_per_usd = 7.1            # cost estimates of platforms billing in CNY (DeepSeek,
+#                                # Zhipu, Moonshot, Alibaba, Ark)
+#   long_decode_budget = 393216  # Gemini 4 (google): total output across continuation hops
+[providers.openai]             # https://api.openai.com/v1 (Responses API)
+api_key = "${OPENAI_API_KEY:-}"
+[providers.anthropic]          # https://api.anthropic.com/v1 (Messages API)
+api_key = "${ANTHROPIC_API_KEY:-}"
+[providers.google]             # Gemini API: https://generativelanguage.googleapis.com/v1beta
+api_key = "${GEMINI_API_KEY:-}"
+[providers.xai]                # https://api.x.ai/v1 (Responses API)
+api_key = "${XAI_API_KEY:-}"
+[providers.deepseek]           # https://api.deepseek.com
+api_key = "${DEEPSEEK_API_KEY:-}"
+[providers.zhipu]              # https://open.bigmodel.cn/api/paas/v4
+api_key = "${ZHIPUAI_API_KEY:-}"
+[providers.moonshot]           # https://api.moonshot.cn/v1
+api_key = "${MOONSHOT_API_KEY:-}"
+[providers.alibaba]            # Bailian / DashScope: https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key = "${DASHSCOPE_API_KEY:-}"
+# Alibaba recommends the workspace domain (the one above gets no new features after 2026-09-30):
+# base_url = "https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+[providers.ark]                # Volcengine Ark (火山方舟, Doubao): https://ark.cn-beijing.volces.com/api/v3
 api_key = "${ARK_API_KEY:-}"
 allow_unlisted_models = false  # only the `db…` prefixes below; true: any `ark:<model id>$`
-# base_url = "https://ark.cn-beijing.volces.com/api/v3"
-# connect_timeout_secs = 15
-# idle_timeout_secs = 1800     # summary-mode models can pause long between chunks
-# max_tokens_cap = 65536       # cap for the automatic max_tokens (Ark reserves quota by it)
-# cny_per_usd = 7.1            # for cost estimates (Ark prices are in CNY)
 
 [render]
 markdown = "clean"             # clean | raw (raw = the model's exact Markdown source)
@@ -267,14 +293,35 @@ spec = "ark:doubao-seed-2-1-pro-260915"
 # otherwise default to the highest the model officially offers (reasoning
 # effort, output length, reasoning summaries, image output).
 
-# Image models: the largest image size by default.
+# Image models: the largest image size by default (4K; 3.1 Flash Lite Image
+# has only 1K), through OpenRouter and the Gemini API alike.
 [[presets]]
-match = "openrouter:google/gemini-*image*"
+match = "openrouter:google/gemini-nano-banana*"
 note = "largest image size"
 options = "4"
 
 [[presets]]
-match = "openrouter:google/gemini-nano-banana*"
+match = "openrouter:google/gemini-3.1-flash-image*"
+note = "largest image size"
+options = "4"
+
+[[presets]]
+match = "openrouter:google/gemini-3-pro-image*"
+note = "largest image size"
+options = "4"
+
+[[presets]]
+match = "google:gemini-nano-banana*"
+note = "largest image size"
+options = "4"
+
+[[presets]]
+match = "google:gemini-3.1-flash-image*"
+note = "largest image size"
+options = "4"
+
+[[presets]]
+match = "google:gemini-3-pro-image*"
 note = "largest image size"
 options = "4"
 

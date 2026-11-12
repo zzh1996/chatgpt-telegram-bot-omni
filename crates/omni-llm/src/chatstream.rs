@@ -168,7 +168,7 @@ pub async fn run_with<P: EventParser>(
         longest_gap = longest_gap.max(last_data.elapsed());
         last_data = tokio::time::Instant::now();
         let items = parser.feed(&chunk);
-        if let Err(e) = handle_items(items, &mut cp, sink, observer, &mut done) {
+        if let Err(e) = handle_items(items, map_error, &mut cp, sink, observer, &mut done) {
             break Err(e);
         }
         if done {
@@ -183,7 +183,7 @@ pub async fn run_with<P: EventParser>(
     let result = match result {
         Ok(()) if !done => {
             let tail = parser.finish();
-            match handle_items(tail, &mut cp, sink, observer, &mut done) {
+            match handle_items(tail, map_error, &mut cp, sink, observer, &mut done) {
                 Err(e) => Err(e),
                 Ok(()) if !cp.finished() && !done => {
                     let mut e = LlmError::network("stream ended without a finish reason or [DONE]");
@@ -200,6 +200,7 @@ pub async fn run_with<P: EventParser>(
 
 fn handle_items<P: EventParser>(
     items: Vec<SseItem>,
+    map_error: ErrorMapper,
     cp: &mut P,
     sink: &mut dyn EventSink,
     observer: &dyn Observer,
@@ -211,6 +212,19 @@ fn handle_items<P: EventParser>(
         }
         match item {
             SseItem::Comment(c) => observer.sse_comment(&c),
+            // A bare JSON line instead of an event: an error object, reported as
+            // one (anything else is only logged).
+            SseItem::Json(line) => {
+                observer.sse_data(&line);
+                if let Ok(v) = serde_json::from_str::<Value>(&line)
+                    && let Some(err) = v.get("error")
+                {
+                    let mut e = map_error(err, None, None, ErrorKind::InBand);
+                    e.partial_output = cp.any_output();
+                    e.details = Some(v);
+                    return Err(e);
+                }
+            }
             SseItem::Event(ev) => {
                 observer.sse_data(&ev.data);
                 let data = ev.data.trim();

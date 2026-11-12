@@ -3,23 +3,33 @@
 //! - [`sse`]: SSE parser.
 //! - [`error`]: errors with retry classification; upstream payloads kept verbatim.
 //! - [`event`]: normalized stream events and the turn accumulator.
-//! - [`openrouter`]: OpenRouter client (catalog, Chat Completions dialect, options).
-//!
-//! Direct official APIs (OpenAI Responses, Anthropic Messages, Gemini) can be
-//! added as further [`Provider`] implementations reusing the same events.
+//! - [`openrouter`]: OpenRouter client (catalog, Chat Completions / Responses /
+//!   Messages skins, options).
+//! - [`provider`]: the platforms' own APIs behind one interface
+//!   ([`provider::Provider`]): [`openai`], [`anthropic`], [`google`], [`xai`],
+//!   [`deepseek`], [`zhipu`], [`moonshot`], [`alibaba`], [`ark`].
 #![allow(clippy::result_large_err)]
 
+pub mod alibaba;
+pub mod anthropic;
 pub mod ark;
 pub mod budget;
 pub mod chatstream;
+pub mod deepseek;
 pub mod error;
 pub mod event;
 #[cfg(test)]
 mod fixtures;
+pub mod google;
+pub mod moonshot;
+pub mod openai;
 pub mod openrouter;
+pub mod provider;
 pub mod request;
 pub mod settings;
 pub mod sse;
+pub mod xai;
+pub mod zhipu;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -107,9 +117,13 @@ pub struct Prepared {
 }
 
 impl Prepared {
-    /// Request that resumes generation from a continuation item: the same
-    /// conversation plus an assistant turn carrying only that item.
+    /// Request that resumes a long-decode answer from a continuation item. On
+    /// OpenRouter: the same conversation plus an assistant turn carrying only
+    /// that item; on the Gemini API: see [`google::continuation_request`].
     pub fn with_continuation(&self, item: &Value) -> Prepared {
+        if self.dialect == google::DIALECT {
+            return google::continuation_request(self, item);
+        }
         let mut p = self.clone();
         if let Some(msgs) = p.body.get_mut("messages").and_then(Value::as_array_mut) {
             msgs.push(serde_json::json!({"role": "assistant", "content": "", "reasoning_details": [item]}));
@@ -117,10 +131,87 @@ impl Prepared {
         p
     }
 
-    /// The output budget of the request (`max_tokens`, or Responses' `max_output_tokens`).
-    pub fn max_tokens(&self) -> Option<u64> {
-        self.body.get("max_tokens").or_else(|| self.body.get("max_output_tokens")).and_then(Value::as_u64)
+    /// Where the request's output budget lives in its body.
+    fn max_tokens_pointer(&self) -> &'static str {
+        if self.dialect == google::DIALECT {
+            "/generationConfig/maxOutputTokens"
+        } else if self.body.get("max_output_tokens").is_some() || self.dialect.ends_with(".responses") {
+            "/max_output_tokens"
+        } else if self.body.get("max_completion_tokens").is_some() {
+            "/max_completion_tokens"
+        } else {
+            "/max_tokens"
+        }
     }
+
+    /// The output budget of the request (`max_tokens`, Responses' `max_output_tokens`,
+    /// Gemini's `maxOutputTokens`, …).
+    pub fn max_tokens(&self) -> Option<u64> {
+        self.body.pointer(self.max_tokens_pointer()).and_then(Value::as_u64)
+    }
+
+    /// Set (`Some`) or remove the output budget, wherever the dialect keeps it.
+    pub fn set_max_tokens(&mut self, v: Option<u64>) {
+        let ptr = self.max_tokens_pointer();
+        let (parent, key) = ptr.rsplit_once('/').unwrap_or(("", ptr));
+        let key = key.to_string();
+        if parent.is_empty() {
+            match (v, self.body.as_object_mut()) {
+                (Some(v), Some(o)) => {
+                    o.insert(key, v.into());
+                }
+                (None, Some(o)) => {
+                    o.remove(&key);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let parent = parent.trim_start_matches('/').to_string();
+        match v {
+            Some(v) => {
+                if !self.body.get(&parent).is_some_and(Value::is_object) {
+                    self.body[&parent] = serde_json::json!({});
+                }
+                self.body[&parent][&key] = v.into();
+            }
+            None => {
+                if let Some(o) = self.body.get_mut(&parent).and_then(Value::as_object_mut) {
+                    o.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// One native payload for replay from those of several long-decode hops
+/// (`full_text`: the whole answer).
+pub fn merge_natives(dialect: &str, natives: &[Value], full_text: &str) -> Value {
+    if dialect == google::DIALECT {
+        return google::merge_natives(natives, full_text);
+    }
+    // Responses output items and Messages content blocks are complete per call
+    // (only Chat Completions answers come in several long-decode hops): kept
+    // exactly as received, or their replay would lose reasoning and tool blocks.
+    if !dialect.ends_with(".chat") {
+        return natives.last().cloned().unwrap_or(Value::Null);
+    }
+    let mut m = natives.last().cloned().unwrap_or_else(|| serde_json::json!({"role": "assistant"}));
+    m["content"] = serde_json::json!(full_text);
+    let details: Vec<Value> = natives
+        .iter()
+        .filter_map(|n| n.get("reasoning_details").and_then(Value::as_array))
+        .flatten()
+        .cloned()
+        .collect();
+    if !details.is_empty() {
+        m["reasoning_details"] = Value::Array(details);
+    }
+    let reasoning: String = natives.iter().filter_map(|n| n.get("reasoning").and_then(Value::as_str)).collect();
+    if !reasoning.is_empty() {
+        m["reasoning"] = serde_json::json!(reasoning);
+    }
+    m
 }
 
 /// Result metadata of a finished (or failed) stream.

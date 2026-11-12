@@ -163,29 +163,38 @@ struct Checkpoint {
 /// OpenRouter's output budget when `max_tokens` is omitted.
 const DEFAULT_BUDGET: u64 = 65_536;
 
-/// Force `max_tokens` (continuations must resend the same cumulative budget, or raise it).
+/// Force the output budget (continuations must resend the same cumulative
+/// budget, or raise it), wherever the request's dialect keeps it.
 fn force_max_tokens(p: &mut Prepared, v: Option<u64>, source: &str) {
-    match v {
-        Some(v) => {
-            if p.max_tokens() != Some(v) {
-                p.body["max_tokens"] = json!(v);
-                p.applied.push(omni_llm::openrouter::options::Applied {
-                    source: source.into(),
-                    patch: json!({"max_tokens": v}),
-                });
-            }
-        }
-        None => {
-            if let Some(o) = p.body.as_object_mut() {
-                o.remove("max_tokens");
-            }
+    if p.max_tokens() != v {
+        p.set_max_tokens(v);
+        if let Some(v) = v {
+            p.applied.push(omni_llm::openrouter::options::Applied {
+                source: source.into(),
+                patch: json!({"max output tokens": v}),
+            });
         }
     }
     p.auto_max_tokens = None;
 }
 
+/// The output budget of a recorded request (`attempts.request`).
+fn recorded_max_tokens(req: &Value) -> Option<u64> {
+    [
+        "/body/max_tokens",
+        "/body/max_output_tokens",
+        "/body/max_completion_tokens",
+        "/body/generationConfig/maxOutputTokens",
+    ]
+    .iter()
+    .find_map(|p| req.pointer(p).and_then(Value::as_u64))
+}
+
 /// Google's 400 when a resumed hop has no budget left (the dropped hop spent it).
 fn budget_exhausted(e: &LlmError) -> bool {
+    if e.error_type.as_deref() == Some(omni_llm::google::errors::BUDGET_EXHAUSTED) {
+        return true;
+    }
     let mut s = e.message.to_ascii_lowercase();
     if let Some(d) = &e.details {
         s.push_str(&d.to_string().to_ascii_lowercase());
@@ -247,13 +256,11 @@ impl Ctx {
         };
         let blobs = Blobs(self.app.blobs.clone());
         let p = match self.spec.provider.as_str() {
-            "ark" => match &self.app.ark {
-                Some(ark) => ark.prepare_chat(&input, &presets, &blobs).await,
-                None => Err(LlmError::request(
-                    "the Volcengine Ark provider is not configured (set ARK_API_KEY / [providers.ark] api_key)",
-                )),
+            "openrouter" => self.app.openrouter.prepare_chat(&input, &presets, &blobs).await,
+            id => match self.app.direct(id) {
+                Some(p) => p.prepare(&input, &presets, &blobs).await,
+                None => Err(not_configured(id)),
             },
-            _ => self.app.openrouter.prepare_chat(&input, &presets, &blobs).await,
         }?;
         crate::policy::check(&self.app, self.user_id, &self.spec.provider, &self.spec.model, &p.body)
             .map_err(LlmError::request)?;
@@ -323,7 +330,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
     };
     let max_attempts = app.cfg.retry.max_attempts.max(1);
     let base_state = RenderState {
-        model: spec.model.clone(),
+        model: spec.display_model(),
         options: spec.options_syntax(),
         parts: Vec::new(),
         status: Status::Generating,
@@ -402,7 +409,7 @@ async fn run_turn(app: Arc<App>, turn_id: i64) -> Result<()> {
         if let Some(last) = attempts.last().filter(|a| a.status == "running") {
             let (req, ..) = conv::attempt_json(&app.db, last.id).await?;
             let appending = req.as_ref().and_then(|r| r.get("continue")).and_then(Value::as_bool).unwrap_or(false);
-            let max_tokens = req.as_ref().and_then(|r| r.pointer("/body/max_tokens")).and_then(Value::as_u64);
+            let max_tokens = req.as_ref().and_then(recorded_max_tokens);
             if let Some(cp) = load_checkpoint(&app, last.id).await.filter(|c| !c.at_budget) {
                 warn!(
                     attempt = last.n,
@@ -509,7 +516,7 @@ async fn run_continue(app: Arc<App>, turn_id: i64, command_msg: i32) -> Result<(
             crate::reply::notice(&app, &ctx.bot, ctx.chat_id, command_msg, &format!("⚠️ {msg}")).await;
             return Ok(());
         }
-        let step = if cp.step > 0 { cp.step } else { app.openrouter.config().fidelity.long_decode_budget };
+        let step = if cp.step > 0 { cp.step } else { app.long_decode_budget(&ctx.spec.provider) };
         let budget = cp.spent + step;
         let mut prepared = match ctx.prepare(None).await {
             Ok(p) => p,
@@ -757,7 +764,9 @@ impl Sink<'_> {
     /// What to show: like [`Self::total_usage`], with the current hop's usage so
     /// far when its final usage has not arrived yet.
     fn display_usage(&self) -> Option<Usage> {
-        match (&self.usage_done, self.hop_usage.as_ref().or(self.live_usage.as_ref())) {
+        // The newest of the two: billed usage arriving mid-stream (a long-decode
+        // checkpoint) clears the live counts, which then take over again.
+        match (&self.usage_done, self.live_usage.as_ref().or(self.hop_usage.as_ref())) {
             (u, Some(h)) => Some(add_usage(u, h)),
             (u, None) => u.clone(),
         }
@@ -805,6 +814,7 @@ impl EventSink for Sink<'_> {
         match &ev {
             StreamEvent::Usage(u) => {
                 self.hop_usage = Some(u.clone());
+                self.live_usage = None;
                 self.meta_dirty = true;
                 self.publish();
                 return;
@@ -892,31 +902,19 @@ async fn stream(
     observer: &RawLog,
     cancel: &CancellationToken,
 ) -> (Result<Value, LlmError>, omni_llm::CallOutcome) {
-    match (provider, &app.ark) {
-        ("ark", Some(ark)) => ark.stream_chat(p, sink, observer, cancel).await,
-        ("ark", None) => (Err(LlmError::request("the Volcengine Ark provider is not configured")), Default::default()),
-        _ => app.openrouter.stream_chat(p, sink, observer, cancel).await,
+    match provider {
+        "openrouter" => app.openrouter.stream_chat(p, sink, observer, cancel).await,
+        id => match app.direct(id) {
+            Some(d) => d.stream(p, sink, observer, cancel).await,
+            None => (Err(not_configured(id)), Default::default()),
+        },
     }
 }
 
-/// Merge the native payloads of several hops into one assistant message for replay.
-fn merge_natives(natives: &[Value], full_text: &str) -> Value {
-    let mut m = natives.last().cloned().unwrap_or_else(|| json!({"role": "assistant"}));
-    m["content"] = json!(full_text);
-    let details: Vec<Value> = natives
-        .iter()
-        .filter_map(|n| n.get("reasoning_details").and_then(Value::as_array))
-        .flatten()
-        .cloned()
-        .collect();
-    if !details.is_empty() {
-        m["reasoning_details"] = Value::Array(details);
-    }
-    let reasoning: String = natives.iter().filter_map(|n| n.get("reasoning").and_then(Value::as_str)).collect();
-    if !reasoning.is_empty() {
-        m["reasoning"] = json!(reasoning);
-    }
-    m
+/// A turn of a provider that is no longer configured (its key was removed).
+fn not_configured(id: &str) -> LlmError {
+    let (name, env) = omni_llm::provider::info(id).map(|i| (i.name, i.env)).unwrap_or((id, "its API key"));
+    LlmError::request(format!("the {name} provider is not configured (set {env} / [providers.{id}] api_key)"))
 }
 
 async fn run_attempt(
@@ -1035,6 +1033,11 @@ async fn run_attempt(
                 let _ = save_echo(app, attempt.id, echo).await;
             }
             if matches!(&result, Err(e) if e.kind == omni_llm::ErrorKind::Cancelled) && app.shutdown.is_cancelled() {
+                // What the provider billed so far (e.g. Gemini up to its last checkpoint) is spent.
+                if let Some(u) = sink.end_hop() {
+                    let meta = ctx.call_meta(attempt.id);
+                    let _ = crate::ledger::record_call(&app.db, &meta, hop_id.clone(), &u, "reported").await;
+                }
                 // Leave the attempt "running": it is resumed (from its checkpoint, if any) after restart.
                 let out = serde_json::to_value(sink.acc.turn()).ok();
                 let up = Some(upstream_ids.join(",")).filter(|s| !s.is_empty());
@@ -1158,8 +1161,13 @@ async fn run_attempt(
                 turn.native = Some(omni_core::NativeOutput {
                     dialect: prepared.dialect.to_string(),
                     model: prepared.model.clone(),
-                    payload: merge_natives(&all_natives, &full_text),
-                    context_tokens: first_prompt.map(|p| p + spent_total),
+                    payload: omni_llm::merge_natives(prepared.dialect, &all_natives, &full_text),
+                    // The reported input counts every internal model call of a turn that used
+                    // server-side tools (each search re-reads the context), far more than the
+                    // conversation's size: then the next turn estimates instead.
+                    context_tokens: first_prompt
+                        .filter(|_| !turn.parts.iter().any(|p| matches!(p, Part::ToolCall(_))))
+                        .map(|p| p + spent_total),
                 });
                 if at_budget {
                     final_state.notes.push(format!(
@@ -1361,8 +1369,13 @@ mod tests {
     fn natives_merge() {
         let n1 = json!({"role": "assistant", "content": "a", "reasoning_details": [{"type": "reasoning.text", "text": "t1"}]});
         let n2 = json!({"role": "assistant", "content": "b", "reasoning_details": [{"type": "reasoning.encrypted", "data": "x"}]});
-        let m = merge_natives(&[n1, n2], "ab");
+        let m = omni_llm::merge_natives("openrouter.chat", &[n1, n2], "ab");
         assert_eq!(m["content"], "ab");
         assert_eq!(m["reasoning_details"].as_array().unwrap().len(), 2);
+        // Messages blocks and Responses items are replayed as received (thinking, tools).
+        let blocks = json!({"role": "assistant", "content": [{"type": "thinking", "thinking": "t", "signature": "s"}, {"type": "text", "text": "a"}]});
+        assert_eq!(omni_llm::merge_natives("openrouter.messages", std::slice::from_ref(&blocks), "a"), blocks);
+        let items = json!({"output": [{"type": "reasoning", "encrypted_content": "e"}]});
+        assert_eq!(omni_llm::merge_natives("openai.responses", std::slice::from_ref(&items), "a"), items);
     }
 }

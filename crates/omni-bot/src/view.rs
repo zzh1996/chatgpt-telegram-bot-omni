@@ -225,9 +225,11 @@ fn next_page<'a>(
     sent: &[(i32, Option<String>, Option<Shape>)],
     markup_of: impl Fn(usize) -> Option<&'a tl::enums::ReplyMarkup>,
 ) -> Option<(usize, &'a Content, String)> {
-    pages.iter().enumerate().map(|(i, c)| (i, c, outbox::page_hash(c, markup_of(i)))).find(|(i, _, h)| {
-        sent.get(*i).and_then(|(_, sh, _)| sh.as_deref()) != Some(h.as_str())
-    })
+    pages
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, c, outbox::page_hash(c, markup_of(i))))
+        .find(|(i, _, h)| sent.get(*i).and_then(|(_, sh, _)| sh.as_deref()) != Some(h.as_str()))
 }
 
 /// What sending or editing page `i` to `content` weighs.
@@ -312,7 +314,8 @@ async fn sync_loop(
                 let pages = pages_for(state, fallback);
                 let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
                 let markup_of = |i: usize| if i + 1 == pages.len() { markup.as_ref() } else { None };
-                let weight = next_page(&pages, &sent, markup_of).map_or(Weight::Light, |(i, c, _)| page_weight(&sent, i, c));
+                let weight =
+                    next_page(&pages, &sent, markup_of).map_or(Weight::Light, |(i, c, _)| page_weight(&sent, i, c));
                 let class = if state.done {
                     Class::Final
                 } else if sent.is_empty() {

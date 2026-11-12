@@ -53,76 +53,85 @@ pub fn check(app: &App, user_id: i64, provider: &str, model: &str, body: &Value)
              ([access].priority_users). Everyone else uses the default tier"
         ))
     };
-    match provider {
-        "ark" => {
-            if let Some(t) = body.get("service_tier").and_then(Value::as_str)
-                && t == "fast"
+    if provider != "openrouter" {
+        // The platforms' own APIs: only their priority tiers, in whatever field
+        // the platform uses (`service_tier`, Gemini's `serviceTier`, Anthropic's
+        // `speed`).
+        for key in ["service_tier", "serviceTier"] {
+            if let Some(t) = body.get(key).and_then(Value::as_str)
+                && HIGH_TIERS.contains(&t.to_ascii_lowercase().as_str())
                 && !priority_ok
             {
-                return deny_priority("service_tier fast");
+                return deny_priority(&format!("{key} {t}"));
             }
-            Ok(())
         }
-        _ => {
-            // Priority tiers, however they are requested.
-            if let Some(t) = body.get("service_tier").and_then(Value::as_str)
-                && HIGH_TIERS.contains(&t)
-                && !priority_ok
-            {
-                return deny_priority(&format!("service_tier {t}"));
-            }
-            if body.get("speed").and_then(Value::as_str) == Some("fast") && !priority_ok {
-                return deny_priority("speed fast");
-            }
-            let sent_model = body.get("model").and_then(Value::as_str).unwrap_or(model);
-            if sent_model.ends_with(":nitro") && !priority_ok {
-                return deny_priority("the :nitro variant");
-            }
-            let routing = body.get("provider");
-            let slugs: Vec<String> = ["only", "order"]
-                .iter()
-                .filter_map(|k| routing.and_then(|p| p.get(*k)).and_then(Value::as_array))
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect();
-            if let Some(s) = slugs.iter().find(|s| high_tier_slug(s))
-                && !priority_ok
-            {
-                return deny_priority(&format!("provider endpoint {s}"));
-            }
-            // Providers.
-            let author = model.split('/').next().unwrap_or("");
-            let mut allowed = app.allowed_providers.get(author).cloned().unwrap_or_default();
-            if let Some(fp) = app.openrouter.config().fidelity.first_party_for(model)
-                && !allowed.iter().any(|a| a == fp)
-            {
-                allowed.insert(0, fp.to_string());
-            }
-            if allowed.is_empty() {
-                // No official serving options known for this author: only the default routing.
-                if !slugs.is_empty() {
-                    return Err(format!("choosing a provider is not allowed for `{model}`"));
-                }
-                return Ok(());
-            }
-            let pinned = routing.and_then(|p| p.get("only")).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
-            let fallbacks = routing.and_then(|p| p.get("allow_fallbacks")).and_then(Value::as_bool) != Some(false);
-            if !pinned || fallbacks {
-                return Err(format!(
-                    "`{model}` must be served by one of its official providers ({}); OpenRouter's free routing is not allowed",
-                    allowed.join(", ")
-                ));
-            }
-            if let Some(bad) = slugs.iter().find(|s| !allowed.iter().any(|a| a == base_slug(s))) {
-                return Err(format!(
-                    "provider `{bad}` is not allowed for `{model}`; allowed: {} (+p=<slug>, regions like google-vertex/us are fine)",
-                    allowed.join(", ")
-                ));
-            }
-            Ok(())
+        if body.get("speed").and_then(Value::as_str) == Some("fast") && !priority_ok {
+            return deny_priority("speed fast");
         }
+        // Moonshot sells its faster serving as separate models at twice the price
+        // (`kimi-k3.1-pro-highspeed`): a priority tier, like OpenRouter's `:nitro`.
+        if provider == "moonshot" && model.ends_with("-highspeed") && !priority_ok {
+            return deny_priority(&format!("`{model}` (Moonshot's high-speed serving)"));
+        }
+        return Ok(());
     }
+    // Priority tiers, however they are requested.
+    if let Some(t) = body.get("service_tier").and_then(Value::as_str)
+        && HIGH_TIERS.contains(&t)
+        && !priority_ok
+    {
+        return deny_priority(&format!("service_tier {t}"));
+    }
+    if body.get("speed").and_then(Value::as_str) == Some("fast") && !priority_ok {
+        return deny_priority("speed fast");
+    }
+    let sent_model = body.get("model").and_then(Value::as_str).unwrap_or(model);
+    if sent_model.ends_with(":nitro") && !priority_ok {
+        return deny_priority("the :nitro variant");
+    }
+    let routing = body.get("provider");
+    let slugs: Vec<String> = ["only", "order"]
+        .iter()
+        .filter_map(|k| routing.and_then(|p| p.get(*k)).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if let Some(s) = slugs.iter().find(|s| high_tier_slug(s))
+        && !priority_ok
+    {
+        return deny_priority(&format!("provider endpoint {s}"));
+    }
+    // Providers.
+    let author = model.split('/').next().unwrap_or("");
+    let mut allowed = app.allowed_providers.get(author).cloned().unwrap_or_default();
+    if let Some(fp) = app.openrouter.config().fidelity.first_party_for(model)
+        && !allowed.iter().any(|a| a == fp)
+    {
+        allowed.insert(0, fp.to_string());
+    }
+    if allowed.is_empty() {
+        // No official serving options known for this author: only the default routing.
+        if !slugs.is_empty() {
+            return Err(format!("choosing a provider is not allowed for `{model}`"));
+        }
+        return Ok(());
+    }
+    let pinned = routing.and_then(|p| p.get("only")).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    let fallbacks = routing.and_then(|p| p.get("allow_fallbacks")).and_then(Value::as_bool) != Some(false);
+    if !pinned || fallbacks {
+        return Err(format!(
+            "`{model}` must be served by one of its official providers ({}); OpenRouter's free routing is not allowed",
+            allowed.join(", ")
+        ));
+    }
+    if let Some(bad) = slugs.iter().find(|s| !allowed.iter().any(|a| a == base_slug(s))) {
+        return Err(format!(
+            "provider `{bad}` is not allowed for `{model}`; allowed: {} (+p=<slug>, regions like google-vertex/us are fine)",
+            allowed.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

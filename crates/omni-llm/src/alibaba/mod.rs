@@ -1,0 +1,921 @@
+//! Alibaba Cloud Model Studio / Bailian (DashScope), China (Beijing) region,
+//! OpenAI-compatible mode at `https://dashscope.aliyuncs.com/compatible-mode/v1`
+//! (the old bot's URL; Alibaba now recommends the workspace domain
+//! `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`,
+//! which can be configured as the base URL). Spec:
+//! docs/research/glm_kimi_qwen.md §3, checked against help.aliyun.com/zh/model-studio
+//! on 2026-11-12.
+//!
+//! - **Chat Completions** (`alibaba.chat`) for every request without the code
+//!   interpreter. Thinking is hybrid (`enable_thinking`, on by default, sent
+//!   explicitly); Qwen3.8 adds `reasoning_effort` low | medium | xhigh, sent
+//!   explicitly as xhigh (unset, the thinking budget is 131,072 instead of
+//!   xhigh's 262,144); `budget=` maps to `thinking_budget`. Web search:
+//!   `enable_search` + `search_options.search_strategy` (the most capable one
+//!   the model has on this API); Chat Completions returns no sources.
+//! - **Code interpreter** (`+c`): Chat Completions has it only for the Qwen3-Max
+//!   and Qwen3.5-Plus series; for the Qwen3.8/3.7 models it is a Responses-API
+//!   tool, so `+c` requests use the Responses API (`alibaba.responses`, see
+//!   [`responses`]) with `store: false`.
+//! - `reasoning_content` is replayed for the same model (Qwen3.8 reads it back by
+//!   default: `preserve_thinking` defaults to true there).
+//! - Images and videos as base64 data URLs, images at the highest resolution
+//!   (`vl_high_resolution_images`). PDFs and documents only go through
+//!   uploads/URLs (Qwen-Long `fileid://`, Responses `input_file` URLs): rejected.
+//! - Output: the default `max_completion_tokens` is the model's maximum and the
+//!   input has its own limit, so no output budget is sent unless a cap is
+//!   configured.
+//! - Errors: `{"error":{"message","type","param","code"},"request_id"}` (DashScope
+//!   style `{"code","message","request_id"}` on some paths); moderation
+//!   (`data_inspection_failed`) may be triggered by the input or the output.
+//! - No cost in responses: estimated from the CNY price list (Beijing).
+
+mod responses;
+
+use omni_core::Usage;
+use omni_core::content::{Part, Role, Turn};
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::error::{ErrorKind, LlmError, Retry, retry_for_status};
+use crate::event::StreamEvent;
+use crate::openrouter::chat::ChunkParser;
+use crate::openrouter::options::{Applied, overlay};
+use crate::provider::{Currency, DirectConfig, PricingSink, Provider, TokenPrice, usd};
+use crate::request::{Requested, RouteCaps, Tool};
+use crate::{BlobLoader, CallInput, CallOutcome, EventSink, MediaClass, Observer, Prepared, classify_mime};
+
+pub const DIALECT: &str = "alibaba.chat";
+/// The Responses API, used for the code interpreter.
+pub const RESPONSES_DIALECT: &str = "alibaba.responses";
+const NAME: &str = "Alibaba Model Studio";
+const REQUEST_ID_HEADER: &str = "x-request-id";
+/// Base64 videos must stay under 10 MB encoded (help.aliyun.com/zh/model-studio/vision).
+const MAX_VIDEO_DATA_URL: usize = 10 * 1024 * 1024;
+/// Shown with every Chat Completions web search.
+const SEARCH_NOTE: &str = "Alibaba's Chat Completions API runs the search but returns no sources or citations";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thinking {
+    /// `enable_thinking` true (default) | false.
+    Hybrid,
+    /// Thinking only (no switch).
+    Always,
+}
+
+/// Prices for requests with up to `up_to` input tokens (all tokens of a request
+/// are billed at its tier).
+#[derive(Debug, Clone, Copy)]
+pub struct Tier {
+    pub up_to: u64,
+    pub price: TokenPrice,
+}
+
+/// Known limits, parameters and list prices of a Qwen model.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelSpec {
+    pub id: &'static str,
+    pub context: u64,
+    /// Output limit of the model page (the default and maximum `max_completion_tokens`).
+    pub max_output: u64,
+    /// Longest chain of thought (`thinking_budget` maximum), where documented.
+    pub max_cot: Option<u64>,
+    /// Image and video input.
+    pub vision: bool,
+    pub thinking: Thinking,
+    /// `reasoning_effort` low | medium | xhigh (Qwen3.8).
+    pub effort: bool,
+    /// The most capable Chat Completions `search_strategy` for `+s`.
+    pub search: &'static str,
+    /// The code interpreter needs thinking mode (Alibaba's list).
+    pub code_needs_thinking: bool,
+    /// CNY per 1M tokens by input length, ascending.
+    pub tiers: &'static [Tier],
+}
+
+const fn cny(input: f64, cached_input: f64, output: f64) -> TokenPrice {
+    // Only the implicit cache is used (no `cache_control`): no cache writes.
+    TokenPrice { input, cached_input, cache_write: input, output }
+}
+
+const WINDOW: u64 = 1_000_000;
+const MAX_OUT: u64 = 131_072;
+const MAX_COT: u64 = 262_144;
+
+const QWEN38_MAX: &[Tier] = &[Tier { up_to: WINDOW, price: cny(12.0, 1.5, 36.0) }];
+const QWEN38_FLASH: &[Tier] = &[Tier { up_to: WINDOW, price: cny(0.8, 0.1, 2.7) }];
+const QWEN37_MAX: &[Tier] = &[Tier { up_to: WINDOW, price: cny(12.0, 2.4, 36.0) }];
+/// No context cache on these snapshots.
+const QWEN37_MAX_PREVIEW: &[Tier] = &[Tier { up_to: WINDOW, price: cny(12.0, 12.0, 36.0) }];
+const QWEN37_PLUS: &[Tier] =
+    &[Tier { up_to: 256_000, price: cny(2.0, 0.4, 8.0) }, Tier { up_to: WINDOW, price: cny(6.0, 1.2, 24.0) }];
+
+const fn qwen38(id: &'static str, tiers: &'static [Tier]) -> ModelSpec {
+    ModelSpec {
+        id,
+        context: WINDOW,
+        max_output: MAX_OUT,
+        max_cot: Some(MAX_COT),
+        vision: true,
+        thinking: Thinking::Hybrid,
+        effort: true,
+        // Qwen3.8 has no `agent` strategy on Chat Completions.
+        search: "max",
+        code_needs_thinking: true,
+        tiers,
+    }
+}
+
+const fn qwen37(id: &'static str, vision: bool, max_cot: Option<u64>, tiers: &'static [Tier]) -> ModelSpec {
+    ModelSpec {
+        id,
+        context: WINDOW,
+        max_output: MAX_OUT,
+        max_cot,
+        vision,
+        thinking: Thinking::Hybrid,
+        effort: false,
+        search: "agent",
+        code_needs_thinking: true,
+        tiers,
+    }
+}
+
+/// Qwen models in the China (Beijing) region: help.aliyun.com/zh/model-studio
+/// model pages (`qwen3-8-max`, `qwen3-8-flash`, `qwen3-7-max`, `qwen3-7-plus`),
+/// `model-pricing`, `deep-thinking`, `web-search`, `qwen-code-interpreter`,
+/// `context-cache`, fetched 2026-11-12. CNY list prices ("原价", without
+/// limited-time discounts). All: 1,000,000-token window, output 131,072, input
+/// limited separately (991,808; 983,616 when thinking).
+pub const MODELS: &[ModelSpec] = &[
+    qwen38("qwen3.8-max", QWEN38_MAX),
+    qwen38("qwen3.8-max-0902", QWEN38_MAX),
+    // The snapshot's documented alias.
+    qwen38("qwen3.8-max-2026-09-02", QWEN38_MAX),
+    qwen38("qwen3.8-flash", QWEN38_FLASH),
+    // `qwen3.7-max` currently equals the 2026-05-20 snapshot: text only.
+    qwen37("qwen3.7-max", false, Some(MAX_COT), QWEN37_MAX),
+    qwen37("qwen3.7-max-2026-05-20", false, Some(MAX_COT), QWEN37_MAX),
+    qwen37("qwen3.7-max-2026-06-08", true, None, QWEN37_MAX),
+    ModelSpec { thinking: Thinking::Always, ..qwen37("qwen3.7-max-preview", false, None, QWEN37_MAX_PREVIEW) },
+    ModelSpec { thinking: Thinking::Always, ..qwen37("qwen3.7-max-2026-05-17", false, None, QWEN37_MAX_PREVIEW) },
+    ModelSpec { code_needs_thinking: false, ..qwen37("qwen3.7-plus", true, Some(MAX_COT), QWEN37_PLUS) },
+    ModelSpec { code_needs_thinking: false, ..qwen37("qwen3.7-plus-2026-05-26", true, Some(MAX_COT), QWEN37_PLUS) },
+];
+
+pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
+    MODELS.iter().find(|m| m.id == model)
+}
+
+/// Qwen3.8 effort levels, highest first.
+const EFFORTS: [&str; 3] = ["xhigh", "medium", "low"];
+
+/// Search fee per call by strategy (CNY, Beijing, from 2026-02-27); the
+/// Responses `web_search` tool is billed as `agent`.
+pub fn search_fee_cny(strategy: &str) -> f64 {
+    match strategy {
+        "turbo" | "standard" | "pro" => 0.003,
+        _ => 0.004, // max, agent, agent_max (its web extractor is free for now), pro_max, pro_ultra
+    }
+}
+
+/// What Alibaba's API offers for a model (the vendor's own API: official = route).
+struct Caps<'a> {
+    spec: &'a ModelSpec,
+    /// The request goes to the Responses API (no `thinking_budget` there).
+    responses: bool,
+}
+
+impl RouteCaps for Caps<'_> {
+    fn name(&self) -> &str {
+        NAME
+    }
+    fn tool(&self, tool: Tool) -> bool {
+        // Search, code interpreter, web extractor: all Qwen3.8/3.7 models (Beijing).
+        tool != Tool::Maps
+    }
+    fn efforts(&self) -> Option<Vec<String>> {
+        self.spec.effort.then(|| EFFORTS.map(String::from).to_vec())
+    }
+    fn can_disable_reasoning(&self) -> bool {
+        self.spec.thinking == Thinking::Hybrid
+    }
+    fn budget(&self) -> bool {
+        !self.responses
+    }
+    fn verbosity(&self) -> bool {
+        false
+    }
+    fn image_options(&self) -> bool {
+        false
+    }
+    fn tiers(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Checks with more precise messages than the generic validation.
+fn check(spec: &ModelSpec, req: &Requested) -> Result<(), LlmError> {
+    let has = |t: Tool| req.tools.contains(&t);
+    let off = req.effort.as_deref() == Some("none");
+    if has(Tool::Fetch) && !has(Tool::Search) {
+        return Err(LlmError::request(format!(
+            "`{}`: Alibaba's web extractor (`+u`) only runs together with its web search: use +su",
+            spec.id
+        )));
+    }
+    if off && has(Tool::Code) && spec.code_needs_thinking {
+        return Err(LlmError::request(format!(
+            "`{}`: Alibaba's code interpreter (`+c`) needs thinking mode on this model (no e=none)",
+            spec.id
+        )));
+    }
+    if off && has(Tool::Fetch) {
+        return Err(LlmError::request(format!(
+            "`{}`: Alibaba's web extractor (`+u`) needs thinking mode (no e=none)",
+            spec.id
+        )));
+    }
+    if let Some(n) = req.budget {
+        if has(Tool::Code) {
+            return Err(LlmError::request(format!(
+                "`{}`: the code interpreter (`+c`) needs Alibaba's Responses API, which has no thinking budget \
+                 (budget=){}",
+                spec.id,
+                if spec.effort { "; use e=xhigh|medium|low" } else { "" }
+            )));
+        }
+        if let Some(max) = spec.max_cot
+            && n > max
+        {
+            return Err(LlmError::request(format!(
+                "budget={n} is above `{}`'s longest chain of thought ({max} tokens)",
+                spec.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `req` asks for anything (`tier=default|auto` changes nothing).
+fn has_options(req: &Requested) -> bool {
+    let mut r = req.clone();
+    if matches!(r.tier.as_deref(), Some("default" | "auto")) {
+        r.tier = None;
+    }
+    r != Requested::default()
+}
+
+pub struct Alibaba {
+    cfg: DirectConfig,
+    http: reqwest::Client,
+}
+
+impl Alibaba {
+    pub fn new(cfg: DirectConfig) -> anyhow::Result<Self> {
+        let http = cfg.http()?;
+        Ok(Self { cfg, http })
+    }
+
+    /// An explicit output budget only when it lowers the default (the model's
+    /// maximum): after a context overflow, or with a configured cap.
+    fn output_budget(&self, input: &CallInput<'_>, spec: Option<&ModelSpec>) -> Option<u64> {
+        if let Some(n) = input.max_tokens_override {
+            return Some(n);
+        }
+        let cap = self.cfg.max_tokens_cap?;
+        match spec {
+            Some(s) if cap >= s.max_output => None,
+            _ => Some(cap),
+        }
+    }
+
+    async fn prepare_request(
+        &self,
+        input: &CallInput<'_>,
+        presets: &[Requested],
+        blobs: &dyn BlobLoader,
+    ) -> Result<Prepared, LlmError> {
+        let user = crate::request::parse(input.options).map_err(LlmError::request)?;
+        let mut req = Requested::default();
+        for p in presets {
+            req = overlay(&req, p);
+        }
+        let req = overlay(&req, &user);
+        if req.providers.is_some() {
+            return Err(LlmError::request("`p=` (provider choice) does not apply to Alibaba Model Studio"));
+        }
+        let spec = model_spec(input.model);
+        let code = req.tools.contains(&Tool::Code);
+        match spec {
+            Some(s) => {
+                check(s, &req)?;
+                crate::request::validate(input.model, &req, &Caps { spec: s, responses: code })
+                    .map_err(LlmError::request)?;
+            }
+            None if has_options(&req) => {
+                return Err(LlmError::request(format!(
+                    "`{}` is not in the bot's Alibaba Model Studio model table, so its options cannot be \
+                     checked: send it without options",
+                    input.model
+                )));
+            }
+            None => {}
+        }
+        let mut notes = Vec::new();
+        let auto_max = self.output_budget(input, spec);
+        let mut p = match spec {
+            Some(s) if code => self.responses_request(input, s, &req, &user, blobs, &mut notes).await?,
+            _ => self.chat_request(input, spec, &req, &user, blobs, &mut notes).await?,
+        };
+        if let Some(n) = auto_max {
+            let key = if p.dialect == RESPONSES_DIALECT { "max_output_tokens" } else { "max_completion_tokens" };
+            p.body[key] = json!(n);
+            let mut patch = serde_json::Map::new();
+            patch.insert(key.into(), json!(n));
+            p.applied.push(Applied { source: "budget".into(), patch: Value::Object(patch) });
+        }
+        p.auto_max_tokens = auto_max;
+        p.notes.extend(notes);
+        if spec.is_none() {
+            p.warnings.push(format!(
+                "`{}` is not in the bot's Alibaba Model Studio model table: limits and price unknown (sent without \
+                 thinking settings; cost not estimated)",
+                input.model
+            ));
+        }
+        Ok(p)
+    }
+
+    async fn chat_request(
+        &self,
+        input: &CallInput<'_>,
+        spec: Option<&ModelSpec>,
+        req: &Requested,
+        user: &Requested,
+        blobs: &dyn BlobLoader,
+        notes: &mut Vec<String>,
+    ) -> Result<Prepared, LlmError> {
+        let (messages, images) = chat_messages(input.history, input.model, spec, blobs, notes).await?;
+        let mut body = json!({
+            "model": input.model,
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let mut applied = Vec::new();
+        let mut settings = Vec::new();
+        if let Some(s) = spec {
+            let mut patch = serde_json::Map::new();
+            let mut set = |k: &str, v: Value| {
+                body[k] = v.clone();
+                patch.insert(k.into(), v);
+            };
+            let described = match (req.effort.as_deref(), req.budget) {
+                (Some("none"), _) => {
+                    set("enable_thinking", json!(false));
+                    "thinking off".to_string()
+                }
+                (_, Some(n)) => {
+                    if s.thinking == Thinking::Hybrid {
+                        set("enable_thinking", json!(true));
+                    }
+                    set("thinking_budget", json!(n));
+                    format!("thinking budget {n}")
+                }
+                (e, None) => {
+                    if s.thinking == Thinking::Hybrid {
+                        set("enable_thinking", json!(true));
+                    }
+                    if s.effort {
+                        let e = e.unwrap_or(EFFORTS[0]);
+                        set("reasoning_effort", json!(e));
+                        format!("effort {e}")
+                    } else if s.thinking == Thinking::Hybrid {
+                        "thinking on".to_string()
+                    } else {
+                        "thinking (always on)".to_string()
+                    }
+                }
+            };
+            if !patch.is_empty() {
+                let by_user = user.effort.is_some() || user.budget.is_some();
+                applied.push(Applied {
+                    source: if by_user { "option" } else { "default" }.into(),
+                    patch: Value::Object(patch),
+                });
+            }
+            settings.push(described);
+            if images && s.vision {
+                // The highest image detail: 16,384 tokens (16,777,216 px) per image instead of 2,560.
+                body["vl_high_resolution_images"] = json!(true);
+                applied.push(Applied { source: "default".into(), patch: json!({"vl_high_resolution_images": true}) });
+                settings.push("high-resolution images".into());
+            }
+            if req.tools.contains(&Tool::Search) {
+                let strategy = if req.tools.contains(&Tool::Fetch) { "agent_max" } else { s.search };
+                body["enable_search"] = json!(true);
+                body["search_options"] = json!({"search_strategy": strategy});
+                // Search calls in `usage.x_tools`, for the cost estimate (no effect on the answer).
+                body["include_tool_usage"] = json!(true);
+                let by_user = user.tools.contains(&Tool::Search);
+                applied.push(Applied {
+                    source: if by_user { "option" } else { "default" }.into(),
+                    patch: json!({"enable_search": true, "search_options": body["search_options"]}),
+                });
+                applied.push(Applied { source: "default".into(), patch: json!({"include_tool_usage": true}) });
+                settings.push(if strategy == "agent_max" {
+                    "web search + web extractor (agent_max)".to_string()
+                } else {
+                    format!("web search ({strategy})")
+                });
+                notes.push(SEARCH_NOTE.into());
+            }
+        }
+        Ok(Prepared {
+            dialect: DIALECT,
+            model: input.model.to_string(),
+            url: self.cfg.url("/chat/completions"),
+            body,
+            applied,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            show_debug: false,
+            auto_max_tokens: None,
+            long_decode: false,
+            settings,
+        })
+    }
+
+    async fn responses_request(
+        &self,
+        input: &CallInput<'_>,
+        spec: &ModelSpec,
+        req: &Requested,
+        user: &Requested,
+        blobs: &dyn BlobLoader,
+        notes: &mut Vec<String>,
+    ) -> Result<Prepared, LlmError> {
+        // The Responses API keeps about 80% of the window and silently truncates the rest.
+        let prompt = crate::budget::estimate_prompt(input.history, input.known_context);
+        let keep = spec.context / 5 * 4;
+        if prompt > keep {
+            return Err(LlmError::request(format!(
+                "`{}`: this conversation (~{prompt} tokens, estimated) is longer than the ~80% of the window \
+                 ({keep} tokens) that Alibaba's Responses API keeps — it would silently truncate the rest; the \
+                 code interpreter (`+c`) is only on that API",
+                spec.id
+            )));
+        }
+        let (items, images) = responses::input_items(input.history, input.model, spec, blobs, notes).await?;
+        let mut body = json!({"model": input.model, "input": items, "stream": true, "store": false});
+        let mut applied = vec![Applied { source: "default".into(), patch: json!({"store": false}) }];
+        let mut settings = Vec::new();
+        let by_user = user.effort.is_some();
+        let off = req.effort.as_deref() == Some("none");
+        let described = if spec.effort {
+            let e = if off { "none" } else { req.effort.as_deref().unwrap_or(EFFORTS[0]) };
+            body["reasoning"] = json!({"effort": e});
+            applied.push(Applied {
+                source: if by_user { "option" } else { "default" }.into(),
+                patch: json!({"reasoning": {"effort": e}}),
+            });
+            if off { "thinking off".to_string() } else { format!("effort {e}") }
+        } else if spec.thinking == Thinking::Hybrid {
+            // No `reasoning.effort` for Qwen3.7 on this API: the (deprecated) switch.
+            body["enable_thinking"] = json!(!off);
+            applied.push(Applied {
+                source: if by_user { "option" } else { "default" }.into(),
+                patch: json!({"enable_thinking": !off}),
+            });
+            if off { "thinking off" } else { "thinking on" }.to_string()
+        } else {
+            "thinking (always on)".to_string()
+        };
+        settings.push(described);
+        let mut tools = vec![json!({"type": "code_interpreter"})];
+        settings.push("code interpreter".into());
+        if req.tools.contains(&Tool::Search) {
+            tools.push(json!({"type": "web_search"}));
+            settings.push("web search".into());
+        }
+        if req.tools.contains(&Tool::Fetch) {
+            tools.push(json!({"type": "web_extractor"}));
+            settings.push("web extractor".into());
+        }
+        body["tools"] = Value::Array(tools);
+        applied.push(Applied {
+            source: if user.tools.contains(&Tool::Code) { "option" } else { "default" }.into(),
+            patch: json!({"tools": body["tools"]}),
+        });
+        if images {
+            notes.push(
+                "images at Alibaba's default resolution: the high-resolution switch is not on the Responses API, \
+                 which the code interpreter needs"
+                    .into(),
+            );
+        }
+        Ok(Prepared {
+            dialect: RESPONSES_DIALECT,
+            model: input.model.to_string(),
+            url: self.cfg.url("/responses"),
+            body,
+            applied,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+            show_debug: false,
+            auto_max_tokens: None,
+            long_decode: false,
+            settings,
+        })
+    }
+
+    async fn stream_request(
+        &self,
+        p: &Prepared,
+        sink: &mut dyn EventSink,
+        observer: &dyn Observer,
+        cancel: &CancellationToken,
+    ) -> (Result<Value, LlmError>, CallOutcome) {
+        let rb = self.http.post(&p.url).bearer_auth(&self.cfg.api_key).json(&p.body);
+        let spec = model_spec(&p.model);
+        let rate = self.cfg.cny_per_usd;
+        if p.dialect == RESPONSES_DIALECT {
+            let crate::chatstream::Streamed { result, parser, header_id } = crate::chatstream::run_with(
+                rb,
+                &p.url,
+                &p.body,
+                self.cfg.idle_timeout,
+                Some(REQUEST_ID_HEADER),
+                error_from_json,
+                responses::Parser::new(spec, rate),
+                sink,
+                observer,
+                cancel,
+            )
+            .await;
+            let outcome = CallOutcome { upstream_id: header_id, ..Default::default() };
+            return match result {
+                Err(e) => (Err(e), outcome),
+                Ok(()) => (Ok(parser.native_payload()), outcome),
+            };
+        }
+        let strategy = p.body.pointer("/search_options/search_strategy").and_then(Value::as_str).map(str::to_string);
+        let estimate = move |u: &Usage| {
+            let searches = search_calls(u);
+            estimate_cost(spec?, u, searches, strategy.as_deref().unwrap_or("max"), rate)
+        };
+        let mut priced = PricingSink { inner: sink, estimate: &estimate };
+        let crate::chatstream::Streamed { result, parser, header_id } = crate::chatstream::run_with(
+            rb,
+            &p.url,
+            &p.body,
+            self.cfg.idle_timeout,
+            Some(REQUEST_ID_HEADER),
+            error_from_json,
+            ChatParser::default(),
+            &mut priced,
+            observer,
+            cancel,
+        )
+        .await;
+        let outcome = CallOutcome { upstream_id: header_id, ..Default::default() };
+        match result {
+            Err(e) => (Err(e), outcome),
+            Ok(()) => (Ok(parser.native_payload()), outcome),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for Alibaba {
+    fn id(&self) -> &'static str {
+        "alibaba"
+    }
+    fn name(&self) -> &'static str {
+        NAME
+    }
+    fn knows(&self, model: &str) -> bool {
+        model_spec(model).is_some()
+    }
+    async fn prepare(
+        &self,
+        input: &CallInput<'_>,
+        presets: &[Requested],
+        blobs: &dyn BlobLoader,
+    ) -> Result<Prepared, LlmError> {
+        self.prepare_request(input, presets, blobs).await
+    }
+    async fn stream(
+        &self,
+        p: &Prepared,
+        sink: &mut dyn EventSink,
+        observer: &dyn Observer,
+        cancel: &CancellationToken,
+    ) -> (Result<Value, LlmError>, CallOutcome) {
+        self.stream_request(p, sink, observer, cancel).await
+    }
+    // No balance API for Model Studio API keys (billing is an Alibaba Cloud account API).
+}
+
+// ------------------------------------------------------------------ history
+
+/// User content, independent of the API surface.
+enum Content {
+    Text(String),
+    /// A data URL.
+    Image(String),
+    /// A data URL.
+    Video(String),
+}
+
+/// The user parts Model Studio takes; `images` is set when there is an image.
+async fn user_content(
+    turn: &Turn,
+    model: &str,
+    spec: Option<&ModelSpec>,
+    blobs: &dyn BlobLoader,
+    notes: &mut Vec<String>,
+) -> Result<Vec<Content>, LlmError> {
+    let text_only = || {
+        LlmError::request(format!(
+            "`{model}` takes text only on Alibaba Model Studio (no image or video input; qwen3.8-max, qwen3.7-plus \
+             and qwen3.7-max-2026-06-08 take both)"
+        ))
+    };
+    let mut out = Vec::new();
+    for part in &turn.parts {
+        match part {
+            Part::Text { text, .. } => {
+                if !text.is_empty() {
+                    out.push(Content::Text(text.clone()));
+                }
+            }
+            Part::Image { blob, .. } => {
+                if spec.is_some_and(|s| !s.vision) {
+                    return Err(text_only());
+                }
+                let bytes = crate::provider::load(blobs, blob).await?;
+                out.push(Content::Image(crate::provider::data_url(&blob.mime, &bytes)));
+            }
+            Part::File { blob, filename, .. } => {
+                let name = filename.as_deref().unwrap_or("file");
+                match classify_mime(&blob.mime, filename.as_deref()) {
+                    MediaClass::Image | MediaClass::Video if spec.is_some_and(|s| !s.vision) => {
+                        return Err(text_only());
+                    }
+                    MediaClass::Image => {
+                        let bytes = crate::provider::load(blobs, blob).await?;
+                        out.push(Content::Image(crate::provider::data_url(&blob.mime, &bytes)));
+                    }
+                    MediaClass::Video => {
+                        let bytes = crate::provider::load(blobs, blob).await?;
+                        let url = crate::provider::data_url(&blob.mime, &bytes);
+                        if url.len() >= MAX_VIDEO_DATA_URL {
+                            return Err(LlmError::request(format!(
+                                "{name} is too large for Alibaba Model Studio: base64 videos must be under 10 MB \
+                                 encoded ({:.1} MB); larger ones only go by public URL",
+                                url.len() as f64 / 1_048_576.0
+                            )));
+                        }
+                        out.push(Content::Video(url));
+                    }
+                    MediaClass::Text => {
+                        let bytes = crate::provider::load(blobs, blob).await?;
+                        let text = String::from_utf8(bytes)
+                            .map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
+                        notes.push(format!(
+                            "📎 {name} inlined as a separate text part by the bot (no native text-file input on this API)"
+                        ));
+                        out.push(Content::Text(text));
+                    }
+                    MediaClass::Pdf | MediaClass::Document => {
+                        return Err(LlmError::request(format!(
+                            "`{model}` takes no {} ({name}) on Alibaba Model Studio: documents only go by upload \
+                             (Qwen-Long `fileid://`) or public URL, which the bot does not use",
+                            blob.mime
+                        )));
+                    }
+                    MediaClass::Audio => {
+                        return Err(LlmError::request(format!(
+                            "`{model}` takes no audio input on Alibaba Model Studio ({name}; only the Omni models do)"
+                        )));
+                    }
+                    MediaClass::Other => {
+                        return Err(LlmError::request(format!(
+                            "`{model}` takes no {} input on Alibaba Model Studio ({name})",
+                            blob.mime
+                        )));
+                    }
+                }
+            }
+            Part::RemoteMedia { url, .. } => {
+                return Err(LlmError::request(format!(
+                    "`{model}` cannot watch remote media on Alibaba Model Studio ({url}): video URLs must point to \
+                     the file itself"
+                )));
+            }
+            Part::Location { .. } => return Err(crate::provider::no_location(model, NAME)),
+            Part::Reasoning(_) | Part::ToolCall(_) | Part::Refusal { .. } => {}
+        }
+    }
+    Ok(out)
+}
+
+/// The conversation as Chat Completions `messages`; also whether it has images.
+async fn chat_messages(
+    history: &[Turn],
+    model: &str,
+    spec: Option<&ModelSpec>,
+    blobs: &dyn BlobLoader,
+    notes: &mut Vec<String>,
+) -> Result<(Vec<Value>, bool), LlmError> {
+    let mut out = Vec::with_capacity(history.len());
+    let mut images = false;
+    for turn in history {
+        match turn.role {
+            Role::System => out.push(json!({"role": "system", "content": turn.answer_text()})),
+            Role::Assistant => out.push(chat_assistant(turn, model)),
+            Role::User => {
+                let parts: Vec<Value> = user_content(turn, model, spec, blobs, notes)
+                    .await?
+                    .into_iter()
+                    .map(|c| match c {
+                        Content::Text(t) => json!({"type": "text", "text": t}),
+                        Content::Image(u) => {
+                            images = true;
+                            json!({"type": "image_url", "image_url": {"url": u}})
+                        }
+                        Content::Video(u) => json!({"type": "video_url", "video_url": {"url": u}}),
+                    })
+                    .collect();
+                if parts.len() == 1 && parts[0]["type"] == "text" {
+                    out.push(json!({"role": "user", "content": parts[0]["text"].clone()}));
+                } else {
+                    out.push(json!({"role": "user", "content": parts}));
+                }
+            }
+        }
+    }
+    Ok((out, images))
+}
+
+/// An assistant turn for Chat Completions: this model's message verbatim (with
+/// `reasoning_content`, kept apart from `content` as Alibaba requires), its
+/// Responses output as such a message, or else its text.
+fn chat_assistant(turn: &Turn, model: &str) -> Value {
+    if let Some(n) = &turn.native
+        && n.model == model
+    {
+        if n.dialect == DIALECT {
+            return n.payload.clone();
+        }
+        if n.dialect == RESPONSES_DIALECT {
+            return responses::to_chat_message(&n.payload);
+        }
+    }
+    json!({"role": "assistant", "content": turn.answer_text()})
+}
+
+// ------------------------------------------------------------------ stream
+
+/// Chat Completions chunks: the shared parser plus DashScope-style error objects.
+#[derive(Debug)]
+struct ChatParser {
+    inner: ChunkParser,
+}
+
+impl Default for ChatParser {
+    fn default() -> Self {
+        let mut inner = ChunkParser::default();
+        inner.map_error = Some(error_from_json);
+        Self { inner }
+    }
+}
+
+impl ChatParser {
+    /// The assistant message as Alibaba returned it (`content`, `reasoning_content`).
+    fn native_payload(&self) -> Value {
+        let n = self.inner.native_payload();
+        let mut m = json!({"role": "assistant", "content": n.get("content").cloned().unwrap_or(json!(""))});
+        if let Some(r) = n.get("reasoning").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            m["reasoning_content"] = json!(r);
+        }
+        m
+    }
+}
+
+impl crate::chatstream::EventParser for ChatParser {
+    fn event(&mut self, _name: Option<&str>, v: &Value) -> Result<Vec<StreamEvent>, LlmError> {
+        // A DashScope-style error object (`{"code","message","request_id"}`) inside the stream.
+        if v.get("choices").is_none()
+            && v.get("error").is_none()
+            && v.get("code").and_then(Value::as_str).is_some_and(|c| !c.is_empty())
+        {
+            let mut e = error_from_json(v, None, None, ErrorKind::InBand);
+            e.partial_output = self.inner.any_output();
+            return Err(e);
+        }
+        self.inner.chunk(v)
+    }
+    fn finished(&self) -> bool {
+        self.inner.finished
+    }
+    fn any_output(&self) -> bool {
+        self.inner.any_output()
+    }
+}
+
+// ------------------------------------------------------------------ cost
+
+/// Search calls reported in `usage.x_tools` (Chat: `search`, Responses: `web_search`).
+fn search_calls(u: &Usage) -> u64 {
+    ["/x_tools/search/count", "/x_tools/web_search/count"]
+        .iter()
+        .find_map(|p| u.raw.pointer(p).and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// Estimated cost in USD: tokens at the CNY list price of the request's input
+/// tier (cache hits at their price, output incl. reasoning) plus search calls
+/// at the price of `strategy` (or the one reported in `usage.x_tools`).
+pub fn estimate_cost(spec: &ModelSpec, u: &Usage, searches: u64, strategy: &str, cny_per_usd: f64) -> Option<f64> {
+    let input = u.input_tokens?;
+    let tier = spec.tiers.iter().find(|t| input <= t.up_to).or_else(|| spec.tiers.last())?;
+    let tokens = tier.price.cost(u)?;
+    let strategy = u.raw.pointer("/x_tools/search/strategy").and_then(Value::as_str).unwrap_or(strategy);
+    usd(tokens + searches as f64 * search_fee_cny(strategy), Currency::Cny, cny_per_usd)
+}
+
+// ------------------------------------------------------------------ errors
+
+/// Classify Model Studio's error objects: OpenAI-compatible
+/// `{"message","type","param","code"}` and DashScope `{"code","message"}`
+/// (help.aliyun.com/zh/model-studio/error-code, 2026-11-12).
+pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Option<u64>, kind: ErrorKind) -> LlmError {
+    let str_of = |k: &str| err.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
+    // (`type: "error"` is the event type of a Responses `error` event.)
+    let code = str_of("code").or_else(|| str_of("type").filter(|t| *t != "error")).unwrap_or("");
+    let message = str_of("message").unwrap_or("(no message)").to_string();
+    let later = || match retry_after {
+        Some(s) => Retry::After(s),
+        None => Retry::Backoff,
+    };
+    let retry = match code {
+        // The input alone is too long (a smaller output budget cannot help).
+        c if c.starts_with("InternalError.Algo.InvalidParameter") => Retry::Never,
+        // TPM limit; "Free allocated quota exceeded" is a used-up free quota (no pay-as-you-go).
+        "Throttling.AllocationQuota" | "insufficient_quota" if message.contains("Free allocated quota") => Retry::Never,
+        c if c.starts_with("Throttling") => Retry::After(retry_after.unwrap_or(20)),
+        "insufficient_quota" | "limit_requests" | "limit_burst_rate" | "rate_limit_exceeded" => {
+            Retry::After(retry_after.unwrap_or(20))
+        }
+        "InternalError"
+        | "internal_error"
+        | "InternalError.Algo"
+        | "InternalError.Timeout"
+        | "SystemError"
+        | "ModelServiceFailed"
+        | "RequestTimeOut"
+        | "ServiceUnavailable"
+        | "ServiceUnavailableError"
+        | "ModelUnavailable"
+        | "server_error" => later(),
+        // Moderation (input or output), invalid requests, billing, auth, permission, unknown model.
+        "DataInspectionFailed"
+        | "data_inspection_failed"
+        | "InvalidParameter"
+        | "InvalidParameter.DataInspection"
+        | "invalid_request_error"
+        | "invalid_parameter_error"
+        | "Arrearage"
+        | "BudgetLimitExceeded"
+        | "PrepaidBillOverdue"
+        | "CommodityNotPurchased"
+        | "InvalidApiKey"
+        | "invalid_api_key"
+        | "AccessDenied"
+        | "access_denied"
+        | "Model.AccessDenied"
+        | "Workspace.AccessDenied"
+        | "AllocationQuota.FreeTierOnly"
+        | "ModelNotFound"
+        | "model_not_found"
+        | "model_not_supported"
+        | "WorkSpaceNotFound"
+        | "NotFound" => Retry::Never,
+        _ => http_status.map(|s| retry_for_status(s, retry_after)).unwrap_or(Retry::Never),
+    };
+    LlmError {
+        kind,
+        retry,
+        status: http_status,
+        error_type: (!code.is_empty()).then(|| code.to_string()),
+        message,
+        details: Some(err.clone()),
+        partial_output: false,
+    }
+}
+
+#[cfg(test)]
+mod tests;

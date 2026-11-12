@@ -121,20 +121,30 @@ async fn run(cfg: Config) -> Result<()> {
         echo_upstream_body: orc.echo_upstream_body,
         router_metadata: true,
     })?;
-    let ark = match cfg.providers.ark.as_ref().filter(|a| !a.api_key.trim().is_empty()) {
-        Some(a) => {
-            info!("Volcengine Ark provider enabled");
-            Some(omni_llm::ark::Ark::new(omni_llm::ark::ArkConfig {
-                api_key: a.api_key.trim().to_string(),
-                base_url: a.base_url.clone(),
-                connect_timeout: Duration::from_secs(a.connect_timeout_secs),
-                idle_timeout: Duration::from_secs(a.idle_timeout_secs),
-                max_tokens_cap: a.max_tokens_cap,
-                cny_per_usd: a.cny_per_usd,
-            })?)
-        }
-        None => None,
-    };
+    // The platforms' own APIs: each one that has a key.
+    let mut direct = std::collections::BTreeMap::new();
+    for info in omni_llm::provider::PROVIDERS {
+        let Some(pc) = cfg.providers.direct(info.id).filter(|p| !p.api_key.trim().is_empty()) else { continue };
+        // Ark reserves TPM quota by the output budget: capped unless configured otherwise.
+        let default_cap = if info.id == "ark" { Some(65_536) } else { None };
+        let dc = omni_llm::provider::DirectConfig {
+            api_key: pc.api_key.trim().to_string(),
+            base_url: pc
+                .base_url
+                .clone()
+                .unwrap_or_else(|| info.base_url.to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            connect_timeout: Duration::from_secs(pc.connect_timeout_secs),
+            idle_timeout: Duration::from_secs(pc.idle_timeout_secs.unwrap_or(info.idle_timeout_secs)),
+            max_tokens_cap: pc.max_tokens_cap.or(default_cap).filter(|&v| v > 0),
+            cny_per_usd: pc.cny_per_usd,
+            long_decode_budget: pc.long_decode_budget,
+        };
+        let p = omni_llm::provider::build(info.id, dc).with_context(|| format!("provider {}", info.id))?;
+        info!(provider = info.id, "{} provider enabled", info.name);
+        direct.insert(info.id.to_string(), p);
+    }
     match openrouter.refresh_catalog().await {
         Ok(n) => info!(models = n, "loaded OpenRouter model catalog"),
         Err(e) => warn!(error = %format!("{e:#}"), "could not load the OpenRouter model catalog (will retry)"),
@@ -166,7 +176,7 @@ async fn run(cfg: Config) -> Result<()> {
         db: db.clone(),
         blobs,
         openrouter,
-        ark,
+        direct,
         allowed_providers: {
             let mut m = policy::default_allowed_providers();
             m.extend(orc.allowed_providers.clone());

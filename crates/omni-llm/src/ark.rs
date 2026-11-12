@@ -262,6 +262,36 @@ impl Ark {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::provider::Provider for Ark {
+    fn id(&self) -> &'static str {
+        "ark"
+    }
+    fn name(&self) -> &'static str {
+        "Volcengine Ark"
+    }
+    fn knows(&self, model: &str) -> bool {
+        model_spec(model).is_some()
+    }
+    async fn prepare(
+        &self,
+        input: &CallInput<'_>,
+        presets: &[crate::request::Requested],
+        blobs: &dyn BlobLoader,
+    ) -> Result<Prepared, LlmError> {
+        self.prepare_chat(input, presets, blobs).await
+    }
+    async fn stream(
+        &self,
+        p: &Prepared,
+        sink: &mut dyn EventSink,
+        observer: &dyn Observer,
+        cancel: &CancellationToken,
+    ) -> (Result<Value, LlmError>, CallOutcome) {
+        self.stream_chat(p, sink, observer, cancel).await
+    }
+}
+
 /// Estimated cost in USD from the list price (lowest input tier).
 pub fn estimate_cost(model: &str, u: &Usage, cny_per_usd: f64) -> Option<f64> {
     let s = model_spec(model)?;

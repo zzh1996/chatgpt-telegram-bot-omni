@@ -165,12 +165,8 @@ impl Budget {
             return now;
         }
         // Room only grows as past operations leave a window: try now, then each such moment.
-        let mut times: Vec<Instant> = self
-            .done
-            .iter()
-            .flat_map(|(t, _)| [*t + SHORT, *t + LONG])
-            .filter(|t| *t > now)
-            .collect();
+        let mut times: Vec<Instant> =
+            self.done.iter().flat_map(|(t, _)| [*t + SHORT, *t + LONG]).filter(|t| *t > now).collect();
         times.sort();
         std::iter::once(now).chain(times).find(|t| self.fits(*t, w, reserve)).unwrap_or(now + LONG)
     }
@@ -352,7 +348,8 @@ mod replay {
             r"^\s+#(?P<n>\d+)\s+(?P<slot>\S+)\s+(?P<op>send|edit|delete)\s+(?P<chars>\d+) chars\s+\d+ B(?:\s+(?P<cp>\d+) cp)?(?:\s+\d+ top)? (?P<script>\S+)\s+at\s+[\d.]+s start\s+(?P<start>[\d.]+)s(?: wall (?P<wall>\d+))? took\s+(?P<took>\d+)ms\s+(?P<verdict>.*)$",
         )
         .unwrap();
-        let series = regex::Regex::new(r"^(\S+)\s+op\s+(\d+) size\s+(\d+)\s+t=\s*([\d.]+)s\s+took\s+(\d+)ms\s+(.*)$").unwrap();
+        let series =
+            regex::Regex::new(r"^(\S+)\s+op\s+(\d+) size\s+(\d+)\s+t=\s*([\d.]+)s\s+took\s+(\d+)ms\s+(.*)$").unwrap();
         let blocks: HashMap<String, HashMap<String, Vec<RBlock>>> =
             serde_json::from_str(&std::fs::read_to_string(dir().join("rate18-blocks.json")).unwrap()).unwrap();
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir())
@@ -402,9 +399,21 @@ mod replay {
                         Some(w) => ("wall".to_string(), w.as_str().parse().unwrap()),
                         None => (format!("{file}/{test}"), (start_s * 1000.0) as i64),
                     };
-                    out.push(Rec { file: file.clone(), test: test.clone(), n, slot, op, content, timeline, start, answered: start + took, refused: verdict.starts_with("FLOOD") });
+                    out.push(Rec {
+                        file: file.clone(),
+                        test: test.clone(),
+                        n,
+                        slot,
+                        op,
+                        content,
+                        timeline,
+                        start,
+                        answered: start + took,
+                        refused: verdict.starts_with("FLOOD"),
+                    });
                 } else if let Some(c) = series.captures(line) {
-                    let (label, n, size): (String, usize, usize) = (c[1].to_string(), c[2].parse().unwrap(), c[3].parse().unwrap());
+                    let (label, n, size): (String, usize, usize) =
+                        (c[1].to_string(), c[2].parse().unwrap(), c[3].parse().unwrap());
                     let start = (c[4].parse::<f64>().unwrap() * 1000.0) as i64;
                     let refused = c[6].contains("FLOOD");
                     let sent = series_sent.entry(label.clone()).or_default();
@@ -413,7 +422,18 @@ mod replay {
                         *sent = true;
                     }
                     let content = Some(crate::devinject::series_content(&label, n, size));
-                    out.push(Rec { file: file.clone(), test: format!("series {label}"), n, slot: "A".into(), op, content, timeline: format!("{file}/{label}"), start, answered: start + c[5].parse::<i64>().unwrap(), refused });
+                    out.push(Rec {
+                        file: file.clone(),
+                        test: format!("series {label}"),
+                        n,
+                        slot: "A".into(),
+                        op,
+                        content,
+                        timeline: format!("{file}/{label}"),
+                        start,
+                        answered: start + c[5].parse::<i64>().unwrap(),
+                        refused,
+                    });
                 }
             }
         }
@@ -471,6 +491,10 @@ mod replay {
             "{} operations, {refused} refused by Telegram, all held back by the bot; {held_needlessly} accepted ones the bot would have delayed",
             recs.len()
         );
-        assert!(violations.is_empty(), "the bot would have sent these, and Telegram refused them:\n{}", violations.join("\n"));
+        assert!(
+            violations.is_empty(),
+            "the bot would have sent these, and Telegram refused them:\n{}",
+            violations.join("\n")
+        );
     }
 }

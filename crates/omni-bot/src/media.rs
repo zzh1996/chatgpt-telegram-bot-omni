@@ -93,61 +93,165 @@ impl Downloadable for Loc<'_> {
     }
 }
 
-/// Extract media descriptors from a message.
-pub fn media_of(msg: &tl::types::Message) -> Vec<MediaRef> {
-    let Some(media) = &msg.media else { return Vec::new() };
-    match media {
-        tl::enums::MessageMedia::Photo(p) => match &p.photo {
-            Some(tl::enums::Photo::Photo(photo)) => {
-                let (thumb, size) = largest_photo_size(&photo.sizes);
-                vec![MediaRef {
-                    kind: MediaKind::Photo,
-                    id: photo.id,
-                    access_hash: photo.access_hash,
-                    file_reference: base64::engine::general_purpose::STANDARD.encode(&photo.file_reference),
-                    dc_id: photo.dc_id,
-                    size,
-                    thumb_size: thumb,
-                    mime: "image/jpeg".into(),
-                    filename: None,
-                    msg_id: msg.id,
-                    grouped_id: msg.grouped_id,
-                    is_sticker: false,
-                }]
+fn photo_ref(photo: &tl::types::Photo, msg: &tl::types::Message) -> MediaRef {
+    let (thumb, size) = largest_photo_size(&photo.sizes);
+    MediaRef {
+        kind: MediaKind::Photo,
+        id: photo.id,
+        access_hash: photo.access_hash,
+        file_reference: base64::engine::general_purpose::STANDARD.encode(&photo.file_reference),
+        dc_id: photo.dc_id,
+        size,
+        thumb_size: thumb,
+        mime: "image/jpeg".into(),
+        filename: None,
+        msg_id: msg.id,
+        grouped_id: msg.grouped_id,
+        is_sticker: false,
+    }
+}
+
+fn document_ref(doc: &tl::types::Document, msg: &tl::types::Message) -> MediaRef {
+    let mut filename = None;
+    let mut is_sticker = false;
+    for a in &doc.attributes {
+        match a {
+            tl::enums::DocumentAttribute::Filename(f) => filename = Some(f.file_name.clone()),
+            tl::enums::DocumentAttribute::Sticker(_) | tl::enums::DocumentAttribute::CustomEmoji(_) => {
+                is_sticker = true
             }
+            _ => {}
+        }
+    }
+    MediaRef {
+        kind: MediaKind::Document,
+        id: doc.id,
+        access_hash: doc.access_hash,
+        file_reference: base64::engine::general_purpose::STANDARD.encode(&doc.file_reference),
+        dc_id: doc.dc_id,
+        size: Some(doc.size as u64),
+        thumb_size: String::new(),
+        mime: normalize_mime(&doc.mime_type, filename.as_deref()),
+        filename,
+        msg_id: msg.id,
+        grouped_id: msg.grouped_id,
+        is_sticker,
+    }
+}
+
+/// Extract media descriptors from a message: its photo or file, or the photos
+/// and files inside a rich message (in block order).
+pub fn media_of(msg: &tl::types::Message) -> Vec<MediaRef> {
+    let mut out = match &msg.media {
+        Some(tl::enums::MessageMedia::Photo(p)) => match &p.photo {
+            Some(tl::enums::Photo::Photo(photo)) => vec![photo_ref(photo, msg)],
             _ => Vec::new(),
         },
-        tl::enums::MessageMedia::Document(d) => match &d.document {
-            Some(tl::enums::Document::Document(doc)) => {
-                let mut filename = None;
-                let mut is_sticker = false;
-                for a in &doc.attributes {
-                    match a {
-                        tl::enums::DocumentAttribute::Filename(f) => filename = Some(f.file_name.clone()),
-                        tl::enums::DocumentAttribute::Sticker(_) | tl::enums::DocumentAttribute::CustomEmoji(_) => {
-                            is_sticker = true
-                        }
-                        _ => {}
-                    }
-                }
-                vec![MediaRef {
-                    kind: MediaKind::Document,
-                    id: doc.id,
-                    access_hash: doc.access_hash,
-                    file_reference: base64::engine::general_purpose::STANDARD.encode(&doc.file_reference),
-                    dc_id: doc.dc_id,
-                    size: Some(doc.size as u64),
-                    thumb_size: String::new(),
-                    mime: normalize_mime(&doc.mime_type, filename.as_deref()),
-                    filename,
-                    msg_id: msg.id,
-                    grouped_id: msg.grouped_id,
-                    is_sticker,
-                }]
-            }
+        Some(tl::enums::MessageMedia::Document(d)) => match &d.document {
+            Some(tl::enums::Document::Document(doc)) => vec![document_ref(doc, msg)],
             _ => Vec::new(),
         },
         _ => Vec::new(),
+    };
+    if let Some(tl::enums::RichMessage::Message(rm)) = &msg.rich_message {
+        let c = crate::tg::richin::convert(&rm.blocks);
+        let photos: Vec<&tl::types::Photo> = rm
+            .photos
+            .iter()
+            .filter_map(|p| match p {
+                tl::enums::Photo::Photo(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let docs: Vec<&tl::types::Document> = rm
+            .documents
+            .iter()
+            .filter_map(|d| match d {
+                tl::enums::Document::Document(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        for id in &c.photo_ids {
+            if let Some(p) = photos.iter().find(|p| p.id == *id) {
+                out.push(photo_ref(p, msg));
+            }
+        }
+        for id in &c.document_ids {
+            if let Some(d) = docs.iter().find(|d| d.id == *id) {
+                out.push(document_ref(d, msg));
+            }
+        }
+        out.dedup_by_key(|m| m.id);
+    }
+    out
+}
+
+/// A position shared in Telegram (location, venue or live location; map blocks
+/// of rich messages).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocationRef {
+    pub latitude: f64,
+    pub longitude: f64,
+    #[serde(default)]
+    pub accuracy_m: Option<u32>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub address: Option<String>,
+}
+
+impl LocationRef {
+    pub fn part(&self) -> omni_core::content::Part {
+        omni_core::content::Part::Location {
+            latitude: self.latitude,
+            longitude: self.longitude,
+            accuracy_m: self.accuracy_m,
+            title: self.title.clone(),
+            address: self.address.clone(),
+        }
+    }
+}
+
+/// The positions in a message: a location / venue / live location (its
+/// current position), or the map blocks of a rich message.
+pub fn locations_of(msg: &tl::types::Message) -> Vec<LocationRef> {
+    let point = |g: &tl::enums::GeoPoint| match g {
+        tl::enums::GeoPoint::Point(p) => Some(LocationRef {
+            latitude: p.lat,
+            longitude: p.long,
+            accuracy_m: p.accuracy_radius.map(|r| r.max(0) as u32),
+            title: None,
+            address: None,
+        }),
+        tl::enums::GeoPoint::Empty => None,
+    };
+    let mut out: Vec<LocationRef> = match &msg.media {
+        Some(tl::enums::MessageMedia::Geo(m)) => point(&m.geo).into_iter().collect(),
+        Some(tl::enums::MessageMedia::GeoLive(m)) => point(&m.geo).into_iter().collect(),
+        Some(tl::enums::MessageMedia::Venue(v)) => point(&v.geo)
+            .map(|mut l| {
+                l.title = Some(v.title.clone()).filter(|s| !s.is_empty());
+                l.address = Some(v.address.clone()).filter(|s| !s.is_empty());
+                l
+            })
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    };
+    if let Some(tl::enums::RichMessage::Message(rm)) = &msg.rich_message {
+        for (lat, lon, acc) in crate::tg::richin::convert(&rm.blocks).maps {
+            out.push(LocationRef { latitude: lat, longitude: lon, accuracy_m: acc, title: None, address: None });
+        }
+    }
+    out
+}
+
+/// The text of a message for the bot: a rich message as Markdown, otherwise
+/// the message text (or caption) as it is.
+pub fn text_of(msg: &tl::types::Message) -> String {
+    match &msg.rich_message {
+        Some(tl::enums::RichMessage::Message(rm)) => crate::tg::richin::convert(&rm.blocks).markdown,
+        None => msg.message.clone(),
     }
 }
 
@@ -262,19 +366,29 @@ async fn download(bot: &BotConn, m: &MediaRef, max_bytes: u64) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// Collect all parts of an album around `msg_id` (album parts have adjacent ids).
-pub async fn album(bot: &BotConn, chat_id: i64, msg_id: i32, grouped_id: i64) -> Result<Vec<MediaRef>> {
+/// One message of an album.
+pub struct AlbumItem {
+    pub msg_id: i32,
+    pub media: Vec<MediaRef>,
+    /// Its caption (Markdown for a rich message).
+    pub text: String,
+}
+
+/// All items of an album around `msg_id` (an album has at most 10 items, with
+/// adjacent ids), in order.
+pub async fn album(bot: &BotConn, chat_id: i64, msg_id: i32, grouped_id: i64) -> Result<Vec<AlbumItem>> {
     let ids: Vec<i32> = ((msg_id - 10).max(1)..=msg_id + 10).collect();
     let msgs = bot.get_messages(chat_id, &ids).await.context("fetch album parts")?;
-    let mut parts: Vec<MediaRef> = msgs
+    let mut items: Vec<AlbumItem> = msgs
         .iter()
         .filter_map(|m| match m {
-            tl::enums::Message::Message(m) if m.grouped_id == Some(grouped_id) => Some(media_of(m)),
+            tl::enums::Message::Message(m) if m.grouped_id == Some(grouped_id) => {
+                Some(AlbumItem { msg_id: m.id, media: media_of(m), text: text_of(m) })
+            }
             _ => None,
         })
-        .flatten()
         .collect();
-    parts.sort_by_key(|p| p.msg_id);
-    parts.dedup_by_key(|p| p.id);
-    Ok(parts)
+    items.sort_by_key(|i| i.msg_id);
+    items.dedup_by_key(|i| i.msg_id);
+    Ok(items)
 }

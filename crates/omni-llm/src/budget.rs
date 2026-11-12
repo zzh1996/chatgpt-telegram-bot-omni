@@ -48,6 +48,7 @@ pub fn estimate_turn(t: &Turn) -> u64 {
                 }
             }
             Part::RemoteMedia { .. } => 20_000,
+            Part::Location { .. } => 16,
             Part::ToolCall(c) => {
                 c.input.as_ref().map_or(0, |v| v.to_string().len() as u64 / 3)
                     + c.output.as_ref().map_or(0, |v| v.to_string().len() as u64 / 3)

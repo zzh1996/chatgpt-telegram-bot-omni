@@ -81,7 +81,15 @@ impl Turn {
     }
 
     pub fn has_media(&self) -> bool {
-        self.parts.iter().any(|p| matches!(p, Part::Image { .. } | Part::File { .. }))
+        self.parts.iter().any(|p| matches!(p, Part::Image { .. } | Part::File { .. } | Part::Location { .. }))
+    }
+
+    /// The last location in this turn, as (latitude, longitude).
+    pub fn location(&self) -> Option<(f64, f64)> {
+        self.parts.iter().rev().find_map(|p| match p {
+            Part::Location { latitude, longitude, .. } => Some((*latitude, *longitude)),
+            _ => None,
+        })
     }
 }
 
@@ -135,6 +143,21 @@ pub enum Part {
     /// A remote resource referenced by URL that the provider fetches itself
     /// (e.g. a YouTube video for Gemini). Never fetched locally.
     RemoteMedia { url: String, kind: RemoteMediaKind },
+    /// A position shared in Telegram (location, venue or live location). It is
+    /// input for location-aware tools (Gemini's Google Maps grounding takes the
+    /// latest one as the user's position); APIs without such input reject it.
+    Location {
+        latitude: f64,
+        longitude: f64,
+        /// Horizontal accuracy in meters, when Telegram reports one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accuracy_m: Option<u32>,
+        /// Venue name and address (venue messages).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+    },
     /// Model reasoning (raw thinking, summary, encrypted or redacted).
     Reasoning(Reasoning),
     /// A server-side (built-in, provider-executed) tool invocation and its result.

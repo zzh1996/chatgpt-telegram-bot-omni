@@ -91,7 +91,10 @@ pub async fn set_place(db: &Db, bot: &str, chat_id: i64, allow: bool, by: i64) -
                 params![bot, chat_id, by, now_ms()],
             )?
         } else {
-            c.execute("DELETE FROM access_rules WHERE bot = ?1 AND chat_id = ?2 AND user_id = 0", params![bot, chat_id])?
+            c.execute(
+                "DELETE FROM access_rules WHERE bot = ?1 AND chat_id = ?2 AND user_id = 0",
+                params![bot, chat_id],
+            )?
         };
         Ok(n > 0)
     })
@@ -297,7 +300,11 @@ pub async fn quota_rules(db: &Db, bot: &str, only_chat: Option<i64>) -> Result<V
                     (_, 0) => Target::Members,
                     (_, u) => Target::Member(u),
                 };
-                Ok(QuotaRow { chat_id: r.get(0)?, target, rule: Rule { capacity: r.get(3)?, refill_per_day: r.get(4)? } })
+                Ok(QuotaRow {
+                    chat_id: r.get(0)?,
+                    target,
+                    rule: Rule { capacity: r.get(3)?, refill_per_day: r.get(4)? },
+                })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(v)

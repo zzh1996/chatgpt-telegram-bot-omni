@@ -25,8 +25,8 @@ pub struct App {
     pub db: Db,
     pub blobs: BlobStore,
     pub openrouter: OpenRouter,
-    /// Volcengine Ark, when configured.
-    pub ark: Option<omni_llm::ark::Ark>,
+    /// The platforms' own APIs that are configured (have a key), by id.
+    pub direct: BTreeMap<String, Arc<dyn omni_llm::provider::Provider>>,
     /// Official providers per model author that users may pick (`+p=`).
     pub allowed_providers: BTreeMap<String, Vec<String>>,
     /// Bots in config order.
@@ -46,7 +46,10 @@ pub struct App {
     pub started_at: jiff::Timestamp,
 }
 
-pub const PROVIDERS: &[&str] = &["openrouter", "ark"];
+/// Every provider id the bot knows (`openrouter` and the platforms' own APIs).
+pub fn is_provider(id: &str) -> bool {
+    id == "openrouter" || omni_llm::provider::info(id).is_some()
+}
 
 impl App {
     pub fn bot(&self, name: &str) -> Option<&Arc<BotConn>> {
@@ -182,13 +185,23 @@ impl App {
         };
     }
 
-    /// Whether a provider exists in this deployment (`ark` only when configured).
+    /// Whether a provider exists in this deployment (a platform's own API only
+    /// when it has a key).
     pub fn provider_enabled(&self, provider: &str) -> bool {
+        provider == "openrouter" || self.direct.contains_key(provider)
+    }
+
+    /// Total output budget of a long-decode answer (Gemini 4) on `provider`.
+    pub fn long_decode_budget(&self, provider: &str) -> u64 {
         match provider {
-            "openrouter" => true,
-            "ark" => self.ark.is_some(),
-            _ => false,
+            "openrouter" => self.openrouter.config().fidelity.long_decode_budget,
+            id => self.cfg.providers.direct(id).map(|c| c.long_decode_budget).unwrap_or(393_216),
         }
+    }
+
+    /// A configured platform API.
+    pub fn direct(&self, provider: &str) -> Option<&Arc<dyn omni_llm::provider::Provider>> {
+        self.direct.get(provider)
     }
 
     /// Whether users may type model ids of `provider` that no prefix names
@@ -198,8 +211,7 @@ impl App {
         self.provider_enabled(provider)
             && match provider {
                 "openrouter" => p.openrouter.as_ref().is_some_and(|c| c.allow_unlisted_models),
-                "ark" => p.ark.as_ref().is_some_and(|c| c.allow_unlisted_models),
-                _ => false,
+                id => p.direct(id).is_some_and(|c| c.allow_unlisted_models),
             }
     }
 
@@ -208,7 +220,7 @@ impl App {
     pub fn served_canonical(&self, bot: &BotConfig, spec: &str) -> Option<String> {
         let model = parse_spec(spec).ok()?.model;
         let (provider, model) = match model.split_once(':') {
-            Some((p, m)) if PROVIDERS.contains(&p) => (p, m),
+            Some((p, m)) if is_provider(p) => (p, m),
             _ => ("openrouter", model.as_str()),
         };
         let canonical = format!("{provider}:{model}");
@@ -254,7 +266,7 @@ impl App {
         }
         options.extend(token.options.iter().cloned());
         let (provider, model) = match model_token.split_once(':') {
-            Some((p, m)) if PROVIDERS.contains(&p) => (p.to_string(), m.to_string()),
+            Some((p, m)) if is_provider(p) => (p.to_string(), m.to_string()),
             _ => ("openrouter".to_string(), model_token.clone()),
         };
         // OpenRouter ids are `author/model`; other providers need their explicit prefix (`ark:…`).
@@ -272,6 +284,10 @@ impl App {
         // use the cached catalog and refresh it in the background on a miss.
         if strict && provider == "openrouter" && self.openrouter.catalog.get(&model).is_none() {
             self.refresh_catalog_soon();
+            return Ok(None);
+        }
+        // A model id typed directly in a group must be in the provider's model table.
+        if strict && !via_alias && self.direct(&provider).is_some_and(|p| !p.knows(&model)) {
             return Ok(None);
         }
         if label.contains(':') && label == model_token {

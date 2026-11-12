@@ -38,11 +38,7 @@ pub struct ChatPrefix {
 /// A valid prefix name, lowercased: 3–16 ASCII letters and digits.
 pub fn check_name(name: &str) -> Result<String, String> {
     if !NAME_LEN.contains(&name.chars().count()) || !name.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!(
-            "a prefix name has {}–{} letters (a–z) and digits only",
-            NAME_LEN.start(),
-            NAME_LEN.end()
-        ));
+        return Err(format!("a prefix name has {}–{} letters (a–z) and digits only", NAME_LEN.start(), NAME_LEN.end()));
     }
     Ok(name.to_ascii_lowercase())
 }
@@ -131,8 +127,10 @@ pub async fn insert(db: &Db, bot: &str, chat_id: i64, name: &str, p: &ChatPrefix
 pub async fn delete(db: &Db, bot: &str, chat_id: i64, name: &str) -> Result<bool> {
     let (bot, name) = (bot.to_string(), name.to_string());
     db.call(move |c| {
-        Ok(c.execute("DELETE FROM chat_prefixes WHERE bot = ?1 AND chat_id = ?2 AND name = ?3", params![bot, chat_id, name])?
-            > 0)
+        Ok(c.execute(
+            "DELETE FROM chat_prefixes WHERE bot = ?1 AND chat_id = ?2 AND name = ?3",
+            params![bot, chat_id, name],
+        )? > 0)
     })
     .await
 }

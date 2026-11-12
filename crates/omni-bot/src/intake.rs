@@ -32,30 +32,8 @@ use crate::tg::bot::BotConn;
 use crate::tg::convert::marked_peer_id;
 
 pub const COMMANDS: &[&str] = &[
-    "start",
-    "help",
-    "ping",
-    "models",
-    "model",
-    "raw",
-    "dump",
-    "prefix",
-    "unprefix",
-    "retry",
-    "continue",
-    "m",
-    "info",
-    "stats",
-    "usage",
-    "allow",
-    "deny",
-    "ban",
-    "unban",
-    "acl",
-    "quota",
-    "alias",
-    "unalias",
-    "credits",
+    "start", "help", "ping", "models", "model", "raw", "dump", "prefix", "unprefix", "retry", "continue", "m", "info",
+    "stats", "usage", "allow", "deny", "ban", "unban", "acl", "quota", "alias", "unalias", "credits",
 ];
 
 fn update_state(s: &State) -> Option<UpdateState> {
@@ -183,7 +161,12 @@ async fn on_update(app: &Arc<App>, bot: &Arc<BotConn>, update: tl::enums::Update
     let Some(kind) = kind else {
         return Ok(());
     };
-    let mut payload = InboundPayload { media: media_of(&m), ..Default::default() };
+    let mut payload = InboundPayload {
+        media: media_of(&m),
+        locations: crate::media::locations_of(&m),
+        rich: m.rich_message.is_some(),
+        ..Default::default()
+    };
     if let Some(Peer::User(u)) = sender_peer {
         payload.sender_name =
             Some(format!("{} {}", u.first_name().unwrap_or(""), u.last_name().unwrap_or("")).trim().to_string());
@@ -197,7 +180,7 @@ async fn on_update(app: &Arc<App>, bot: &Arc<BotConn>, update: tl::enums::Update
         _ => None,
     };
     let (bot_name, text, date, msg_id, grouped) =
-        (bot.name.clone(), m.message.clone(), m.date as i64, m.id, m.grouped_id);
+        (bot.name.clone(), crate::media::text_of(&m), m.date as i64, m.id, m.grouped_id);
     let payload_json = serde_json::to_string(&payload)?;
     let inserted: Option<i64> = app
         .db
@@ -319,7 +302,8 @@ pub fn parse_command<'a>(text: &'a str, our_username: &str) -> Option<(String, &
 }
 
 async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::types::Message) -> Option<Kind> {
-    let text = m.message.as_str();
+    let text = crate::media::text_of(m);
+    let text = text.as_str();
     if let Some((name, _, addressed)) = parse_command(text, &bot.username) {
         // Every bot answers commands addressed to it or to everyone, like an
         // independent instance; `/m`, `/raw`, `/dump`, `/retry`, `/continue`,
@@ -371,6 +355,7 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
         // A prefix this bot does not know: ignored in groups (another bot may know it).
         return None;
     }
+    // (Not for media: the uncaptioned items of an album would each get one.)
     if chat_id > 0 && m.media.is_none() {
         return Some(Kind::Hint);
     }

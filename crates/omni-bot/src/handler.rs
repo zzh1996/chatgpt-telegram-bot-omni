@@ -82,6 +82,17 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
                 return Ok(());
             }
         }
+        // An album arrives as one message per item. Handle it once, with the
+        // first of its messages that was recorded (all album items of a reply
+        // to an answer are; of a new conversation only those with a prefix).
+        if let (Some(g), Some(Kind::Trigger | Kind::Reply)) = (ib.grouped_id, &kind) {
+            tokio::time::sleep(ALBUM_WAIT).await;
+            let leader = conv::album_leader(&app.db, &ib.bot, ib.chat_id, g).await?;
+            if leader.is_some_and(|l| l != ib.msg_id) {
+                info!(leader = ?leader, "album item handled with the album's first message");
+                return Ok(());
+            }
+        }
         match kind {
             Some(Kind::Trigger) => new_conversation(&app, &bot, &ib).await,
             Some(Kind::Reply) => continue_conversation(&app, &bot, &ib, None).await,
@@ -145,26 +156,43 @@ pub async fn resolve_specs(
         }
     }
     if !unknown.is_empty() && explicit {
-        let ids = crate::commands::direct_ids(app).map(|ids| format!("; {ids} works too")).unwrap_or_default();
+        let ids =
+            crate::commands::direct_ids(app).map(|ids| format!("; a model id ({ids}) works too")).unwrap_or_default();
         return Err(format!("unknown prefix: {}. The prefixes are listed by /models{ids}", unknown.join(", ")));
     }
     Ok(out)
 }
 
+/// How long to wait for the other items of an album (they arrive together).
+const ALBUM_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// What a message brings besides its own text: media and positions (its own,
+/// the rest of its album's, and those of the replied-to message when that is
+/// not a bot message, like the old bot), and the captions of its album's
+/// other items.
+struct Attached {
+    parts: Vec<Part>,
+    captions: Vec<String>,
+}
+
 /// Collect the media of a message (album-aware) as blobs/parts.
-async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Vec<Part>> {
+async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached> {
     let max = app.cfg.general_max_file_bytes();
     let mut refs = ib.payload.media.clone();
-    if let Some(g) = ib.grouped_id {
-        // Give the other album parts a moment to arrive, then fetch them by id.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        if let Ok(parts) = media::album(bot, ib.chat_id, ib.msg_id, g).await
-            && !parts.is_empty()
-        {
-            refs = parts;
-        }
+    let mut locations = ib.payload.locations.clone();
+    let mut captions = Vec::new();
+    if let Some(g) = ib.grouped_id
+        && let Ok(items) = media::album(bot, ib.chat_id, ib.msg_id, g).await
+        && !items.is_empty()
+    {
+        refs = items.iter().flat_map(|i| i.media.clone()).collect();
+        captions = items
+            .iter()
+            .filter(|i| i.msg_id != ib.msg_id && !i.text.trim().is_empty())
+            .map(|i| i.text.clone())
+            .collect();
     }
-    // Media of a replied-to (non-bot) message, like the old bot.
+    // Media and positions of a replied-to (non-bot) message, like the old bot.
     if let Some(rt) = ib.reply_to_msg_id
         && conv::turn_for_message(&app.db, &bot.name, ib.chat_id, rt).await?.is_none()
         && let Ok(msgs) = bot.get_messages(ib.chat_id, &[rt]).await
@@ -172,15 +200,17 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Vec<Part>
         for m in msgs {
             if let grammers_tl_types::enums::Message::Message(m) = m {
                 let mut r = media::media_of(&m);
-                if let (Some(g), true) = (m.grouped_id, !r.is_empty())
-                    && let Ok(parts) = media::album(bot, ib.chat_id, m.id, g).await
-                    && !parts.is_empty()
+                if let Some(g) = m.grouped_id
+                    && let Ok(items) = media::album(bot, ib.chat_id, m.id, g).await
+                    && !items.is_empty()
                 {
-                    r = parts;
+                    r = items.into_iter().flat_map(|i| i.media).collect();
                 }
-                let mut combined = r;
-                combined.extend(refs);
-                refs = combined;
+                r.extend(refs);
+                refs = r;
+                let mut l = media::locations_of(&m);
+                l.extend(locations);
+                locations = l;
             }
         }
     }
@@ -197,7 +227,8 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Vec<Part>
             media::MediaKind::Document => Part::File { blob, filename: r.filename.clone(), generated: false },
         });
     }
-    Ok(parts)
+    parts.extend(locations.iter().map(media::LocationRef::part));
+    Ok(Attached { parts, captions })
 }
 
 /// Build user turns from message text (role markers -> synthetic history).
@@ -275,14 +306,20 @@ async fn new_conversation(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> R
             return Ok(());
         }
     };
-    let media = match media_parts(app, bot, ib).await {
+    let attached = match media_parts(app, bot, ib).await {
         Ok(m) => m,
         Err(e) => {
             reply::notice(app, bot, ib.chat_id, ib.msg_id, &format!("⚠️ {e:#}")).await;
             return Ok(());
         }
     };
-    let turns = match user_turns(&t.text, media) {
+    let turns = match user_turns(&t.text, attached.parts).map(|mut ts| {
+        // Captions of the album's other items follow the message text.
+        if let Some(last) = ts.iter_mut().rev().find(|t| t.role == Role::User) {
+            last.parts.extend(attached.captions.iter().map(|c| Part::text(c.clone())));
+        }
+        ts
+    }) {
         Ok(t) => t,
         Err(e) => {
             reply::notice(app, bot, ib.chat_id, ib.msg_id, &format!("⚠️ {e}")).await;
@@ -335,17 +372,18 @@ pub async fn continue_conversation(
             (vec![spec], text)
         }
     };
-    let media = match media_parts(app, bot, ib).await {
+    let attached = match media_parts(app, bot, ib).await {
         Ok(m) => m,
         Err(e) => {
             reply::notice(app, bot, ib.chat_id, ib.msg_id, &format!("⚠️ {e:#}")).await;
             return Ok(());
         }
     };
-    let mut parts = media;
+    let mut parts = attached.parts;
     if !text.is_empty() {
         parts.push(Part::text(text));
     }
+    parts.extend(attached.captions.into_iter().map(Part::text));
     if parts.is_empty() {
         reply::notice(app, bot, ib.chat_id, ib.msg_id, "⚠️ empty message").await;
         return Ok(());

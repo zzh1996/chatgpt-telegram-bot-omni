@@ -89,7 +89,7 @@ pub fn body(model: &str, messages: Vec<Value>, plan: &super::options::Plan) -> V
         .filter_map(|t| match t {
             crate::request::Tool::Search => Some(super::options::search_tool()),
             crate::request::Tool::Fetch => Some(super::options::fetch_tool()),
-            crate::request::Tool::Code => None, // rejected by validation on this skin
+            crate::request::Tool::Code | crate::request::Tool::Maps => None, // rejected by validation on this skin
         })
         .collect();
     if !tools.is_empty() {
@@ -241,6 +241,15 @@ pub async fn convert_history_with(
                         }
                         Part::RemoteMedia { url, .. } => {
                             content.push(json!({"type": "video_url", "video_url": {"url": url}}));
+                        }
+                        Part::Location { .. } => {
+                            return Err(LlmError::request(if flavor.dialect == DIALECT {
+                                super::NO_LOCATION.to_string()
+                            } else {
+                                format!(
+                                    "{target_model} does not take a location (only Gemini's Google Maps grounding does)"
+                                )
+                            }));
                         }
                         // Reasoning/tool parts never appear in user turns.
                         Part::Reasoning(_) | Part::ToolCall(_) | Part::Refusal { .. } => {}

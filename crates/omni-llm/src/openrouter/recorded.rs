@@ -5,10 +5,10 @@
 
 use serde_json::Value;
 
+use crate::Accumulator;
 use crate::chatstream::{EventParser, http_error};
 use crate::error::{LlmError, Retry};
 use crate::fixtures::case;
-use crate::Accumulator;
 
 /// The error the bot builds for a recorded HTTP error response.
 fn http(name: &str) -> LlmError {
@@ -147,10 +147,25 @@ fn openai_bad_image_arrives_as_an_opaque_provider_failure() {
 fn every_recorded_case_has_a_test() {
     let dir = format!("{}/tests/fixtures/errors", env!("CARGO_MANIFEST_DIR"));
     let tested = [
-        "cc_bad_key", "cc_unknown_model", "cc_no_endpoint", "cc_reasoning_mandatory_off", "cc_audio_to_text_model",
-        "msg_empty_message", "msg_bad_image_claude", "cc_bad_image_gemini", "cc_cannot_afford", "rsp_cannot_afford",
-        "cc_context_too_long", "msg_context_too_long", "cc_rate_limited_upstream", "cc_length", "rsp_length",
-        "msg_length", "rsp_reasoning_ate_budget", "msg_max_tokens_too_big", "rsp_bad_image_openai",
+        "cc_bad_key",
+        "cc_unknown_model",
+        "cc_no_endpoint",
+        "cc_reasoning_mandatory_off",
+        "cc_audio_to_text_model",
+        "msg_empty_message",
+        "msg_bad_image_claude",
+        "cc_bad_image_gemini",
+        "cc_cannot_afford",
+        "rsp_cannot_afford",
+        "cc_context_too_long",
+        "msg_context_too_long",
+        "cc_rate_limited_upstream",
+        "cc_length",
+        "rsp_length",
+        "msg_length",
+        "rsp_reasoning_ate_budget",
+        "msg_max_tokens_too_big",
+        "rsp_bad_image_openai",
     ];
     for f in std::fs::read_dir(dir).unwrap() {
         let name = f.unwrap().file_name().into_string().unwrap();

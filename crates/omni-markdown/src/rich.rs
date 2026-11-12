@@ -32,7 +32,10 @@ pub enum RText {
     Sub(Box<RText>),
     /// Smaller text above the line (`textSuperscript`). Bot-only.
     Super(Box<RText>),
-    Url { text: Box<RText>, url: String },
+    Url {
+        text: Box<RText>,
+        url: String,
+    },
     Math(String),
     Concat(Vec<RText>),
 }

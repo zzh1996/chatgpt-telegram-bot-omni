@@ -142,6 +142,8 @@ impl RouteCaps for OrCaps<'_> {
             // OpenAI's hosted code_interpreter is passed through on the Responses skin.
             Tool::Code => author == "openai" && self.dialect == Dialect::Responses,
             Tool::Fetch => self.all_pinned_have("openrouter:web_fetch"),
+            // Gemini's Google Maps grounding is not reachable through OpenRouter.
+            Tool::Maps => false,
         }
     }
 

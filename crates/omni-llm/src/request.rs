@@ -27,6 +27,9 @@ pub enum Tool {
     Code,
     /// Reading web pages / URLs given in the prompt (`u`).
     Fetch,
+    /// Google Maps grounding (`m`); the conversation's latest location is the
+    /// user's position.
+    Maps,
 }
 
 impl Tool {
@@ -35,6 +38,7 @@ impl Tool {
             Tool::Search => 's',
             Tool::Code => 'c',
             Tool::Fetch => 'u',
+            Tool::Maps => 'm',
         }
     }
     pub fn describe(self) -> &'static str {
@@ -42,6 +46,7 @@ impl Tool {
             Tool::Search => "web search",
             Tool::Code => "code execution",
             Tool::Fetch => "URL fetching",
+            Tool::Maps => "Google Maps",
         }
     }
 }
@@ -68,6 +73,8 @@ pub const HELP: &str = "\
 s                 the provider's own web search
 c                 the provider's own code execution
 u                 let the model read URLs from the prompt (provider's own tool)
+m                 Google Maps grounding (Gemini API); a Telegram location in the conversation
+                  (sent, or replied to) is the user's position
 e=<level>         reasoning effort, from the levels the model supports; e=none turns reasoning off
                   (Volcengine Ark: e=minimal turns thinking off too)
 budget=<n>        reasoning token budget (models with budget-based thinking)
@@ -100,11 +107,12 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
             OptionToken::Flag(f) => {
                 for c in f.chars() {
                     match c {
-                        's' | 'c' | 'u' => {
+                        's' | 'c' | 'u' | 'm' => {
                             let tool = match c {
                                 's' => Tool::Search,
                                 'c' => Tool::Code,
-                                _ => Tool::Fetch,
+                                'u' => Tool::Fetch,
+                                _ => Tool::Maps,
                             };
                             if !r.tools.contains(&tool) {
                                 r.tools.push(tool);
@@ -182,6 +190,8 @@ pub mod official {
     pub fn has_tool(model: &str, tool: Tool) -> Option<bool> {
         let v = vendor(model);
         Some(match (v, tool) {
+            ("google", Tool::Maps) => true, // googleMaps grounding (Gemini API)
+            (_, Tool::Maps) => false,
             ("openai", Tool::Search | Tool::Code) => true,
             ("openai", Tool::Fetch) => false,
             ("anthropic", _) => true, // web_search, code_execution, web_fetch
@@ -211,6 +221,9 @@ pub mod official {
         }
         if m.starts_with("gemini-nano-banana-2") {
             Some((&["1K", "2K", "4K"], EXTENDED))
+        } else if m.starts_with("gemini-3.1-flash-lite-image") {
+            // The fastest image model: 1K only (Google's model page, 2026-11-12).
+            Some((&["1K"], BASE))
         } else if m.starts_with("gemini-3.1-flash-image") {
             Some((&["512", "1K", "2K", "4K"], EXTENDED))
         } else if m.contains("image") || m.contains("nano-banana") {

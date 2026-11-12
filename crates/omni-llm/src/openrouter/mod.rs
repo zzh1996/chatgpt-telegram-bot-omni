@@ -4,9 +4,9 @@ pub mod catalog;
 pub mod chat;
 pub mod messages;
 pub mod options;
-pub mod responses;
 #[cfg(test)]
 mod recorded;
+pub mod responses;
 
 use std::time::Duration;
 
@@ -19,6 +19,9 @@ use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared};
 
 use catalog::{Catalog, EndpointInfo, ModelInfo};
 use options::FidelityConfig;
+
+/// A location in the conversation, which OpenRouter cannot send.
+pub const NO_LOCATION: &str = "OpenRouter cannot send a location: only Gemini's Google Maps grounding takes one, through the Gemini API (`google:` models)";
 
 #[derive(Debug, Clone)]
 pub struct OpenRouterConfig {

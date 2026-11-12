@@ -314,8 +314,11 @@ impl Gates {
         let (bot2, since) = (bot.to_string(), now_ms() - crate::tg::flood::LONG.as_millis() as i64);
         let rows: Vec<(i64, i64, u32)> = db
             .call(move |c| {
-                let mut s = c.prepare("SELECT chat_id, at, units FROM flood_log WHERE bot = ?1 AND at >= ?2 ORDER BY at")?;
-                let v = s.query_map(params![bot2, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
+                let mut s =
+                    c.prepare("SELECT chat_id, at, units FROM flood_log WHERE bot = ?1 AND at >= ?2 ORDER BY at")?;
+                let v = s
+                    .query_map(params![bot2, since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(v)
             })
             .await?;
@@ -323,7 +326,8 @@ impl Gates {
         let (now, now_wall) = (Instant::now(), now_ms());
         let mut map = HashMap::new();
         for (chat, at, units) in rows {
-            let gate = map.entry(chat).or_insert_with(|| ChatGate::with(Budget::default(), false, Some((log.clone(), chat))));
+            let gate =
+                map.entry(chat).or_insert_with(|| ChatGate::with(Budget::default(), false, Some((log.clone(), chat))));
             let ago = Duration::from_millis((now_wall - at).max(0) as u64);
             gate.state.lock().budget.record(now.checked_sub(ago).unwrap_or(now), Weight::from_units(units));
         }

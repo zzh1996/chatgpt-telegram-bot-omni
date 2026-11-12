@@ -12,7 +12,7 @@ intake（每 bot 一个顺序循环）──► inbound 表；pts/qts 在整批�
 handler：解析触发/回复/命令 → 权限、下载媒体 → turns（对话树）
    │ spawn
    ▼
-jobs：等待父回合 → attempts（重试）→ OpenRouter / 方舟流式 → Accumulator
+jobs：等待父回合 → attempts（重试）→ OpenRouter / 各平台官方 API 流式 → Accumulator
    │                                         │
    │                                         └─ rawlog（verbose：原始 SSE，blob 落盘）
    ▼
@@ -25,7 +25,7 @@ view：RenderState → compose（富消息块）→ paginate → outbox（幂等
 |---|---|---|
 | `omni-core` | 对话内容模型（`Turn`/`Part`/`Reasoning`/`Citation`/`NativeOutput`）、blob 引用、触发语法与 `::role` 解析、用量、JSON 工具（merge patch、blob 脱敏） | 纯逻辑 |
 | `omni-markdown` | Markdown → 自有 AST（带源码范围）→ 富消息块 `RBlock`/`RText`（镜像 TL PageBlock）或经典 entities；限额统计与切分 | pulldown-cmark（`vendor/` 里打了 CJK 友好强调补丁的副本） |
-| `omni-llm` | Provider 抽象（`CallInput`→`Prepared`→流事件）、SSE 解析、错误分类、OpenRouter（目录、Chat Completions / Responses / Messages 三种接口、选项/预设解析）、火山方舟直连 | reqwest |
+| `omni-llm` | Provider 抽象（`CallInput`→`Prepared`→流事件）、SSE 解析、错误分类、OpenRouter（目录、Chat Completions / Responses / Messages 三种接口、选项/预设解析）、各平台官方 API 直连（`provider` 及各平台模块，见 §7） | reqwest |
 | `omni-bot` | 二进制 `omni`：配置、日志、SQLite、grammers Session、Telegram 收发、多 bot（各自独立）、任务、渲染、命令、权限、限额 | grammers、rusqlite |
 
 ## 2. 对话数据模型
@@ -33,7 +33,7 @@ view：RenderState → compose（富消息块）→ paginate → outbox（幂等
 对话是一棵树（回复任意一条消息即分叉），存于 `turns` 表：
 
 - `role`：system / user / assistant；`data`：`omni_core::Turn` 的 JSON；`parent_id`。
-- `Turn.parts`：规范化内容，按顺序：`Text`（含 `citations`）、`Image`、`File`（PDF/音频/视频/文本…，按 MIME 在请求时决定发送方式）、`RemoteMedia`（如 YouTube URL）、`Reasoning`（kind：Text/Summary/Encrypted/Redacted，`opaque` 存签名/密文）、`ToolCall`（服务端内置工具的输入输出原文）、`Refusal`。
+- `Turn.parts`：规范化内容，按顺序：`Text`（含 `citations`）、`Image`、`File`（PDF/音频/视频/文本…，按 MIME 在请求时决定发送方式）、`RemoteMedia`（如 YouTube URL）、`Location`（Telegram 的定位/地点/实时位置，供 Gemini 的 Google Maps 用）、`Reasoning`（kind：Text/Summary/Encrypted/Redacted，`opaque` 存签名/密文）、`ToolCall`（服务端内置工具的输入输出原文）、`Refusal`。
 - `Turn.native`：**该轮在其 API 方言下的原样输出**（例如 Chat Completions 的 assistant message，含完整 `reasoning_details` 签名/密文；Responses 的全部输出项；Messages 的 content block）。下一轮请求若方言与模型都相同，原样回放 native（最大保真）；否则只用规范化 `parts`（例如换模型继续时只带文本）。
 - `Turn.origin`：Live（真实消息/真实生成）或 Synthetic（用户用 `::role` 写的伪造历史）。
 - assistant 回合还有 `spec`（provider、模型、选项、alias 标签）与 `status`（pending/running/done/failed）。
@@ -63,6 +63,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 
 ## 5. 渲染与限速
 
+- 输入（`intake`、`handler`、`media`、`tg::richin`）：消息的文字（富消息转成 Markdown）、媒体（照片、文件，富消息里的图片和文件）、位置（定位/地点/实时位置，富消息的地图块）记入 `inbound`；相册每张一条，等 1.5 秒后只由第一条被记录的消息处理（`conv::album_leader`），附上整个相册和其它张的说明；被回复的非 bot 消息只附上它的媒体和位置。
 - `prefixes`：本聊天的前缀（自定义 chatbot，表 `chat_prefixes`，按 bot + 聊天）：创建时把模型和选项解析定死，内存里缓存；`App::resolve_spec` 先查 bot 的前缀，再查本聊天的；新对话里每个这样的前缀单独一条链（它的 system prompt 和历史以 synthetic 回合写在用户消息前面），所以删除前缀不影响已有对话。
 - `compose`：把回合状态组装为富消息块（头部、折叠的推理/工具/来源、正文、提示、错误、页脚），每条消息第一行是 bot 的头部（小字），bot 生成的其它部分只用模型 Markdown 永远不会产生的块（details、footer），保证模型输出无法冒充。
 - `paginate`：按 32640 字 / 499 块切成多条消息（富消息上限 32768 / 500，留出续页头部的位置），超大块按结构拆分（代码按行、列表按项、表格按行并重复表头、折叠块按子块）。
@@ -78,7 +79,13 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 4. 额外检查：原生搜索在所选 endpoint 不存在时拒绝；service tier 自动加入对应 tier endpoint；PDF 强制 native 引擎；最终请求体再按 provider 白名单和 priority 名单检查（`policy::check`）。
 5. 流解析（`chat::ChunkParser`，Responses/Messages 各有 `EventParser`）：跳过 `:` 注释心跳；`reasoning_details` 按 `index` 合并；图片 data URL 解码；`url_citation` 转为引用；带内错误（HTTP 200 后的 `error` 块）按 `error_type` 分类；没有 finish/`[DONE]` 就断开视为可重试的网络错误；空闲超时（默认 3600 秒，方舟 1800 秒；保活注释也算数据，每个请求结束时日志记录最长间隔 `longest_gap_ms`）。
 
-## 7. 日志
+## 7. 官方直连 provider
+
+- `omni_llm::provider`：`Provider` trait（`prepare` → `Prepared`，`stream` → 事件，`knows` 模型表，`balance` 余额）、`DirectConfig`、价目表工具（`TokenPrice`、`PricingSink` 给没有费用的用量估价）、`PROVIDERS`（id、名字、key 的环境变量、默认地址）。bot 启动时为每个有 key 的 `[providers.<id>]` 建一个，`App.direct` 按 id 查；`jobs` 按回合的 provider 分派。
+- 每个平台一个模块：自己的模型表（上下文、最大输出、推理档位、价格）、`RouteCaps`（官方能力即通道能力）、历史转换（同方言同模型原样回放 native，否则只发文本）、请求体、错误分类。流解析复用三种方言的解析器（OpenRouter 的 Responses / Messages `EventParser`、Chat Completions `ChunkParser`，各自包一层补上平台特有的事件）和 `chatstream`；Gemini 是自己的 generateContent 解析器（含 long decode 的续写和 checkpoint：`Prepared::with_continuation`、`merge_natives` 按方言分派）。
+- 一个平台有两种接口时（DeepSeek 的 Chat + Anthropic 兼容、Moonshot 的 Chat + Responses、百炼的 Chat + Responses），两种方言分开记 native，只在同方言同模型时回放。
+
+## 8. 日志
 
 - `verbose`（默认）：`raw` target 记录每个上游请求体、响应头、每个 SSE 事件（微秒时间戳，便于统计 token 间隔）；大 base64/data URL 存为 blob，日志里写 `<blob sha256:… N bytes mime>`。
 - `normal`：只记录生命周期；`quiet`：只记录警告和错误。也可以直接写任意 tracing 过滤串，或用 `RUST_LOG` 覆盖。

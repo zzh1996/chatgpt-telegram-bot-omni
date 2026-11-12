@@ -35,6 +35,13 @@ impl ResolvedSpec {
         format!("{}:{}", self.provider, self.model)
     }
 
+    /// The model as shown in replies: OpenRouter ids as they are
+    /// (`openai/gpt-6.1-sol`), the platforms' own APIs with their prefix
+    /// (`openai:gpt-6.1-sol`), so the route of an answer is always visible.
+    pub fn display_model(&self) -> String {
+        if self.provider == "openrouter" { self.model.clone() } else { self.canonical() }
+    }
+
     pub fn options_syntax(&self) -> String {
         self.options.iter().map(|o| format!("+{}", o.to_syntax())).collect()
     }
@@ -221,7 +228,10 @@ pub async fn claim_retry(db: &Db, turn_id: i64) -> Result<bool> {
             params![now_ms(), turn_id],
         )?;
         if n == 1 {
-            tx.execute("UPDATE attempts SET status = 'superseded' WHERE turn_id = ?1 AND status = 'failed'", params![turn_id])?;
+            tx.execute(
+                "UPDATE attempts SET status = 'superseded' WHERE turn_id = ?1 AND status = 'failed'",
+                params![turn_id],
+            )?;
         }
         tx.commit()?;
         Ok(n == 1)
@@ -431,9 +441,7 @@ pub async fn prior_attempts(db: &Db, turn_id: i64, before_n: i64) -> Result<Vec<
             error: err.and_then(|e| serde_json::from_str::<omni_llm::LlmError>(&e).ok()),
             interrupted: status == "interrupted",
             usage: usage.and_then(|u| serde_json::from_str(&u).ok()),
-            elapsed: finished
-                .filter(|f| *f >= started)
-                .map(|f| std::time::Duration::from_millis((f - started) as u64)),
+            elapsed: finished.filter(|f| *f >= started).map(|f| std::time::Duration::from_millis((f - started) as u64)),
         })
         .collect())
 }
@@ -467,11 +475,12 @@ pub struct InboundPayload {
     /// Media attached to this message.
     #[serde(default)]
     pub media: Vec<crate::media::MediaRef>,
-    /// Media of the message this one replies to (when it is not a bot message).
-    #[serde(default)]
-    pub reply_media: Vec<crate::media::MediaRef>,
-    #[serde(default)]
-    pub reply_grouped_id: Option<i64>,
+    /// Positions shared in this message (location, venue, live location, map blocks).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<crate::media::LocationRef>,
+    /// The message is a rich message (its text is the Markdown of its blocks).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rich: bool,
     #[serde(default)]
     pub sender_name: Option<String>,
     #[serde(default)]
@@ -533,6 +542,19 @@ pub async fn get_inbound(db: &Db, id: i64) -> Result<Inbound> {
             payload: serde_json::from_str(&row.9).unwrap_or_default(),
             status: row.10,
         })
+    })
+    .await
+}
+
+/// The first recorded message of an album (the one that handles it).
+pub async fn album_leader(db: &Db, bot: &str, chat_id: i64, grouped_id: i64) -> Result<Option<i32>> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        Ok(c.query_row(
+            "SELECT MIN(msg_id) FROM inbound WHERE bot = ?1 AND chat_id = ?2 AND grouped_id = ?3",
+            params![bot, chat_id, grouped_id],
+            |r| r.get::<_, Option<i32>>(0),
+        )?)
     })
     .await
 }
@@ -670,7 +692,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let ids = |v: Vec<(i32, Option<String>, Option<crate::tg::flood::Shape>)>| v.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>();
+        let ids = |v: Vec<(i32, Option<String>, Option<crate::tg::flood::Shape>)>| {
+            v.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>()
+        };
         assert_eq!(ids(reply_messages(&db, "b", b, a2).await.unwrap()), vec![100, 105]);
         assert_eq!(ids(reply_messages(&db, "b", b, a1).await.unwrap()), vec![100, 105]);
         assert_eq!(ids(reply_messages(&db, "b", b, a3).await.unwrap()), vec![200]);
@@ -679,7 +703,10 @@ mod tests {
         assert!(claim_retry(&db, b).await.unwrap());
         assert!(!claim_retry(&db, b).await.unwrap());
         assert_eq!(get_turn(&db, b).await.unwrap().status, TurnStatus::Pending);
-        let st: String = db.call(move |c| Ok(c.query_row("SELECT status FROM attempts WHERE id = ?1", params![a1], |r| r.get(0))?)).await.unwrap();
+        let st: String = db
+            .call(move |c| Ok(c.query_row("SELECT status FROM attempts WHERE id = ?1", params![a1], |r| r.get(0))?))
+            .await
+            .unwrap();
         assert_eq!(st, "superseded");
         let prior = prior_attempts(&db, b, 4).await.unwrap();
         assert_eq!(prior.len(), 1);

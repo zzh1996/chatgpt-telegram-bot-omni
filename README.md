@@ -4,7 +4,7 @@
 
 - **MTProto**（grammers），不是 HTTP Bot API；发送用持久化的 `random_id` 实现幂等。
 - **单进程多 bot**：每个 bot 都像独立实例（各自的模型范围、授权名单、限额、前缀和速率限制），可按模型/群组分工。
-- **默认走 OpenRouter**，接口按"方言"抽象，便于以后直连各家官方 API。
+- **OpenRouter 与各家官方 API**：默认走 OpenRouter；配了 key 的平台也可以直连它自己的 API（OpenAI、Anthropic、Gemini、xAI、DeepSeek、智谱、Moonshot、阿里云百炼、火山方舟；国内厂商接国内官网，和旧版一样），模型写成 `openai:gpt-6.1-sol` 这样，回复第一行也这样显示。
 - **请求干净透明**：不注入任何 system prompt；所有参数（包括默认的"能力拉满"预设）都可查看（/info），并可用选项逐项覆盖（如 `+e=low`）；上游错误原样展示。
 - **重启不重不漏**：入站消息先落盘、处理完一批后才推进 Telegram 的 pts（重复投递被唯一键去重）；被重启打断的生成在原消息里重新生成（Gemini 4 long decode 从 checkpoint 接着写）；半截消息会被标注而不会悬空。
 - **Telegram 富消息**：思考过程放在可折叠块里，表格/公式/代码高亮；超出能力的部分按块回退为原始 Markdown；每条回复第一行是模型名，bot 加的其它内容都在折叠块或小字页脚里，模型输出无法伪造。
@@ -13,6 +13,7 @@
 
 ```sh
 cp .env.example .env                       # 填入 TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_BOT_TOKEN / OPENROUTER_API_KEY
+                                           # （可选：各平台官方 API 的 key，如 OPENAI_API_KEY、DEEPSEEK_API_KEY）
 cp config/omni.example.toml config/omni.toml
 # 编辑 config/omni.toml：至少把你的 Telegram user id 填进 [access].admins
 docker compose up -d --build
@@ -33,9 +34,11 @@ docker compose logs -f
 | `$你好` | 名字为空的前缀（配置里 `[[aliases]] name = ""`） |
 | `c$你好` | 前缀（`/models` 查看）；`$` 后的正文原样发送 |
 | `anthropic/claude-opus-5.5$你好` | 直接写 bot 有的任意 OpenRouter 模型 ID（需 `allow_unlisted_models = true`），新模型无需改配置 |
+| `openai:gpt-6.1-sol$你好` | 直连该平台的官方 API（需配置它的 key；直接写 ID 同样需 `allow_unlisted_models = true`） |
 | `c,g,61s$比较一下` | 多个模型并行 |
 | `c+s$` / `c+e=low$` / `gi+4W$` | 选项：官方搜索、推理强度、图片尺寸/比例…（本地校验，`/help options`） |
 | `c$::system` + 换行 + 角色段落 | 自定义 system prompt 和前文历史 |
+| 图片/文件/相册的说明里写前缀，或带前缀回复图片/文件/相册/位置 | 附件交给模型；相册当一条消息；位置给 Gemini 的 Google Maps（`+m`）；富消息按 Markdown |
 | 回复 bot 消息 | 原样作为下一轮用户消息（开头的 `\` 会被去掉，用于转义） |
 | 回复 + `/m g$文字` | 换模型继续这段对话 |
 | 回复 + `/raw` `/dump` `/info` `/retry` `/continue` | 原始 Markdown/文件、整段对话的 JSON、请求详情、重试失败的回答、继续写撞到预算的回答 |
@@ -63,6 +66,6 @@ cargo test -p omni-llm --test live -- --ignored --nocapture    # 在线测试（
 ```
 crates/omni-core      领域模型：对话树、内容块、触发语法解析、用量
 crates/omni-markdown  Markdown → Telegram（富消息块 / 经典 entities），限额切分
-crates/omni-llm       Provider 抽象、OpenRouter（目录、Chat Completions / Responses / Messages 三种接口、选项、SSE、错误分类）、火山方舟直连
+crates/omni-llm       Provider 抽象、OpenRouter（目录、Chat Completions / Responses / Messages 三种接口、选项、SSE、错误分类）、各平台官方 API 直连（OpenAI、Anthropic、Gemini、xAI、DeepSeek、智谱、Moonshot、百炼、方舟）
 crates/omni-bot       可执行文件：MTProto、多 bot（各自独立）、SQLite、任务、渲染、命令、权限与限额
 ```

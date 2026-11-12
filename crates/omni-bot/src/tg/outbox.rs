@@ -208,7 +208,7 @@ fn classify(e: InvocationError, permit: &GatePermit, has_reply: bool) -> OpError
     OpError::Other(anyhow!("{e}"))
 }
 
-fn reply_header(reply_to: Option<i32>) -> Option<tl::enums::InputReplyTo> {
+pub(crate) fn reply_header(reply_to: Option<i32>) -> Option<tl::enums::InputReplyTo> {
     reply_to.map(|id| {
         tl::enums::InputReplyTo::Message(tl::types::InputReplyToMessage {
             reply_to_msg_id: id,
@@ -389,7 +389,13 @@ pub async fn edit_once_status(
 }
 
 /// One attempt to delete messages, using a permit the caller already holds.
-pub async fn delete_once(db: &Db, bot: &BotConn, permit: &GatePermit, chat_id: i64, ids: &[i32]) -> Result<(), OpError> {
+pub async fn delete_once(
+    db: &Db,
+    bot: &BotConn,
+    permit: &GatePermit,
+    chat_id: i64,
+    ids: &[i32],
+) -> Result<(), OpError> {
     permit.set_weight(Weight::Free);
     if ids.is_empty() {
         permit.unused();
