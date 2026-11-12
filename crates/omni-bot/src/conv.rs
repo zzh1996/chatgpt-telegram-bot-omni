@@ -481,6 +481,9 @@ pub struct InboundPayload {
     /// The message is a rich message (its text is the Markdown of its blocks).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rich: bool,
+    /// Polls, contacts, dice, to-do lists, as text (`media::cards_of`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<String>,
     #[serde(default)]
     pub sender_name: Option<String>,
     #[serde(default)]

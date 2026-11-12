@@ -264,6 +264,16 @@ impl Ctx {
         }?;
         crate::policy::check(&self.app, self.user_id, &self.spec.provider, &self.spec.model, &p.body)
             .map_err(LlmError::request)?;
+        let mut p = p;
+        // An animated sticker went as its still preview (intake): say so.
+        let preview = self.history.iter().rev().find(|t| t.role == Role::User).is_some_and(|t| {
+            t.parts.iter().any(
+                |p| matches!(p, Part::Image { filename: Some(f), .. } if f == crate::media::ANIMATED_STICKER_PREVIEW),
+            )
+        });
+        if preview {
+            p.notes.push("the animated sticker was sent as its still preview: no model reads Lottie animations".into());
+        }
         Ok(p)
     }
 
@@ -353,6 +363,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         reasoning_open: app.cfg.render.reasoning_open,
         mode: app.cfg.render.markdown,
         prior: Vec::new(),
+        previews: Vec::new(),
         retry_button: false,
         done: false,
     };
@@ -718,6 +729,7 @@ impl Sink<'_> {
     fn render(&self) -> RenderState {
         let mut s = self.state.clone();
         s.parts = self.acc.parts().to_vec();
+        s.previews = self.acc.previews.iter().map(|(_, b, d)| (b.clone(), *d)).collect();
         s.usage = self.display_usage();
         s.provider = self.acc.provider.clone();
         s.finish_reason = self.acc.finish_reason.clone();
@@ -741,6 +753,7 @@ impl Sink<'_> {
             acc.sync_parts(&mut s.parts);
             if meta {
                 s.usage = usage;
+                s.previews = acc.previews.iter().map(|(_, b, d)| (b.clone(), *d)).collect();
                 s.provider = acc.provider.clone();
                 s.finish_reason = acc.finish_reason.clone();
                 s.native_finish_reason = acc.native_finish_reason.clone();
@@ -854,6 +867,7 @@ impl EventSink for Sink<'_> {
         }
         let is_image = matches!(ev, StreamEvent::Image { .. } | StreamEvent::ThoughtImage { .. });
         let is_file = matches!(ev, StreamEvent::File { .. });
+        let is_preview = matches!(ev, StreamEvent::PartialImage { .. } | StreamEvent::PreviewDone { .. });
         if !matches!(ev, StreamEvent::Text(_) | StreamEvent::Reasoning { .. }) {
             self.meta_dirty = true;
         }
@@ -865,6 +879,15 @@ impl EventSink for Sink<'_> {
                     Err(e) => warn!(error = %e, "failed to store generated image"),
                 }
             }
+        }
+        if is_preview {
+            for (slot, data, mime) in self.acc.take_pending_previews() {
+                match self.app.blobs.put_sync(&data, &mime) {
+                    Ok(b) => self.acc.set_preview(slot, b, image_dims(&data)),
+                    Err(e) => warn!(error = %e, "failed to store an image preview"),
+                }
+            }
+            self.meta_dirty = true;
         }
         if is_file {
             for (data, mime, name) in self.acc.take_pending_files() {
@@ -1140,6 +1163,8 @@ async fn run_attempt(
         }
         let usage = sink.total_usage();
         let mut final_state = sink.render();
+        // Previews only stand in for images still being generated.
+        final_state.previews.clear();
         final_state.show_usage = show_usage(app, usage.as_ref());
         let hops = sink.hops;
         let spent_before = sink.spent_before;

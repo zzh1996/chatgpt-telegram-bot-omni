@@ -180,6 +180,7 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached>
     let max = app.cfg.general_max_file_bytes();
     let mut refs = ib.payload.media.clone();
     let mut locations = ib.payload.locations.clone();
+    let mut cards = ib.payload.cards.clone();
     let mut captions = Vec::new();
     if let Some(g) = ib.grouped_id
         && let Ok(items) = media::album(bot, ib.chat_id, ib.msg_id, g).await
@@ -211,11 +212,16 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached>
                 let mut l = media::locations_of(&m);
                 l.extend(locations);
                 locations = l;
+                let mut c = media::cards_of(&m);
+                c.extend(cards);
+                cards = c;
             }
         }
     }
     let mut parts = Vec::new();
-    for r in refs.iter().filter(|r| !r.is_sticker) {
+    // Every kind of Telegram media: photos, files, voice and video messages,
+    // GIFs, stickers (an animated one as its still preview).
+    for r in &refs {
         let blob = media::fetch(&app.db, &app.blobs, bot, ib.chat_id, r, max)
             .await
             .with_context(|| format!("download {}", r.describe()))?;
@@ -230,6 +236,7 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached>
         });
     }
     parts.extend(locations.iter().map(media::LocationRef::part));
+    parts.extend(cards.into_iter().map(Part::text));
     Ok(Attached { parts, captions })
 }
 

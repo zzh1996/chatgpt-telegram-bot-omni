@@ -164,6 +164,7 @@ async fn on_update(app: &Arc<App>, bot: &Arc<BotConn>, update: tl::enums::Update
     let mut payload = InboundPayload {
         media: media_of(&m),
         locations: crate::media::locations_of(&m),
+        cards: crate::media::cards_of(&m),
         rich: m.rich_message.is_some(),
         ..Default::default()
     };

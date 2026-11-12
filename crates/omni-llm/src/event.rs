@@ -25,6 +25,13 @@ pub enum StreamEvent {
     /// Another generated file (a video, a file a code tool wrote), already
     /// downloaded: shown as a document where it appeared.
     File { data: Vec<u8>, mime: String, name: Option<String> },
+    /// A preview of an image still being generated (streamed partial images):
+    /// replaces the previous preview of the same `slot` (a stable name the
+    /// provider picks, e.g. the output index); shown until `PreviewDone` for
+    /// that slot or the end of the attempt, never kept in the turn.
+    PartialImage { data: Vec<u8>, mime: String, slot: String },
+    /// The image of `slot` is finished (its `Image` comes with it): its preview goes.
+    PreviewDone { slot: String },
     /// A server-side tool call started/progressed/finished.
     Tool(ToolCall),
     /// A tool call the provider reports only after the answer text it grounded
@@ -53,6 +60,9 @@ pub enum StreamEvent {
     Checkpoint(Value),
 }
 
+/// The latest preview of an image still being generated: (slot, blob, pixel size).
+pub type Preview = (String, BlobRef, Option<(u32, u32)>);
+
 /// Builds an assistant turn incrementally. Rendering reads `turn()` at any time.
 #[derive(Debug, Clone, Default)]
 pub struct Accumulator {
@@ -72,6 +82,11 @@ pub struct Accumulator {
     pending_images: Vec<(Vec<u8>, String, bool)>,
     /// Other generated files to store: (bytes, MIME type, file name).
     pending_files: Vec<(Vec<u8>, String, Option<String>)>,
+    /// Image previews to store: (slot, bytes, MIME type).
+    pending_previews: Vec<(String, Vec<u8>, String)>,
+    /// Images still being generated, as their latest preview: (slot, blob,
+    /// pixel size). Shown after the parts; not part of the turn.
+    pub previews: Vec<Preview>,
     last_reasoning_block: Option<usize>,
     /// Parts changed since the last [`Accumulator::sync_parts`].
     changes: Option<PartsChange>,
@@ -197,6 +212,15 @@ impl Accumulator {
             StreamEvent::Image { data, mime } => self.pending_images.push((data, mime, false)),
             StreamEvent::ThoughtImage { data, mime } => self.pending_images.push((data, mime, true)),
             StreamEvent::File { data, mime, name } => self.pending_files.push((data, mime, name)),
+            StreamEvent::PartialImage { data, mime, slot } => {
+                // Only the newest preview of a slot matters.
+                self.pending_previews.retain(|(s, ..)| *s != slot);
+                self.pending_previews.push((slot, data, mime));
+            }
+            StreamEvent::PreviewDone { slot } => {
+                self.pending_previews.retain(|(s, ..)| *s != slot);
+                self.previews.retain(|(s, ..)| *s != slot);
+            }
             StreamEvent::Tool(call) => {
                 // Update an existing call with the same id, else append.
                 if let Some(id) = &call.id {
@@ -289,6 +313,19 @@ impl Accumulator {
     /// calls [`Accumulator::attach_image`] with the resulting reference.
     pub fn take_pending_images(&mut self) -> Vec<(Vec<u8>, String, bool)> {
         std::mem::take(&mut self.pending_images)
+    }
+
+    /// Image previews not yet stored as blobs (see [`Accumulator::set_preview`]).
+    pub fn take_pending_previews(&mut self) -> Vec<(String, Vec<u8>, String)> {
+        std::mem::take(&mut self.pending_previews)
+    }
+
+    /// The latest preview of `slot` (replacing the one before).
+    pub fn set_preview(&mut self, slot: String, blob: BlobRef, dims: Option<(u32, u32)>) {
+        match self.previews.iter_mut().find(|(s, ..)| *s == slot) {
+            Some(p) => *p = (slot, blob, dims),
+            None => self.previews.push((slot, blob, dims)),
+        }
     }
 
     /// Generated files not yet stored as blobs (see [`Accumulator::attach_file`]).
@@ -409,6 +446,24 @@ mod tests {
         // Reported again (e.g. updated metadata): updated in place.
         a.apply(StreamEvent::ToolBefore(ToolCall { status: Some("completed".into()), ..call }));
         assert_eq!(a.parts().len(), 3);
+    }
+
+    #[test]
+    fn image_previews_replace_each_other_and_go() {
+        let mut a = Accumulator::new();
+        let blob = |x: &[u8]| BlobRef::for_bytes(x, "image/png");
+        a.apply(StreamEvent::PartialImage { data: b"p1".to_vec(), mime: "image/png".into(), slot: "0".into() });
+        a.apply(StreamEvent::PartialImage { data: b"p2".to_vec(), mime: "image/png".into(), slot: "0".into() });
+        let pending = a.take_pending_previews();
+        assert_eq!(pending.len(), 1, "only the newest preview of a slot is stored");
+        a.set_preview("0".into(), blob(b"p2"), None);
+        a.set_preview("1".into(), blob(b"q1"), None);
+        a.set_preview("0".into(), blob(b"p3"), None);
+        assert_eq!(a.previews.len(), 2);
+        assert_eq!(a.previews[0].1, blob(b"p3"));
+        a.apply(StreamEvent::PreviewDone { slot: "0".into() });
+        assert_eq!(a.previews.iter().map(|(s, ..)| s.as_str()).collect::<Vec<_>>(), ["1"]);
+        assert!(a.parts().is_empty(), "previews are never parts of the turn");
     }
 
     #[test]

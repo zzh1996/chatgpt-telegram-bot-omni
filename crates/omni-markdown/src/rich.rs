@@ -211,13 +211,26 @@ pub enum RBlock {
         key: String,
         caption: RText,
     },
+    /// A video, playable in place (`pageBlockVideo`; uploaded like a document).
+    Video {
+        key: String,
+        caption: RText,
+    },
+    /// An audio file, playable in place (`pageBlockAudio`).
+    Audio {
+        key: String,
+        caption: RText,
+    },
 }
 
 impl RBlock {
     /// Media keys referenced by this block (photos and documents), recursively.
     pub fn media_keys(&self, out: &mut Vec<String>) {
         match self {
-            RBlock::Photo { key, .. } | RBlock::Document { key, .. } => {
+            RBlock::Photo { key, .. }
+            | RBlock::Document { key, .. }
+            | RBlock::Video { key, .. }
+            | RBlock::Audio { key, .. } => {
                 if !out.contains(key) {
                     out.push(key.clone());
                 }
@@ -279,10 +292,15 @@ impl RBlock {
             | RBlock::Heading { text: t, .. }
             | RBlock::CollapsedQuote { text: t }
             | RBlock::Photo { caption: t, .. }
-            | RBlock::Document { caption: t, .. } => {
+            | RBlock::Document { caption: t, .. }
+            | RBlock::Video { caption: t, .. }
+            | RBlock::Audio { caption: t, .. } => {
                 m.chars = t.chars();
                 m.depth = 1 + t.depth();
-                if matches!(self, RBlock::Photo { .. } | RBlock::Document { .. }) {
+                if matches!(
+                    self,
+                    RBlock::Photo { .. } | RBlock::Document { .. } | RBlock::Video { .. } | RBlock::Audio { .. }
+                ) {
                     m.media = 1;
                 }
             }
@@ -423,6 +441,8 @@ fn sanitize_block(b: RBlock) -> Option<RBlock> {
         }
         RBlock::Photo { key, caption } => RBlock::Photo { key, caption: sanitize_text(caption) },
         RBlock::Document { key, caption } => RBlock::Document { key, caption: sanitize_text(caption) },
+        RBlock::Video { key, caption } => RBlock::Video { key, caption: sanitize_text(caption) },
+        RBlock::Audio { key, caption } => RBlock::Audio { key, caption: sanitize_text(caption) },
         RBlock::Table { rows, .. } if rows.iter().all(|r| r.is_empty()) => return None,
         RBlock::Table { rows, bordered, striped } => RBlock::Table {
             rows: rows
@@ -842,7 +862,12 @@ fn split_block(b: RBlock, chars: usize, blocks: usize) -> Option<(RBlock, RBlock
             let (a, rest) = split_text_at(&plain, chars)?;
             Some((RBlock::Footer(RText::plain(a)), RBlock::Footer(RText::plain(rest))))
         }
-        RBlock::Math(_) | RBlock::Divider | RBlock::Photo { .. } | RBlock::Document { .. } => None,
+        RBlock::Math(_)
+        | RBlock::Divider
+        | RBlock::Photo { .. }
+        | RBlock::Document { .. }
+        | RBlock::Video { .. }
+        | RBlock::Audio { .. } => None,
     }
 }
 

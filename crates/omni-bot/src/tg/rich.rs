@@ -23,7 +23,15 @@ fn caption(t: &RText) -> tl::enums::PageCaption {
     tl::types::PageCaption { text: text(t), credit: tl::enums::RichText::TextEmpty }.into()
 }
 
-fn media_block(key: &str, cap: &RText, media: &RichMedia) -> tl::enums::PageBlock {
+/// How an uploaded document is shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    File,
+    Video,
+    Audio,
+}
+
+fn media_block(key: &str, cap: &RText, media: &RichMedia, shown: Shown) -> tl::enums::PageBlock {
     match media.items.get(key) {
         Some(Uploaded::Photo(p)) => tl::types::PageBlockPhoto {
             spoiler: false,
@@ -33,7 +41,18 @@ fn media_block(key: &str, cap: &RText, media: &RichMedia) -> tl::enums::PageBloc
             webpage_id: None,
         }
         .into(),
-        Some(Uploaded::Document(d)) => tl::types::PageBlockDocument { document_id: d.id, caption: caption(cap) }.into(),
+        Some(Uploaded::Document(d)) => match shown {
+            Shown::File => tl::types::PageBlockDocument { document_id: d.id, caption: caption(cap) }.into(),
+            Shown::Video => tl::types::PageBlockVideo {
+                autoplay: false,
+                r#loop: false,
+                spoiler: false,
+                video_id: d.id,
+                caption: caption(cap),
+            }
+            .into(),
+            Shown::Audio => tl::types::PageBlockAudio { audio_id: d.id, caption: caption(cap) }.into(),
+        },
         // Not uploaded (should not happen: senders resolve media first).
         None => tl::types::PageBlockParagraph { text: plain("[media unavailable]") }.into(),
     }
@@ -183,7 +202,9 @@ fn block_with(b: &RBlock, m: &RichMedia) -> tl::enums::PageBlock {
             tl::types::PageBlockDetails { open: *open, blocks: blocks.iter().map(block).collect(), title: text(title) }
                 .into()
         }
-        RBlock::Photo { key, caption: c } | RBlock::Document { key, caption: c } => media_block(key, c, m),
+        RBlock::Photo { key, caption: c } | RBlock::Document { key, caption: c } => media_block(key, c, m, Shown::File),
+        RBlock::Video { key, caption: c } => media_block(key, c, m, Shown::Video),
+        RBlock::Audio { key, caption: c } => media_block(key, c, m, Shown::Audio),
     }
 }
 
@@ -317,7 +338,9 @@ pub fn expected_text(blocks: &[RBlock]) -> String {
             | RBlock::Footer(t)
             | RBlock::CollapsedQuote { text: t }
             | RBlock::Photo { caption: t, .. }
-            | RBlock::Document { caption: t, .. } => out.push_str(&t.to_plain()),
+            | RBlock::Document { caption: t, .. }
+            | RBlock::Video { caption: t, .. }
+            | RBlock::Audio { caption: t, .. } => out.push_str(&t.to_plain()),
             RBlock::Pre { text, .. } => out.push_str(text),
             RBlock::Math(s) => out.push_str(s),
             RBlock::Divider => {}

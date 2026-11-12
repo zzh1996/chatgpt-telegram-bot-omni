@@ -63,6 +63,8 @@ pub struct RenderState {
     pub mode: Mode,
     /// Earlier attempts of this reply (shown above, in the same messages).
     pub prior: Vec<PriorAttempt>,
+    /// Latest previews of images still being generated (streamed partial images).
+    pub previews: Vec<(omni_core::BlobRef, Option<(u32, u32)>)>,
     /// The reply finally failed: a "🔁 Retry" button under its last message.
     pub retry_button: bool,
     /// Final state: sync it and stop.
@@ -94,6 +96,7 @@ impl RenderState {
             attachments: &self.attachments.iter().map(|a| a.key.clone()).collect::<Vec<_>>(),
             settings: &self.settings,
             prior: &self.prior,
+            previews: &self.previews,
         })
     }
 }
@@ -589,6 +592,17 @@ fn media_sources(state: &RenderState, pages: &[Content]) -> Vec<Source> {
             want: Want::Document,
         })
         .collect();
+    // Previews of images still being generated.
+    for (i, (blob, _)) in state.previews.iter().enumerate() {
+        if keys.contains(&blob.sha256) && !out.iter().any(|s: &Source| s.key == blob.sha256) {
+            out.push(Source {
+                key: blob.sha256.clone(),
+                blob: blob.clone(),
+                filename: format!("preview-{}.{}", i + 1, blob.mime.rsplit('/').next().unwrap_or("png")),
+                want: Want::Photo,
+            });
+        }
+    }
     // Generated files (videos, files written by code tools), as documents.
     for p in &state.parts {
         if let Part::File { blob, filename, generated: true } = p
@@ -596,11 +610,18 @@ fn media_sources(state: &RenderState, pages: &[Content]) -> Vec<Source> {
             && !out.iter().any(|s: &Source| s.key == blob.sha256)
         {
             let ext = blob.mime.rsplit('/').next().unwrap_or("bin");
+            let want = if blob.mime.starts_with("video/") {
+                Want::Video
+            } else if blob.mime.starts_with("audio/") {
+                Want::Audio
+            } else {
+                Want::Document
+            };
             out.push(Source {
                 key: blob.sha256.clone(),
                 blob: blob.clone(),
                 filename: filename.clone().unwrap_or_else(|| format!("file.{ext}")),
-                want: Want::Document,
+                want,
             });
         }
     }

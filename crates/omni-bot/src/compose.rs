@@ -82,6 +82,8 @@ pub struct ComposeInput<'a> {
     pub settings: &'a [String],
     /// Earlier attempts of this reply, oldest first.
     pub prior: &'a [PriorAttempt],
+    /// Previews of images still being generated, shown after the output.
+    pub previews: &'a [(omni_core::BlobRef, Option<(u32, u32)>)],
 }
 
 /// The model output of `parts` as Markdown, exactly (reasoning in HTML comments).
@@ -419,9 +421,14 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
                 flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
                 stretch.flush(&mut out);
                 let name = filename.clone().unwrap_or_else(|| blob.mime.clone());
-                out.push(RBlock::Document {
-                    key: blob.sha256.clone(),
-                    caption: RText::plain(format!("{name} · {}", fmt_size(blob.size))),
+                let (key, caption) = (blob.sha256.clone(), RText::plain(format!("{name} · {}", fmt_size(blob.size))));
+                // Videos and audio play in place; anything else is a file.
+                out.push(if blob.mime.starts_with("video/") {
+                    RBlock::Video { key, caption }
+                } else if blob.mime.starts_with("audio/") {
+                    RBlock::Audio { key, caption }
+                } else {
+                    RBlock::Document { key, caption }
                 });
                 i += 1;
             }
@@ -514,6 +521,13 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     }
     // 3. this attempt's output, in the order it was produced.
     out.extend(output_blocks(inp.parts, raw, 0, inp.reasoning_open && inp.status == Status::Generating));
+    // Images still being generated: their latest streamed preview.
+    for (blob, dims) in inp.previews {
+        out.push(RBlock::Photo {
+            key: blob.sha256.clone(),
+            caption: RText::plain(format!("⏳ preview · {}", image_caption(blob, *dims))),
+        });
+    }
 
     // 6. error: the message in the title; the complete error object inside.
     if let Some(e) = inp.error {
@@ -767,6 +781,14 @@ fn write_block(f: &mut Formatted, b: &RBlock, depth: usize) {
             f.push_str("📎 [file] ");
             write_text(f, caption);
         }
+        RBlock::Video { caption, .. } => {
+            f.push_str("🎬 [video] ");
+            write_text(f, caption);
+        }
+        RBlock::Audio { caption, .. } => {
+            f.push_str("🔊 [audio] ");
+            write_text(f, caption);
+        }
         RBlock::Details { title, blocks, .. } => {
             write_text(f, title);
             f.push_char('\n');
@@ -873,6 +895,7 @@ mod tests {
             attachments: &[],
             settings: &[],
             prior: &[],
+            previews: &[],
         }
     }
 

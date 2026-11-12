@@ -22,6 +22,10 @@ pub enum Want {
     /// Shown inline; falls back to a document when Telegram refuses it as a photo.
     Photo,
     Document,
+    /// A document with video attributes (playable in `pageBlockVideo`).
+    Video,
+    /// A document with audio attributes (playable in `pageBlockAudio`).
+    Audio,
 }
 
 impl Want {
@@ -29,6 +33,8 @@ impl Want {
         match self {
             Want::Photo => "photo",
             Want::Document => "document",
+            Want::Video => "video",
+            Want::Audio => "audio",
         }
     }
 }
@@ -159,15 +165,47 @@ async fn upload(
             }
         }
     }
+    let mut attributes: Vec<tl::enums::DocumentAttribute> =
+        vec![tl::types::DocumentAttributeFilename { file_name: filename.to_string() }.into()];
+    match want {
+        Want::Video => {
+            let (duration, w, h) = crate::media::mp4_info(&bytes).unwrap_or((0.0, 0, 0));
+            attributes.push(
+                tl::types::DocumentAttributeVideo {
+                    round_message: false,
+                    supports_streaming: true,
+                    nosound: false,
+                    duration,
+                    w: w as i32,
+                    h: h as i32,
+                    preload_prefix_size: None,
+                    video_start_ts: None,
+                    video_codec: None,
+                }
+                .into(),
+            );
+        }
+        Want::Audio => attributes.push(
+            tl::types::DocumentAttributeAudio {
+                voice: false,
+                duration: crate::media::wav_seconds(&bytes).unwrap_or(0.0).round() as i32,
+                title: None,
+                performer: None,
+                waveform: None,
+            }
+            .into(),
+        ),
+        Want::Photo | Want::Document => {}
+    }
     let file = upload_file(bot, &bytes, filename).await?;
     let media = tl::types::InputMediaUploadedDocument {
         nosound_video: false,
-        force_file: true,
+        force_file: matches!(want, Want::Photo | Want::Document),
         spoiler: false,
         file,
         thumb: None,
         mime_type: mime.to_string(),
-        attributes: vec![tl::types::DocumentAttributeFilename { file_name: filename.to_string() }.into()],
+        attributes,
         stickers: None,
         video_cover: None,
         video_timestamp: None,

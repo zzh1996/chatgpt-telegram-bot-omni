@@ -23,6 +23,32 @@ pub enum MediaKind {
     Document,
 }
 
+/// What a Telegram media item is, as the user sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TgKind {
+    #[default]
+    File,
+    Photo,
+    Voice,
+    Audio,
+    Video,
+    /// A round video message.
+    VideoNote,
+    /// A GIF (an MP4 without sound).
+    Animation,
+    /// A static sticker (WebP).
+    Sticker,
+    /// A video sticker (WebM).
+    VideoSticker,
+    /// An animated (Lottie) sticker: no model reads the animation, so its still
+    /// preview is downloaded instead (`thumb_size`), and the reply says so.
+    AnimatedSticker,
+}
+
+/// File name of the still preview sent for an animated (Lottie) sticker.
+pub const ANIMATED_STICKER_PREVIEW: &str = "animated-sticker-preview.webp";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRef {
     pub kind: MediaKind,
@@ -43,9 +69,11 @@ pub struct MediaRef {
     pub msg_id: i32,
     #[serde(default)]
     pub grouped_id: Option<i64>,
-    /// Sticker / animated emoji etc. (not sent to models).
+    /// Sticker / animated emoji etc.
     #[serde(default)]
     pub is_sticker: bool,
+    #[serde(default)]
+    pub tg_kind: TgKind,
 }
 
 impl MediaRef {
@@ -76,11 +104,12 @@ impl Downloadable for Loc<'_> {
                 thumb_size: m.thumb_size.clone(),
             }
             .into(),
+            // A document's preview when `thumb_size` names one (animated stickers).
             MediaKind::Document => tl::types::InputDocumentFileLocation {
                 id: m.id,
                 access_hash: m.access_hash,
                 file_reference,
-                thumb_size: String::new(),
+                thumb_size: m.thumb_size.clone(),
             }
             .into(),
         })
@@ -108,22 +137,50 @@ fn photo_ref(photo: &tl::types::Photo, msg: &tl::types::Message) -> MediaRef {
         msg_id: msg.id,
         grouped_id: msg.grouped_id,
         is_sticker: false,
+        tg_kind: TgKind::Photo,
     }
 }
 
 fn document_ref(doc: &tl::types::Document, msg: &tl::types::Message) -> MediaRef {
+    use tl::enums::DocumentAttribute as A;
     let mut filename = None;
     let mut is_sticker = false;
+    let (mut voice, mut audio, mut video, mut round, mut animated) = (false, false, false, false, false);
     for a in &doc.attributes {
         match a {
-            tl::enums::DocumentAttribute::Filename(f) => filename = Some(f.file_name.clone()),
-            tl::enums::DocumentAttribute::Sticker(_) | tl::enums::DocumentAttribute::CustomEmoji(_) => {
-                is_sticker = true
-            }
+            A::Filename(f) => filename = Some(f.file_name.clone()),
+            A::Sticker(_) | A::CustomEmoji(_) => is_sticker = true,
+            A::Audio(x) => (audio, voice) = (true, x.voice),
+            A::Video(x) => (video, round) = (true, x.round_message),
+            A::Animated => animated = true,
             _ => {}
         }
     }
-    MediaRef {
+    let mime = normalize_mime(&doc.mime_type, filename.as_deref());
+    let tg_kind = match () {
+        _ if is_sticker && mime == "application/x-tgsticker" => TgKind::AnimatedSticker,
+        _ if is_sticker && mime.starts_with("video/") => TgKind::VideoSticker,
+        _ if is_sticker => TgKind::Sticker,
+        _ if voice => TgKind::Voice,
+        _ if audio => TgKind::Audio,
+        _ if round => TgKind::VideoNote,
+        _ if animated => TgKind::Animation,
+        _ if video => TgKind::Video,
+        _ => TgKind::File,
+    };
+    // Telegram has no file name for these; models and /raw get a sensible one.
+    let ext = |m: &str, default: &str| {
+        mime_guess::get_mime_extensions_str(m).and_then(|e| e.first().copied()).unwrap_or(default).to_string()
+    };
+    let filename = filename.or_else(|| match tg_kind {
+        TgKind::Voice => Some(format!("voice.{}", ext(&mime, "ogg"))),
+        TgKind::VideoNote => Some("video-message.mp4".into()),
+        TgKind::Animation => Some("animation.mp4".into()),
+        TgKind::Sticker => Some("sticker.webp".into()),
+        TgKind::VideoSticker => Some("sticker.webm".into()),
+        _ => None,
+    });
+    let mut r = MediaRef {
         kind: MediaKind::Document,
         id: doc.id,
         access_hash: doc.access_hash,
@@ -131,12 +188,22 @@ fn document_ref(doc: &tl::types::Document, msg: &tl::types::Message) -> MediaRef
         dc_id: doc.dc_id,
         size: Some(doc.size as u64),
         thumb_size: String::new(),
-        mime: normalize_mime(&doc.mime_type, filename.as_deref()),
+        mime,
         filename,
         msg_id: msg.id,
         grouped_id: msg.grouped_id,
         is_sticker,
+        tg_kind,
+    };
+    if tg_kind == TgKind::AnimatedSticker {
+        // The largest still preview Telegram keeps for it (a WebP image).
+        let (thumb, size) = largest_photo_size(doc.thumbs.as_deref().unwrap_or(&[]));
+        r.thumb_size = thumb;
+        r.size = size;
+        r.mime = "image/webp".into();
+        r.filename = Some(ANIMATED_STICKER_PREVIEW.into());
     }
+    r
 }
 
 /// Extract media descriptors from a message: its photo or file, or the photos
@@ -244,6 +311,88 @@ pub fn locations_of(msg: &tl::types::Message) -> Vec<LocationRef> {
         }
     }
     out
+}
+
+/// Telegram messages that are neither text nor files, as text for the model:
+/// a poll (question, options, votes when known), a contact, a die and its
+/// value, a to-do list.
+pub fn cards_of(msg: &tl::types::Message) -> Vec<String> {
+    use tl::enums::MessageMedia as M;
+    let text = |t: &tl::enums::TextWithEntities| {
+        let tl::enums::TextWithEntities::Entities(t) = t;
+        t.text.clone()
+    };
+    match &msg.media {
+        Some(M::Poll(p)) => {
+            let tl::enums::Poll::Poll(poll) = &p.poll;
+            let tl::enums::PollResults::Results(res) = &p.results;
+            let votes = |option: &[u8]| {
+                res.results.iter().flatten().find_map(|v| {
+                    let tl::enums::PollAnswerVoters::Voters(v) = v;
+                    (v.option == option).then_some((v.voters, v.correct))
+                })
+            };
+            let mut kind = Vec::new();
+            if poll.quiz {
+                kind.push("quiz");
+            }
+            if poll.multiple_choice {
+                kind.push("multiple answers");
+            }
+            if poll.closed {
+                kind.push("closed");
+            }
+            let mut out = format!(
+                "📊 Poll{}: {}",
+                if kind.is_empty() { String::new() } else { format!(" ({})", kind.join(", ")) },
+                text(&poll.question)
+            );
+            for a in &poll.answers {
+                let tl::enums::PollAnswer::Answer(a) = a else { continue };
+                out.push_str(&format!("\n- {}", text(&a.text)));
+                if let Some((n, correct)) = votes(&a.option) {
+                    if let Some(n) = n {
+                        out.push_str(&format!(" — {n} votes"));
+                    }
+                    if correct {
+                        out.push_str(" (correct)");
+                    }
+                }
+            }
+            if let Some(n) = res.total_voters {
+                out.push_str(&format!("\n{n} voters"));
+            }
+            vec![out]
+        }
+        Some(M::Contact(c)) => {
+            let name = format!("{} {}", c.first_name, c.last_name).trim().to_string();
+            let mut out = format!("👤 Contact: {name}, {}", c.phone_number);
+            if !c.vcard.trim().is_empty() {
+                out.push_str(&format!("\n{}", c.vcard.trim()));
+            }
+            vec![out]
+        }
+        Some(M::Dice(d)) => vec![format!("{} (Telegram dice) = {}", d.emoticon, d.value)],
+        Some(M::ToDo(t)) => {
+            let tl::enums::TodoList::List(list) = &t.todo;
+            let done: Vec<i32> = t
+                .completions
+                .iter()
+                .flatten()
+                .map(|c| {
+                    let tl::enums::TodoCompletion::Completion(c) = c;
+                    c.id
+                })
+                .collect();
+            let mut out = format!("☑️ {}", text(&list.title));
+            for it in &list.list {
+                let tl::enums::TodoItem::Item(it) = it;
+                out.push_str(&format!("\n- [{}] {}", if done.contains(&it.id) { "x" } else { " " }, text(&it.title)));
+            }
+            vec![out]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The text of a message for the bot: a rich message as Markdown, otherwise
@@ -391,4 +540,102 @@ pub async fn album(bot: &BotConn, chat_id: i64, msg_id: i32, grouped_id: i64) ->
     items.sort_by_key(|i| i.msg_id);
     items.dedup_by_key(|i| i.msg_id);
     Ok(items)
+}
+
+/// Duration (seconds) and video size of an MP4/MOV file, from its `mvhd` and
+/// the first `tkhd` with a size (no decoding).
+pub fn mp4_info(b: &[u8]) -> Option<(f64, u32, u32)> {
+    fn be32(b: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    }
+    fn be64(b: &[u8], at: usize) -> Option<u64> {
+        Some(u64::from_be_bytes(b.get(at..at + 8)?.try_into().ok()?))
+    }
+    // Boxes inside `b[from..to]`: (type, payload start, end).
+    fn boxes(b: &[u8], from: usize, to: usize) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut at = from;
+        while at + 8 <= to {
+            let Some(size) = be32(b, at) else { break };
+            let kind: [u8; 4] = b[at + 4..at + 8].try_into().unwrap();
+            let (start, end) = match size {
+                1 => match be64(b, at + 8) {
+                    Some(s) if s >= 16 => (at + 16, at + s as usize),
+                    _ => break,
+                },
+                0 => (at + 8, to),
+                s if s >= 8 => (at + 8, at + s as usize),
+                _ => break,
+            };
+            if end > to {
+                break;
+            }
+            out.push((kind, start, end));
+            at = end;
+        }
+        out
+    }
+    let moov = boxes(b, 0, b.len()).into_iter().find(|(k, ..)| k == b"moov")?;
+    let inner = boxes(b, moov.1, moov.2);
+    let mvhd = inner.iter().find(|(k, ..)| k == b"mvhd")?;
+    let duration = match b.get(mvhd.1)? {
+        1 => be64(b, mvhd.1 + 24)? as f64 / be32(b, mvhd.1 + 20)?.max(1) as f64,
+        _ => be32(b, mvhd.1 + 16)? as f64 / be32(b, mvhd.1 + 12)?.max(1) as f64,
+    };
+    let (mut w, mut h) = (0, 0);
+    for (_, s, e) in inner.iter().filter(|(k, ..)| k == b"trak") {
+        if let Some(t) = boxes(b, *s, *e).into_iter().find(|(k, ..)| k == b"tkhd") {
+            // Width and height are the last 8 bytes, as 16.16 fixed point.
+            let (tw, th) = (be32(b, t.2 - 8)? >> 16, be32(b, t.2 - 4)? >> 16);
+            if tw > 0 && th > 0 {
+                (w, h) = (tw, th);
+                break;
+            }
+        }
+    }
+    Some((duration, w, h))
+}
+
+/// Duration (seconds) of a WAV file, from its header.
+pub fn wav_seconds(b: &[u8]) -> Option<f64> {
+    if b.get(0..4)? != b"RIFF" || b.get(8..12)? != b"WAVE" {
+        return None;
+    }
+    let mut at = 12;
+    let mut byte_rate = None;
+    while at + 8 <= b.len() {
+        let size = u32::from_le_bytes(b[at + 4..at + 8].try_into().ok()?) as usize;
+        match &b[at..at + 4] {
+            b"fmt " => byte_rate = Some(u32::from_le_bytes(b.get(at + 16..at + 20)?.try_into().ok()?)),
+            b"data" => return Some(size as f64 / byte_rate?.max(1) as f64),
+            _ => {}
+        }
+        at += 8 + size + (size & 1);
+    }
+    None
+}
+
+#[cfg(test)]
+mod probe_tests {
+    #[test]
+    fn mp4_and_wav_headers() {
+        // A 2-second 64×48 H.264 clip made with ffmpeg.
+        let mp4 = include_bytes!("../tests/fixtures/tiny-64x48-2s.mp4");
+        let (d, w, h) = super::mp4_info(mp4).unwrap();
+        assert!((d - 2.0).abs() < 0.1, "{d}");
+        assert_eq!((w, h), (64, 48));
+        assert!(super::mp4_info(b"not a video").is_none());
+        // 1.5 s of 16-bit mono at 8 kHz: 24,000 bytes of data at 16,000 bytes/s.
+        let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        wav.extend(16u32.to_le_bytes());
+        wav.extend([1, 0, 1, 0]);
+        wav.extend(8000u32.to_le_bytes());
+        wav.extend(16000u32.to_le_bytes());
+        wav.extend([2, 0, 16, 0]);
+        wav.extend(b"data");
+        wav.extend(24000u32.to_le_bytes());
+        wav.extend(vec![0u8; 24000]);
+        assert_eq!(super::wav_seconds(&wav), Some(1.5));
+        assert!(super::wav_seconds(mp4).is_none());
+    }
 }
