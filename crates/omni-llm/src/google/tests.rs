@@ -349,7 +349,7 @@ async fn maps_takes_the_latest_location() {
     let img = blobs.add(b"\x89PNG", "image/png");
     let history = vec![user_turn(vec![
         location(1.0, 2.0),
-        Part::Image { blob: img, filename: None, generated: false, dims: None },
+        Part::Image { blob: img, filename: None, generated: false, dims: None, thought: false },
         Part::text("what is this place?"),
     ])];
     let p = prep_full(&google(), "gemini-3.8-flash", &[flag("m")], &history, &[], &blobs, None).await.unwrap();
@@ -418,7 +418,7 @@ async fn media_goes_natively_at_the_highest_resolution() {
     let mp4 = b.add(b"\0\0\0\x18ftypmp4", "video/mp4");
     let history = vec![user_turn(vec![
         Part::RemoteMedia { url: "https://www.youtube.com/watch?v=9hE5-98ZeCg".into(), kind: RemoteMediaKind::YouTube },
-        Part::Image { blob: img.clone(), filename: None, generated: false, dims: None },
+        Part::Image { blob: img.clone(), filename: None, generated: false, dims: None, thought: false },
         file(pdf.clone(), "paper.pdf"),
         file(rs, "main.rs"),
         file(md, "README.md"),
@@ -462,7 +462,7 @@ async fn media_goes_natively_at_the_highest_resolution() {
 
     // Image models take no per-part media resolution and fewer kinds of input.
     let one = |part: Part| vec![user_turn(vec![part, Part::text("?")])];
-    let image = Part::Image { blob: img, filename: None, generated: false, dims: None };
+    let image = Part::Image { blob: img, filename: None, generated: false, dims: None, thought: false };
     let p = prep_full(&google(), "gemini-nano-banana-2.1", &[], &one(image), &[], &b, None).await.unwrap();
     assert!(p.body["contents"][0]["parts"][0].get("mediaResolution").is_none());
     let check = |model: &'static str, part: Part, what: &'static str| {
@@ -619,7 +619,7 @@ fn search_grounding_becomes_a_tool_call_and_citations() {
     ];
     let mut p = parser("gemini-3.8-flash", json!({"tools": [{"googleSearch": {}}]}));
     let evs = run(&mut p, &chunks);
-    let tool = evs.iter().find_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None }).unwrap();
+    let tool = evs.iter().find_map(|e| if let StreamEvent::ToolBefore(t) = e { Some(t) } else { None }).unwrap();
     assert_eq!(tool.name, "google_search");
     assert_eq!(tool.input, Some(json!({"queries": ["UEFA Euro 2024 winner", "who won euro 2024", ""]})));
     assert_eq!(tool.output, Some(json!({"search_suggestions": suggestions})));
@@ -630,10 +630,11 @@ fn search_grounding_becomes_a_tool_call_and_citations() {
     assert_eq!(cites[0].range, Some((0, t1.len())));
     assert_eq!(cites[1].range, Some((s2, t1.len() + t2.len())));
     assert_eq!(cites[1].extra.as_ref().unwrap()["supports"][0]["confidenceScores"], json!([0.9, 0.8]));
-    // Sources follow the text they ground (attached to it); the tool call comes where it arrived.
+    // The search ran before the answer (it is only reported with the last chunk);
+    // the sources follow the text they ground (attached to it).
     let a = accumulate(&evs);
-    assert!(matches!(&a.parts()[0], Part::Text { citations, .. } if citations.len() == 2));
-    assert!(matches!(&a.parts()[1], Part::ToolCall(t) if t.name == "google_search"));
+    assert!(matches!(&a.parts()[0], Part::ToolCall(t) if t.name == "google_search"));
+    assert!(matches!(&a.parts()[1], Part::Text { citations, .. } if citations.len() == 2));
     // Two billable queries (the empty one is not billed); tool-use tokens at the input rate.
     let u = usages(&evs)[0];
     assert_eq!(u.input_tokens, Some(400));
@@ -693,7 +694,7 @@ fn maps_grounding_attributes_google_maps() {
         "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 20}})];
     let mut p = parser("gemini-3.8-flash", json!({"tools": [{"googleMaps": {}}]}));
     let evs = run(&mut p, &chunks);
-    let tool = evs.iter().find_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None }).unwrap();
+    let tool = evs.iter().find_map(|e| if let StreamEvent::ToolBefore(t) = e { Some(t) } else { None }).unwrap();
     assert_eq!(tool.name, "google_maps");
     let cites = evs.iter().find_map(|e| if let StreamEvent::Citations(c) = e { Some(c) } else { None }).unwrap();
     assert_eq!(cites[0].title.as_deref(), Some("Heaven on 7th Marketplace · Google Maps"));
@@ -722,8 +723,13 @@ fn code_execution_url_context_and_images() {
     ];
     let mut p = parser("gemini-3.8-flash", json!({}));
     let evs = run(&mut p, &chunks);
-    let tools: Vec<&ToolCall> =
-        evs.iter().filter_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None }).collect();
+    let tools: Vec<&ToolCall> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Tool(t) | StreamEvent::ToolBefore(t) => Some(t),
+            _ => None,
+        })
+        .collect();
     assert_eq!(tools[0].name, "code_execution");
     assert_eq!(tools[0].status.as_deref(), Some("in_progress"));
     assert_eq!(tools[0].input.as_ref().unwrap()["code"], "print(sum(range(10)))");
@@ -754,9 +760,16 @@ fn image_model_thought_images_and_image_pricing() {
                           "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 10}, {"modality": "IMAGE", "tokenCount": 1120}]}})];
     let mut p = parser("gemini-nano-banana-2.1", json!({}));
     let evs = run(&mut p, &chunks);
-    let images: Vec<&Vec<u8>> =
-        evs.iter().filter_map(|e| if let StreamEvent::Image { data, .. } = e { Some(data) } else { None }).collect();
-    assert_eq!(images, vec![&b"draft".to_vec(), &b"final".to_vec()]);
+    // The draft made while thinking stays with the reasoning; the answer image is an image.
+    let images: Vec<(&Vec<u8>, bool)> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Image { data, .. } => Some((data, false)),
+            StreamEvent::ThoughtImage { data, .. } => Some((data, true)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images, vec![(&b"draft".to_vec(), true), (&b"final".to_vec(), false)]);
     assert_eq!(p.native_payload()["parts"], chunks[0]["candidates"][0]["content"]["parts"]);
     // 1,120 image tokens at $30/M ($0.0336 per 1K image); text and thinking at $7.50/M.
     let u = usages(&evs)[0];

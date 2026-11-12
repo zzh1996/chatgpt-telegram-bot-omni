@@ -1052,7 +1052,7 @@ mod tests {
         let bmp = BlobRef::for_bytes(b"BM", "image/bmp");
         let blobs = Blobs(vec![(img.clone(), png.clone()), (txt.clone(), b"fn main() {}".to_vec())]);
         let turn = |parts: Vec<Part>| vec![Turn { role: Role::User, origin: Origin::Live, parts, native: None }];
-        let image = Part::Image { blob: img.clone(), filename: None, generated: false, dims: None };
+        let image = Part::Image { blob: img.clone(), filename: None, generated: false, dims: None, thought: false };
         let h = turn(vec![Part::text("what?"), image.clone()]);
         let p = ds().prepare(&input("deepseek-flash", &[], &h), &[], &blobs).await.unwrap();
         assert_eq!(
@@ -1061,7 +1061,7 @@ mod tests {
         );
         let e = ds().prepare(&input("deepseek-v4-pro", &[], &h), &[], &blobs).await.unwrap_err();
         assert!(e.message.contains("images only on deepseek-flash"), "{}", e.message);
-        let h = turn(vec![Part::Image { blob: bmp, filename: None, generated: false, dims: None }]);
+        let h = turn(vec![Part::Image { blob: bmp, filename: None, generated: false, dims: None, thought: false }]);
         let e = ds().prepare(&input("deepseek-flash", &[], &h), &[], &blobs).await.unwrap_err();
         assert!(e.message.contains("not image/bmp"), "{}", e.message);
         // Text files are inlined as their own part, with a note.

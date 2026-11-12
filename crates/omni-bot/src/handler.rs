@@ -220,9 +220,11 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached>
             .await
             .with_context(|| format!("download {}", r.describe()))?;
         parts.push(match r.kind {
-            media::MediaKind::Photo => Part::Image { blob, filename: None, generated: false, dims: None },
+            media::MediaKind::Photo => {
+                Part::Image { blob, filename: None, generated: false, dims: None, thought: false }
+            }
             media::MediaKind::Document if r.mime.starts_with("image/") => {
-                Part::Image { blob, filename: r.filename.clone(), generated: false, dims: None }
+                Part::Image { blob, filename: r.filename.clone(), generated: false, dims: None, thought: false }
             }
             media::MediaKind::Document => Part::File { blob, filename: r.filename.clone(), generated: false },
         });
@@ -478,6 +480,7 @@ mod tests {
             filename: None,
             generated: false,
             dims: None,
+            thought: false,
         };
         let t = user_turns("::system\nbe brief\n::user\nwhat is this?\n::assistant\nIt is", vec![img.clone()]).unwrap();
         assert_eq!(t.len(), 3);

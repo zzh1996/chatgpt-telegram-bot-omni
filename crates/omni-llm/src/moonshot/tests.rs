@@ -288,7 +288,8 @@ async fn media() {
     let (blobs, refs) = Blobs::new(&[b"\x89PNG", b"\x00\x00mp4", b"%PDF", b"fn main() {}", b"<svg/>", b"ID3"]);
     let with = |mime: &str, r: &BlobRef| BlobRef { mime: mime.into(), ..r.clone() };
     let user = |parts: Vec<Part>| Turn { role: Role::User, origin: Origin::Live, parts, native: None };
-    let image = Part::Image { blob: with("image/png", &refs[0]), filename: None, generated: false, dims: None };
+    let image =
+        Part::Image { blob: with("image/png", &refs[0]), filename: None, generated: false, dims: None, thought: false };
     let video = Part::File { blob: with("video/mp4", &refs[1]), filename: Some("v.mp4".into()), generated: false };
     let h = vec![user(vec![Part::text("look"), image.clone(), video.clone()])];
     let p = moonshot(None).prepare(&input("kimi-k3", &[], &h), &[], &blobs).await.unwrap();
@@ -318,7 +319,13 @@ async fn media() {
     let audio = Part::File { blob: with("audio/mpeg", &refs[5]), filename: Some("a.mp3".into()), generated: false };
     let e = moonshot(None).prepare(&input("kimi-k3", &[], &[user(vec![audio])]), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("no audio input"), "{}", e.message);
-    let svg = Part::Image { blob: with("image/svg+xml", &refs[4]), filename: None, generated: false, dims: None };
+    let svg = Part::Image {
+        blob: with("image/svg+xml", &refs[4]),
+        filename: None,
+        generated: false,
+        dims: None,
+        thought: false,
+    };
     let e = moonshot(None).prepare(&input("kimi-k3", &[], &[user(vec![svg])]), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("SVG"), "{}", e.message);
     let yt = Part::RemoteMedia { url: "https://youtu.be/x".into(), kind: omni_core::content::RemoteMediaKind::YouTube };

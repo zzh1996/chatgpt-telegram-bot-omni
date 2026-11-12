@@ -531,7 +531,7 @@ async fn user_media_is_sent_natively() {
         role: Role::User,
         origin: Origin::Live,
         parts: vec![
-            Part::Image { blob: jpg.clone(), filename: None, generated: false, dims: Some((10, 10)) },
+            Part::Image { blob: jpg.clone(), filename: None, generated: false, dims: Some((10, 10)), thought: false },
             Part::File { blob: jpg_label, filename: Some("scan.jpg".into()), generated: false },
             Part::File { blob: pdf, filename: Some("paper.pdf".into()), generated: false },
             Part::File { blob: txt, filename: Some("notes.txt".into()), generated: false },
@@ -567,7 +567,13 @@ async fn user_media_is_sent_natively() {
     let mut blobs = Blobs::default();
     let cases = [
         (
-            Part::Image { blob: blobs.add(b"heic", "image/heic"), filename: None, generated: false, dims: None },
+            Part::Image {
+                blob: blobs.add(b"heic", "image/heic"),
+                filename: None,
+                generated: false,
+                dims: None,
+                thought: false,
+            },
             "image/heic images",
         ),
         (
@@ -614,7 +620,10 @@ async fn generated_images_of_other_models_are_noted() {
     let answer = Turn {
         role: Role::Assistant,
         origin: Origin::Live,
-        parts: vec![Part::text("Here it is."), Part::Image { blob: png, filename: None, generated: true, dims: None }],
+        parts: vec![
+            Part::text("Here it is."),
+            Part::Image { blob: png, filename: None, generated: true, dims: None, thought: false },
+        ],
         native: None,
     };
     let history = vec![Turn::user_text("draw"), answer, Turn::user_text("describe it")];

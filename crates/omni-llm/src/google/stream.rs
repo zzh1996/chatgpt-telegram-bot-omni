@@ -355,6 +355,11 @@ impl ChunkParser {
             let mime = s(get(d, "mimeType", "mime_type")).unwrap_or_else(|| "application/octet-stream".into());
             let data = d.get("data").and_then(Value::as_str).unwrap_or("");
             match base64::engine::general_purpose::STANDARD.decode(data.trim()) {
+                // A draft made while thinking stays with the reasoning.
+                Ok(bytes) if mime.starts_with("image/") && thought => {
+                    self.shown(true);
+                    evs.push(StreamEvent::ThoughtImage { data: bytes, mime });
+                }
                 Ok(bytes) if mime.starts_with("image/") => {
                     self.shown(false);
                     evs.push(StreamEvent::Image { data: bytes, mime });
@@ -492,7 +497,8 @@ impl ChunkParser {
             input["image_queries"] = json!(self.image_queries);
         }
         self.shown(false);
-        evs.push(StreamEvent::Tool(ToolCall {
+        // Reported with the last chunk, but run before the answer it grounds.
+        evs.push(StreamEvent::ToolBefore(ToolCall {
             id: Some(id),
             name,
             status: Some("completed".into()),
@@ -520,7 +526,8 @@ impl ChunkParser {
                 == Some("URL_RETRIEVAL_STATUS_SUCCESS")
         });
         self.shown(false);
-        evs.push(StreamEvent::Tool(ToolCall {
+        // Retrieved before the answer it grounds, reported with it.
+        evs.push(StreamEvent::ToolBefore(ToolCall {
             id: Some(format!("{}#url_context", self.response_id.as_deref().unwrap_or("gemini"))),
             name: "url_context".into(),
             status: Some(if ok { "completed" } else { "failed" }.into()),
@@ -578,8 +585,10 @@ impl ChunkParser {
                 out.push(Citation { url: field(w, "uri"), title: field(w, "title"), cited_text: None, range, extra });
             } else if let Some(m) = chunk.get("maps") {
                 // Google Maps sources: attributed to "Google Maps", linked with `uri`/`googleMapsUri`.
+                // (Google's titles usually carry it already: "People's Square - Google Maps".)
                 let attributed = |t: Option<String>| {
                     Some(match t.filter(|t| !t.is_empty()) {
+                        Some(t) if t.contains("Google Maps") => t,
                         Some(t) => format!("{t} · Google Maps"),
                         None => "Google Maps".to_string(),
                     })

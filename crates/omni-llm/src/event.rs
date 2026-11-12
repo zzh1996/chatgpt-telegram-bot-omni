@@ -19,8 +19,15 @@ pub enum StreamEvent {
     OpaqueReasoning { kind: ReasoningKind },
     /// A generated image (already decoded).
     Image { data: Vec<u8>, mime: String },
+    /// A draft image made while thinking (Gemini's `thought` image parts):
+    /// shown with the reasoning.
+    ThoughtImage { data: Vec<u8>, mime: String },
     /// A server-side tool call started/progressed/finished.
     Tool(ToolCall),
+    /// A tool call the provider reports only after the answer text it grounded
+    /// (Gemini's search and Maps grounding arrive with the last chunk): placed
+    /// before that text, where it ran.
+    ToolBefore(ToolCall),
     /// Citations attached to the answer text.
     Citations(Vec<Citation>),
     /// Refusal text.
@@ -58,7 +65,8 @@ pub struct Accumulator {
     pub notices: Vec<String>,
     /// Native replay payload, maintained by the adapter.
     pub native: Option<NativeOutput>,
-    pending_images: Vec<(Vec<u8>, String)>,
+    /// Images to store: (bytes, MIME type, made while thinking).
+    pending_images: Vec<(Vec<u8>, String, bool)>,
     last_reasoning_block: Option<usize>,
     /// Parts changed since the last [`Accumulator::sync_parts`].
     changes: Option<PartsChange>,
@@ -181,7 +189,8 @@ impl Accumulator {
                     self.push_part(Part::Reasoning(Reasoning { kind, ..Default::default() }));
                 }
             }
-            StreamEvent::Image { data, mime } => self.pending_images.push((data, mime)),
+            StreamEvent::Image { data, mime } => self.pending_images.push((data, mime, false)),
+            StreamEvent::ThoughtImage { data, mime } => self.pending_images.push((data, mime, true)),
             StreamEvent::Tool(call) => {
                 // Update an existing call with the same id, else append.
                 if let Some(id) = &call.id {
@@ -204,6 +213,19 @@ impl Accumulator {
                     }
                 }
                 self.push_part(Part::ToolCall(call));
+            }
+            StreamEvent::ToolBefore(call) => {
+                // Already shown: update it in place.
+                if call.id.is_some() && self.parts.iter().any(|p| matches!(p, Part::ToolCall(c) if c.id == call.id)) {
+                    return self.apply(StreamEvent::Tool(call));
+                }
+                // Before the trailing run of answer text (after any reasoning).
+                let mut at = self.parts.len();
+                while at > 0 && matches!(self.parts[at - 1], Part::Text { .. }) {
+                    at -= 1;
+                }
+                self.parts.insert(at, Part::ToolCall(call));
+                self.touched(at);
             }
             StreamEvent::Citations(cs) => {
                 // Attach to the last text part (create one if needed).
@@ -259,12 +281,13 @@ impl Accumulator {
 
     /// Generated images not yet stored as blobs. The caller stores them and
     /// calls [`Accumulator::attach_image`] with the resulting reference.
-    pub fn take_pending_images(&mut self) -> Vec<(Vec<u8>, String)> {
+    pub fn take_pending_images(&mut self) -> Vec<(Vec<u8>, String, bool)> {
         std::mem::take(&mut self.pending_images)
     }
 
-    pub fn attach_image(&mut self, blob: BlobRef, dims: Option<(u32, u32)>) {
-        self.push_part(Part::Image { blob, filename: None, generated: true, dims });
+    /// `thought`: a draft made while thinking.
+    pub fn attach_image(&mut self, blob: BlobRef, dims: Option<(u32, u32)>, thought: bool) {
+        self.push_part(Part::Image { blob, filename: None, generated: true, dims, thought });
     }
 
     pub fn parts(&self) -> &[Part] {
@@ -341,6 +364,36 @@ mod tests {
         check(&mut a, &mut mirror);
         a.sync_parts(&mut mirror); // no changes: nothing to do
         check(&mut a, &mut mirror);
+    }
+
+    #[test]
+    fn grounding_reported_late_goes_before_the_answer() {
+        let mut a = Accumulator::new();
+        let mut mirror = Vec::new();
+        a.apply(StreamEvent::Reasoning { kind: ReasoningKind::Summary, text: "think".into(), block: 0 });
+        a.apply(StreamEvent::Text("Paris is ".into()));
+        a.sync_parts(&mut mirror);
+        a.apply(StreamEvent::Text("the capital.".into()));
+        let call = ToolCall { id: Some("g".into()), name: "google_search".into(), ..Default::default() };
+        a.apply(StreamEvent::ToolBefore(call.clone()));
+        let kinds: Vec<&str> = a
+            .parts()
+            .iter()
+            .map(|p| match p {
+                Part::Reasoning(_) => "reasoning",
+                Part::ToolCall(_) => "tool",
+                Part::Text { .. } => "text",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["reasoning", "tool", "text"]);
+        assert_eq!(a.turn().answer_text(), "Paris is the capital.");
+        // A mirror taken before the insertion catches up.
+        a.sync_parts(&mut mirror);
+        assert_eq!(serde_json::to_value(&mirror).unwrap(), serde_json::to_value(a.parts()).unwrap());
+        // Reported again (e.g. updated metadata): updated in place.
+        a.apply(StreamEvent::ToolBefore(ToolCall { status: Some("completed".into()), ..call }));
+        assert_eq!(a.parts().len(), 3);
     }
 
     #[test]

@@ -852,15 +852,15 @@ impl EventSink for Sink<'_> {
             }
             _ => {}
         }
-        let is_image = matches!(ev, StreamEvent::Image { .. });
+        let is_image = matches!(ev, StreamEvent::Image { .. } | StreamEvent::ThoughtImage { .. });
         if !matches!(ev, StreamEvent::Text(_) | StreamEvent::Reasoning { .. }) {
             self.meta_dirty = true;
         }
         self.acc.apply(ev);
         if is_image {
-            for (data, mime) in self.acc.take_pending_images() {
+            for (data, mime, thought) in self.acc.take_pending_images() {
                 match self.app.blobs.put_sync(&data, &mime) {
-                    Ok(b) => self.acc.attach_image(b, image_dims(&data)),
+                    Ok(b) => self.acc.attach_image(b, image_dims(&data), thought),
                     Err(e) => warn!(error = %e, "failed to store generated image"),
                 }
             }
@@ -1123,10 +1123,10 @@ async fn run_attempt(
         };
 
         // Store generated images (if any are still pending).
-        for (data, mime) in sink.acc.take_pending_images() {
+        for (data, mime, thought) in sink.acc.take_pending_images() {
             let dims = image_dims(&data);
             if let Ok(b) = app.blobs.put(data, mime).await {
-                sink.acc.attach_image(b, dims);
+                sink.acc.attach_image(b, dims, thought);
             }
         }
         let usage = sink.total_usage();

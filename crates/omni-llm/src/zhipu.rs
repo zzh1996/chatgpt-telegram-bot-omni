@@ -1068,7 +1068,8 @@ mod tests {
         ]);
         let user = |parts: Vec<Part>| vec![Turn { role: Role::User, origin: Origin::Live, parts, native: None }];
         let file = |b: &BlobRef, n: &str| Part::File { blob: b.clone(), filename: Some(n.into()), generated: false };
-        let image = |b: &BlobRef| Part::Image { blob: b.clone(), filename: None, generated: false, dims: None };
+        let image =
+            |b: &BlobRef| Part::Image { blob: b.clone(), filename: None, generated: false, dims: None, thought: false };
         let run = |model: &'static str, h: Vec<Turn>| {
             let blobs = &blobs;
             async move { zp().prepare(&input(model, &[], &h), &[], blobs).await }

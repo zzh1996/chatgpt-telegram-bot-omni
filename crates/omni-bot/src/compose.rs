@@ -176,6 +176,82 @@ fn visible(p: &Part) -> bool {
     }
 }
 
+/// What a tool call did, in a few words: the query, URL or code it ran (from
+/// its input, whatever the provider's shape), on one line.
+fn tool_detail(t: &ToolCall) -> Option<String> {
+    use serde_json::Value;
+    fn find(v: &Value, depth: usize) -> Option<String> {
+        let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let list = |v: &Value| {
+            let l: Vec<String> = v.as_array()?.iter().filter_map(text).collect();
+            (!l.is_empty()).then(|| l.join("; "))
+        };
+        match v {
+            Value::String(s) => text(&Value::String(s.clone())),
+            Value::Object(o) if depth < 3 => {
+                // Web search actions that are not searches (OpenAI, xAI).
+                let field = |k: &str| o.get(k).and_then(text);
+                match o.get("type").and_then(Value::as_str) {
+                    Some("open_page") if let Some(u) = field("url") => return Some(format!("open {u}")),
+                    Some("find_in_page" | "find") if let Some(p) = field("pattern") => {
+                        return Some(match field("url") {
+                            Some(u) => format!("find \"{p}\" in {u}"),
+                            None => format!("find \"{p}\""),
+                        });
+                    }
+                    _ => {}
+                }
+                for k in ["query", "queries", "url", "urls", "pattern", "code", "command", "commands", "prompt"] {
+                    if let Some(x) = o.get(k)
+                        && let Some(d) = text(x).or_else(|| list(x))
+                    {
+                        return Some(d);
+                    }
+                }
+                // OpenAI-style `action` objects and other nesting.
+                ["action", "input", "arguments"].iter().find_map(|k| o.get(*k).and_then(|x| find(x, depth + 1)))
+            }
+            _ => None,
+        }
+    }
+    let d = find(t.input.as_ref()?, 0)?;
+    let line = d.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if line.chars().count() > 60 { format!("{}…", line.chars().take(59).collect::<String>()) } else { line })
+}
+
+/// The title of a fold of tool calls: what they did, so it reads without
+/// opening (`🔧 web_search: rust release`, `🔧 web_search ×2: a; b`, mixed
+/// tools separated by ` · `), with any status other than completed.
+fn tools_title(calls: &[&ToolCall]) -> String {
+    let status = |t: &ToolCall| match t.status.as_deref() {
+        None | Some("completed" | "complete" | "success" | "succeeded" | "done") => String::new(),
+        Some(s) => format!(" ({s})"),
+    };
+    let same = calls.len() > 1 && calls.windows(2).all(|w| w[0].name == w[1].name);
+    let mut title = if same {
+        let details: Vec<String> = calls.iter().filter_map(|t| tool_detail(t)).collect();
+        let mut s = format!("🔧 {} ×{}", calls[0].name, calls.len());
+        if !details.is_empty() {
+            s.push_str(": ");
+            s.push_str(&details.join("; "));
+        }
+        s
+    } else {
+        let each: Vec<String> = calls
+            .iter()
+            .map(|t| match tool_detail(t) {
+                Some(d) => format!("{}{}: {d}", t.name, status(t)),
+                None => format!("{}{}", t.name, status(t)),
+            })
+            .collect();
+        format!("🔧 {}", each.join(" · "))
+    };
+    if title.chars().count() > 120 {
+        title = format!("{}…", title.chars().take(119).collect::<String>());
+    }
+    title
+}
+
 fn tool_item(t: &ToolCall) -> RItem {
     let mut s = t.name.clone();
     if let Some(st) = &t.status {
@@ -301,16 +377,16 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
             }
             Part::ToolCall(_) => {
                 flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
-                let mut items = Vec::new();
+                let mut calls = Vec::new();
                 while let Some(Part::ToolCall(t)) = parts.get(i) {
-                    items.push(tool_item(t));
+                    calls.push(t);
                     i += 1;
                 }
-                stretch.tool_calls += items.len();
+                stretch.tool_calls += calls.len();
                 stretch.blocks.push(RBlock::Details {
                     open: false,
-                    title: RText::plain(format!("🔧 Tool calls · {}", items.len())),
-                    blocks: vec![RBlock::List { items }],
+                    title: RText::plain(tools_title(&calls)),
+                    blocks: vec![RBlock::List { items: calls.iter().map(|t| tool_item(t)).collect() }],
                 });
             }
             Part::Text { text, citations: c } => {
@@ -320,6 +396,16 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
                 }
                 answer.push_str(text);
                 citations.extend(c.iter().cloned());
+                i += 1;
+            }
+            // A draft made while thinking: part of the reasoning stretch.
+            Part::Image { blob, generated: true, dims, thought: true, .. } => {
+                flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                stretch.reasoning += 1;
+                stretch.blocks.push(RBlock::Photo {
+                    key: blob.sha256.clone(),
+                    caption: RText::plain(format!("💭 {}", image_caption(blob, *dims))),
+                });
                 i += 1;
             }
             Part::Image { blob, generated: true, dims, .. } => {
@@ -683,6 +769,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_fold_titles_say_what_ran() {
+        let call = |name: &str, input: serde_json::Value, status: &str| ToolCall {
+            id: None,
+            name: name.into(),
+            status: Some(status.into()),
+            input: Some(input),
+            output: None,
+        };
+        let search =
+            call("web_search", serde_json::json!({"type": "search", "query": "rust latest version"}), "completed");
+        let openai = call(
+            "web_search",
+            serde_json::json!({"action": {"type": "search", "query": "rust 1.100 date"}}),
+            "completed",
+        );
+        let gemini = call("google_search", serde_json::json!({"queries": ["a", "", "b"]}), "completed");
+        let code = call("code_interpreter", serde_json::json!("print(2**100)\nprint(1)"), "in_progress");
+        let fetch = call("web_fetch", serde_json::json!({"url": "https://www.rust-lang.org/"}), "completed");
+        let open = call("web_search", serde_json::json!({"type": "open_page", "url": "https://a.b/c"}), "completed");
+        let find = call(
+            "web_search",
+            serde_json::json!({"type": "find_in_page", "pattern": "1.100.0", "url": "https://a.b/c"}),
+            "completed",
+        );
+        assert_eq!(
+            tools_title(&[&open, &find]),
+            "🔧 web_search ×2: open https://a.b/c; find \"1.100.0\" in https://a.b/c"
+        );
+        assert_eq!(tools_title(&[&search]), "🔧 web_search: rust latest version");
+        assert_eq!(tools_title(&[&search, &openai]), "🔧 web_search ×2: rust latest version; rust 1.100 date");
+        assert_eq!(tools_title(&[&gemini]), "🔧 google_search: a; b");
+        assert_eq!(
+            tools_title(&[&code, &fetch]),
+            "🔧 code_interpreter (in_progress): print(2**100) print(1) · web_fetch: https://www.rust-lang.org/"
+        );
+        let bare = ToolCall { name: "x_search".into(), ..Default::default() };
+        assert_eq!(tools_title(&[&bare]), "🔧 x_search");
+        let long = call("web_search", serde_json::json!({"query": "word ".repeat(40)}), "completed");
+        assert!(tools_title(&[&long]).chars().count() <= 120);
+    }
+
+    #[test]
     fn token_counts_in_units() {
         let cases = [
             (0, "0"),
@@ -860,6 +988,7 @@ mod tests {
             filename: None,
             generated: true,
             dims: Some((1, 1)),
+            thought: false,
         };
         let parts = vec![
             reasoning("plan"),

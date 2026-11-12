@@ -279,7 +279,13 @@ async fn media() {
         big_video,
     ]);
     let with = |mime: &str, r: &BlobRef| BlobRef { mime: mime.into(), ..r.clone() };
-    let image = Part::Image { blob: with("image/jpeg", &refs[0]), filename: None, generated: false, dims: None };
+    let image = Part::Image {
+        blob: with("image/jpeg", &refs[0]),
+        filename: None,
+        generated: false,
+        dims: None,
+        thought: false,
+    };
     let video = Part::File { blob: with("video/mp4", &refs[1]), filename: Some("v.mp4".into()), generated: false };
     let h = [user(vec![Part::text("look"), image.clone(), video.clone()])];
     let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &h), &[], &blobs).await.unwrap();

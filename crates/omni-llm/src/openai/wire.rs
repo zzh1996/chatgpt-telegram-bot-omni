@@ -1015,7 +1015,10 @@ pub(crate) mod tests {
 
     pub(crate) fn photo(mime: &str, data: &[u8]) -> (Part, (BlobRef, Vec<u8>)) {
         let b = BlobRef::for_bytes(data, mime);
-        (Part::Image { blob: b.clone(), filename: None, generated: false, dims: None }, (b, data.to_vec()))
+        (
+            Part::Image { blob: b.clone(), filename: None, generated: false, dims: None, thought: false },
+            (b, data.to_vec()),
+        )
     }
 
     pub(crate) fn user(parts: Vec<Part>) -> Turn {
@@ -1238,7 +1241,7 @@ pub(crate) mod tests {
         let (txt, b2) = file("notes.md", "application/octet-stream", b"# hi");
         let (big, _) = {
             let b = BlobRef { sha256: "0".repeat(64), size: 21 * 1024 * 1024, mime: "image/png".into() };
-            (Part::Image { blob: b.clone(), filename: None, generated: false, dims: None }, b)
+            (Part::Image { blob: b.clone(), filename: None, generated: false, dims: None, thought: false }, b)
         };
         let blobs = MemBlobs(vec![b1, b2]);
         let c = convert_history(&[user(vec![pdf, txt])], &inputs(Platform::Xai), &blobs).await.unwrap();

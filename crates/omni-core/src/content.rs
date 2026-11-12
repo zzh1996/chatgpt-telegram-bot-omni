@@ -129,6 +129,10 @@ pub enum Part {
         /// Pixel dimensions (width, height), when known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dims: Option<(u32, u32)>,
+        /// A draft the model made while thinking (Gemini's thought images):
+        /// shown with its reasoning, not as an answer.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        thought: bool,
     },
     /// Any other file: PDF, audio, video, text/code documents, ...
     /// Mapping to the provider's input type (native document, inline data,
