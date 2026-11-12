@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::access::{self, Access};
 use crate::app::App;
-use crate::compose::fmt_cost;
+use crate::compose::{fmt_cost, fmt_tokens_compact};
 use crate::conv::{self, Inbound, TurnStatus};
 use crate::jobs;
 use crate::reply;
@@ -1573,7 +1573,9 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
             let rows = rank(app, &bot.name, since, chat_f, user_f, d, limit).await?;
             let rows = rows
                 .into_iter()
-                .map(|(k, n, i, o, c)| vec![k, n.to_string(), i.to_string(), o.to_string(), fmt_cost(c)])
+                .map(|(k, n, i, o, c)| {
+                    vec![k, n.to_string(), fmt_tokens_compact(i), fmt_tokens_compact(o), fmt_cost(c)]
+                })
                 .collect();
             blocks.push(table(&[d.header(), "calls", "in", "out", "cost"], rows));
         }

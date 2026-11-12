@@ -141,6 +141,26 @@ pub fn fmt_cost(c: f64) -> String {
     }
 }
 
+/// A token count for statistics: exact below 1000, else in K / M / B with one
+/// decimal below 10 and none above (`1.2K`, `45K`, `380K`, `1.2M`, `12M`), so a
+/// large total reads at a glance; the exact count would not mean more.
+pub fn fmt_tokens_compact(n: i64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let n = n as f64;
+    let units = [("K", 1e3), ("M", 1e6), ("B", 1e9)];
+    for (i, (unit, div)) in units.iter().enumerate() {
+        let v = n / div;
+        let shown = if v < 9.95 { format!("{v:.1}") } else { format!("{v:.0}") };
+        // Rounding up to 1000 of a unit is the next unit (999,960 is 1M, not 1000K).
+        if shown.parse::<f64>().unwrap_or(0.0) < 1000.0 || i == units.len() - 1 {
+            return format!("{}{unit}", shown.strip_suffix(".0").unwrap_or(&shown));
+        }
+    }
+    unreachable!()
+}
+
 fn ai_blocks(md: &str, raw: bool, base_depth: usize) -> Vec<RBlock> {
     if raw { rich::raw_markdown_blocks(md) } else { rich::markdown_to_blocks(md, base_depth, RichLimits::TELEGRAM) }
 }
@@ -661,6 +681,28 @@ fn write_block(f: &mut Formatted, b: &RBlock, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_counts_in_units() {
+        let cases = [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1K"),
+            (1_234, "1.2K"),
+            (9_940, "9.9K"),
+            (9_960, "10K"),
+            (45_321, "45K"),
+            (380_499, "380K"),
+            (999_499, "999K"),
+            (999_960, "1M"),
+            (1_234_567, "1.2M"),
+            (12_345_678, "12M"),
+            (2_500_000_000, "2.5B"),
+        ];
+        for (n, want) in cases {
+            assert_eq!(fmt_tokens_compact(n), want, "{n}");
+        }
+    }
     use omni_core::content::{Citation, Reasoning};
 
     fn input<'a>(parts: &'a [Part], status: Status) -> ComposeInput<'a> {
