@@ -171,7 +171,7 @@ fn visible(p: &Part) -> bool {
         Part::Reasoning(r) => r.text.as_deref().is_some_and(|t| !t.is_empty()),
         Part::Text { text, citations } => !text.trim().is_empty() || !citations.is_empty(),
         Part::ToolCall(_) | Part::Refusal { .. } => true,
-        Part::Image { generated, .. } => *generated,
+        Part::Image { generated, .. } | Part::File { generated, .. } => *generated,
         _ => false,
     }
 }
@@ -414,6 +414,17 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
                 out.push(RBlock::Photo { key: blob.sha256.clone(), caption: RText::plain(image_caption(blob, *dims)) });
                 i += 1;
             }
+            // A generated file (a video, a file a code tool wrote): where it appeared.
+            Part::File { blob, filename, generated: true } => {
+                flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
+                stretch.flush(&mut out);
+                let name = filename.clone().unwrap_or_else(|| blob.mime.clone());
+                out.push(RBlock::Document {
+                    key: blob.sha256.clone(),
+                    caption: RText::plain(format!("{name} · {}", fmt_size(blob.size))),
+                });
+                i += 1;
+            }
             Part::Refusal { text } => {
                 flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
                 stretch.flush(&mut out);
@@ -580,6 +591,11 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         out.push(RBlock::Footer(RText::plain(f.join(" · "))));
     }
     out
+}
+
+/// A file size: `623.9 KB`, `12.4 MB`.
+fn fmt_size(b: u64) -> String {
+    if b >= 1_000_000 { format!("{:.1} MB", b as f64 / 1e6) } else { format!("{:.1} KB", b as f64 / 1e3) }
 }
 
 /// `1024×1024 · 623.9 KB · JPEG` (dimensions when known, file size, format).

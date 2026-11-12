@@ -22,6 +22,9 @@ pub enum StreamEvent {
     /// A draft image made while thinking (Gemini's `thought` image parts):
     /// shown with the reasoning.
     ThoughtImage { data: Vec<u8>, mime: String },
+    /// Another generated file (a video, a file a code tool wrote), already
+    /// downloaded: shown as a document where it appeared.
+    File { data: Vec<u8>, mime: String, name: Option<String> },
     /// A server-side tool call started/progressed/finished.
     Tool(ToolCall),
     /// A tool call the provider reports only after the answer text it grounded
@@ -67,6 +70,8 @@ pub struct Accumulator {
     pub native: Option<NativeOutput>,
     /// Images to store: (bytes, MIME type, made while thinking).
     pending_images: Vec<(Vec<u8>, String, bool)>,
+    /// Other generated files to store: (bytes, MIME type, file name).
+    pending_files: Vec<(Vec<u8>, String, Option<String>)>,
     last_reasoning_block: Option<usize>,
     /// Parts changed since the last [`Accumulator::sync_parts`].
     changes: Option<PartsChange>,
@@ -191,6 +196,7 @@ impl Accumulator {
             }
             StreamEvent::Image { data, mime } => self.pending_images.push((data, mime, false)),
             StreamEvent::ThoughtImage { data, mime } => self.pending_images.push((data, mime, true)),
+            StreamEvent::File { data, mime, name } => self.pending_files.push((data, mime, name)),
             StreamEvent::Tool(call) => {
                 // Update an existing call with the same id, else append.
                 if let Some(id) = &call.id {
@@ -283,6 +289,15 @@ impl Accumulator {
     /// calls [`Accumulator::attach_image`] with the resulting reference.
     pub fn take_pending_images(&mut self) -> Vec<(Vec<u8>, String, bool)> {
         std::mem::take(&mut self.pending_images)
+    }
+
+    /// Generated files not yet stored as blobs (see [`Accumulator::attach_file`]).
+    pub fn take_pending_files(&mut self) -> Vec<(Vec<u8>, String, Option<String>)> {
+        std::mem::take(&mut self.pending_files)
+    }
+
+    pub fn attach_file(&mut self, blob: BlobRef, filename: Option<String>) {
+        self.push_part(Part::File { blob, filename, generated: true });
     }
 
     /// `thought`: a draft made while thinking.

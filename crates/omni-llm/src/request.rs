@@ -30,6 +30,9 @@ pub enum Tool {
     /// Google Maps grounding (`m`); the conversation's latest location is the
     /// user's position.
     Maps,
+    /// The provider's own image generation tool in a chat (`i`; OpenAI and
+    /// xAI `image_generation`).
+    Image,
 }
 
 impl Tool {
@@ -39,6 +42,7 @@ impl Tool {
             Tool::Code => 'c',
             Tool::Fetch => 'u',
             Tool::Maps => 'm',
+            Tool::Image => 'i',
         }
     }
     pub fn describe(self) -> &'static str {
@@ -47,6 +51,7 @@ impl Tool {
             Tool::Code => "code execution",
             Tool::Fetch => "URL fetching",
             Tool::Maps => "Google Maps",
+            Tool::Image => "image generation",
         }
     }
 }
@@ -66,6 +71,14 @@ pub struct Requested {
     /// Provider slugs (route-specific meaning).
     pub providers: Option<Vec<String>>,
     pub tier: Option<String>,
+    /// Image quality (`q=`; image generation models).
+    pub quality: Option<String>,
+    /// Number of images (`n=`; image generation models).
+    pub count: Option<u32>,
+    /// Image background (`bg=`: auto, opaque, transparent).
+    pub background: Option<String>,
+    /// Video length in seconds (`sec=`; video generation models).
+    pub seconds: Option<u32>,
 }
 
 /// Help for the option vocabulary.
@@ -75,12 +88,17 @@ c                 the provider's own code execution
 u                 let the model read URLs from the prompt (provider's own tool)
 m                 Google Maps grounding (Gemini API); a Telegram location in the conversation
                   (sent, or replied to) is the user's position
+i                 the provider's own image generation tool in a chat (OpenAI, xAI)
 e=<level>         reasoning effort, from the levels the model supports; e=none turns reasoning off
                   (Volcengine Ark: e=minimal turns thinking off too)
 budget=<n>        reasoning token budget (models with budget-based thinking)
 v=<level>         verbosity (low|medium|high; OpenAI)
 1 2 4             image size 1K / 2K / 4K (image models)
 S W H w h         image aspect ratio 1:1 / 16:9 / 9:16 / 4:3 / 3:4;  ar=<w:h> for any ratio the model supports
+q=<level>         image quality, from the levels the image model has (highest by default)
+n=<count>         number of images (image models that make several per request; 1 by default)
+bg=<background>   image background: auto | opaque | transparent (models that have it)
+sec=<seconds>     video length (video models)
 p=<slug>          another official provider of the model (e.g. p=google-vertex); p=a|b: any of these
                   (OpenRouter only)
 tier=<tier>       service tier (flex; higher tiers only for users on the priority list;
@@ -107,12 +125,13 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
             OptionToken::Flag(f) => {
                 for c in f.chars() {
                     match c {
-                        's' | 'c' | 'u' | 'm' => {
+                        's' | 'c' | 'u' | 'm' | 'i' => {
                             let tool = match c {
                                 's' => Tool::Search,
                                 'c' => Tool::Code,
                                 'u' => Tool::Fetch,
-                                _ => Tool::Maps,
+                                'm' => Tool::Maps,
+                                _ => Tool::Image,
                             };
                             if !r.tools.contains(&tool) {
                                 r.tools.push(tool);
@@ -159,6 +178,24 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
                     set(&mut r.providers, slugs, "provider")?;
                 }
                 "tier" => set(&mut r.tier, v.to_ascii_lowercase(), "tier")?,
+                "q" => set(&mut r.quality, v.to_ascii_lowercase(), "quality")?,
+                "bg" => set(&mut r.background, v.to_ascii_lowercase(), "background")?,
+                "n" => {
+                    let n: u32 = v
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| format!("`n=` needs a number of images (1 or more), got `{v}`"))?;
+                    set(&mut r.count, n, "image count")?;
+                }
+                "sec" => {
+                    let n: u32 = v
+                        .parse()
+                        .ok()
+                        .filter(|n| *n >= 1)
+                        .ok_or_else(|| format!("`sec=` needs a whole number of seconds, got `{v}`"))?;
+                    set(&mut r.seconds, n, "video length")?;
+                }
                 other => return Err(format!("unknown option `{other}=`; see /help options")),
             },
         }
@@ -192,6 +229,8 @@ pub mod official {
         Some(match (v, tool) {
             ("google", Tool::Maps) => true, // googleMaps grounding (Gemini API)
             (_, Tool::Maps) => false,
+            ("openai" | "x-ai", Tool::Image) => true, // image_generation (Responses)
+            (_, Tool::Image) => false,
             ("openai", Tool::Search | Tool::Code) => true,
             ("openai", Tool::Fetch) => false,
             ("anthropic", _) => true, // web_search, code_execution, web_fetch
@@ -257,6 +296,20 @@ pub trait RouteCaps {
     fn image_options(&self) -> bool;
     /// Service tiers available for the chosen provider(s), excluding the default.
     fn tiers(&self) -> Vec<String>;
+    /// Which image/video generation options (`q=`, `n=`, `bg=`, `sec=`) the
+    /// route takes for the model; their values are checked by the provider.
+    fn generation(&self) -> Generation {
+        Generation::default()
+    }
+}
+
+/// Image/video generation options a route takes (see [`RouteCaps::generation`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Generation {
+    pub quality: bool,
+    pub count: bool,
+    pub background: bool,
+    pub seconds: bool,
 }
 
 /// Check `r` against the vendor's capabilities and the route's. Returns the
@@ -330,6 +383,17 @@ pub fn validate(model: &str, r: &Requested, route: &dyn RouteCaps) -> Result<(),
         }
         if !route.image_options() {
             return Err(format!("{via} does not support image size/aspect options for `{model}`"));
+        }
+    }
+    let g = route.generation();
+    for (asked, ok, what, opt) in [
+        (r.quality.is_some(), g.quality, "image quality", "q="),
+        (r.count.is_some(), g.count, "a choice of the number of images", "n="),
+        (r.background.is_some(), g.background, "a background option", "bg="),
+        (r.seconds.is_some(), g.seconds, "a video length", "sec="),
+    ] {
+        if asked && !ok {
+            return Err(format!("`{model}` has no {what} (`{opt}`) via {via}"));
         }
     }
     if let Some(t) = &r.tier

@@ -589,6 +589,21 @@ fn media_sources(state: &RenderState, pages: &[Content]) -> Vec<Source> {
             want: Want::Document,
         })
         .collect();
+    // Generated files (videos, files written by code tools), as documents.
+    for p in &state.parts {
+        if let Part::File { blob, filename, generated: true } = p
+            && keys.contains(&blob.sha256)
+            && !out.iter().any(|s: &Source| s.key == blob.sha256)
+        {
+            let ext = blob.mime.rsplit('/').next().unwrap_or("bin");
+            out.push(Source {
+                key: blob.sha256.clone(),
+                blob: blob.clone(),
+                filename: filename.clone().unwrap_or_else(|| format!("file.{ext}")),
+                want: Want::Document,
+            });
+        }
+    }
     let mut n = 0;
     for p in &state.parts {
         if let Part::Image { blob, generated: true, .. } = p {

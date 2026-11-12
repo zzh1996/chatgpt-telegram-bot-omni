@@ -89,7 +89,7 @@ pub fn body(model: &str, messages: Vec<Value>, plan: &super::options::Plan) -> V
         .filter_map(|t| match t {
             crate::request::Tool::Search => Some(super::options::search_tool()),
             crate::request::Tool::Fetch => Some(super::options::fetch_tool()),
-            crate::request::Tool::Code | crate::request::Tool::Maps => None, // rejected by validation on this skin
+            crate::request::Tool::Code | crate::request::Tool::Maps | crate::request::Tool::Image => None, // rejected by validation
         })
         .collect();
     if !tools.is_empty() {

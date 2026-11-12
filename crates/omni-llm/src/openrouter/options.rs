@@ -144,6 +144,8 @@ impl RouteCaps for OrCaps<'_> {
             Tool::Fetch => self.all_pinned_have("openrouter:web_fetch"),
             // Gemini's Google Maps grounding is not reachable through OpenRouter.
             Tool::Maps => false,
+            // OpenRouter replaces OpenAI's image_generation tool with its own (D28).
+            Tool::Image => false,
         }
     }
 
@@ -243,6 +245,10 @@ pub fn overlay(base: &Requested, over: &Requested) -> Requested {
     take!(aspect_ratio);
     take!(providers);
     take!(tier);
+    take!(quality);
+    take!(count);
+    take!(background);
+    take!(seconds);
     if over.effort.is_some() {
         r.budget = None;
     }

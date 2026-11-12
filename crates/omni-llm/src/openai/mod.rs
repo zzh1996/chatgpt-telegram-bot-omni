@@ -400,7 +400,8 @@ impl OpenAi {
                     json!({"type": "code_interpreter", "container": {"type": "auto"}}),
                     "code_interpreter_call.outputs",
                 ),
-                Tool::Fetch | Tool::Maps => {
+                // TODO(image generation agent): the image_generation tool.
+                Tool::Fetch | Tool::Maps | Tool::Image => {
                     return Err(LlmError::request(format!("`{model}` has no {} (`+{}`)", t.describe(), t.letter())));
                 }
             };

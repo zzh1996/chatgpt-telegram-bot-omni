@@ -155,7 +155,7 @@ pub fn body(model: &str, input: Vec<Value>, plan: &Plan) -> Value {
             Tool::Search => Some(search_tool()),
             Tool::Code => Some(json!({"type": "code_interpreter", "container": {"type": "auto"}})),
             Tool::Fetch => Some(fetch_tool()),
-            Tool::Maps => None, // rejected by validation
+            Tool::Maps | Tool::Image => None, // rejected by validation
         })
         .collect();
     if !tools.is_empty() {

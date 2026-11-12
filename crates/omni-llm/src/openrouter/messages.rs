@@ -162,7 +162,7 @@ pub fn body(model: &str, system: Option<Value>, messages: Vec<Value>, plan: &Pla
         .filter_map(|t| match t {
             Tool::Search => Some(search_tool()),
             Tool::Fetch => Some(fetch_tool()),
-            Tool::Code | Tool::Maps => None, // rejected by validation
+            Tool::Code | Tool::Maps | Tool::Image => None, // rejected by validation
         })
         .collect();
     if !tools.is_empty() {

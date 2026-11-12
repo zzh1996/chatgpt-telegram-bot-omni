@@ -853,6 +853,7 @@ impl EventSink for Sink<'_> {
             _ => {}
         }
         let is_image = matches!(ev, StreamEvent::Image { .. } | StreamEvent::ThoughtImage { .. });
+        let is_file = matches!(ev, StreamEvent::File { .. });
         if !matches!(ev, StreamEvent::Text(_) | StreamEvent::Reasoning { .. }) {
             self.meta_dirty = true;
         }
@@ -862,6 +863,14 @@ impl EventSink for Sink<'_> {
                 match self.app.blobs.put_sync(&data, &mime) {
                     Ok(b) => self.acc.attach_image(b, image_dims(&data), thought),
                     Err(e) => warn!(error = %e, "failed to store generated image"),
+                }
+            }
+        }
+        if is_file {
+            for (data, mime, name) in self.acc.take_pending_files() {
+                match self.app.blobs.put_sync(&data, &mime) {
+                    Ok(b) => self.acc.attach_file(b, name),
+                    Err(e) => warn!(error = %e, "failed to store generated file"),
                 }
             }
         }

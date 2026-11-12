@@ -195,6 +195,10 @@ pub async fn prepare(
             Tool::Code => json!({"codeExecution": {}}),
             Tool::Fetch => json!({"urlContext": {}}),
             Tool::Maps => json!({"googleMaps": {}}),
+            // Gemini has no image-generation tool (its image models draw by themselves).
+            Tool::Image => {
+                return Err(LlmError::request(format!("`{model}` has no {} (`+{}`)", t.describe(), t.letter())));
+            }
         };
         applied.push(Applied { source: src(user.tools.contains(t)), patch: json!({"tools": [tool]}) });
         tools.push(tool);

@@ -250,7 +250,7 @@ impl Xai {
             let (tool, inc) = match t {
                 Tool::Search => (json!({"type": "web_search"}), "web_search_call.action.sources"),
                 Tool::Code => (json!({"type": "code_interpreter"}), "code_interpreter_call.outputs"),
-                Tool::Fetch | Tool::Maps => {
+                Tool::Fetch | Tool::Maps | Tool::Image => {
                     return Err(LlmError::request(format!("`{model}` has no {} (`+{}`)", t.describe(), t.letter())));
                 }
             };
