@@ -556,6 +556,16 @@ mod tests {
         assert!(s.contains(&("c".into(), EntityKind::Code)));
         assert!(s.contains(&("fn main(){}".into(), EntityKind::Pre { language: "rs".into() })));
         assert!(s.contains(&("> q".into(), EntityKind::Blockquote { collapsed: false })));
+        // LaTeX delimiters are rewritten only for parsing: raw mode shows them as written.
+        let md = "Let \\( x_1 \\) be:\n\n\\[\nx = \\frac{a}{b}\n\\]\n";
+        assert_eq!(render(md, RenderOptions { mode: Mode::Raw, ..Default::default() }).text, md);
+    }
+
+    #[test]
+    fn latex_delimiters_render_as_math() {
+        let f = render("Let \\(x_1 * y_2\\) be", RenderOptions::default());
+        assert_eq!(f.text, "Let x_1 * y_2 be");
+        assert!(spans(&f).contains(&("x_1 * y_2".into(), EntityKind::Code)), "{:?}", spans(&f));
     }
 
     #[test]

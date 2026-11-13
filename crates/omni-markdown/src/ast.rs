@@ -183,7 +183,7 @@ pub fn options() -> Options {
 type Ev<'a> = (Event<'a>, Src);
 
 struct Events<'a> {
-    inner: std::iter::Peekable<pulldown_cmark::OffsetIter<'a>>,
+    inner: std::iter::Peekable<std::vec::IntoIter<Ev<'a>>>,
 }
 
 impl<'a> Events<'a> {
@@ -196,9 +196,154 @@ impl<'a> Events<'a> {
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
-    let mut ev = Events { inner: Parser::new_ext(src, options()).into_offset_iter().peekable() };
+    let math = latex_delimiters(src);
+    let text = math.as_ref().map_or(src, |m| m.text.as_str());
+    let events: Vec<Ev<'_>> = Parser::new_ext(text, options())
+        .into_offset_iter()
+        .map(|(e, r)| match &math {
+            // Ranges point into the model's own text, not the rewritten one.
+            Some(m) => (e, m.original(r.start, false)..m.original(r.end, true)),
+            None => (e, r),
+        })
+        .collect();
+    let mut ev = Events { inner: events.into_iter().peekable() };
     let blocks = parse_blocks(&mut ev, None);
     normalize_display_math(blocks)
+}
+
+/// The text with LaTeX's own math delimiters rewritten for the parser, and the
+/// way back to the original byte offsets.
+struct Rewritten {
+    text: String,
+    /// `(new offset, original offset, new length, original length)` of every
+    /// piece, in order: copied pieces have equal lengths, rewritten delimiters not.
+    pieces: Vec<(usize, usize, usize, usize)>,
+}
+
+impl Rewritten {
+    /// The original offset of `pos` in the rewritten text. Inside a rewritten
+    /// formula: its start, or its end for the end of a range.
+    fn original(&self, pos: usize, end: bool) -> usize {
+        let i = self.pieces.partition_point(|p| p.0 <= pos).saturating_sub(1);
+        let Some(&(new, orig, new_len, orig_len)) = self.pieces.get(i) else { return pos };
+        if new_len == orig_len {
+            orig + (pos - new).min(orig_len)
+        } else if pos == new || !end {
+            orig
+        } else {
+            orig + orig_len
+        }
+    }
+}
+
+/// Characters that make a `\[ … \]` body math rather than an escaped bracket.
+const MATHY: &[char] = &['\\', '^', '_', '=', '{', '}', '+', '<', '>', '|'];
+
+/// LaTeX's own delimiters, `\( … \)` for inline math and `\[ … \]` for display
+/// math, which OpenAI, DeepSeek, Qwen, Grok and Doubao models write (seen
+/// 2026-11-14), are CommonMark escapes of brackets: they are rewritten to
+/// `$…$` and `$$…$$` so that the math extension takes them (outside code; an
+/// inline formula's inner spaces trimmed, which `$` needs). `\[ … \]` only
+/// when the body looks like math, so that an escaped bracket like `\[1\]`
+/// stays one. `None`: nothing to rewrite.
+fn latex_delimiters(src: &str) -> Option<Rewritten> {
+    if !src.contains("\\(") && !src.contains("\\[") {
+        return None;
+    }
+    // Code spans and blocks (and raw HTML) keep their text.
+    let mut code: Vec<Range<usize>> = Vec::new();
+    let mut depth = 0usize;
+    for (e, r) in Parser::new_ext(src, options()).into_offset_iter() {
+        match e {
+            Event::Code(_) | Event::InlineHtml(_) | Event::Html(_) if depth == 0 => code.push(r),
+            Event::Start(Tag::CodeBlock(_)) => {
+                if depth == 0 {
+                    code.push(r);
+                }
+                depth += 1;
+            }
+            Event::End(TagEnd::CodeBlock) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let in_code = |i: usize| code.iter().any(|r| r.contains(&i));
+    let bytes = src.as_bytes();
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let (close, display) = match bytes[i + 1] {
+            b'(' => (b')', false),
+            b'[' => (b']', true),
+            // An escaped backslash, or another escape.
+            _ => {
+                i += 2;
+                continue;
+            }
+        };
+        if in_code(i) {
+            i += 2;
+            continue;
+        }
+        let start = i + 2;
+        let Some(len) = closing(&bytes[start..], close) else {
+            i += 2;
+            continue;
+        };
+        let body = &src[start..start + len];
+        let end = start + len + 2;
+        let ok = !body.trim().is_empty()
+            && !body.contains('$')
+            && !body.contains("\n\n")
+            && !body.contains("\r\n\r\n")
+            && (!display || body.contains('\n') || body.contains(MATHY))
+            && !in_code(end - 1);
+        if !ok {
+            i += 2;
+            continue;
+        }
+        let new = if display { format!("$${body}$$") } else { format!("${}$", body.trim_matches([' ', '\t'])) };
+        edits.push((i..end, new));
+        i = end;
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(src.len());
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    for (r, new) in edits {
+        if r.start > at {
+            pieces.push((text.len(), at, r.start - at, r.start - at));
+            text.push_str(&src[at..r.start]);
+        }
+        pieces.push((text.len(), r.start, new.len(), r.end - r.start));
+        text.push_str(&new);
+        at = r.end;
+    }
+    pieces.push((text.len(), at, src.len() - at, src.len() - at));
+    text.push_str(&src[at..]);
+    Some(Rewritten { text, pieces })
+}
+
+/// The length of a body up to its closing `\)` or `\]` (escaped backslashes
+/// skipped), if there is one.
+fn closing(rest: &[u8], close: u8) -> Option<usize> {
+    let mut j = 0;
+    while j + 1 < rest.len() {
+        if rest[j] == b'\\' {
+            if rest[j + 1] == close {
+                return Some(j);
+            }
+            j += 2;
+        } else {
+            j += 1;
+        }
+    }
+    None
 }
 
 fn is_inline_start(e: &Event<'_>) -> bool {
@@ -645,5 +790,81 @@ mod tests {
             Block::CodeBlock { code, .. } => assert_eq!(code, "print(1)\n"),
             b => panic!("unexpected {b:?}"),
         }
+    }
+
+    fn math_of(inlines: &[Inline]) -> Vec<(String, bool)> {
+        inlines
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Math { tex, display, .. } => Some((tex.clone(), *display)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// LaTeX's own delimiters, as chat-latest writes them (2026-11-14).
+    #[test]
+    fn latex_delimiters_are_math() {
+        let md = "We are given:\n\n\\[\nx^2 - 5x + 6 = 0\n\\]\n\nComparing with \\(ax^2 + bx + c = 0\\):\n\n- \\(a = 1\\)\n- \\( b = -5 \\)\n";
+        let blocks = parse(md);
+        match &blocks[1] {
+            Block::MathBlock { tex, src } => {
+                assert_eq!(tex.trim(), "x^2 - 5x + 6 = 0");
+                // Ranges are the model's own text.
+                assert_eq!(md[src.clone()].trim_end(), "\\[\nx^2 - 5x + 6 = 0\n\\]");
+            }
+            b => panic!("unexpected {b:?}"),
+        }
+        match &blocks[2] {
+            Block::Paragraph { inlines, src } => {
+                assert_eq!(math_of(inlines), [("ax^2 + bx + c = 0".to_string(), false)]);
+                assert_eq!(md[src.clone()].trim_end(), "Comparing with \\(ax^2 + bx + c = 0\\):");
+                let Inline::Math { src: m, .. } = &inlines[1] else { panic!("{inlines:?}") };
+                assert_eq!(&md[m.clone()], "\\(ax^2 + bx + c = 0\\)");
+            }
+            b => panic!("unexpected {b:?}"),
+        }
+        let Block::List { items, .. } = &blocks[3] else { panic!("{:?}", blocks[3]) };
+        let tex: Vec<_> = items
+            .iter()
+            .flat_map(|it| match &it.blocks[0] {
+                Block::TightParagraph { inlines, .. } => math_of(inlines),
+                b => panic!("unexpected {b:?}"),
+            })
+            .collect();
+        assert_eq!(tex, [("a = 1".to_string(), false), ("b = -5".to_string(), false)]);
+        // Underscores and stars inside stay math, not emphasis.
+        let blocks = parse("\\(a_1 * b_2 * c\\) and \\[\\sum_{i=1}^n i\\]");
+        let Block::Paragraph { inlines, .. } = &blocks[0] else { panic!("{blocks:?}") };
+        assert_eq!(math_of(inlines), [("a_1 * b_2 * c".to_string(), false), ("\\sum_{i=1}^n i".to_string(), true)]);
+    }
+
+    #[test]
+    fn what_stays_text() {
+        let text = |md: &str| match &parse(md)[..] {
+            [Block::Paragraph { inlines, .. }] => (plain_text(inlines), math_of(inlines).len()),
+            b => panic!("unexpected {b:?}"),
+        };
+        // Escaped brackets that are not math, unclosed or empty delimiters, escaped backslashes.
+        assert_eq!(text("see \\[1\\] and \\[note\\]"), ("see [1] and [note]".to_string(), 0));
+        assert_eq!(text("a \\(b"), ("a (b".to_string(), 0));
+        assert_eq!(text("a \\( \\) b"), ("a ( ) b".to_string(), 0));
+        assert_eq!(text("a \\\\(b\\\\) c"), ("a \\(b\\) c".to_string(), 0));
+        // A dollar inside: left alone.
+        assert_eq!(text("\\(\\$5\\)").1, 0);
+        // Code keeps its text.
+        match &parse("`\\(x\\)` and \\(y\\)")[..] {
+            [Block::Paragraph { inlines, .. }] => {
+                assert!(matches!(&inlines[0], Inline::Code { code, .. } if code == "\\(x\\)"), "{inlines:?}");
+                assert_eq!(math_of(inlines), [("y".to_string(), false)]);
+            }
+            b => panic!("unexpected {b:?}"),
+        }
+        match &parse("```\n\\[x^2\\]\n```\n")[..] {
+            [Block::CodeBlock { code, .. }] => assert_eq!(code, "\\[x^2\\]\n"),
+            b => panic!("unexpected {b:?}"),
+        }
+        // No paragraph break inside a formula.
+        assert_eq!(parse("\\(a\n\nb\\)").len(), 2);
     }
 }

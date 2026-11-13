@@ -987,6 +987,20 @@ mod tests {
         assert!(matches!(&b[6], RBlock::Quote { .. }));
         assert!(matches!(&b[7], RBlock::Divider));
         assert!(matches!(&b[8], RBlock::Math(m) if m == "E=mc^2"));
+        // LaTeX's own delimiters (OpenAI, DeepSeek, Qwen, Grok, Doubao) are formulas too.
+        let b = markdown_to_blocks(
+            "Comparing with \\(ax^2+bx+c=0\\):\n\n\\[\n\\boxed{x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}}\n\\]\n",
+            0,
+            RichLimits::TELEGRAM,
+        );
+        match &b[0] {
+            RBlock::Paragraph(t) => {
+                let s = format!("{t:?}");
+                assert!(s.contains("Math(\"ax^2+bx+c=0\")"), "{s}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(&b[1], RBlock::Math(m) if m == "\\boxed{x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}}"), "{b:?}");
     }
 
     #[test]
