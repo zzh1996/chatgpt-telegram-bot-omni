@@ -27,7 +27,7 @@ Naming: Ark (China) ids look like `doubao-seed-…`, BytePlus ids like `dola-see
 
 - **Limits** are context / max input / max output / max CoT [A-models]. Max output is the answer only, and the API default is 4k.
 - **RPM/TPM** apply per account per model and are shared across versions and endpoints [A-text].
-- **Price** is CNY per 1M tokens for input / cache hit / output, at the lowest input tier [A-price].
+- **Price** is CNY per 1M tokens for input / cache hit / output, at the lowest input tier [A-price]. The bot prices every input-length tier, the fast (低延迟) and flex (低优) tables and audio input (`ark/mod.rs` `MODELS`, from the price page as fetched 2026-11-13). Measured 2026-11-13: `prompt_tokens` includes `prompt_tokens_details.audio_tokens` (57 text tokens alone, 90 with a 5 s clip of 32 audio tokens).
 
 | Model id | Limits (tokens) | Input modalities | Thinking (default effort) | Reasoning returned | RPM / TPM | Price | Status | On OR? |
 |---|---|---|---|---|---|---|---|---|

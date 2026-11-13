@@ -75,6 +75,29 @@ pub struct ArkConfig {
     pub cny_per_usd: f64,
 }
 
+/// CNY per 1M tokens in one input-length tier: input, cache hit, output, and
+/// audio input / audio cache hit for the models that take audio.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rates {
+    pub input: f64,
+    pub cached: f64,
+    pub output: f64,
+    pub audio: Option<(f64, f64)>,
+}
+
+const fn r(input: f64, cached: f64, output: f64) -> Rates {
+    Rates { input, cached, output, audio: None }
+}
+
+const fn ra(input: f64, cached: f64, output: f64, audio: f64, audio_cached: f64) -> Rates {
+    Rates { input, cached, output, audio: Some((audio, audio_cached)) }
+}
+
+/// Prices by input length, ascending: (largest prompt of the tier in K tokens, rates).
+/// K is 1,024: the top tiers ("(128, 256]", "[0, 1024]") are the context windows
+/// (262,144 and 1,048,576 tokens), which 1,000 would not cover.
+pub type Tiers = &'static [(u64, Rates)];
+
 /// Known limits and list prices of Ark models (matched by id prefix, longest first).
 #[derive(Debug, Clone, Copy)]
 pub struct ModelSpec {
@@ -82,25 +105,116 @@ pub struct ModelSpec {
     pub context: u64,
     /// Max answer tokens (`max_tokens`), excluding reasoning.
     pub max_answer: u64,
-    /// CNY per 1M tokens: input, cached input, output (lowest input tier).
-    pub price_cny: (f64, f64, f64),
+    /// 在线推理（常规）: `service_tier` `default`.
+    pub standard: Tiers,
+    /// 在线推理（低延迟）: `fast` (empty: not offered).
+    pub fast: Tiers,
+    /// 在线推理（低优）: `flex` (empty: not offered).
+    pub flex: Tiers,
 }
 
-/// From the Ark model list, 2026-11-11 (docs/research/doubao.md §1.1).
+const PRO_21: Tiers = &[(1024, r(6.0, 1.2, 30.0))];
+const SEED_20_PRO: Tiers = &[(32, r(3.2, 0.64, 16.0)), (128, r(4.8, 0.96, 24.0)), (256, r(9.6, 1.92, 48.0))];
+
+/// Limits from the Ark model list, 2026-11-11 (docs/research/doubao.md §1.1);
+/// prices from docs.volcengine.com `ark/model-pricing`, 2026-11-13. The tier
+/// a response reports (`service_tier`) is the one billed ("实际计费以响应回显档位为准").
 pub const MODELS: &[ModelSpec] = &[
-    ModelSpec { prefix: "doubao-seed-evolving", context: 1_048_576, max_answer: 262_144, price_cny: (6.0, 1.2, 30.0) },
-    ModelSpec { prefix: "doubao-seed-2-1-pro", context: 1_048_576, max_answer: 262_144, price_cny: (6.0, 1.2, 30.0) },
-    ModelSpec { prefix: "doubao-seed-2-1-lite", context: 1_048_576, max_answer: 262_144, price_cny: (0.8, 0.16, 2.7) },
-    ModelSpec { prefix: "doubao-seed-2-1-turbo", context: 262_144, max_answer: 262_144, price_cny: (3.0, 0.6, 15.0) },
-    ModelSpec { prefix: "doubao-seed-2-0-lite", context: 262_144, max_answer: 131_072, price_cny: (0.6, 0.12, 3.6) },
-    ModelSpec { prefix: "doubao-seed-2-0-mini", context: 262_144, max_answer: 131_072, price_cny: (0.2, 0.04, 2.0) },
-    ModelSpec { prefix: "doubao-seed-2-0-pro", context: 262_144, max_answer: 131_072, price_cny: (3.2, 0.64, 16.0) },
-    ModelSpec { prefix: "doubao-seed-2-0-code", context: 262_144, max_answer: 131_072, price_cny: (3.2, 0.64, 16.0) },
+    ModelSpec {
+        prefix: "doubao-seed-evolving",
+        context: 1_048_576,
+        max_answer: 262_144,
+        standard: PRO_21,
+        fast: &[],
+        flex: &[],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-1-pro",
+        context: 1_048_576,
+        max_answer: 262_144,
+        standard: PRO_21,
+        fast: &[],
+        flex: &[(1024, r(3.0, 1.2, 15.0))],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-1-lite",
+        context: 1_048_576,
+        max_answer: 262_144,
+        standard: &[(1024, ra(0.8, 0.16, 2.7, 12.0, 2.4))],
+        fast: &[(1024, ra(1.6, 0.32, 5.4, 24.0, 4.8))],
+        flex: &[(1024, ra(0.4, 0.16, 1.35, 6.0, 2.4))],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-1-turbo",
+        context: 262_144,
+        max_answer: 262_144,
+        standard: &[(256, r(3.0, 0.6, 15.0))],
+        fast: &[(256, r(6.0, 1.2, 30.0))],
+        flex: &[(256, r(1.5, 0.6, 7.5))],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-0-lite",
+        context: 262_144,
+        max_answer: 131_072,
+        standard: &[
+            (32, ra(0.6, 0.12, 3.6, 9.0, 1.8)),
+            (128, ra(0.9, 0.18, 5.4, 13.5, 2.7)),
+            (256, ra(1.8, 0.36, 10.8, 27.0, 5.4)),
+        ],
+        fast: &[
+            (32, ra(1.2, 0.24, 7.2, 18.0, 3.6)),
+            (128, ra(1.8, 0.36, 10.8, 27.0, 5.4)),
+            (256, ra(3.6, 0.72, 21.6, 54.0, 10.8)),
+        ],
+        flex: &[
+            (32, ra(0.3, 0.12, 1.8, 4.5, 1.8)),
+            (128, ra(0.45, 0.18, 2.7, 6.75, 2.7)),
+            (256, ra(0.9, 0.36, 5.4, 13.5, 5.4)),
+        ],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-0-mini",
+        context: 262_144,
+        max_answer: 131_072,
+        standard: &[
+            (32, ra(0.2, 0.04, 2.0, 3.0, 0.6)),
+            (128, ra(0.4, 0.08, 4.0, 6.0, 1.2)),
+            (256, ra(0.8, 0.16, 8.0, 12.0, 2.4)),
+        ],
+        fast: &[
+            (32, ra(0.4, 0.08, 4.0, 6.0, 1.2)),
+            (128, ra(0.8, 0.16, 8.0, 12.0, 2.4)),
+            (256, ra(1.6, 0.32, 16.0, 24.0, 4.8)),
+        ],
+        flex: &[
+            (32, ra(0.1, 0.04, 1.0, 1.5, 0.6)),
+            (128, ra(0.2, 0.08, 2.0, 3.0, 1.2)),
+            (256, ra(0.4, 0.16, 4.0, 6.0, 2.4)),
+        ],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-0-pro",
+        context: 262_144,
+        max_answer: 131_072,
+        standard: SEED_20_PRO,
+        fast: &[(32, r(9.6, 1.92, 48.0)), (128, r(14.4, 2.88, 72.0)), (256, r(28.8, 5.76, 144.0))],
+        flex: &[(32, r(1.6, 0.64, 8.0)), (128, r(2.4, 0.96, 12.0)), (256, r(4.8, 1.92, 24.0))],
+    },
+    ModelSpec {
+        prefix: "doubao-seed-2-0-code",
+        context: 262_144,
+        max_answer: 131_072,
+        standard: SEED_20_PRO,
+        fast: &[],
+        flex: &[],
+    },
     ModelSpec {
         prefix: "doubao-seed-character-260628",
         context: 131_072,
         max_answer: 32_768,
-        price_cny: (0.8, 0.16, 2.0),
+        standard: &[(32, r(0.8, 0.16, 2.0)), (128, r(1.2, 0.16, 6.0))],
+        fast: &[],
+        flex: &[],
     },
 ];
 
@@ -276,7 +390,6 @@ impl Ark {
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
         let rb = self.http.post(&p.url).bearer_auth(&self.cfg.api_key).json(&p.body);
-        let mut priced = PricingSink { inner: sink, model: &p.model, cny_per_usd: self.cfg.cny_per_usd };
         let crate::chatstream::Streamed { result, parser, header_id } = crate::chatstream::run_with(
             rb,
             &p.url,
@@ -284,8 +397,8 @@ impl Ark {
             self.cfg.idle_timeout,
             Some("x-request-id"),
             error_from_json,
-            ChatParser::new(),
-            &mut priced,
+            ChatParser::new(&p.model, &p.body, self.cfg.cny_per_usd),
+            sink,
             observer,
             cancel,
         )
@@ -295,7 +408,7 @@ impl Ark {
             Err(e) => (Err(e), outcome),
             Ok(()) => {
                 if p.body.get("web_search_options").is_some() && parser.no_search() {
-                    priced.event(StreamEvent::Notice(NO_SEARCH.into()));
+                    sink.event(StreamEvent::Notice(NO_SEARCH.into()));
                 }
                 (Ok(parser.inner.native_payload()), outcome)
             }
@@ -348,16 +461,38 @@ impl crate::provider::Provider for Ark {
     }
 }
 
-/// Estimated cost in USD from the list price (lowest input tier), plus the
-/// searches the usage reports (`tool_usage.web_search`, [`WEB_SEARCH_CNY`] each).
-pub fn estimate_cost(model: &str, u: &Usage, cny_per_usd: f64) -> Option<f64> {
+/// Estimated cost in USD, plus the searches the usage reports
+/// (`tool_usage.web_search`, [`WEB_SEARCH_CNY`] each). `tier`: the response's
+/// `service_tier` (`default`, `fast`, `flex`; the request's when the response
+/// has none); `None` for a tier the model's price list does not have. The
+/// input-length tier is chosen by the whole prompt (`prompt_tokens`, cache hits
+/// included), as Ark's example does ("200K 输入 … (128, 256]"). `prompt_tokens`
+/// includes the audio (measured 2026-11-13: 57 tokens of text, 90 with a 5 s
+/// clip of `audio_tokens` 32), which costs the audio rates.
+pub fn estimate_cost(model: &str, u: &Usage, tier: Option<&str>, cny_per_usd: f64) -> Option<f64> {
     let s = model_spec(model)?;
-    let input = u.input_tokens? as f64;
+    let tiers = match tier {
+        Some("fast") => s.fast,
+        Some("flex") => s.flex,
+        _ => s.standard,
+    };
+    let prompt = u.input_tokens?;
+    let (_, rates) = tiers.iter().find(|(k, _)| prompt <= k * 1024).or(tiers.last())?;
     let output = u.output_tokens? as f64;
-    let cached = u.cached_input_tokens.unwrap_or(0) as f64;
-    let searches = u.raw.pointer("/tool_usage/web_search").and_then(Value::as_u64).unwrap_or(0) as f64;
-    let (pi, pc, po) = s.price_cny;
-    let cny = ((input - cached).max(0.0) * pi + cached * pc + output * po) / 1e6 + searches * WEB_SEARCH_CNY;
+    let cached = u.cached_input_tokens.unwrap_or(0).min(prompt);
+    let n = |p: &str| u.raw.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+    let (audio_rate, audio_cached_rate) = rates.audio.unwrap_or((rates.input, rates.cached));
+    let audio_cached = n("/prompt_tokens_details/audio_cached_tokens").min(cached);
+    let audio = n("/prompt_tokens_details/audio_tokens").saturating_sub(audio_cached).min(prompt - cached);
+    let f = |x: u64| x as f64;
+    let searches = n("/tool_usage/web_search") as f64;
+    let cny = (f(prompt - cached - audio) * rates.input
+        + f(audio) * audio_rate
+        + f(cached - audio_cached) * rates.cached
+        + f(audio_cached) * audio_cached_rate
+        + output * rates.output)
+        / 1e6
+        + searches * WEB_SEARCH_CNY;
     (cny_per_usd > 0.0).then(|| cny / cny_per_usd)
 }
 
@@ -370,6 +505,11 @@ pub fn estimate_cost(model: &str, u: &Usage, cny_per_usd: f64) -> Option<f64> {
 /// rises after the answer began (the model answers after searching).
 struct ChatParser {
     inner: ChunkParser,
+    /// For the cost: the model, CNY per USD, and the tier (the request's until
+    /// a chunk reports the tier used, `service_tier`).
+    model: String,
+    cny_per_usd: f64,
+    tier: Option<String>,
     /// Searches shown so far.
     searches: u64,
     /// Answer text has been streamed.
@@ -383,10 +523,20 @@ struct ChatParser {
 }
 
 impl ChatParser {
-    fn new() -> Self {
+    fn new(model: &str, body: &Value, cny_per_usd: f64) -> Self {
         let mut inner = ChunkParser::default();
         inner.map_error = Some(error_from_json);
-        Self { inner, searches: 0, text: false, usage: false, cited: false, finish: None }
+        Self {
+            inner,
+            model: model.to_string(),
+            cny_per_usd,
+            tier: body.get("service_tier").and_then(Value::as_str).map(str::to_string),
+            searches: 0,
+            text: false,
+            usage: false,
+            cited: false,
+            finish: None,
+        }
     }
 
     /// The answer ended normally (or at the output limit) and the usage
@@ -398,7 +548,18 @@ impl ChatParser {
 
 impl EventParser for ChatParser {
     fn event(&mut self, _name: Option<&str>, v: &Value) -> Result<Vec<StreamEvent>, LlmError> {
-        let evs = self.inner.chunk(v)?;
+        if let Some(t) = v.get("service_tier").and_then(Value::as_str) {
+            self.tier = Some(t.to_string());
+        }
+        let mut evs = self.inner.chunk(v)?;
+        for e in &mut evs {
+            if let StreamEvent::Usage(u) = e
+                && u.cost_usd.is_none()
+            {
+                u.cost_usd = estimate_cost(&self.model, u, self.tier.as_deref(), self.cny_per_usd);
+                u.cost_source = if u.cost_usd.is_some() { CostSource::Estimated } else { CostSource::Unknown };
+            }
+        }
         let mut out = Vec::with_capacity(evs.len() + 1);
         if let Some(n) = v.pointer("/usage/tool_usage/web_search").and_then(Value::as_u64)
             && n > self.searches
@@ -432,25 +593,6 @@ impl EventParser for ChatParser {
     }
     fn any_output(&self) -> bool {
         self.inner.any_output()
-    }
-}
-
-struct PricingSink<'a> {
-    inner: &'a mut dyn EventSink,
-    model: &'a str,
-    cny_per_usd: f64,
-}
-
-impl EventSink for PricingSink<'_> {
-    fn event(&mut self, ev: StreamEvent) {
-        match ev {
-            StreamEvent::Usage(mut u) if u.cost_usd.is_none() => {
-                u.cost_usd = estimate_cost(self.model, &u, self.cny_per_usd);
-                u.cost_source = if u.cost_usd.is_some() { CostSource::Estimated } else { CostSource::Unknown };
-                self.inner.event(StreamEvent::Usage(u));
-            }
-            other => self.inner.event(other),
-        }
     }
 }
 
@@ -535,8 +677,78 @@ mod tests {
             ..Default::default()
         };
         // 6 CNY + 3 CNY at 7.0 CNY/USD
-        let c = estimate_cost("doubao-seed-2-1-pro-260915", &u, 7.0).unwrap();
+        let c = estimate_cost("doubao-seed-2-1-pro-260915", &u, None, 7.0).unwrap();
         assert!((c - 9.0 / 7.0).abs() < 1e-9);
+        assert!((estimate_cost("doubao-seed-2-1-pro-260915", &u, Some("default"), 7.0).unwrap() - c).abs() < 1e-12);
+        // Flex: half on input and output (3 + 1.5 CNY); no fast tier on 2.1 Pro.
+        let flex = estimate_cost("doubao-seed-2-1-pro-260915", &u, Some("flex"), 7.0).unwrap();
+        assert!((flex - 4.5 / 7.0).abs() < 1e-9, "{flex}");
+        assert!(estimate_cost("doubao-seed-2-1-pro-260915", &u, Some("fast"), 7.0).is_none());
+    }
+
+    /// Prices by input length (K = 1,024, the whole prompt, cache hits included)
+    /// and by the tier used, from Ark's price list (2026-11-13).
+    #[test]
+    fn cost_by_input_length_and_tier() {
+        let usage = |prompt: u64, cached: u64| Usage {
+            input_tokens: Some(prompt),
+            cached_input_tokens: Some(cached),
+            output_tokens: Some(1_000_000),
+            ..Default::default()
+        };
+        let cny = |model: &str, u: &Usage, tier: Option<&str>| estimate_cost(model, u, tier, 1.0).unwrap();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 2.0 Pro: [0, 32K] 3.2/0.64/16, (32K, 128K] 4.8/0.96/24, (128K, 256K] 9.6/1.92/48.
+        let pro = "doubao-seed-2-0-pro-260215";
+        assert!(near(cny(pro, &usage(32_768, 0), None), (32_768.0 * 3.2) / 1e6 + 16.0));
+        assert!(near(cny(pro, &usage(32_769, 0), None), (32_769.0 * 4.8) / 1e6 + 24.0));
+        assert!(near(cny(pro, &usage(200_000, 150_000), None), (50_000.0 * 9.6 + 150_000.0 * 1.92) / 1e6 + 48.0));
+        // Fast 3×, flex: half, cache hits at the standard price.
+        assert!(near(cny(pro, &usage(10_000, 0), Some("fast")), 10_000.0 * 9.6 / 1e6 + 48.0));
+        assert!(near(cny(pro, &usage(10_000, 5_000), Some("flex")), (5_000.0 * 1.6 + 5_000.0 * 0.64) / 1e6 + 8.0));
+        // Character: (32K, 128K] 1.2/0.16/6.
+        assert!(near(cny("doubao-seed-character-260628", &usage(40_000, 0), None), 40_000.0 * 1.2 / 1e6 + 6.0));
+        // Single-tier models: 2.1 Turbo fast 6/1.2/30.
+        assert!(near(
+            cny("doubao-seed-2-1-turbo-260915", &usage(200_000, 0), Some("fast")),
+            200_000.0 * 6.0 / 1e6 + 30.0
+        ));
+        // Audio at its own rates (2.1 Lite: 12, cache hits 2.4), out of `prompt_tokens`.
+        let audio = Usage {
+            input_tokens: Some(90),
+            cached_input_tokens: Some(0),
+            output_tokens: Some(115),
+            raw: json!({"prompt_tokens": 90, "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 32}}),
+            ..Default::default()
+        };
+        assert!(near(cny("doubao-seed-2-1-lite-260915", &audio, None), (58.0 * 0.8 + 32.0 * 12.0 + 115.0 * 2.7) / 1e6));
+        let cached_audio = Usage {
+            input_tokens: Some(1000),
+            cached_input_tokens: Some(600),
+            output_tokens: Some(0),
+            raw: json!({"prompt_tokens_details": {"cached_tokens": 600, "audio_tokens": 500, "audio_cached_tokens": 400}}),
+            ..Default::default()
+        };
+        // Text: 300 uncached at 0.8, 200 cached at 0.16; audio: 100 at 12, 400 cached at 2.4.
+        let want = (300.0 * 0.8 + 200.0 * 0.16 + 100.0 * 12.0 + 400.0 * 2.4) / 1e6;
+        assert!(near(cny("doubao-seed-2-1-lite-260915", &cached_audio, None), want));
+    }
+
+    /// The tier a response reports is the one billed.
+    #[test]
+    fn the_tier_used_is_billed() {
+        let mut c = chunk(json!({"content": "hi"}), Some("stop"), 1_000_000, 100_000, None);
+        c["service_tier"] = json!("flex");
+        let mut p = ChatParser::new(MODEL, &json!({"service_tier": "flex"}), 7.0);
+        let evs = p.event(None, &c).unwrap();
+        let u = evs.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(u) } else { None }).unwrap();
+        assert!((u.cost_usd.unwrap() - 4.5 / 7.0).abs() < 1e-9);
+        // Asked for flex, served at the default tier: the default price.
+        c["service_tier"] = json!("default");
+        let mut p = ChatParser::new(MODEL, &json!({"service_tier": "flex"}), 7.0);
+        let evs = p.event(None, &c).unwrap();
+        let u = evs.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(u) } else { None }).unwrap();
+        assert!((u.cost_usd.unwrap() - 9.0 / 7.0).abs() < 1e-9);
     }
 
     #[test]
@@ -673,16 +885,11 @@ mod tests {
     }
 
     fn run(chunks: &[Value]) -> (ChatParser, crate::Accumulator, Vec<StreamEvent>) {
-        let mut p = ChatParser::new();
+        let mut p = ChatParser::new(MODEL, &json!({}), 7.0);
         let mut acc = crate::Accumulator::new();
         let mut all = Vec::new();
-        let model = MODEL.to_string();
-        let mut priced = |e: StreamEvent| all.push(e);
-        let mut sink = PricingSink { inner: &mut priced, model: &model, cny_per_usd: 7.0 };
         for c in chunks {
-            for e in p.event(None, c).unwrap() {
-                sink.event(e);
-            }
+            all.extend(p.event(None, c).unwrap());
         }
         for e in &all {
             acc.apply(e.clone());
@@ -781,7 +988,7 @@ mod tests {
             ..Default::default()
         };
         // 6 + 3 CNY + 3 × 0.02 CNY at 7.0 CNY/USD
-        let c = estimate_cost(MODEL, &u, 7.0).unwrap();
+        let c = estimate_cost(MODEL, &u, None, 7.0).unwrap();
         assert!((c - 9.06 / 7.0).abs() < 1e-9);
     }
 
