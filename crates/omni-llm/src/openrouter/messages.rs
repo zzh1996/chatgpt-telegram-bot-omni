@@ -381,6 +381,7 @@ pub fn usage_from_anthropic(u: &Value) -> omni_core::Usage {
         } else {
             omni_core::usage::CostSource::Unknown
         },
+        unbilled: Vec::new(),
         raw: u.clone(),
     }
 }

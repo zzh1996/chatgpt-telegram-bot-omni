@@ -136,6 +136,7 @@ pub fn usage_from_generation(d: &Value) -> Usage {
         // `usage` is what was charged; `total_cost` is the older name.
         cost_usd: d.get("usage").and_then(Value::as_f64).or_else(|| d.get("total_cost").and_then(Value::as_f64)),
         cost_source: Default::default(),
+        unbilled: Vec::new(),
         raw: d.clone(),
     }
 }

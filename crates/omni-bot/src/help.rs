@@ -438,7 +438,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 - What was asked for: `effort max · web search` and the like.
 - `in 1,234 (cached 1,000)` — input tokens, of which 1,000 were read from the cache (billed at the cache price); `cache write` — written to it.
 - `out 567 (reasoning 400)` — output tokens, and how many were reasoning.
-- The cost in USD. `≈` means my estimate from the platform's prices (the platform reported none); `+ code execution` and the like name a charge the estimate leaves out.
+- The cost in USD. `≈` means my estimate from the platform's prices (the platform reported none); `+ code execution` and the like name a charge the estimate leaves out. `+ 24 searches ≈{USD}0.336` is a charge a monthly free allowance may cover, so it is not in the cost or the spend limits; the amount is what it costs once the allowance is used up.
 - How long it took.
 - `attempt 2/4` — I retried; `continued` — written by /continue.
 - `via …` — which provider served it on OpenRouter.
@@ -472,7 +472,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 - 请求了什么：`effort max · web search` 之类。
 - `in 1,234 (cached 1,000)` — 输入 token，其中 1,000 是从缓存读的（按缓存价计费）；`cache write` — 写入缓存的。
 - `out 567 (reasoning 400)` — 输出 token，其中多少是推理。
-- 费用（USD）。`≈` 表示是我按平台价格估算的（平台没有给出费用）；`+ code execution` 之类表示估算里没算进去的收费。
+- 费用（USD）。`≈` 表示是我按平台价格估算的（平台没有给出费用）；`+ code execution` 之类表示估算里没算进去的收费。`+ 24 searches ≈{USD}0.336` 是可能被每月免费额度覆盖的收费，所以不算进费用和限额；金额是免费额度用完后的价钱。
 - 用了多长时间。
 - `attempt 2/4` — 我重试过；`continued` — 是 /continue 写的。
 - `via …` — 在 OpenRouter 上由哪个提供方处理。
@@ -663,6 +663,8 @@ fn fill(text: &str, ctx: &Ctx) -> String {
         .replace("{MAX_FILE_MB}", &ctx.max_file_mb.to_string())
         .replace("{BOLD_COST}", &bold)
         .replace("{ORDER}", order)
+        // A dollar sign that is not the trigger marker (amounts in examples).
+        .replace("{USD}", "$")
 }
 
 /// [`fill`] for the Chinese texts.
@@ -697,6 +699,8 @@ fn fill_zh(text: &str, ctx: &Ctx) -> String {
         .replace("{MAX_FILE_MB}", &ctx.max_file_mb.to_string())
         .replace("{BOLD_COST}", &bold)
         .replace("{ORDER}", order)
+        // A dollar sign that is not the trigger marker (amounts in examples).
+        .replace("{USD}", "$")
 }
 
 fn md(s: &str, depth: usize) -> Vec<RBlock> {
@@ -819,15 +823,15 @@ mod tests {
         assert!(topic(&ctx(false, false), "admin").is_err());
     }
 
-    /// The marker is the configured one everywhere; nothing else uses `$`;
-    /// the deployment's values are filled in.
+    /// The marker is the configured one everywhere; nothing else uses `$` but
+    /// amounts (`≈$0.336`, written `{USD}`); the deployment's values are filled in.
     #[test]
     fn texts_use_the_configured_marker_and_values() {
         let all = text(&overview(&ctx(true, false)));
         assert!(all.contains("c%Hello!") && all.contains("/alias name% spec"), "{all}");
-        assert!(!all.contains('$'), "a `$` that is not the marker");
+        assert!(!all.replace("≈$", "≈").contains('$'), "a `$` that is not the marker or an amount");
         assert!(all.contains("up to 50 MB") && all.contains("above 0.2 USD") && all.contains("author/model%"));
-        for placeholder in ["{MAX_FILE_MB}", "{IMAGE_MODELS}", "{BOLD_COST}", "{DIRECT_IDS}", "{ORDER}"] {
+        for placeholder in ["{MAX_FILE_MB}", "{IMAGE_MODELS}", "{BOLD_COST}", "{DIRECT_IDS}", "{ORDER}", "{USD}"] {
             assert!(!all.contains(placeholder), "{placeholder}");
         }
         assert!(!all.contains(":::"), "every fold is closed and converted");
@@ -879,10 +883,10 @@ mod tests {
         }
         let all = text(&overview(&zh(true, false)));
         assert!(all.contains("c%你好！") && all.contains("/alias name% spec"), "{all}");
-        assert!(!all.contains('$'), "a `$` that is not the marker");
+        assert!(!all.replace("≈$", "≈").contains('$'), "a `$` that is not the marker or an amount");
         assert!(all.contains("文件最大 50 MB") && all.contains("超过 0.2 USD") && all.contains("author/model%"));
         assert!(!all.contains(":::"), "unconverted fold");
-        for placeholder in ["{MAX_FILE_MB}", "{IMAGE_MODELS}", "{BOLD_COST}", "{DIRECT_IDS}"] {
+        for placeholder in ["{MAX_FILE_MB}", "{IMAGE_MODELS}", "{BOLD_COST}", "{DIRECT_IDS}", "{USD}"] {
             assert!(!all.contains(placeholder), "{placeholder}");
         }
         let (title, _) = topic(&zh(false, true), "stats").unwrap();
@@ -927,7 +931,9 @@ mod tests {
                 for (admin, group) in [(true, true), (true, false), (false, true)] {
                     let c = Ctx { marker: marker.into(), lang, ..ctx(admin, group) };
                     let all = text(&overview(&c));
-                    assert!(!all.contains('$'), "{marker} {lang:?}");
+                    // Amounts in examples (`≈$0.336`) keep their dollar sign.
+                    assert!(all.contains("≈$0.336"), "{marker} {lang:?}");
+                    assert!(!all.replace("≈$", "≈").contains('$'), "{marker} {lang:?}");
                     assert!(all.contains(&format!("c{marker}")), "{marker} {lang:?}");
                 }
             }

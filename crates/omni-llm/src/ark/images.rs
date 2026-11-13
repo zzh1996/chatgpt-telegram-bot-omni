@@ -834,6 +834,7 @@ impl Parser {
                 cache_write_tokens: None,
                 cost_usd: cost,
                 cost_source: if cost.is_some() { CostSource::Estimated } else { CostSource::Unknown },
+                unbilled: Vec::new(),
                 raw: usage,
             }));
         }

@@ -726,6 +726,11 @@ fn add_usage(a: &Option<Usage>, b: &Usage) -> Usage {
             (x, y) => Some(x.unwrap_or(0.0) + y.unwrap_or(0.0)),
         },
         cost_source: b.cost_source,
+        unbilled: {
+            let mut u = Usage { unbilled: a.unbilled.clone(), ..Default::default() };
+            u.add_unbilled(&b.unbilled);
+            u.unbilled
+        },
         raw: {
             let mut v = match &a.raw {
                 Value::Array(x) => x.clone(),

@@ -17,15 +17,19 @@
 //! 5,003, tool use 321,767, cached 224,091); `candidatesTokenCount + thoughtsTokenCount` at the
 //! output rate (image tokens of `candidatesTokensDetails` at the image output
 //! rate, see [`estimate`]), the >200K-token rates when `promptTokenCount` exceeds 200,000,
-//! the tier actually served (`usageMetadata.serviceTier`), plus grounding:
+//! the tier actually served (`usageMetadata.serviceTier`).
+//!
+//! Grounding is priced apart and left out of the cost ([`grounding_fees`]):
 //! Gemini 3 and newer $14 per 1,000 executed (unique, non-empty) search
 //! queries for Google Search and Google Maps alike; Gemini 2.5 $35 (Search)
 //! / $25 (Maps) per 1,000 grounded prompts. The free allowances (5,000
 //! queries a month shared by all Gemini 3+ models; 1,500 / 10,000 grounded
 //! prompts a day on 2.5) depend on the whole project's usage, which the bot
-//! cannot see: every query is priced, so the estimate is an upper bound
-//! while the allowance lasts. Storage of explicit caches is not used.
+//! cannot see; the owner's rule (2026-11-13): the fee is shown after the cost
+//! (`+ 24 searches ≈$0.336`, what it costs once the allowance is used up) and
+//! spend limits do not count it. Storage of explicit caches is not used.
 
+use omni_core::usage::{Counted, Unbilled};
 use serde_json::Value;
 
 /// 2026-12-01T00:00:00Z.
@@ -259,7 +263,11 @@ fn has_modality(u: &Value, key: &str, m: &str) -> bool {
 /// `gemini-3.1-flash-lite-image` responses reported `candidatesTokenCount` 305
 /// and 325 with `candidatesTokensDetails` `[{IMAGE: 1120}]` (and a
 /// `totalTokenCount` built from 305); the estimate takes the 1,120 of the list.
-pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g: &GroundingUse) -> Option<f64> {
+///
+/// `free_media`: the VIDEO and AUDIO tokens are free (they all come from
+/// YouTube links, `super::stream::youtube_only`), read from the cache or not.
+/// Grounding fees are not in the estimate: see [`grounding_fees`].
+pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, free_media: bool) -> Option<f64> {
     let served = usage.get("serviceTier").and_then(Value::as_str).and_then(Tier::parse);
     let tier = served.or(requested).unwrap_or(Tier::Standard);
     let p = price(model, tier, now)?;
@@ -273,10 +281,16 @@ pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g
     let cached = count(usage, "cachedContentTokenCount").min(all_input);
     let candidates = count(usage, "candidatesTokenCount");
     let thoughts = count(usage, "thoughtsTokenCount");
-    let audio_cached = modality(usage, "cacheTokensDetails", "AUDIO").min(cached);
-    let audio_all =
-        modality(usage, "promptTokensDetails", "AUDIO") + modality(usage, "toolUsePromptTokensDetails", "AUDIO");
-    let uncached = all_input - cached;
+    // Tokens of these modalities in the input: cached, and in all.
+    let of = |kinds: &[&str]| {
+        let sum = |key: &str| kinds.iter().map(|m| modality(usage, key, m)).sum::<u64>();
+        (sum("cacheTokensDetails").min(cached), sum("promptTokensDetails") + sum("toolUsePromptTokensDetails"))
+    };
+    let (free_cached, free_all) = if free_media { of(&["VIDEO", "AUDIO"]) } else { (0, 0) };
+    let free_uncached = free_all.saturating_sub(free_cached).min(all_input - cached);
+    let cached = cached - free_cached;
+    let uncached = all_input - free_cached - cached - free_uncached;
+    let (audio_cached, audio_all) = if free_media { (0, 0) } else { of(&["AUDIO"]) };
     let audio_uncached = audio_all.saturating_sub(audio_cached).min(uncached);
     let image_out = modality(usage, "candidatesTokensDetails", "IMAGE");
     let text_out = if image_out == 0 {
@@ -292,12 +306,30 @@ pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g
         + f(cached - audio_cached) * rates.cached
         + f(audio_cached) * rates.cached_audio.unwrap_or(rates.cached);
     let output = f(text_out + thoughts) * rates.output + f(image_out) * rates.image_output.unwrap_or(rates.output);
-    let fees = match p.grounding {
-        Grounding::PerQuery(q) => g.queries as f64 * q,
+    Some((input + output) / 1e6)
+}
+
+/// The grounding fees of a response, left out of the cost (owner, 2026-11-13):
+/// the free allowances belong to the whole project, which the bot cannot see,
+/// so the reply shows what they cost once the allowance is used up and spend
+/// limits do not count them. Empty when nothing was grounded or the model is
+/// not in the price list.
+pub fn grounding_fees(model: &str, now: i64, g: &GroundingUse) -> Vec<Unbilled> {
+    // The fees are the same on every service tier.
+    let Some(p) = price(model, Tier::Standard, now) else { return Vec::new() };
+    match p.grounding {
+        Grounding::PerQuery(q) if g.queries > 0 => {
+            vec![Unbilled { what: Counted::SearchQueries, count: g.queries as u64, usd: g.queries as f64 * q }]
+        }
+        Grounding::PerQuery(_) => Vec::new(),
         // A prompt counts as grounded when it returned sources of that kind.
         Grounding::PerPrompt { search, maps } => {
-            (if g.web_results { search } else { 0.0 }) + (if g.maps_results { maps } else { 0.0 })
+            let fees = [(g.web_results, search), (g.maps_results, maps)];
+            let grounded: Vec<f64> = fees.iter().filter(|(used, _)| *used).map(|(_, usd)| *usd).collect();
+            if grounded.is_empty() {
+                return Vec::new();
+            }
+            vec![Unbilled { what: Counted::GroundedPrompts, count: grounded.len() as u64, usd: grounded.iter().sum() }]
         }
-    };
-    Some((input + output) / 1e6 + fees)
+    }
 }

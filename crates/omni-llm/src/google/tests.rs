@@ -8,6 +8,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use omni_core::content::{NativeOutput, Part, ReasoningKind, RemoteMediaKind, Role};
 use omni_core::trigger::OptionToken;
+use omni_core::usage::{Counted, Unbilled};
 use omni_core::{BlobRef, Origin, Turn};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -547,6 +548,11 @@ fn usages(evs: &[StreamEvent]) -> Vec<&omni_core::Usage> {
     evs.iter().filter_map(|e| if let StreamEvent::Usage(u) = e { Some(u) } else { None }).collect()
 }
 
+/// `n` search queries at $14 per 1,000, left out of the cost.
+fn searches(n: u64) -> Unbilled {
+    Unbilled { what: Counted::SearchQueries, count: n, usd: n as f64 * 0.014 }
+}
+
 #[test]
 fn stream_thoughts_text_signature_and_usage() {
     // Shapes of docs/research/gemini.md §7.
@@ -645,11 +651,13 @@ fn search_grounding_becomes_a_tool_call_and_citations() {
     let a = accumulate(&evs);
     assert!(matches!(&a.parts()[0], Part::ToolCall(t) if t.name == "google_search"));
     assert!(matches!(&a.parts()[1], Part::Text { citations, .. } if citations.len() == 2));
-    // Two billable queries (the empty one is not billed); tool-use tokens at the input rate.
+    // Two billable queries (the empty one is not billed), left out of the cost;
+    // tool-use tokens at the input rate.
     let u = usages(&evs)[0];
     assert_eq!(u.input_tokens, Some(400));
-    let expected = (400.0 * 0.75 + 40.0 * 3.75) / 1e6 + 2.0 * 0.014;
+    let expected = (400.0 * 0.75 + 40.0 * 3.75) / 1e6;
     assert!((u.cost_usd.unwrap() - expected).abs() < 1e-12, "{:?}", u.cost_usd);
+    assert_eq!(u.unbilled, vec![searches(2)]);
 }
 
 #[test]
@@ -713,8 +721,9 @@ fn maps_grounding_attributes_google_maps() {
     assert_eq!(cites[1].title.as_deref(), Some("Great coffee · Google Maps"));
     assert_eq!(cites[1].url.as_deref(), Some("https://maps.google.com/?cid=1&review=rv1"));
     let u = usages(&evs)[0];
-    let expected = (10.0 * 0.75 + 20.0 * 3.75) / 1e6 + 0.014;
+    let expected = (10.0 * 0.75 + 20.0 * 3.75) / 1e6;
     assert!((u.cost_usd.unwrap() - expected).abs() < 1e-12);
+    assert_eq!(u.unbilled, vec![searches(1)], "a Maps query is a search query");
 }
 
 #[test]
@@ -1196,9 +1205,10 @@ fn server_side_tool_parts_are_the_tool_calls() {
     assert_eq!(citations.len(), 2, "{citations:?}");
     assert_eq!(citations[0].range, Some((0, text.len())), "partIndex counts the tool parts");
     assert_eq!(citations[1].title.as_deref(), Some("Google Search: latest stable Rust version"));
-    // One billed query; the parts go back verbatim, signatures included.
+    // One billed query (apart); the parts go back verbatim, signatures included.
     let u = usages(&evs)[0];
-    assert!((u.cost_usd.unwrap() - ((196.0 * 0.75 + 446.0 * 3.75) / 1e6 + 0.014)).abs() < 1e-12);
+    assert!((u.cost_usd.unwrap() - (196.0 * 0.75 + 446.0 * 3.75) / 1e6).abs() < 1e-12);
+    assert_eq!(u.unbilled, vec![searches(1)]);
     assert_eq!(p.native_payload()["parts"][1], chunks[1]["candidates"][0]["content"]["parts"][0]);
     assert_eq!(p.native_payload()["parts"][2]["thoughtSignature"], "SIG2");
 }
@@ -1253,7 +1263,8 @@ fn every_kind_of_tool_part() {
     assert_eq!(calls[1].output.as_ref().unwrap()["places"][0]["place_id"], "ChIJ");
     // One web (Maps) query and one image query.
     let u = usages(&evs)[0];
-    assert!((u.cost_usd.unwrap() - ((10.0 * 0.75 + 2.0 * 3.75) / 1e6 + 2.0 * 0.014)).abs() < 1e-12);
+    assert!((u.cost_usd.unwrap() - (10.0 * 0.75 + 2.0 * 3.75) / 1e6).abs() < 1e-12);
+    assert_eq!(u.unbilled, vec![searches(2)]);
 }
 
 #[test]
@@ -1333,10 +1344,11 @@ fn web_and_image_queries_are_billed_apart() {
         (cites[0].url.as_deref(), cites[0].title.as_deref()),
         (Some("https://example.org/butterflies"), Some("Butterflies of Peru"))
     );
-    // One web and one image query at $14 per 1,000 each; 1,120 image tokens at $30/M.
+    // One web and one image query at $14 per 1,000 each (apart); 1,120 image tokens at $30/M.
     let u = usages(&evs)[0];
-    let expected = (10.0 * 1.50 + 1120.0 * 30.0) / 1e6 + 2.0 * 0.014;
+    let expected = (10.0 * 1.50 + 1120.0 * 30.0) / 1e6;
     assert!((u.cost_usd.unwrap() - expected).abs() < 1e-12, "{:?}", u.cost_usd);
+    assert_eq!(u.unbilled, vec![searches(2)]);
 }
 
 #[tokio::test]
@@ -1534,21 +1546,66 @@ fn cached_tool_use_tokens_are_billed_at_the_cache_rate() {
         "toolUsePromptTokensDetails": [{"modality": "IMAGE", "tokenCount": 76594}, {"modality": "TEXT", "tokenCount": 245173}],
         "thoughtsTokenCount": 4980, "serviceTier": "standard"
     });
-    let cost = |g: GroundingUse| pricing::estimate("gemini-3.8-flash", &usage, None, NOW, &g).unwrap();
+    let cost = pricing::estimate("gemini-3.8-flash", &usage, None, NOW, false).unwrap();
     // (5,003 + 321,767 − 224,091) × $0.75 + 224,091 × $0.075 + (7,380 + 4,980) × $3.75, per million.
     let tokens = (102_679.0 * 0.75 + 224_091.0 * 0.075 + 12_360.0 * 3.75) / 1e6;
-    assert!((cost(GroundingUse::default()) - tokens).abs() < 1e-12, "{} vs {tokens}", cost(GroundingUse::default()));
-    assert!((cost(GroundingUse { queries: 3, ..Default::default() }) - (tokens + 0.042)).abs() < 1e-12);
+    assert!((cost - tokens).abs() < 1e-12, "{cost} vs {tokens}");
     // The footer's counts agree: input 326,770 including the 224,091 cached.
     let u = crate::google::stream::usage_from_gemini(&usage);
     assert_eq!((u.input_tokens, u.cached_input_tokens), (Some(326_770), Some(224_091)));
 }
 
+/// YouTube links are free while in preview: their VIDEO tokens (cached or not)
+/// are left out when every video of the request is one (measured 2026-11-13:
+/// a 19-second video, VIDEO 1,676, no AUDIO entry); a request that also has
+/// another video is priced in full.
+#[test]
+fn youtube_video_tokens_are_free() {
+    let yt = |extra: Vec<Value>| {
+        let mut parts =
+            vec![json!({"fileData": {"fileUri": "https://www.youtube.com/watch?v=jNQXAC9IVRw"}}), json!({"text": "?"})];
+        parts.extend(extra);
+        json!({"contents": [{"role": "user", "parts": parts}]})
+    };
+    assert!(super::stream::youtube_only(&yt(vec![])));
+    assert!(super::stream::youtube_only(
+        &json!({"contents": [{"parts": [{"fileData": {"fileUri": "https://youtu.be/x"}}]}]})
+    ));
+    assert!(!super::stream::youtube_only(&yt(vec![json!({"inlineData": {"mimeType": "video/mp4", "data": ""}})])));
+    assert!(!super::stream::youtube_only(&yt(vec![json!({"inlineData": {"mimeType": "audio/ogg", "data": ""}})])));
+    assert!(super::stream::youtube_only(&yt(vec![json!({"inlineData": {"mimeType": "image/png", "data": ""}})])));
+    assert!(!super::stream::youtube_only(&json!({"contents": [{"parts": [{"text": "no video"}]}]})));
+    assert!(!super::stream::youtube_only(
+        &json!({"contents": [{"parts": [{"fileData": {"fileUri": "https://notyoutube.com/v"}}]}]})
+    ));
+
+    let usage = json!({"promptTokenCount": 1706, "candidatesTokenCount": 27, "thoughtsTokenCount": 200,
+        "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 30}, {"modality": "VIDEO", "tokenCount": 1676}]});
+    let c = |free| pricing::estimate("gemini-3.8-flash", &usage, None, NOW, free).unwrap();
+    assert!((c(true) - (30.0 * 0.75 + 227.0 * 3.75) / 1e6).abs() < 1e-12, "{}", c(true));
+    assert!((c(false) - (1706.0 * 0.75 + 227.0 * 3.75) / 1e6).abs() < 1e-12);
+    // A follow-up reads the video from the cache: free too, the rest at the cache rate.
+    let cached = json!({"promptTokenCount": 1800, "cachedContentTokenCount": 1700, "candidatesTokenCount": 10,
+        "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 124}, {"modality": "VIDEO", "tokenCount": 1676}],
+        "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 24}, {"modality": "VIDEO", "tokenCount": 1676}]});
+    let c = pricing::estimate("gemini-3.8-flash", &cached, None, NOW, true).unwrap();
+    assert!((c - (100.0 * 0.75 + 24.0 * 0.075 + 10.0 * 3.75) / 1e6).abs() < 1e-12, "{c}");
+
+    // Through the stream parser: the request decides.
+    let chunk = json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "A man at the zoo."}]}, "finishReason": "STOP"}],
+        "usageMetadata": usage});
+    let mut p = parser("gemini-3.8-flash", yt(vec![]));
+    let u = usages(&run(&mut p, std::slice::from_ref(&chunk)))[0].clone();
+    assert!((u.cost_usd.unwrap() - (30.0 * 0.75 + 227.0 * 3.75) / 1e6).abs() < 1e-12);
+    let mut p = parser("gemini-3.8-flash", yt(vec![json!({"inlineData": {"mimeType": "video/mp4", "data": ""}})]));
+    let u = usages(&run(&mut p, &[chunk]))[0].clone();
+    assert!((u.cost_usd.unwrap() - (1706.0 * 0.75 + 227.0 * 3.75) / 1e6).abs() < 1e-12, "mixed: priced in full");
+}
+
 #[test]
 fn prices_by_tier_date_and_modality() {
-    let m = |u: Value, tier: Option<Tier>, now: i64| {
-        pricing::estimate("gemini-4-carbon", &u, tier, now, &GroundingUse::default()).unwrap()
-    };
+    let m =
+        |u: Value, tier: Option<Tier>, now: i64| pricing::estimate("gemini-4-carbon", &u, tier, now, false).unwrap();
     let million_in = json!({"promptTokenCount": 1_000_000});
     assert!((m(million_in.clone(), None, NOW) - 2.0).abs() < 1e-9);
     assert!((m(million_in.clone(), None, pricing::DEC_1_2026) - 4.0).abs() < 1e-9, "introductory price ends");
@@ -1567,7 +1624,7 @@ fn prices_by_tier_date_and_modality() {
             &json!({"promptTokenCount": prompt, "candidatesTokenCount": 1000}),
             None,
             NOW,
-            &GroundingUse::default(),
+            false,
         )
         .unwrap()
     };
@@ -1575,18 +1632,25 @@ fn prices_by_tier_date_and_modality() {
     assert!((pro(200_001) - (200_001.0 * 4.0 + 1000.0 * 18.0) / 1e6).abs() < 1e-12, ">200K tier");
 
     let audio = json!({"promptTokenCount": 3000, "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 2000}, {"modality": "AUDIO", "tokenCount": 1000}]});
-    let c = pricing::estimate("gemini-3.1-flash-lite", &audio, None, NOW, &GroundingUse::default()).unwrap();
+    let c = pricing::estimate("gemini-3.1-flash-lite", &audio, None, NOW, false).unwrap();
     assert!((c - (2000.0 * 0.25 + 1000.0 * 0.50) / 1e6).abs() < 1e-12);
 
-    let flash = |g: GroundingUse, model: &str| pricing::estimate(model, &json!({}), None, NOW, &g).unwrap();
-    assert!((flash(GroundingUse { queries: 3, ..Default::default() }, "gemini-3.8-flash") - 0.042).abs() < 1e-12);
-    assert!(pricing::estimate("gemini-9", &json!({}), None, NOW, &GroundingUse::default()).is_none());
+    // Grounding fees are apart from the cost.
+    let fees = |g: GroundingUse, model: &str| pricing::grounding_fees(model, NOW, &g);
+    assert_eq!(fees(GroundingUse { queries: 3, ..Default::default() }, "gemini-3.8-flash"), vec![searches(3)]);
+    assert!(fees(GroundingUse::default(), "gemini-3.8-flash").is_empty());
+    assert!(fees(GroundingUse { queries: 3, ..Default::default() }, "gemini-9").is_empty(), "no price, no fee");
+    let grounded = GroundingUse { queries: 2, web_results: true, maps_results: true };
+    assert_eq!(
+        fees(grounded, "gemini-2.5-flash-lite"),
+        vec![Unbilled { what: Counted::GroundedPrompts, count: 2, usd: 0.035 + 0.025 }],
+        "2.5: per grounded prompt, whatever the queries"
+    );
+    assert!(pricing::estimate("gemini-9", &json!({}), None, NOW, false).is_none());
     assert!(pricing::price("gemini-nano-banana-2.1", Tier::Flex, NOW).is_none(), "image models have no flex tier");
 
     // Gemini 4 Hydrogen: flat, no introductory price.
-    let m = |tier, now| {
-        pricing::estimate("gemini-4-hydrogen", &million_in, Some(tier), now, &GroundingUse::default()).unwrap()
-    };
+    let m = |tier, now| pricing::estimate("gemini-4-hydrogen", &million_in, Some(tier), now, false).unwrap();
     assert!((m(Tier::Standard, NOW) - 1.50).abs() < 1e-9);
     assert!((m(Tier::Standard, pricing::JAN_1_2027) - 1.50).abs() < 1e-9);
     assert!((m(Tier::Flex, NOW) - 0.75).abs() < 1e-9);
@@ -1596,7 +1660,7 @@ fn prices_by_tier_date_and_modality() {
     // says less (as logged on 2026-11-12: 305 against IMAGE 1,120).
     let u = json!({"promptTokenCount": 11, "candidatesTokenCount": 305, "thoughtsTokenCount": 287,
                    "totalTokenCount": 603, "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}]});
-    let c = pricing::estimate("gemini-3.1-flash-lite-image", &u, None, NOW, &GroundingUse::default()).unwrap();
+    let c = pricing::estimate("gemini-3.1-flash-lite-image", &u, None, NOW, false).unwrap();
     assert!((c - (11.0 * 0.25 + 287.0 * 1.50 + 1120.0 * 30.0) / 1e6).abs() < 1e-12, "{c}");
     // Gemini 2.5 Flash Image (end of service announced for 2027-03-15) is not in the table: no price.
     assert!(pricing::price("gemini-2.5-flash-image", Tier::Standard, NOW).is_none());

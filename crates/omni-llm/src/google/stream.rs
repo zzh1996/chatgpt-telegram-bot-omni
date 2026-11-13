@@ -118,8 +118,46 @@ pub fn usage_from_gemini(u: &Value) -> Usage {
         cache_write_tokens: None,
         cost_usd: None,
         cost_source: CostSource::Unknown,
+        unbilled: Vec::new(),
         raw: u.clone(),
     }
+}
+
+/// The request has a YouTube link (`fileData` with a YouTube URI) and no
+/// other video or audio: then the VIDEO and AUDIO tokens of the usage are the
+/// links'. "The YouTube URL feature is in preview and is available at no
+/// charge" (Google's video understanding page, 2026-11-13); measured
+/// 2026-11-13: a 19-second video is `promptTokensDetails` VIDEO 1,676 (no
+/// AUDIO entry). A request that mixes them is priced in full.
+pub fn youtube_only(body: &Value) -> bool {
+    let parts = body
+        .get("contents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("parts").and_then(Value::as_array))
+        .flatten();
+    let media = |d: &Value| {
+        get(d, "mimeType", "mime_type")
+            .and_then(Value::as_str)
+            .is_some_and(|m| m.starts_with("video/") || m.starts_with("audio/"))
+    };
+    let mut youtube = false;
+    for p in parts {
+        if let Some(f) = get(p, "fileData", "file_data") {
+            let uri = get(f, "fileUri", "file_uri").and_then(Value::as_str).unwrap_or("");
+            let host = uri.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+            if matches!(host, "youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtu.be") {
+                youtube = true;
+            } else if media(f) {
+                return false;
+            }
+        }
+        if get(p, "inlineData", "inline_data").is_some_and(media) {
+            return false;
+        }
+    }
+    youtube
 }
 
 fn get<'a>(v: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
@@ -136,6 +174,9 @@ pub struct ChunkParser {
     model: String,
     tier: Option<Tier>,
     now: i64,
+    /// Every video of the request is a YouTube link, free while in preview:
+    /// its VIDEO (and AUDIO) tokens are not priced ([`youtube_only`]).
+    free_media: bool,
     search_on: bool,
     maps_on: bool,
     /// The model's parts, as received (parts carried over from a dropped hop first).
@@ -206,6 +247,7 @@ impl ChunkParser {
             model: model.to_string(),
             tier: body.get("service_tier").and_then(Value::as_str).and_then(Tier::parse),
             now,
+            free_media: youtube_only(body),
             search_on: has("googleSearch"),
             maps_on: has("googleMaps"),
             parts: carried,
@@ -328,7 +370,8 @@ impl ChunkParser {
 
     fn priced(&self, u: &Value) -> Usage {
         let mut usage = usage_from_gemini(u);
-        usage.cost_usd = pricing::estimate(&self.model, u, self.tier, self.now, &self.grounding_use());
+        usage.cost_usd = pricing::estimate(&self.model, u, self.tier, self.now, self.free_media);
+        usage.unbilled = pricing::grounding_fees(&self.model, self.now, &self.grounding_use());
         usage.cost_source = if usage.cost_usd.is_some() { CostSource::Estimated } else { CostSource::Unknown };
         usage
     }

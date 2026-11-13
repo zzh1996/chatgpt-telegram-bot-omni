@@ -811,6 +811,7 @@ pub(crate) fn usage_from(u: &Value) -> Usage {
         cache_write_tokens: g("/input_tokens_details/cache_write_tokens"),
         cost_usd: cost,
         cost_source: if cost.is_some() { CostSource::Reported } else { CostSource::Unknown },
+        unbilled: Vec::new(),
         raw: u.clone(),
     }
 }

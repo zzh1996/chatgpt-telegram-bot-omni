@@ -696,6 +696,7 @@ fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool, bold_cost: f64) ->
     if show_usage && let Some(u) = &a.usage {
         f.extend(usage_parts(u));
         bold = bold_cost_at(&f, u, bold_cost);
+        after_cost(&mut f, u.cost_usd.is_some(), &unbilled_parts(u));
     }
     if let Some(t) = a.elapsed.filter(|t| !t.is_zero()) {
         f.push(format!("{:.1}s", t.as_secs_f64()));
@@ -737,6 +738,28 @@ fn footer_text(f: &[String], bold: Option<(usize, usize)>) -> RText {
         }
     }
     RText::concat(t)
+}
+
+/// Charges left out of the cost ([`omni_core::usage::Unbilled`]), with what
+/// they cost once the free allowance is used up: `+ 24 searches ≈$0.336`.
+fn unbilled_parts(u: &Usage) -> Vec<String> {
+    u.unbilled.iter().map(|x| format!("+ {} ≈{}", x.what.words(x.count), fmt_cost(x.usd))).collect()
+}
+
+/// `extra` (charges the cost leaves out, `+ …`) right after the cost, the last
+/// of `f` when `has_cost`; else a part of their own.
+fn after_cost(f: &mut Vec<String>, has_cost: bool, extra: &[String]) {
+    if extra.is_empty() {
+        return;
+    }
+    let extra = extra.join(" ");
+    match f.last_mut().filter(|_| has_cost) {
+        Some(cost) => {
+            cost.push(' ');
+            cost.push_str(&extra);
+        }
+        None => f.push(extra),
+    }
 }
 
 /// Usage in words: input (cache), output (reasoning), cost. The input count
@@ -861,19 +884,15 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         f.push(format!("attempt {}/{}", inp.attempt, inp.max_attempts));
     }
     let mut bold = None;
+    let mut extra: Vec<String> = extra_costs.into_iter().cloned().collect();
     if inp.show_usage
         && let Some(u) = inp.usage
     {
         f.extend(usage_parts(u));
         bold = bold_cost_at(&f, u, inp.bold_cost);
+        extra.extend(unbilled_parts(u));
     }
-    if !extra_costs.is_empty() {
-        let extra = extra_costs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
-        match f.last_mut().filter(|_| inp.show_usage && inp.usage.is_some_and(|u| u.cost_usd.is_some())) {
-            Some(cost) => cost.push_str(&format!(" {extra}")),
-            None => f.push(extra),
-        }
-    }
+    after_cost(&mut f, inp.show_usage && inp.usage.is_some_and(|u| u.cost_usd.is_some()), &extra);
     if finished && !inp.elapsed.is_zero() {
         f.push(format!("{:.1}s", inp.elapsed.as_secs_f64()));
     }
@@ -1147,6 +1166,50 @@ mod tests {
             "{footer}"
         );
         assert_eq!(footer.matches("+ code execution").count(), 1, "{footer}");
+    }
+
+    /// Charges a free allowance may cover (Google's search queries) follow the
+    /// cost with what they cost without it, and are not bold with it.
+    #[test]
+    fn unbilled_charges_follow_the_cost() {
+        use omni_core::usage::{CostSource, Counted, Unbilled};
+        let usage = Usage {
+            input_tokens: Some(1325),
+            cached_input_tokens: Some(990),
+            output_tokens: Some(4033),
+            cost_usd: Some(0.25),
+            cost_source: CostSource::Estimated,
+            unbilled: vec![Unbilled { what: Counted::SearchQueries, count: 24, usd: 0.336 }],
+            ..Default::default()
+        };
+        let settings = vec!["web search".to_string()];
+        let mut i = input(&[], Status::Done);
+        i.usage = Some(&usage);
+        i.settings = &settings;
+        i.bold_cost = 0.2;
+        let RBlock::Footer(t) = compose(&i).pop().unwrap() else { panic!() };
+        let footer = t.to_plain();
+        assert!(
+            footer.starts_with("web search · in 1,325 (cached 990) · out 4,033 · ≈$0.250 + 24 searches ≈$0.336 · "),
+            "{footer}"
+        );
+        let RText::Concat(parts) = &t else { panic!("{t:?}") };
+        let bold: Vec<String> =
+            parts.iter().filter_map(|x| if let RText::Bold(b) = x { Some(b.to_plain()) } else { None }).collect();
+        assert_eq!(bold, ["≈$0.250"]);
+        // One search; and the same after a failed attempt's output.
+        assert_eq!(Counted::SearchQueries.words(1), "1 search");
+        let prior = PriorAttempt {
+            n: 1,
+            parts: Vec::new(),
+            error: None,
+            interrupted: false,
+            usage: Some(usage.clone()),
+            elapsed: None,
+        };
+        let RBlock::Details { blocks, .. } = prior_block(&prior, false, true, 0.0) else { panic!() };
+        let Some(RBlock::Footer(t)) = blocks.last() else { panic!() };
+        assert!(t.to_plain().contains("≈$0.250 + 24 searches ≈$0.336"), "{}", t.to_plain());
     }
 
     /// A cost above `render.bold_cost_usd` is bold, without what follows it.

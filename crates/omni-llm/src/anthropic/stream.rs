@@ -424,6 +424,7 @@ fn combine(earlier: Option<&Usage>, earlier_raw: &[Value], cur: Usage) -> Usage 
         cache_write_tokens: s(e.cache_write_tokens, cur.cache_write_tokens),
         cost_usd: cost,
         cost_source: if cost.is_some() { cur.cost_source } else { CostSource::Unknown },
+        unbilled: Vec::new(),
         raw: Value::Array(raw),
     }
 }
