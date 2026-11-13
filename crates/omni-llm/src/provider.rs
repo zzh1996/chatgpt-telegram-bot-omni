@@ -349,7 +349,7 @@ pub fn unsent_media(
 ) -> Result<(), crate::LlmError> {
     match media_not_sent(
         history.iter().filter(|t| t.role == omni_core::Role::Assistant && !own(t)),
-        "assistant messages here carry text only",
+        "this model sees only the text of other models' answers; send it the file as an attachment",
     ) {
         Some(why) => Err(crate::LlmError::request(why)),
         None => Ok(()),

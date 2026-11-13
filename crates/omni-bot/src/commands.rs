@@ -53,7 +53,9 @@ pub fn direct_ids(app: &App) -> Option<String> {
 const PAID_COMMANDS: &[&str] = &["m", "retry", "continue"];
 
 /// The answer to a paid request from someone banned in the chat.
-pub const BANNED: &str = "⛔ You are banned from using this bot in this chat.";
+pub fn banned(chat_id: i64) -> String {
+    format!("⛔ You are banned from using this bot in {}.", access::this_chat(chat_id))
+}
 
 const HINT: &str = "Start a conversation with `prefix$question` (the prefixes are listed by /models), or reply to one of my answers to continue. /help for details.";
 
@@ -109,10 +111,11 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     let access = access::check(app, &bot.name, ib.chat_id, user).await?;
     if name == "ping" {
         // Everything an administrator needs to allow a chat or ban someone.
+        let place = access::this_chat(ib.chat_id);
         let here = match access {
-            Access::Allowed => "this chat is allowed",
-            Access::Banned => "this chat is allowed, you are banned here",
-            Access::NotAllowed => "this chat is not allowed",
+            Access::Allowed => format!("{place} is allowed"),
+            Access::Banned => format!("{place} is allowed, you are banned here"),
+            Access::NotAllowed => format!("{place} is not allowed"),
         };
         let up = jiff::Timestamp::now().duration_since(app.started_at);
         say(
@@ -120,13 +123,13 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
             bot,
             ib,
             &format!(
-                "pong · chat_id={} · user_id={}{}{} · {here} · bot={} · up {}s",
+                "pong · chat_id={} · user_id={}{}{} · {here} · bot={} · up {}",
                 ib.chat_id,
                 user,
                 ib.payload.sender_username.as_ref().map(|u| format!(" (@{u})")).unwrap_or_default(),
                 if admin { " · admin" } else { "" },
                 bot.name,
-                up.as_secs()
+                fmt_uptime(up.as_secs().max(0) as u64)
             ),
         )
         .await;
@@ -143,13 +146,7 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         if !admin {
             say(app, bot, ib, "⛔ admin only").await;
         } else if ib.chat_id < 0 && !GROUP_ADMIN_COMMANDS.contains(&name) {
-            say(
-                app,
-                bot,
-                ib,
-                &format!("⛔ In a group, admin commands only act on that group. Use /{name} in private chat."),
-            )
-            .await;
+            say(app, bot, ib, &format!("⛔ /{name} works only in your private chat with me.")).await;
         } else {
             admin_command(app, bot, ib, name, args, user).await?;
         }
@@ -157,7 +154,7 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     }
     // Paid requests: not when banned here (queries are answered even then).
     if PAID_COMMANDS.contains(&name) && access == Access::Banned {
-        say(app, bot, ib, BANNED).await;
+        say(app, bot, ib, &banned(ib.chat_id)).await;
         return Ok(());
     }
     match name {
@@ -169,6 +166,7 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
                 ids_platforms: omni_llm::provider::PROVIDERS.iter().any(|p| enabled_ids(p.id)),
                 max_file_mb: app.cfg.general.max_file_mb,
                 bold_cost_usd: app.cfg.render.bold_cost_usd,
+                answer_first: app.cfg.render.answer_first,
                 admin,
                 group: ib.chat_id < 0,
                 lang: crate::help::Lang::En,
@@ -207,6 +205,16 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         _ => {}
     }
     Ok(())
+}
+
+/// How long the bot has been running: `42s`, `5m 3s`, `3h 5m`, `10d 0h`.
+fn fmt_uptime(s: u64) -> String {
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m {}s", s / 60, s % 60),
+        3600..86400 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d {}h", s / 86400, s % 86400 / 3600),
+    }
 }
 
 /// A platform's balance (`/credits`): the amounts readable (DeepSeek's
@@ -262,18 +270,22 @@ fn credits_blocks(v: &serde_json::Value) -> Result<Vec<RBlock>> {
     let num = |k: &str| d.get(k).and_then(serde_json::Value::as_f64);
     let usd = |x: Option<f64>| x.map(fmt_cost).unwrap_or_else(|| "-".into());
     let mut lines = Vec::new();
+    // `limit` and `limit_remaining` are per period (`limit_reset`); `usage` is all time.
+    let (per, this) = match d.get("limit_reset").and_then(|x| x.as_str()) {
+        Some("daily") => (" a day".to_string(), " today"),
+        Some("weekly") => (" a week".to_string(), " this week"),
+        Some("monthly") => (" a month".to_string(), " this month"),
+        Some(other) => (format!(" (resets {other})"), ""),
+        None => (String::new(), ""),
+    };
     match num("limit") {
-        Some(limit) => {
-            let reset =
-                d.get("limit_reset").and_then(|x| x.as_str()).map(|r| format!(" · resets {r}")).unwrap_or_default();
-            lines.push(format!(
-                "limit {} · used {} · remaining {}{reset}",
-                usd(Some(limit)),
-                usd(num("usage")),
-                usd(num("limit_remaining"))
-            ));
-        }
-        None => lines.push(format!("no limit · used {}", usd(num("usage")))),
+        Some(limit) => lines.push(format!(
+            "limit {}{per} · {} left{this} · {} used in total",
+            usd(Some(limit)),
+            usd(num("limit_remaining")),
+            usd(num("usage"))
+        )),
+        None => lines.push(format!("no limit · {} used in total", usd(num("usage")))),
     }
     lines.push(format!(
         "spent today {} · this week {} · this month {} (UTC)",
@@ -456,7 +468,8 @@ async fn admin_command(
                     bot,
                     ib,
                     &with_marker(
-                        "usage: /alias <prefix$> <spec>, e.g. /alias g5$ openrouter:google/gemini-5+e=high (the empty prefix is `$`)",
+                        "usage: /alias <prefix$> <spec>: the spec is the id of a model this bot has, with options, \
+                         e.g. /alias low$ openai:gpt-6.1-sol+e=low (the empty prefix is `$`)",
                         marker,
                     ),
                 )
@@ -465,8 +478,36 @@ async fn admin_command(
             };
             let n = prefix_name(n, marker);
             let spec = spec.trim();
-            if let Err(e) = trigger::parse_spec(spec) {
-                say(app, bot, ib, &format!("⚠️ invalid spec: {e}")).await;
+            if spec.contains(',') {
+                say(app, bot, ib, "⚠️ a prefix is one model (with options), not a list").await;
+                return Ok(());
+            }
+            let parsed = match trigger::parse_spec(spec) {
+                Ok(p) => p,
+                Err(e) => {
+                    say(app, bot, ib, &format!("⚠️ invalid spec: {e}")).await;
+                    return Ok(());
+                }
+            };
+            // Only a model this bot has: anything else would be a prefix that only errs.
+            let has = app.bot_cfg(&bot.name).and_then(|cfg| app.served_canonical(cfg, spec)).is_some_and(|c| {
+                match c.strip_prefix("openrouter:") {
+                    Some(m) => app.openrouter.catalog.get(m).is_some(),
+                    None => true,
+                }
+            });
+            if !has {
+                say(
+                    app,
+                    bot,
+                    ib,
+                    &format!(
+                        "⚠️ not saved: this bot has no model `{}` (a model id with its platform, e.g. \
+                         `openai:gpt-6.1-sol`, or an OpenRouter id `author/model`; /models lists what it has)",
+                        parsed.model
+                    ),
+                )
+                .await;
                 return Ok(());
             }
             if !trigger::alias_name_ok(n, marker) {
@@ -560,7 +601,7 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
             .map(|(n, s)| vec![format!("{n}{marker}"), s.clone()])
             .collect();
         if !matching.is_empty() {
-            blocks.push(table(&["prefix", "spec"], matching));
+            blocks.push(table(&["prefix", "model"], matching));
         }
         let own: Vec<Vec<String>> = app
             .chat_prefixes_of(&bot.name, ib.chat_id)
@@ -569,7 +610,7 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
             .map(|(n, p)| vec![format!("{n}{marker}"), p.spec.clone()])
             .collect();
         if !own.is_empty() {
-            blocks.push(table(&["this chat's prefix", "spec"], own));
+            blocks.push(table(&[&format!("{}'s prefix", access::this_chat(ib.chat_id)), "model"], own));
         }
         if app.unlisted_models_allowed("openrouter") {
             let ids: Vec<Vec<String>> = app
@@ -599,7 +640,7 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
         // Prefixes of platforms without an API key are not offered.
         vec![RBlock::Paragraph(RText::plain("No prefix of this bot is available (their platforms have no API key)."))]
     } else {
-        vec![table(&["prefix", "spec"], rows)]
+        vec![table(&["prefix", "model"], rows)]
     };
     let own: Vec<Vec<String>> = app
         .chat_prefixes_of(&bot.name, ib.chat_id)
@@ -608,7 +649,7 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
         .map(|(n, p)| vec![format!("{n}{marker}"), p.spec.clone()])
         .collect();
     if !own.is_empty() {
-        blocks.push(table(&["this chat's prefix", "spec"], own));
+        blocks.push(table(&[&format!("{}'s prefix", access::this_chat(ib.chat_id)), "model"], own));
     }
     let tail = match direct_ids(app) {
         Some(ids) => format!("A model id ({ids}) works as a prefix too. Search: /models <text>."),
@@ -720,7 +761,7 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
         return Ok(());
     }
     if t.status == TurnStatus::Failed {
-        let msg = "this answer failed, so it has no final text; /info has every attempt's output and error";
+        let msg = "this answer failed, so it has no final text; each attempt's output and error is folded in the answer, the requests are in /info";
         say(app, bot, ib, msg).await;
         return Ok(());
     }
@@ -983,14 +1024,14 @@ async fn cmd_prefix(
         }
         let blocks = if rows.is_empty() {
             vec![RBlock::Paragraph(RText::plain(with_marker(
-                "No prefixes in this chat yet. Create one: /prefix name prefix$::system …",
+                &format!("No prefixes in {} yet: /help prefixes shows how to make one.", access::this_chat(chat)),
                 marker,
             )))]
         } else {
-            vec![table(&["prefix", "spec", "system", "history", "by"], rows)]
+            vec![table(&["prefix", "model", "system prompt", "history turns", "by"], rows)]
         };
         let title = if chat == ib.chat_id {
-            "Prefixes of this chat".to_string()
+            format!("Prefixes of {}", access::this_chat(chat))
         } else {
             format!("Prefixes of {}", place_label(chat))
         };
@@ -1007,7 +1048,7 @@ async fn cmd_prefix(
     // Show one.
     if rest.is_empty() && ib.reply_to_msg_id.is_none() {
         let Some(p) = app.chat_prefix(&bot.name, chat, &name) else {
-            say(app, bot, ib, &format!("there is no prefix {name}{marker} in this chat")).await;
+            say(app, bot, ib, &format!("there is no prefix {name}{marker} in {}", access::this_chat(chat))).await;
             return Ok(());
         };
         let mut blocks = vec![RBlock::Paragraph(RText::plain(format!(
@@ -1039,7 +1080,7 @@ async fn cmd_prefix(
     }
     // Create one: members allowed here and not banned.
     if access == Access::Banned {
-        say(app, bot, ib, BANNED).await;
+        say(app, bot, ib, &banned(ib.chat_id)).await;
         return Ok(());
     }
     if app.prefix_taken(&bot.name, chat, &name) {
@@ -1122,9 +1163,10 @@ async fn cmd_prefix(
         p.turns.iter().any(|t| t.role == omni_core::content::Role::System),
     );
     let text = format!(
-        "✅ {name}{marker} → {} · {} · {history} history turns. Anyone in this chat can use it; /unprefix {name} deletes it.",
+        "✅ {name}{marker} → {} · {} · {history} history turns. Anyone in {} can use it; /unprefix {name} deletes it.",
         p.spec,
         if system { "with a system prompt" } else { "no system prompt" },
+        access::this_chat(chat),
     );
     app.chat_prefixes.write().entry((bot.name.clone(), chat)).or_default().insert(name, Arc::new(p));
     say(app, bot, ib, &text).await;
@@ -1170,10 +1212,10 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
     let mut blocks = Vec::new();
     if let Some(s) = &t.spec {
         blocks.push(RBlock::Paragraph(RText::plain(format!(
-            "model: {} · options: {} · status: {:?}",
+            "model: {}{} · status: {}",
             s.canonical(),
-            s.options_syntax(),
-            t.status
+            Some(s.options_syntax()).filter(|o| !o.is_empty()).map(|o| format!(" · options: {o}")).unwrap_or_default(),
+            format!("{:?}", t.status).to_lowercase()
         ))));
     }
     let mut dump = json!({"turn": t.id, "attempts": []});
@@ -1287,8 +1329,7 @@ async fn cmd_retry(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
         return Ok(());
     }
     if t.status != TurnStatus::Failed {
-        say(app, bot, ib, "only failed answers can be retried; to regenerate, reply to the previous message again")
-            .await;
+        say(app, bot, ib, "only failed answers can be retried; for another answer, send the question again").await;
         return Ok(());
     }
     if !retry_turn(app, t.id).await? {
@@ -1332,7 +1373,7 @@ pub async fn on_callback(app: &Arc<App>, bot: &Arc<BotConn>, q: tl::types::Updat
     match access::check(app, &bot.name, chat_id, q.user_id).await? {
         Access::Allowed => {}
         Access::Banned => {
-            answer(Some("You are banned from using this bot in this chat.")).await;
+            answer(Some(&format!("You are banned from using this bot in {}.", access::this_chat(chat_id)))).await;
             return Ok(());
         }
         Access::NotAllowed => {
@@ -1342,7 +1383,7 @@ pub async fn on_callback(app: &Arc<App>, bot: &Arc<BotConn>, q: tl::types::Updat
     }
     let t = conv::get_turn(&app.db, turn_id).await?;
     if t.status != TurnStatus::Failed {
-        answer(Some("This answer is not failed (any more).")).await;
+        answer(Some("This answer has already been retried.")).await;
         return Ok(());
     }
     if retry_turn(app, turn_id).await? {
@@ -1378,8 +1419,8 @@ async fn cmd_continue(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Resul
             app,
             bot,
             ib,
-            "only answers that stopped at the long-decode output budget can be continued (their note says \
-             \"reached the long-decode output budget\" and suggests /continue)",
+            "/continue only works on a long answer whose note says to reply /continue; to get more of another \
+             answer, reply to it (e.g. \"go on\")",
         )
         .await;
         return Ok(());
@@ -1619,7 +1660,7 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
             [c, u, ..] => (Some(c), Some(u), format!("user {u} in {}", place_label(c))),
         }
     } else {
-        (Some(chat), None, "this chat".into())
+        (Some(chat), None, access::this_chat(chat).into())
     };
     let (since, period) = period_start(app, words.first().copied().unwrap_or("30d"));
     let (calls, total) = usage_total(app, &bot.name, since, chat_f, user_f).await?;
@@ -1638,7 +1679,7 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
                     vec![k, n.to_string(), fmt_tokens_compact(i), fmt_tokens_compact(o), fmt_cost(c)]
                 })
                 .collect();
-            blocks.push(table(&[d.header(), "calls", "in", "out", "cost"], rows));
+            blocks.push(table(&[d.header(), "API calls", "tokens in", "tokens out", "cost"], rows));
         }
     }
     send(app, bot, ib, "Usage stats", blocks).await;
@@ -1649,14 +1690,12 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
 async fn cmd_usage(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let user = ib.sender_id.unwrap_or(0);
     let mut lines = Vec::new();
-    for (what, target) in [("this chat", access::Target::Chat), ("you here", access::Target::Member(user))] {
+    let here = access::this_chat(ib.chat_id);
+    for (what, target) in
+        [(here.to_string(), access::Target::Chat), (format!("you in {here}"), access::Target::Member(user))]
+    {
         lines.push(match access::level(&app.db, &bot.name, ib.chat_id, target).await? {
-            Some((lvl, r)) => format!(
-                "{what}: balance {} of {} USD, refills {} USD/day",
-                fmt_cost(lvl).trim_start_matches('$'),
-                r.capacity,
-                r.refill_per_day
-            ),
+            Some((lvl, r)) => format!("{what}: {}", access::balance_text(lvl, &r)),
             None => format!("{what}: no limit"),
         });
     }
@@ -1742,7 +1781,11 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
             // Show it.
             let text = match (target, access::level(&app.db, &bot.name, chat, target).await?) {
                 (Target::Members, _) => match access::rule_for(&app.db, &bot.name, chat, Target::Members).await? {
-                    Some(r) => format!("{who}: {} USD capacity, refills {} USD/day", r.capacity, r.refill_per_day),
+                    Some(r) => format!(
+                        "{who}: a limit of {} USD, refilling {} USD/day",
+                        access::usd(r.capacity),
+                        access::usd(r.refill_per_day)
+                    ),
                     None => format!("{who}: no limit"),
                 },
                 (_, Some((lvl, r))) => {
@@ -1752,12 +1795,7 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
                         }
                         _ => "",
                     };
-                    format!(
-                        "{who}: balance {} of {} USD, refills {} USD/day{default}",
-                        fmt_cost(lvl).trim_start_matches('$'),
-                        r.capacity,
-                        r.refill_per_day
-                    )
+                    format!("{who}: {}{default}", access::balance_text(lvl, &r))
                 }
                 (_, None) => format!("{who}: no limit"),
             };
@@ -1779,7 +1817,11 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
     };
     access::set_rule(&app.db, &bot.name, chat, target, rule, by).await.context("set quota")?;
     let text = match rule {
-        Some(r) => format!("✅ {who}: {} USD capacity, refills {} USD/day", r.capacity, r.refill_per_day),
+        Some(r) => format!(
+            "✅ {who}: a limit of {} USD, refilling {} USD/day",
+            access::usd(r.capacity),
+            access::usd(r.refill_per_day)
+        ),
         None => format!("✅ {who}: no limit"),
     };
     say(app, bot, ib, &text).await;
@@ -1792,12 +1834,15 @@ async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Ve
     let mut rows = Vec::new();
     for q in access::quota_rules(&app.db, bot, only_chat).await? {
         let (target, balance) = match q.target {
-            Target::Chat => ("whole chat".to_string(), access::level(&app.db, bot, q.chat_id, q.target).await?),
+            Target::Chat => (
+                if q.chat_id < 0 { "whole group" } else { "whole chat" }.to_string(),
+                access::level(&app.db, bot, q.chat_id, q.target).await?,
+            ),
             Target::Members => ("each member".to_string(), None),
             Target::Member(u) => (format!("user {u}"), access::level(&app.db, bot, q.chat_id, q.target).await?),
         };
-        let balance = balance.map(|(l, _)| fmt_cost(l).trim_start_matches('$').to_string()).unwrap_or("-".into());
-        let mut row = vec![target, format!("{}", q.rule.capacity), format!("{}", q.rule.refill_per_day), balance];
+        let balance = balance.map(|(l, _)| access::usd(l)).unwrap_or("-".into());
+        let mut row = vec![target, access::usd(q.rule.capacity), access::usd(q.rule.refill_per_day), balance];
         if only_chat.is_none() {
             row.insert(0, place_label(q.chat_id));
         }
@@ -1807,9 +1852,9 @@ async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Ve
         return Ok(vec![RBlock::Paragraph(RText::plain("No spend limits."))]);
     }
     let header: &[&str] = if only_chat.is_none() {
-        &["chat", "applies to", "capacity", "refill/day", "balance"]
+        &["chat", "applies to", "limit USD", "refill USD/day", "balance USD"]
     } else {
-        &["applies to", "capacity", "refill/day", "balance"]
+        &["applies to", "limit USD", "refill USD/day", "balance USD"]
     };
     Ok(vec![table(header, rows)])
 }

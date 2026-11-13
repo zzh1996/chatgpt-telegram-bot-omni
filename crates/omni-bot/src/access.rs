@@ -359,27 +359,47 @@ pub async fn charge(db: &Db, bot: &str, chat_id: i64, user_id: i64, cost: f64) -
     Ok(())
 }
 
+/// A spend-limit amount: two decimals, a minus sign when in debt (`-0.50`).
+pub fn usd(v: f64) -> String {
+    format!("{v:.2}")
+}
+
+/// A spend-limit balance in words: `balance 1.23 of 5.00 USD, refills 1.00 USD/day`.
+pub fn balance_text(level: f64, rule: &Rule) -> String {
+    let refill = if rule.refill_per_day > 0.0 {
+        format!("refills {} USD/day", usd(rule.refill_per_day))
+    } else {
+        "does not refill".to_string()
+    };
+    format!("balance {} of {} USD, {refill}", usd(level), usd(rule.capacity))
+}
+
+/// What a chat is called in messages: a group is "this group", a private
+/// chat "this chat".
+pub fn this_chat(chat_id: i64) -> &'static str {
+    if chat_id < 0 { "this group" } else { "this chat" }
+}
+
 /// `Err(message)` if this chat's bucket or the member's bucket in it is
 /// exhausted (for everyone, administrators included).
 pub async fn check_quota(app: &App, bot: &str, chat_id: i64, user_id: i64) -> Result<Result<(), String>> {
-    for (what, target) in [("this chat's", Target::Chat), ("your", Target::Member(user_id))] {
+    let here = this_chat(chat_id);
+    for (what, target) in [
+        (format!("{here}'s spend limit"), Target::Chat),
+        (format!("your spend limit in {here}"), Target::Member(user_id)),
+    ] {
         if let Some((lvl, rule)) = level(&app.db, bot, chat_id, target).await?
             && lvl <= 0.0
         {
             // Usable again once the bucket is back above zero.
             let wait_h = if rule.refill_per_day > 0.0 { -lvl / rule.refill_per_day * 24.0 } else { f64::INFINITY };
-            let usd = |v: f64| {
-                if v < 0.0 { format!("-{}", crate::compose::fmt_cost(-v)) } else { crate::compose::fmt_cost(v) }
-            };
             return Ok(Err(format!(
-                "{what} spend limit here is used up (balance {}, capacity {}, refill {}/day){}",
-                usd(lvl),
-                usd(rule.capacity),
-                usd(rule.refill_per_day),
+                "{what} is used up ({}); {}",
+                balance_text(lvl, &rule),
                 if wait_h.is_finite() {
-                    format!("; available again in ~{:.1} h", wait_h.max(0.1))
+                    format!("usable again in about {:.1} h", wait_h.max(0.1))
                 } else {
-                    String::new()
+                    "it does not refill: ask an admin".to_string()
                 }
             )));
         }

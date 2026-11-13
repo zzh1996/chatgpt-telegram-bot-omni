@@ -94,7 +94,10 @@ async fn wait_for_ancestors(app: &App, turn_id: i64) -> Result<Result<Vec<TurnRo
             if t.turn.role == Role::Assistant {
                 match t.status {
                     TurnStatus::Failed => {
-                        return Ok(Err("the message this conversation continues from failed to generate".into()));
+                        return Ok(Err(
+                            "the answer you replied to failed: retry it first (🔁 Retry under it), then this one"
+                                .into(),
+                        ));
                     }
                     TurnStatus::Pending | TurnStatus::Running => blocking = Some(t.id),
                     TurnStatus::Done => {}
@@ -401,6 +404,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         show_usage: true,
         bold_cost: app.cfg.render.bold_cost_usd,
         reasoning_open: app.cfg.render.reasoning_open,
+        answer_first: app.cfg.render.answer_first,
         mode: app.cfg.render.markdown,
         prior: Vec::new(),
         previews: Vec::new(),
@@ -644,8 +648,7 @@ async fn mark_interrupted(ctx: &Ctx, last: &AttemptRow, appending: bool) -> Resu
     st.attempt = last.n;
     st.elapsed_override = Some(Duration::ZERO);
     st.status = Status::Failed;
-    st.error =
-        Some(LlmError::request("interrupted by a bot restart; reply /continue to the previous message to try again"));
+    st.error = Some(LlmError::request("interrupted by a bot restart; reply /continue to this answer to try again"));
     view.finish(st).await;
     Ok(())
 }
@@ -1072,11 +1075,13 @@ async fn stream(
 
 /// A turn of a provider that is no longer configured (its key was removed).
 fn not_configured(id: &str) -> LlmError {
-    let (name, env) = match id {
-        "openrouter" => ("OpenRouter", "OPENROUTER_API_KEY"),
-        _ => omni_llm::provider::info(id).map(|i| (i.name, i.env)).unwrap_or((id, "its API key")),
+    let name = match id {
+        "openrouter" => "OpenRouter",
+        _ => omni_llm::provider::info(id).map(|i| i.name).unwrap_or(id),
     };
-    LlmError::request(format!("the {name} provider is not configured (set {env} / [providers.{id}] api_key)"))
+    LlmError::request(format!(
+        "{name} is not configured on this bot any more (no API key); /m continues this conversation with another model"
+    ))
 }
 
 async fn run_attempt(

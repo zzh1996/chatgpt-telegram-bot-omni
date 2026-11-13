@@ -138,6 +138,9 @@ reasoning_open = false         # keep the reasoning fold open while the model th
                                # re-open it for readers who closed it)
 show_usage = "always"          # always | never | USD threshold such as "0.05"
 bold_cost_usd = 0.2            # a reply's cost above this (USD) is bold in its footer; 0: never
+answer_first = true            # an answer that is one continuous stretch (text, images, videos) comes first,
+                               # its reasoning and tool calls below it (Telegram's "show more" never hides it);
+                               # false: everything in the order it was produced
 
 [retry]
 max_attempts = 4               # including the first; only retryable errors are retried

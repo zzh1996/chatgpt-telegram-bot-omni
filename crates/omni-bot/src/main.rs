@@ -304,12 +304,12 @@ const STALE_COMMAND_LISTS: &[(tl::enums::BotCommandScope, &str)] = &[
 /// it; administrators also see the admin commands in their private chats.
 async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
     let marker = app.marker();
-    let continue_with = format!("Reply: continue with another model (spec{marker}text)");
+    let continue_with = format!("Reply: continue with another model (prefix{marker}text)");
     let public = [
         ("help", "How to use this bot"),
         ("help_zh", "使用帮助（中文）"),
         ("models", "List model prefixes / search models"),
-        ("model", "Show a model's capabilities"),
+        ("model", "Show which model a prefix calls"),
         ("m", continue_with.as_str()),
         ("raw", "Reply: get the original Markdown and files"),
         ("dump", "Reply: the whole conversation as a JSON file"),
@@ -319,7 +319,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("retry", "Reply: retry a failed answer"),
         ("continue", "Reply: keep writing an answer that hit its long-decode budget"),
         ("stats", "Usage statistics"),
-        ("usage", "Your (and this group's) spend limits"),
+        ("usage", "Spend limits here: the chat's and yours"),
         ("ping", "Check the bot: your and this chat's ids, access here"),
     ];
     let admin = [

@@ -31,6 +31,8 @@ pub struct Ctx {
     pub max_file_mb: u64,
     /// `render.bold_cost_usd` (0: never).
     pub bold_cost_usd: f64,
+    /// `render.answer_first`.
+    pub answer_first: bool,
     pub admin: bool,
     pub group: bool,
     pub lang: Lang,
@@ -83,9 +85,9 @@ const INTRO: &str = r#"I answer with AI models. Each model has a prefix: /models
 | reply /dump | the conversation as a JSON file |
 | reply /info | the request's details |
 | reply /retry | try a failed answer again |
-| reply /continue | keep writing an answer that hit its budget |
+| reply /continue | keep writing a long answer that stopped at its length budget |
 | /prefix | this chat's own prefixes (custom chatbots) |
-| /stats | use and costs in this chat |
+| /stats | usage and costs in this chat |
 | /usage | spend limits in this chat |
 | /ping | ids, and whether I work here |
 | /help | this help; `/help options` one topic |
@@ -112,7 +114,7 @@ const INTRO_ZH: &str = r#"我用各家的 AI 模型回答问题。每个模型�
 | 回复 /dump | 整段对话的 JSON 文件 |
 | 回复 /info | 请求详情 |
 | 回复 /retry | 重新生成失败的回答 |
-| 回复 /continue | 让达到预算而停下的回答接着写 |
+| 回复 /continue | 让写到长度预算停下的长回答接着写 |
 | /prefix | 本聊天自己的前缀（自定义 chatbot） |
 | /stats | 本聊天的用量和费用 |
 | /usage | 本聊天的限额 |
@@ -305,7 +307,7 @@ const TOPICS: &[Topic] = &[
         who: Who::Everyone,
         body: r#"**Draw in a chat**: some chat models draw while they answer, others draw with `+i`. Reply to keep changing the picture: the model sees the whole conversation.
 
-**Image and video models** make one image or video from one prompt.{IMAGE_MODELS}
+**Image and video models** make images or a video from one prompt.{IMAGE_MODELS}
 - To edit, attach images, or reply to an image or video they made, saying what to change.
 - They take one prompt, not a conversation: replying to an answer they cannot edit is an error.
 
@@ -316,7 +318,7 @@ const TOPICS: &[Topic] = &[
         title_zh: "🎨 生成图片和视频",
         body_zh: r#"**在对话里画图**：有的聊天模型回答时直接画图，有的要加 `+i` 才画。回复它就能接着改图：模型能看到整段对话。
 
-**图片和视频模型**根据一条提示词生成一张图或一段视频。{IMAGE_MODELS}
+**图片和视频模型**根据一条提示词生成图片或一段视频。{IMAGE_MODELS}
 - 想编辑，就附上图片，或者回复它生成的图片或视频，写明要改什么。
 - 它们只接收一条提示词，不接收对话：回复一条它们没法编辑的回答会报错。
 
@@ -417,10 +419,10 @@ Arr!
 - **🔧** tool calls (searches, code, pages read) with readable results. Several in a row are grouped: `💭 2 · 🔧 1`.
 - **📚 Sources**: the links the answer cites.
 - **ℹ️** a note from me, e.g. that a search was asked for but none ran.
-- **Small text at the end**: settings, tokens, cost and time; on the right, how the platform actually served the request.{BOLD_COST}
+- **Small text at the end**: settings, tokens, cost and time, then how the platform actually served the request.{BOLD_COST}
 - **⚠️** errors, with the full original error. I retry on my own when that can help; earlier attempts are folded above.
 
-Everything I add is a fold or small text, so you can always tell which part is the model's answer. There is no stop button: once started, an answer is written to the end.
+Everything I add is a fold or small text, so you can always tell which part is the model's answer.{ORDER} There is no stop button: once started, an answer is written to the end.
 
 **Commands for an answer** (reply with them to it):
 - /raw — its original Markdown, and the original files
@@ -451,10 +453,10 @@ Everything I add is a fold or small text, so you can always tell which part is t
 - **🔧** 工具调用（搜索、代码、读取的网页），结果是可读的形式。连续的几段会合成一组：`💭 2 · 🔧 1`。
 - **📚 Sources**：回答引用的链接。
 - **ℹ️** 我加的提示，例如要求了搜索、但这次没有搜索。
-- **末尾的小字**：设置、token、费用和耗时；右边是平台实际怎么处理这个请求的。{BOLD_COST}
+- **末尾的小字**：设置、token、费用和耗时，然后是平台实际怎么处理这个请求的。{BOLD_COST}
 - **⚠️** 错误，附带完整的原始错误。可能有用的时候我会自动重试；之前的尝试折叠在上面。
 
-我加的内容都在折叠块或小字里，所以总能分清哪部分是模型的回答。没有停止按钮：回答一旦开始，就会写完。
+我加的内容都在折叠块或小字里，所以总能分清哪部分是模型的回答。{ORDER}没有停止按钮：回答一旦开始，就会写完。
 
 **针对回答的命令**（回复这条回答时使用）：
 - /raw — 它的原始 Markdown 和原始文件
@@ -485,23 +487,23 @@ Everything I add is a fold or small text, so you can always tell which part is t
         title: "📊 Costs, statistics and spend limits",
         commands: &["stats", "usage"],
         who: Who::Everyone,
-        body: r#"- /stats — this bot's use in this chat over the last 30 days: calls, tokens and cost by model (in a group also by person).
+        body: r#"- /stats — this bot's usage in this chat over the last 30 days: API calls (each retry counts), tokens and cost by model (in a group also by person).
 - `/stats today`, `/stats 7d`, `/stats 30d`, `/stats all` — other periods, in calendar days of the bot's time zone.
 - In a group, `/stats user_id`, or /stats as a reply to someone's message: one member.
 - /usage — this chat's spend limits, and yours here.
 
-**Spend limits**: an admin can give this chat, each member or one person a budget in USD that refills every day. When one runs out, new requests are refused until it refills; the message says which limit and when.
+**Spend limits**: an admin can give this chat, each member or one person a limit in USD that refills every day. When one runs out, new requests are refused until it refills; the message says which limit and when.
 
 **Costs**: every answer shows its cost at the end; `≈` means I estimated it from the platform's prices.
 
 **Faster tiers** (`tier=priority`, fast modes) cost more and are only for priority users."#,
         title_zh: "📊 费用、统计和限额",
-        body_zh: r#"- /stats — 最近 30 天这个 bot 在本聊天的用量：按模型统计的调用次数、token 和费用（群里还按人统计）。
+        body_zh: r#"- /stats — 最近 30 天这个 bot 在本聊天的用量：按模型统计的 API 调用次数（每次重试都算）、token 和费用（群里还按人统计）。
 - `/stats today`、`/stats 7d`、`/stats 30d`、`/stats all` — 其他时间段，按 bot 所在时区的自然日计算。
 - 群里：`/stats user_id`，或者回复某人的消息发 /stats，只看这个成员。
 - /usage — 本聊天的限额，以及你在这里的限额。
 
-**限额**：管理员可以给这个聊天、每个成员或者某个人设一个每天恢复的预算（USD）。用完后，新请求会被拒绝，直到额度恢复；提示里会写明是哪个限额、多久后恢复。
+**限额**：管理员可以给这个聊天、每个成员或者某个人设一个每天恢复的额度（USD）。用完后，新请求会被拒绝，直到额度恢复；提示里会写明是哪个限额、多久后恢复。
 
 **费用**：每条回答的末尾都写着费用；`≈` 表示是我按平台价格估算的。
 
@@ -578,7 +580,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - `/stats chat_id` — one chat; `/stats chat_id user_id` — one person in it.
 
 **Prefixes**
-- `/alias name$ spec` — add a prefix to this bot, no restart needed. The spec is a model with options, as in a message: `/alias low$ provider:model+e=low`. `/alias $ spec` sets the empty prefix.
+- `/alias name$ spec` — add a prefix to this bot, no restart needed. The spec is the id of a model this bot has, with options, as in a message (`provider:model+e=low`); a model it does not have is refused. `/alias $ spec` sets the empty prefix.
 - `/unalias name$` — remove a prefix added with /alias (a configured prefix of that name comes back).
 - `/prefix chat_id` — a chat's own prefixes; `/unprefix chat_id name` — delete one.
 
@@ -605,7 +607,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - `/stats chat_id` — 某个聊天；`/stats chat_id user_id` — 那个聊天里的某个人。
 
 **前缀**
-- `/alias name$ spec` — 给这个 bot 加一个前缀，不用重启。spec 就是"模型 + 选项"，写法和消息里一样：`/alias low$ provider:model+e=low`。`/alias $ spec` 设置名字为空的前缀。
+- `/alias name$ spec` — 给这个 bot 加一个前缀，不用重启。spec 是这个 bot 有的某个模型的 ID 加选项，写法和消息里一样（`provider:model+e=low`）；bot 没有的模型会被拒绝。`/alias $ spec` 设置名字为空的前缀。
 - `/unalias name$` — 删除用 /alias 加的前缀（配置里同名的前缀会恢复）。
 - `/prefix chat_id` — 某个聊天自己的前缀；`/unprefix chat_id name` — 删除其中一个。
 
@@ -647,11 +649,18 @@ fn fill(text: &str, ctx: &Ctx) -> String {
     } else {
         " `≈` means the cost is my estimate.".to_string()
     };
+    let order = if ctx.answer_first {
+        " When the answer is one piece, it comes first and its reasoning and tool calls follow it; when answer and \
+         reasoning alternate, everything is in the order it happened."
+    } else {
+        " Everything is in the order it happened."
+    };
     text.replace('$', m)
         .replace("{DIRECT_IDS}", &direct)
         .replace("{IMAGE_MODELS}", &media_how)
         .replace("{MAX_FILE_MB}", &ctx.max_file_mb.to_string())
         .replace("{BOLD_COST}", &bold)
+        .replace("{ORDER}", order)
 }
 
 /// [`fill`] for the Chinese texts.
@@ -675,11 +684,17 @@ fn fill_zh(text: &str, ctx: &Ctx) -> String {
     } else {
         "`≈` 表示费用是我估算的。".to_string()
     };
+    let order = if ctx.answer_first {
+        "回答只有一段正文时，正文在最上面，推理和工具调用在它下面；正文和推理穿插时，一切按发生的顺序显示。"
+    } else {
+        "一切按发生的顺序显示。"
+    };
     text.replace('$', m)
         .replace("{DIRECT_IDS}", &direct)
         .replace("{IMAGE_MODELS}", &media_how)
         .replace("{MAX_FILE_MB}", &ctx.max_file_mb.to_string())
         .replace("{BOLD_COST}", &bold)
+        .replace("{ORDER}", order)
 }
 
 fn md(s: &str, depth: usize) -> Vec<RBlock> {
@@ -770,6 +785,7 @@ mod tests {
             ids_platforms: true,
             max_file_mb: 50,
             bold_cost_usd: 0.2,
+            answer_first: true,
             admin,
             group,
             lang: Lang::En,
@@ -809,7 +825,7 @@ mod tests {
         assert!(all.contains("c%Hello!") && all.contains("/alias name% spec"), "{all}");
         assert!(!all.contains('$'), "a `$` that is not the marker");
         assert!(all.contains("up to 50 MB") && all.contains("above 0.2 USD") && all.contains("author/model%"));
-        for placeholder in ["{MAX_FILE_MB}", "{IMAGE_MODELS}", "{BOLD_COST}", "{DIRECT_IDS}"] {
+        for placeholder in ["{MAX_FILE_MB}", "{IMAGE_MODELS}", "{BOLD_COST}", "{DIRECT_IDS}", "{ORDER}"] {
             assert!(!all.contains(placeholder), "{placeholder}");
         }
         assert!(!all.contains(":::"), "every fold is closed and converted");

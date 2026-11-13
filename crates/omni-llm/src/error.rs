@@ -124,9 +124,21 @@ impl LlmError {
     }
 }
 
+/// How users read an error: the bot's own checks are just their message; the
+/// rest say where it happened (`HTTP 429 [rate_limit]: …`, `provider error
+/// [content_filter]: …`, `network error: …`).
 impl fmt::Display for LlmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.kind)?;
+        let what = match self.kind {
+            ErrorKind::Request => return f.write_str(&self.message),
+            ErrorKind::Cancelled => return f.write_str(&self.message),
+            ErrorKind::Http => "HTTP",
+            ErrorKind::InBand => "provider error",
+            ErrorKind::Network => "network error",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::Decode => "unreadable response",
+        };
+        f.write_str(what)?;
         if let Some(s) = self.status {
             write!(f, " {s}")?;
         }

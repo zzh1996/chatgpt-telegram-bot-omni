@@ -637,7 +637,8 @@ async fn generated_media_of_other_models_is_an_error() {
     let history = vec![Turn::user_text("draw"), answer.clone(), Turn::user_text("describe it")];
     let e = prep("claude-opus-5-5", &[], &history).await.unwrap_err();
     assert_eq!(
-        e.message, "1 image generated in an earlier turn cannot be sent: Claude's assistant messages carry text only",
+        e.message,
+        "1 image generated in an earlier turn cannot be sent: Claude sees only the text of other models' answers; send it the file as an attachment",
         "the draft made while thinking is reasoning, not counted"
     );
     assert_eq!(e.retry, Retry::Never);
@@ -657,7 +658,7 @@ async fn generated_media_of_other_models_is_an_error() {
     let e = prep("claude-opus-5-5", &[], &history).await.unwrap_err();
     assert_eq!(
         e.message,
-        "2 images and 1 video generated in earlier turns cannot be sent: Claude's assistant messages carry text only"
+        "2 images and 1 video generated in earlier turns cannot be sent: Claude sees only the text of other models' answers; send it the file as an attachment"
     );
     // An answer that is only an image has nothing Claude can take.
     let only = Turn {

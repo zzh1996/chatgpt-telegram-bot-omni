@@ -243,7 +243,7 @@ impl Provider for DeepSeek {
             });
             if let Some(why) = crate::anthropic::history::media_not_sent(
                 as_text,
-                "the assistant messages of DeepSeek's Anthropic-compatible API carry text only",
+                "DeepSeek's search API sees only the text of other models' answers; send it the file as an attachment",
             ) {
                 return Err(LlmError::request(why));
             }
@@ -1143,7 +1143,7 @@ mod tests {
         let e = prepare("deepseek-flash", &[], &h).await.unwrap_err();
         assert_eq!(
             e.message,
-            "2 images and 1 audio file generated in an earlier turn cannot be sent: assistant messages here carry text only"
+            "2 images and 1 audio file generated in an earlier turn cannot be sent: this model sees only the text of other models' answers; send it the file as an attachment"
         );
         // Its text alone goes as an assistant message.
         let text = Turn { parts: vec![Part::text("Here:")], ..earlier };
@@ -1408,8 +1408,7 @@ mod tests {
         let e = prepare("deepseek-v4-pro", &[flag("s")], &h).await.unwrap_err();
         assert_eq!(
             e.message,
-            "1 image generated in an earlier turn cannot be sent: the assistant messages of DeepSeek's \
-             Anthropic-compatible API carry text only"
+            "1 image generated in an earlier turn cannot be sent: DeepSeek's search API sees only the text of other models' answers; send it the file as an attachment"
         );
         // Its text alone goes as an assistant message.
         let text = Turn { parts: vec![Part::text("Here is the chart.")], ..answer };

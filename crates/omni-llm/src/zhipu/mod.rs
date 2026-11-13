@@ -1553,7 +1553,7 @@ mod tests {
         let e = prepare("glm-5.3", &[], &h).await.unwrap_err();
         assert_eq!(
             e.message,
-            "1 image and 1 file generated in an earlier turn cannot be sent: assistant messages here carry text only"
+            "1 image and 1 file generated in an earlier turn cannot be sent: this model sees only the text of other models' answers; send it the file as an attachment"
         );
         // The answer's text alone goes as an assistant message.
         let text = Turn { parts: vec![Part::text("Done:")], ..earlier };

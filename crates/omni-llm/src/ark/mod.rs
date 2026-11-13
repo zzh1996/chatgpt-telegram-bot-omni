@@ -817,7 +817,7 @@ mod tests {
         let e = ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap_err();
         assert_eq!(
             e.message,
-            "1 image generated in an earlier turn cannot be sent: assistant messages here carry text only"
+            "1 image generated in an earlier turn cannot be sent: this model sees only the text of other models' answers; send it the file as an attachment"
         );
         // The answer's text alone goes as an assistant message.
         let text_only = Turn { parts: vec![Part::text("画好了")], ..earlier };

@@ -148,7 +148,8 @@ pub async fn convert(
     Ok(Converted { system: (!system.is_empty()).then_some(Value::Array(system)), messages, notes, warnings, documents })
 }
 
-const ASSISTANT_TEXT_ONLY: &str = "Claude's assistant messages carry text only";
+const ASSISTANT_TEXT_ONLY: &str =
+    "Claude sees only the text of other models' answers; send it the file as an attachment";
 
 pub use crate::provider::media_not_sent;
 

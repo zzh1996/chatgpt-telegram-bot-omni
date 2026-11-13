@@ -380,6 +380,10 @@ pub struct RenderConfig {
     pub show_usage: String,
     /// A cost above this (USD) is bold where a reply shows it; 0: never.
     pub bold_cost_usd: f64,
+    /// An answer that is one continuous stretch (text, images, videos) comes
+    /// first, its reasoning and tool calls after it, so that Telegram's "show
+    /// more" never hides it; `false`: everything in the order it was produced.
+    pub answer_first: bool,
 }
 
 impl Default for RenderConfig {
@@ -390,6 +394,7 @@ impl Default for RenderConfig {
             reasoning_open: false,
             show_usage: "always".into(),
             bold_cost_usd: 0.2,
+            answer_first: true,
         }
     }
 }

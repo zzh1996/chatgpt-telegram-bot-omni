@@ -77,6 +77,15 @@ pub struct MediaRef {
 }
 
 impl MediaRef {
+    /// The file's name, or what it is (`photo`, its type) when it has none.
+    pub fn name(&self) -> String {
+        match (&self.filename, self.kind) {
+            (Some(f), _) => f.clone(),
+            (None, MediaKind::Photo) => "the photo".into(),
+            (None, MediaKind::Document) => format!("the {} file", self.mime),
+        }
+    }
+
     pub fn describe(&self) -> String {
         format!(
             "{} {}{}",
@@ -468,7 +477,7 @@ pub async fn fetch(
     if let Some(s) = m.size
         && s > max_bytes
     {
-        bail!("{} is too large ({} MB > {} MB limit)", m.describe(), s / 1_000_000, max_bytes / 1_000_000);
+        bail!("too large: {:.1} MB, the limit is {} MB", s as f64 / 1_000_000.0, max_bytes / 1_000_000);
     }
     let bytes = match download(bot, m, max_bytes).await {
         Ok(b) => b,

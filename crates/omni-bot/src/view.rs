@@ -62,6 +62,8 @@ pub struct RenderState {
     /// Costs above this (USD) are bold; 0: never (`render.bold_cost_usd`).
     pub bold_cost: f64,
     pub reasoning_open: bool,
+    /// `render.answer_first`.
+    pub answer_first: bool,
     pub mode: Mode,
     /// Earlier attempts of this reply (shown above, in the same messages).
     pub prior: Vec<PriorAttempt>,
@@ -94,6 +96,7 @@ impl RenderState {
             show_usage: self.show_usage,
             bold_cost: self.bold_cost,
             reasoning_open: self.reasoning_open,
+            answer_first: self.answer_first,
             mode: self.mode,
             raw_ai,
             hops: self.hops,

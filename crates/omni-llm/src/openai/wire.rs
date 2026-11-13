@@ -9,7 +9,7 @@
 //!   text. Their media (an image another model generated, a file a code run
 //!   wrote) go along only where the API takes them in an assistant message:
 //!   xAI's message content takes images and files whatever the role
-//!   (`openapi.json`); OpenAI's assistant messages carry text only (its own
+//!   (`openapi.json`); OpenAI shows the model only the text of other models' answers; send it the file as an attachment (its own
 //!   `image_generation_call` items replay only with the model's own turns).
 //!   What is not sent is said in a warning. User parts become `input_text` /
 //!   `input_image` / `input_file` per what each API takes.
@@ -214,7 +214,10 @@ async fn assistant_turn(
     if inp.platform == Platform::OpenAi {
         // Assistant content is `output_text` or `refusal` only.
         for k in turn.parts.iter().filter_map(kind) {
-            unsent.add(k, "OpenAI's assistant messages carry text only");
+            unsent.add(
+                k,
+                "OpenAI shows the model only the text of other models' answers; send it the file as an attachment",
+            );
         }
         c.input.push(plain);
         return Ok(());

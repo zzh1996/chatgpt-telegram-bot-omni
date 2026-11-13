@@ -49,8 +49,8 @@ pub fn check(app: &App, user_id: i64, provider: &str, model: &str, body: &Value)
     let priority_ok = app.cfg.access.priority_users.contains(&user_id);
     let deny_priority = |what: &str| {
         Err(format!(
-            "{what} is a higher-priority (more expensive) tier; it is only available to users on the priority list \
-             ([access].priority_users). Everyone else uses the default tier"
+            "{what} is a faster, more expensive tier, only for users on the priority list: send it again without \
+             `tier=` (or with another model)"
         ))
     };
     if provider != "openrouter" {

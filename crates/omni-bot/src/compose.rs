@@ -70,6 +70,9 @@ pub struct ComposeInput<'a> {
     pub bold_cost: f64,
     /// Open the reasoning fold while the model is thinking (`render.reasoning_open`).
     pub reasoning_open: bool,
+    /// One continuous answer is shown above its reasoning and tool calls
+    /// (`render.answer_first`).
+    pub answer_first: bool,
     pub mode: Mode,
     /// Show AI-generated content as raw Markdown (fallback after Telegram rejected the rendering).
     pub raw_ai: bool,
@@ -135,6 +138,22 @@ fn fmt_tokens(n: u64) -> String {
     out
 }
 
+/// A bot text with `` `code` `` spans shown as code (ids, prefixes, options in
+/// notices and error titles); unpaired backticks leave the text as it is.
+pub fn with_code(text: &str) -> RText {
+    let pieces: Vec<&str> = text.split('`').collect();
+    if pieces.len() < 3 || pieces.len().is_multiple_of(2) {
+        return RText::plain(text);
+    }
+    RText::concat(
+        pieces
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if i % 2 == 1 { RText::fixed(RText::plain(*s)) } else { RText::plain(*s) })
+            .collect(),
+    )
+}
+
 pub fn fmt_cost(c: f64) -> String {
     if c == 0.0 {
         // Also -0.0, which is what an empty f64 sum gives.
@@ -181,6 +200,51 @@ fn visible(p: &Part) -> bool {
         Part::Image { generated, .. } | Part::File { generated, .. } => *generated,
         _ => false,
     }
+}
+
+/// The answer: text, generated images and files, a refusal.
+fn is_answer(p: &Part) -> bool {
+    match p {
+        Part::Text { text, citations } => !text.trim().is_empty() || !citations.is_empty(),
+        Part::Image { generated: true, thought, .. } => !thought,
+        Part::File { generated: true, .. } | Part::Refusal { .. } => true,
+        _ => false,
+    }
+}
+
+/// How the model got there: reasoning, tool calls, drafts while thinking.
+fn is_process(p: &Part) -> bool {
+    match p {
+        Part::Reasoning(r) => r.text.as_deref().is_some_and(|t| !t.is_empty()),
+        Part::ToolCall(_) => true,
+        Part::Image { generated: true, thought: true, .. } => true,
+        _ => false,
+    }
+}
+
+/// The parts with the answer first, when the answer is one continuous stretch
+/// (text, images, videos, files) that reasoning or tool calls came before: the
+/// answer, then everything else in its own order. `None` when there is nothing
+/// to move (no answer yet, it comes first anyway, or answer and reasoning
+/// alternate: then everything stays in the order it was produced).
+fn answer_first(parts: &[Part]) -> Option<Vec<Part>> {
+    let (mut stretches, mut in_answer, mut process_before) = (0, false, false);
+    for p in parts {
+        if is_answer(p) {
+            if !in_answer {
+                stretches += 1;
+                in_answer = true;
+            }
+        } else if is_process(p) {
+            in_answer = false;
+            process_before |= stretches == 0;
+        }
+    }
+    if stretches != 1 || !process_before {
+        return None;
+    }
+    let (answer, rest): (Vec<&Part>, Vec<&Part>) = parts.iter().partition(|p| is_answer(p));
+    Some(answer.into_iter().chain(rest).cloned().collect())
 }
 
 /// What a tool call did, in a few words: the query, URL or code it ran (from
@@ -489,7 +553,14 @@ impl Stretch {
 /// Strictly in production order. Each uninterrupted stretch of reasoning and
 /// tool calls with more than one fold is put in one outer fold, so that models
 /// that think and call tools many times do not flood the chat.
-fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool, live: bool) -> Vec<RBlock> {
+fn output_blocks(
+    parts: &[Part],
+    raw: bool,
+    depth: usize,
+    open_thinking: bool,
+    live: bool,
+    thinking_live: bool,
+) -> Vec<RBlock> {
     let mut out = Vec::new();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
@@ -515,7 +586,7 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool, l
                 if !text.is_empty() {
                     flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
                     // The model is thinking this right now: nothing has come after it yet.
-                    let current = !parts[i..].iter().any(visible);
+                    let current = thinking_live && !parts[i..].iter().any(visible);
                     let open = open_thinking && current;
                     let thinking = (live && current).then(|| thinking_title(&text)).flatten();
                     let title = match &thinking {
@@ -614,7 +685,7 @@ fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool, bold_cost: f64) ->
     } else {
         format!("⚠️ Attempt {} failed", a.n)
     };
-    let mut blocks = output_blocks(&a.parts, raw, 1, false, false);
+    let mut blocks = output_blocks(&a.parts, raw, 1, false, false, false);
     if let Some(d) = a.error.as_ref().and_then(|e| e.details.as_ref()) {
         blocks.push(RBlock::Pre { text: pretty(&error_shown(d)), language: "json".into() });
     }
@@ -633,7 +704,7 @@ fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool, bold_cost: f64) ->
     if blocks.is_empty() {
         blocks.push(RBlock::Footer(RText::plain("no output")));
     }
-    RBlock::Details { open: false, title: RText::plain(title), blocks }
+    RBlock::Details { open: false, title: with_code(&title), blocks }
 }
 
 /// Where the cost is in footer parts that end with [`usage_parts`], when it is
@@ -710,7 +781,17 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     }
     // 3. this attempt's output, in the order it was produced.
     let live = inp.status == Status::Generating;
-    out.extend(output_blocks(inp.parts, raw, 0, inp.reasoning_open && live, live));
+    // One continuous answer: above its reasoning and tool calls, so that Telegram's
+    // "show more" on a long message never hides it (owner's rule, `render.answer_first`).
+    let reordered = inp.answer_first.then(|| answer_first(inp.parts)).flatten();
+    let (parts, thinking_live) = match &reordered {
+        // The model thinks right now only if its last visible output is reasoning.
+        Some(p) => {
+            (p.as_slice(), inp.parts.iter().rev().find(|p| visible(p)).is_some_and(|p| matches!(p, Part::Reasoning(_))))
+        }
+        None => (inp.parts, true),
+    };
+    out.extend(output_blocks(parts, raw, 0, inp.reasoning_open && live, live, thinking_live));
     // Images still being generated: their latest streamed preview.
     for (blob, dims) in inp.previews {
         out.push(RBlock::Photo {
@@ -725,10 +806,10 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         match &e.details {
             Some(d) => out.push(RBlock::Details {
                 open: false,
-                title: RText::plain(title),
+                title: with_code(&title),
                 blocks: vec![RBlock::Pre { text: pretty(&error_shown(d)), language: "json".into() }],
             }),
-            None => out.push(RBlock::Footer(RText::plain(title))),
+            None => out.push(RBlock::Footer(with_code(&title))),
         }
     }
 
@@ -1029,9 +1110,14 @@ mod tests {
             })
         };
         let parts = vec![reasoning("**Planning**\n\nSo")];
-        let title = |blocks: &[RBlock]| match &blocks[1] {
-            RBlock::Details { title, .. } => title.to_plain(),
-            other => panic!("{other:?}"),
+        let title = |blocks: &[RBlock]| {
+            blocks
+                .iter()
+                .find_map(|b| match b {
+                    RBlock::Details { title, .. } => Some(title.to_plain()),
+                    _ => None,
+                })
+                .unwrap()
         };
         // While generating: the heading; once the reply is done: a plain 💭.
         assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭 Planning");
@@ -1181,6 +1267,7 @@ mod tests {
             show_usage: true,
             bold_cost: 0.2,
             reasoning_open: true,
+            answer_first: true,
             mode: Mode::Clean,
             raw_ai: false,
             hops: 0,
@@ -1214,6 +1301,8 @@ mod tests {
         let usage =
             Usage { input_tokens: Some(10), output_tokens: Some(50), reasoning_tokens: Some(40), ..Default::default() };
         i.usage = Some(&usage);
+        // The order as produced (`render.answer_first = false`; the default is tested below).
+        i.answer_first = false;
         let blocks = compose(&i);
         // Header: model only (no alias), small text, no underline/italic.
         assert!(matches!(&blocks[0], RBlock::Footer(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5"));
@@ -1304,8 +1393,65 @@ mod tests {
         Part::ToolCall(ToolCall { id: Some("t".into()), name: "web_search".into(), ..Default::default() })
     }
 
+    /// One continuous answer comes first, its reasoning and tool calls after
+    /// it in their order; answers that alternate with reasoning stay in order.
+    #[test]
+    fn one_answer_comes_first() {
+        let reasoning = |t: &str| {
+            Part::Reasoning(Reasoning { kind: ReasoningKind::Summary, text: Some(t.into()), ..Default::default() })
+        };
+        let cite = Citation { url: Some("https://a.b".into()), title: Some("A".into()), ..Default::default() };
+        let image = Part::Image {
+            blob: omni_core::BlobRef::for_bytes(b"png", "image/png"),
+            filename: None,
+            generated: true,
+            dims: Some((1, 1)),
+            thought: false,
+        };
+        let kinds =
+            |parts: &[Part], status: Status| compose(&input(parts, status)).iter().map(kind).collect::<Vec<_>>();
+        // Thinking, a search, thinking, then the answer (text with sources and an image).
+        let parts = vec![
+            reasoning("plan"),
+            tool_call(),
+            reasoning("after the search"),
+            Part::Text { text: "answer".into(), citations: vec![cite] },
+            image,
+        ];
+        assert_eq!(kinds(&parts, Status::Done), ["header", "p:answer", "📚", "photo", "💭", "footer"]);
+        let blocks = compose(&input(&parts, Status::Done));
+        let RBlock::Details { title, blocks: inner, .. } = &blocks[4] else { panic!("{:?}", blocks[4]) };
+        assert_eq!(title.to_plain(), "💭 2 · 🔧 1");
+        assert_eq!(inner.iter().map(kind).collect::<Vec<_>>(), ["💭", "🔧", "💭"]);
+        // While the answer streams the reasoning is below it, closed and plain: thinking is over.
+        let parts = vec![reasoning("**Planning**\n\nSo"), Part::text("Ans")];
+        assert_eq!(kinds(&parts, Status::Generating), ["header", "p:Ans", "💭", "footer"]);
+        // Thinking again after the one answer: still one answer, so it stays first; the
+        // reasoning in progress keeps its title.
+        let parts = vec![reasoning("a"), Part::text("Ans"), reasoning("**Checking**\n\nb")];
+        let blocks = compose(&input(&parts, Status::Generating));
+        assert_eq!(blocks.iter().map(kind).collect::<Vec<_>>(), ["header", "p:Ans", "💭+", "footer"]);
+        assert!(matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "💭 Checking"));
+        // Answers alternating with reasoning or tool calls: the order as produced.
+        let parts = vec![reasoning("a"), Part::text("first"), tool_call(), Part::text("second")];
+        assert_eq!(kinds(&parts, Status::Done), ["header", "💭", "p:first", "🔧", "p:second", "footer"]);
+        // Nothing to move: reasoning only, or the answer first anyway.
+        assert_eq!(kinds(&[reasoning("a")], Status::Done), ["header", "💭", "footer"]);
+        assert_eq!(kinds(&[Part::text("Ans"), tool_call()], Status::Done), ["header", "p:Ans", "🔧", "footer"]);
+        // `render.answer_first = false`: the order as produced.
+        let mut i = input(&parts[..2], Status::Done);
+        i.answer_first = false;
+        assert_eq!(compose(&i).iter().map(kind).collect::<Vec<_>>(), ["header", "💭", "p:first", "footer"]);
+    }
+
     #[test]
     fn output_is_shown_in_the_order_it_was_produced() {
+        // As produced (`render.answer_first = false`).
+        let chrono = |parts: &[Part], status: Status| {
+            let mut i = input(parts, status);
+            i.answer_first = false;
+            compose(&i)
+        };
         let reasoning = |t: &str| {
             Part::Reasoning(Reasoning { kind: ReasoningKind::Summary, text: Some(t.into()), ..Default::default() })
         };
@@ -1333,7 +1479,7 @@ mod tests {
             Part::text("second"),
             tool,
         ];
-        let blocks = compose(&input(&parts, Status::Done));
+        let blocks = chrono(&parts, Status::Done);
         let kinds: Vec<String> = blocks.iter().map(kind).collect();
         // The stretch of reasoning and tool calls before the answer is one fold;
         // the lone tool call after the second text stays as it is.
@@ -1347,14 +1493,14 @@ mod tests {
         // While generating, only reasoning with nothing after it yet is open
         // (with `render.reasoning_open`), and the fold around it.
         let parts = vec![reasoning("a"), Part::text("x"), reasoning("b")];
-        let kinds: Vec<String> = compose(&input(&parts, Status::Generating)).iter().map(kind).collect();
+        let kinds: Vec<String> = chrono(&parts, Status::Generating).iter().map(kind).collect();
         assert_eq!(kinds, vec!["header", "💭", "p:x", "💭+", "footer"]);
         let parts = vec![reasoning("a"), tool_call(), reasoning("b")];
-        let kinds: Vec<String> = compose(&input(&parts, Status::Generating)).iter().map(kind).collect();
+        let kinds: Vec<String> = chrono(&parts, Status::Generating).iter().map(kind).collect();
         assert_eq!(kinds, vec!["header", "💭+", "footer"]);
         // Whitespace between tool calls does not split a stretch.
         let parts = vec![tool_call(), Part::text("\n\n"), reasoning("a"), Part::text("done")];
-        let blocks = compose(&input(&parts, Status::Done));
+        let blocks = chrono(&parts, Status::Done);
         assert!(
             matches!(&blocks[1], RBlock::Details { title, .. } if title.to_plain() == "💭 1 · 🔧 1"),
             "{blocks:#?}"

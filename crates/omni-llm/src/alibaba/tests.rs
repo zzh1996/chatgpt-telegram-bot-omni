@@ -398,7 +398,7 @@ async fn generated_media_of_other_models_are_not_sent() {
         let e = alibaba(None).prepare(&input("qwen3.8-max", &opts, &h), &[], &blobs).await.unwrap_err();
         assert_eq!(
             e.message,
-            "2 images and 1 video generated in an earlier turn cannot be sent: assistant messages here carry text only",
+            "2 images and 1 video generated in an earlier turn cannot be sent: this model sees only the text of other models' answers; send it the file as an attachment",
             "{opts:?}"
         );
     }

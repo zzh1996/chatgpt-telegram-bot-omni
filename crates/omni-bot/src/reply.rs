@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use omni_markdown::rich::{RBlock, RText};
+use omni_markdown::rich::RBlock;
 use tracing::warn;
 
 use crate::app::App;
@@ -15,7 +15,7 @@ use crate::tg::upload::{self, Source};
 /// (It cannot be mistaken for model output: model replies always start with
 /// the `🤖 model` header line.)
 pub async fn notice(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, reply_to: i32, text: &str) {
-    let blocks = vec![RBlock::Paragraph(RText::plain(text))];
+    let blocks = vec![RBlock::Paragraph(crate::compose::with_code(text))];
     send_blocks(app, bot, chat_id, reply_to, blocks).await;
 }
 

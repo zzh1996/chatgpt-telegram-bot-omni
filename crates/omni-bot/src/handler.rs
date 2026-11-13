@@ -73,7 +73,7 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
             Access::Allowed => {}
             Access::Banned => {
                 if matches!(kind, Some(Kind::Trigger | Kind::Reply)) {
-                    reply::notice(&app, &bot, ib.chat_id, ib.msg_id, crate::commands::BANNED).await;
+                    reply::notice(&app, &bot, ib.chat_id, ib.msg_id, &crate::commands::banned(ib.chat_id)).await;
                 }
                 return Ok(());
             }
@@ -157,9 +157,9 @@ pub async fn resolve_specs(
     }
     if !unknown.is_empty() && explicit {
         let ids = crate::commands::direct_ids(app)
-            .map(|ids| format!("; so does the id of a model it has ({ids})"))
+            .map(|ids| format!("; the id of a model this bot has works too ({ids})"))
             .unwrap_or_default();
-        return Err(format!("unknown prefix: {}. The prefixes are listed by /models{ids}", unknown.join(", ")));
+        return Err(format!("unknown prefix {}: /models lists the prefixes{ids}", unknown.join(", ")));
     }
     Ok(out)
 }
@@ -225,7 +225,7 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached>
     for r in &refs {
         let blob = media::fetch(&app.db, &app.blobs, bot, ib.chat_id, r, max)
             .await
-            .with_context(|| format!("download {}", r.describe()))?;
+            .with_context(|| format!("cannot use {}", r.name()))?;
         parts.push(match r.kind {
             media::MediaKind::Photo => {
                 Part::Image { blob, filename: None, generated: false, dims: None, thought: false }

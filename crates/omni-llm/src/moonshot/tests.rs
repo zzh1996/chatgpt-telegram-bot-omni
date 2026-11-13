@@ -597,7 +597,7 @@ async fn generated_media_of_other_models_are_not_sent() {
         let e = moonshot(None).prepare(&input("kimi-k3", &opts, &h), &[], &blobs).await.unwrap_err();
         assert_eq!(
             e.message,
-            "1 image and 1 video generated in an earlier turn cannot be sent: assistant messages here carry text only",
+            "1 image and 1 video generated in an earlier turn cannot be sent: this model sees only the text of other models' answers; send it the file as an attachment",
             "{opts:?}"
         );
     }

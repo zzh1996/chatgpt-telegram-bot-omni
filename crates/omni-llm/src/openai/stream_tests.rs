@@ -727,7 +727,7 @@ async fn media_of_other_answers_cannot_be_sent() {
     let e = o.prepare(&input, &[], &MemBlobs(vec![])).await.unwrap_err();
     assert_eq!(
         e.message,
-        "2 images and 1 video from earlier answers cannot be sent: OpenAI's assistant messages carry text only"
+        "2 images and 1 video from earlier answers cannot be sent: OpenAI shows the model only the text of other models' answers; send it the file as an attachment"
     );
     // A draft alone is reasoning, which never goes to another model: the answer goes as its text.
     let drafted = Turn { parts: gemini.parts[..2].to_vec(), ..gemini };
