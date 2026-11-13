@@ -1,8 +1,11 @@
 //! Configuration file (`config/omni.toml`).
 //!
-//! Secrets are referenced as `${ENV_VAR}` (or `${ENV_VAR:-default}`) and
-//! interpolated from the environment before parsing, so the TOML file itself
-//! can be committed or shared without secrets.
+//! What differs between deployments (secrets, ids, the trigger marker) is
+//! referenced as `${ENV_VAR}` or `${ENV_VAR:-default}` in string values and
+//! interpolated from the environment after parsing (comments are never
+//! touched), so the TOML file can be committed or shared without secrets and
+//! the example config runs as is. Id lists take such a string too
+//! (`admins = "${OMNI_ADMINS:-}"`, ids separated by commas).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -133,13 +136,43 @@ fn default_models() -> Vec<String> {
 #[serde(deny_unknown_fields, default)]
 pub struct Access {
     /// Telegram user ids of administrators.
+    #[serde(deserialize_with = "ids")]
     pub admins: Vec<i64>,
     /// Chats (group ids, or user ids for private chats) allowed for every bot,
     /// once, at the first start after being added; then managed with /allow, /deny.
+    #[serde(deserialize_with = "ids")]
     pub allowed_chats: Vec<i64>,
     /// Users who may ask for higher-priority (more expensive) service tiers
     /// (`+tier=priority`, fast modes). Nobody gets them by default.
+    #[serde(deserialize_with = "ids")]
     pub priority_users: Vec<i64>,
+}
+
+/// A list of Telegram ids: a TOML array of integers, or a string of ids
+/// separated by commas or whitespace — what `"${OMNI_ADMINS:-}"` gives from the
+/// environment (empty: none).
+fn ids<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<i64>, D::Error> {
+    struct Ids;
+    impl<'de> serde::de::Visitor<'de> for Ids {
+        type Value = Vec<i64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a list of Telegram ids, or a string of ids separated by commas")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<i64>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(id) = seq.next_element::<i64>()? {
+                out.push(id);
+            }
+            Ok(out)
+        }
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Vec<i64>, E> {
+            s.split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.parse().map_err(|_| E::custom(format!("{t:?} is not a Telegram id (an integer)"))))
+                .collect()
+        }
+    }
+    d.deserialize_any(Ids)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -406,21 +439,21 @@ impl Default for LogConfig {
     }
 }
 
-/// Replace `${VAR}` / `${VAR:-default}` with environment values.
+/// Replace `${VAR}` / `${VAR:-default}` with environment values. As in the
+/// shell, the default also replaces an empty value (`VAR=` in `.env`).
 pub fn interpolate_env(raw: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String> {
     let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").unwrap();
     let mut missing = Vec::new();
     let out = re.replace_all(raw, |c: &regex::Captures<'_>| {
         let name = &c[1];
-        match lookup(name) {
-            Some(v) => v,
-            None => match c.get(2) {
-                Some(d) => d.as_str().to_string(),
-                None => {
-                    missing.push(name.to_string());
-                    String::new()
-                }
-            },
+        match (lookup(name), c.get(2)) {
+            (Some(v), Some(d)) if v.is_empty() => d.as_str().to_string(),
+            (Some(v), _) => v,
+            (None, Some(d)) => d.as_str().to_string(),
+            (None, None) => {
+                missing.push(name.to_string());
+                String::new()
+            }
         }
     });
     if !missing.is_empty() {
@@ -558,10 +591,29 @@ mod tests {
     fn env_interpolation() {
         let env = |k: &str| match k {
             "A" => Some("1".to_string()),
+            "EMPTY" => Some(String::new()),
             _ => None,
         };
         assert_eq!(interpolate_env("x=${A} y=${B:-dflt}", &env).unwrap(), "x=1 y=dflt");
         assert!(interpolate_env("${MISSING}", &env).is_err());
+        // `VAR=` in .env: the default, as in the shell; without one, the empty value.
+        assert_eq!(interpolate_env("${EMPTY:-$}|${EMPTY}|${A:-$}", &env).unwrap(), "$||1");
+    }
+
+    /// Id lists: a TOML array, or a string from the environment.
+    #[test]
+    fn id_lists_take_a_string() {
+        let access = |toml_text: &str| toml::from_str::<Access>(toml_text);
+        assert_eq!(access("admins = [1, -1002]").unwrap().admins, vec![1, -1002]);
+        let a =
+            access("admins = \"123456789, 42\"\nallowed_chats = \"-1001234567890 7\"\npriority_users = \"\"").unwrap();
+        assert_eq!(
+            (a.admins, a.allowed_chats, a.priority_users),
+            (vec![123456789, 42], vec![-1001234567890, 7], vec![])
+        );
+        assert!(access("").unwrap().admins.is_empty());
+        let e = access("admins = \"12, @me\"").unwrap_err().to_string();
+        assert!(e.contains("\"@me\" is not a Telegram id"), "{e}");
     }
 
     #[test]
@@ -600,6 +652,22 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.telegram.api_id.as_i32().unwrap(), 12345);
         assert!(cfg.aliases.iter().any(|a| a.name == "c"));
+        assert_eq!(cfg.general.trigger_marker, "$");
+        assert!(cfg.access.admins.is_empty() && cfg.access.allowed_chats.is_empty());
+        // What differs between deployments comes from the environment: the copy runs as is.
+        let deployed = |k: &str| match k {
+            "OMNI_TRIGGER_MARKER" => Some("%".to_string()),
+            "OMNI_ADMINS" => Some("123456789".to_string()),
+            "OMNI_ALLOWED_CHATS" => Some("-1001234567890,-1002".to_string()),
+            "OMNI_PRIORITY_USERS" => Some(String::new()),
+            k => env(k),
+        };
+        let cfg = Config::parse(&raw, &deployed).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.general.trigger_marker, "%");
+        assert_eq!(cfg.access.admins, vec![123456789]);
+        assert_eq!(cfg.access.allowed_chats, vec![-1001234567890, -1002]);
+        assert!(cfg.access.priority_users.is_empty());
         let err = Config::parse(
             "[telegram]\napi_id = \"${NOPE}\"\napi_hash = \"x\"\n[[bots]]\nname=\"a\"\ntoken=\"1:a\"\n",
             &env,

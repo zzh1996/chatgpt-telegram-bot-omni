@@ -13,10 +13,9 @@
 ## 快速开始（Docker）
 
 ```sh
-cp .env.example .env                       # 填入 TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_BOT_TOKEN，以及要用的平台的 key
-                                           # （OPENROUTER_API_KEY、OPENAI_API_KEY、DEEPSEEK_API_KEY…；没填 key 的平台不提供，bot 照常运行）
-cp config/omni.example.toml config/omni.toml
-# 编辑 config/omni.toml：至少把你的 Telegram user id 填进 [access].admins
+cp .env.example .env                       # 填入 TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_BOT_TOKEN、OMNI_ADMINS（你的 Telegram user id），
+                                           # 以及要用的平台的 key（OPENROUTER_API_KEY、OPENAI_API_KEY、DEEPSEEK_API_KEY…；没填 key 的平台不提供，bot 照常运行）
+cp config/omni.example.toml config/omni.toml   # 原样复制：每个部署不同的值（key、管理员、前缀标记…）都从 .env 读
 docker compose up -d --build
 docker compose logs -f
 ```

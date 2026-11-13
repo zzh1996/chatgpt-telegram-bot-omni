@@ -1061,7 +1061,9 @@ fn task_error(status: &str, task: &Value) -> LlmError {
     if e.error_type.is_none() {
         e.error_type = Some(status.to_string());
     }
-    e.details = Some(task.clone());
+    let mut task = task.clone();
+    super::hide_account(&mut task);
+    e.details = Some(task);
     e
 }
 

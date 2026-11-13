@@ -21,6 +21,9 @@
 //!   as `annotations` (title and URL). A searched answer whose usage reports
 //!   none says that no search ran.
 //! - Errors are `{"error":{"code","message","param","type"}}` with string codes.
+//!   Their messages name the account (`Your account 2100123456 has not
+//!   activated …`); the number is removed from what the bot shows and stores
+//!   ([`hide_account`]), only the raw log keeps it.
 //! - No cost in responses: estimated from a CNY price table, plus Doubao
 //!   Search's pay-as-you-go fee per reported search.
 //! - The served model, tier (`service_tier`) and a model fallback
@@ -34,7 +37,7 @@
 pub mod images;
 pub mod video;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use omni_core::Usage;
@@ -451,8 +454,29 @@ impl EventSink for PricingSink<'_> {
     }
 }
 
-/// Classify Ark's error objects (docs/research/doubao.md §7).
+/// Ark's messages name the account (`Your account 2100123456 has not activated
+/// the model …`): the number goes, in every string of `v`.
+pub fn hide_account(v: &mut Value) {
+    static ACCOUNT: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(\baccount|账号|账户)(?:\s*id)?\s*[:=：]?\s*\d{6,}\b").expect("valid regex")
+    });
+    match v {
+        Value::String(s) => {
+            if let std::borrow::Cow::Owned(n) = ACCOUNT.replace_all(s, "$1") {
+                *s = n;
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(hide_account),
+        Value::Object(o) => o.values_mut().for_each(hide_account),
+        _ => {}
+    }
+}
+
+/// Classify Ark's error objects (docs/research/doubao.md §7), without the
+/// account number ([`hide_account`]).
 pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Option<u64>, kind: ErrorKind) -> LlmError {
+    let mut err = err.clone();
+    hide_account(&mut err);
     let code = err.get("code").and_then(Value::as_str).unwrap_or("").to_string();
     let message = err.get("message").and_then(Value::as_str).unwrap_or("(no message)").to_string();
     let rate_limited = code.starts_with("RateLimitExceeded")
@@ -486,15 +510,7 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
         "" => None,
         c => Some(c.to_string()),
     };
-    LlmError {
-        kind,
-        retry,
-        status: http_status,
-        error_type,
-        message,
-        details: Some(err.clone()),
-        partial_output: false,
-    }
+    LlmError { kind, retry, status: http_status, error_type, message, details: Some(err), partial_output: false }
 }
 
 #[cfg(test)]
@@ -544,6 +560,38 @@ mod tests {
         let e =
             error_from_json(&json!({"code": "InternalServiceError", "message": "x"}), Some(500), None, ErrorKind::Http);
         assert!(matches!(e.retry, Retry::Backoff));
+    }
+
+    /// The account number is neither shown nor stored: not in the message, not
+    /// in the verbatim JSON of the error fold.
+    #[test]
+    fn errors_hide_the_account() {
+        let e = error_from_json(
+            &json!({"code": "ModelNotOpen", "message": "Your account 2100123456 has not activated the model \
+                doubao-seedream-5-5-261028. Please activate the model service in the Ark Console. Request id: \
+                0217630000000000000000000000000000000000000000000000", "param": "", "type": "NotFound"}),
+            Some(404),
+            None,
+            ErrorKind::Http,
+        );
+        assert!(
+            e.message.starts_with("Your account has not activated the model doubao-seedream-5-5-261028."),
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("Request id: 0217630000"), "{}", e.message);
+        assert!(!e.details.as_ref().unwrap().to_string().contains("2100123456"));
+        for (raw, shown) in [
+            ("account ID: 2100123456 is overdue", "account is overdue"),
+            ("AccountId=2100123456", "Account"),
+            ("您的账号 2100123456 未开通该模型", "您的账号 未开通该模型"),
+            ("账户ID：2100123456", "账户"),
+            ("an account of 42 users", "an account of 42 users"),
+        ] {
+            let mut v = json!(raw);
+            hide_account(&mut v);
+            assert_eq!(v, json!(shown), "{raw}");
+        }
     }
 
     struct NoBlobs;

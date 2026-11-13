@@ -1,12 +1,16 @@
-# omni configuration. Copy to config/omni.toml and adjust.
-# Secrets come from the environment (see .env.example): `${VAR}` is replaced by
-# the variable's value, `${VAR:-default}` provides a default.
+# omni configuration. Copy to config/omni.toml; the copy runs as is.
+# What differs between deployments comes from the environment (.env, see
+# .env.example): keys, tokens, the admins, the trigger marker. In string values
+# `${VAR}` is replaced by the variable's value; `${VAR:-default}` gives the
+# default when the variable is unset or empty.
 
 [general]
 data_dir = "data"              # database, blobs, logs (mounted as a volume in Docker)
 timezone = "Asia/Shanghai"     # displayed times and daily stats boundaries
-trigger_marker = "$"           # what ends the model prefix: `c$hello`; e.g. "%" or "¥" or ">>" (no letters,
-                               # digits, whitespace or ,+{}"=/-.:_\@`); help texts and /models follow it
+# What ends the model prefix (`c$hello`): OMNI_TRIGGER_MARKER, default "$"; e.g. "%" or "¥" or ">>"
+# for a test bot in the same groups (no letters, digits, whitespace or ,+{}"=/-.:_\@`). Help texts
+# and /models follow it.
+trigger_marker = "${OMNI_TRIGGER_MARKER:-$}"
 max_parallel_specs = 20        # max models in one `a,b,c$` trigger
 max_file_mb = 50               # max Telegram file size forwarded to a model
 
@@ -43,12 +47,14 @@ models = [
 # token = "${TELEGRAM_BOT_TOKEN_CLAUDE}"
 # models = ["openrouter:anthropic/*"]
 
+# Telegram ids separated by commas, from the environment (empty: none); a TOML array
+# such as [123456789] works here too.
 [access]
-admins = []                    # your Telegram user id(s), shown by /ping; their private chats are allowed once at first start
-allowed_chats = []             # chats (groups, or user ids for private chats) allowed for every bot once,
-                               # at the first start after an id is added; removing one revokes nothing (/deny)
-priority_users = []            # may request higher-priority (pricier) tiers: +tier=priority, fast modes.
-                               # Nobody (admins included) gets them by default.
+admins = "${OMNI_ADMINS:-}"    # your Telegram user id(s), shown by /ping; their private chats are allowed once at first start
+allowed_chats = "${OMNI_ALLOWED_CHATS:-}"  # chats (groups, or user ids for private chats) allowed for every bot
+                               # once, at the first start after an id is added; removing one revokes nothing (/deny)
+priority_users = "${OMNI_PRIORITY_USERS:-}"  # may request higher-priority (pricier) tiers: +tier=priority, fast
+                               # modes. Nobody (admins included) gets them by default.
 
 [providers.openrouter]
 api_key = "${OPENROUTER_API_KEY:-}"   # empty: OpenRouter is off (like any platform without a key)
