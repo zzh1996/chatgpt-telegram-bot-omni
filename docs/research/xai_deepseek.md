@@ -267,6 +267,7 @@ FIM limits: **non-thinking only**, max 4K tokens. `echo` can't be combined with 
 
 ## B5. Search / server-side tools / citations
 
+* **2026-11-13 release ("发布全家桶应用 API", /updates):** `deepseek-flash` gets `deepseek_web_search` (thinking on: deep search with `open_page`/`find_in_page`) and `deepseek_read_url` on Messages, Responses and Chat Completions (guides/web_tools); file parsing via the Files API (guides/document_parsing); `safety_check`; standalone OCR, ASR, TTS. Chat Completions: `choices[].server_tool_event` (`step_reasoning_done`, `call_started`, `call_completed`), the last chunk's `delta.server_tool_calls` (replay unchanged: read pages come back from `signature`) and `url_citation` annotations; `usage.server_tool_use{tool_search (query terms), tool_fetch, tool_image_search}`, ¥5 per 1,000 each. Measured 2026-11-13: the old Messages tool `web_search_20260209` also searches on flash now; Responses `web_search` is still ignored on flash. Everything below describes the docs as of 2026-11-11.
 * **Server-side `web_search`:**
   * Responses: `{"type":"web_search"}`, **`deepseek-v4-pro` only**. With `deepseek-flash` it is **ignored** [DRSP].
   * Anthropic: `{"type":"web_search_20250305"|"web_search_20260209","name":"web_search","max_uses":N}` (default/cap 5) [DMSG]. The documented example uses v4-pro. Whether flash supports it on this endpoint isn't stated (**UNVERIFIED**) [DANT].

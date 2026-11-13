@@ -11,12 +11,19 @@
 //!   so people continuing one conversation in a group would stop sharing cache
 //!   hits (on flash a hit costs 1/50 of a miss); the old bot did not send it
 //!   either.
-//! - **Web search** (`+s`) exists only as a server tool of the
-//!   Anthropic-compatible Messages endpoint and of the Responses API, and only
-//!   for `deepseek-v4-pro`. The Messages endpoint
-//!   (`POST /anthropic/v1/messages`, dialect `deepseek.messages`) takes the same
-//!   thinking switch (`thinking.type`) and effort levels
-//!   (`output_config.effort`), so `+s` requests go there. Its stream is
+//! - **Web tools of `deepseek-flash`** (released 2026-11-13, guides/web_tools):
+//!   `deepseek_web_search` (`+s`; with thinking on it is "deep thinking search":
+//!   searches, opens pages and finds in them over several steps) and
+//!   `deepseek_read_url` (`+u`: reads the links of the last user message), run
+//!   by the server on Chat Completions (which keeps image input). Each call
+//!   streams as `server_tool_event`s (`call_started`, `call_completed`) and
+//!   becomes a tool call; the last chunk carries every call as
+//!   `server_tool_calls`, replayed unchanged (read pages come back from their
+//!   `signature`), and the citations as `url_citation` annotations.
+//! - **Web search of `deepseek-v4-pro`** (`+s`): the Anthropic-style server tool
+//!   of the Messages endpoint (`POST /anthropic/v1/messages`, dialect
+//!   `deepseek.messages`), which takes the same thinking switch
+//!   (`thinking.type`) and effort levels (`output_config.effort`). Its stream is
 //!   Anthropic's (OpenRouter's Messages parser, plus DeepSeek's unnamed
 //!   `{"error":…}` frame).
 //! - **Replay** only within the same dialect and model: Chat `content` +
@@ -25,21 +32,24 @@
 //!   with its signature, the search call and its results). Assistant messages
 //!   carry text only on both endpoints: media other models generated in
 //!   earlier turns are not sent (a warning says what).
-//! - **Searches**: on the Messages endpoint, `usage.server_tool_use` counts
-//!   every search attempt (`web_search_requests`) and the successful
-//!   non-empty ones (`tool_search`, the billed ones); when some came back
-//!   empty or failed, a notice says how many.
+//! - **Searches**: `usage.server_tool_use` counts the billed ones: `tool_search`
+//!   (the Messages tool: successful non-empty calls; the web tools: the query
+//!   terms of each call that returned results), `tool_fetch` (pages fetched
+//!   from the web) and `tool_image_search`. On the Messages endpoint
+//!   `web_search_requests` counts every attempt: when some came back empty or
+//!   failed, a notice says how many.
 //! - **Finishes**: `content_filter` is a block (not retried);
 //!   `insufficient_system_resource` and `aborted` interrupt the answer, so
 //!   they are retryable failures.
 //! - **Cost**: the CNY price list with peak hours (Beijing time 9–12 and
 //!   14–18 on weekdays that are not Chinese public holidays, judged at the
-//!   request time), plus 5 CNY per 1000 successful searches.
+//!   request time), plus 5 CNY per 1000 billed searches, fetches and image
+//!   searches.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use omni_core::Usage;
-use omni_core::content::{Part, Role, Turn};
+use omni_core::content::{Part, Role, ToolCall, Turn};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -71,9 +81,23 @@ const EFFORTS: &[&str] = &["max", "high", "low"];
 /// versions select the same tool). `max_uses` is left at its default, which is
 /// also the cap (5).
 const SEARCH_TOOL: &str = "web_search_20260209";
-/// CNY per successful search (`usage.server_tool_use.tool_search`): 5 CNY per
-/// 1000 successful requests, the same at all hours.
+/// CNY per billed search, page fetch or image search (`usage.server_tool_use`
+/// `tool_search`, `tool_fetch`, `tool_image_search`): 5 CNY per 1000, the same
+/// at all hours (pricing page: "搜索（文字、图片）… 网页抓取 每 1,000 次 5元").
 pub const SEARCH_CNY: f64 = 0.005;
+
+/// A `+s` answer during which no search ran.
+const NO_SEARCH: &str = "no web search ran (the model decides)";
+
+/// The server-side web tools a model has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebTools {
+    None,
+    /// The Anthropic-style search tool of the Messages endpoint ([`SEARCH_TOOL`]).
+    MessagesSearch,
+    /// `deepseek_web_search` and `deepseek_read_url`, on Chat Completions.
+    DeepSeek,
+}
 
 /// A model id the API accepts, with its limits and list prices.
 #[derive(Debug, Clone, Copy)]
@@ -85,8 +109,8 @@ pub struct ModelSpec {
     pub max_output: u64,
     /// Image input.
     pub vision: bool,
-    /// The server-side web search tool.
-    pub search: bool,
+    /// The server-side web tools.
+    pub web: WebTools,
     /// CNY per 1M tokens: off-peak, and peak (twice as much).
     pub off_peak: TokenPrice,
     pub peak: TokenPrice,
@@ -103,7 +127,7 @@ const FLASH: ModelSpec = ModelSpec {
     context: 1_048_576,
     max_output: 393_216,
     vision: true,
-    search: false,
+    web: WebTools::DeepSeek,
     off_peak: cny(1.0, 0.02, 4.0),
     peak: cny(2.0, 0.04, 8.0),
 };
@@ -116,7 +140,7 @@ pub const MODELS: &[ModelSpec] = &[
         id: "deepseek-v4-pro",
         serves: "DeepSeek-V4-Pro-0813",
         vision: false,
-        search: true,
+        web: WebTools::MessagesSearch,
         off_peak: cny(4.5, 0.15, 13.5),
         peak: cny(9.0, 0.30, 27.0),
         ..FLASH
@@ -135,7 +159,12 @@ impl RouteCaps for Caps {
         NAME
     }
     fn tool(&self, tool: Tool) -> bool {
-        tool == Tool::Search && self.0.is_some_and(|s| s.search)
+        let web = self.0.map_or(WebTools::None, |s| s.web);
+        match tool {
+            Tool::Search => web != WebTools::None,
+            Tool::Fetch => web == WebTools::DeepSeek,
+            _ => false,
+        }
     }
     fn efforts(&self) -> Option<Vec<String>> {
         Some(EFFORTS.iter().map(|e| e.to_string()).collect())
@@ -211,14 +240,12 @@ impl Provider for DeepSeek {
         }
         let model = input.model;
         let spec = model_spec(model);
-        let search = req.tools.contains(&Tool::Search);
-        if search && !spec.is_some_and(|s| s.search) {
-            return Err(LlmError::request(format!(
-                "`{model}` has no web search (`+s`): DeepSeek's server-side web search is documented for \
-                 deepseek-v4-pro only"
-            )));
-        }
+        let web = spec.map_or(WebTools::None, |s| s.web);
+        let wants_search = req.tools.contains(&Tool::Search);
+        let wants_fetch = req.tools.contains(&Tool::Fetch);
         request::validate(model, &req, &Caps(spec)).map_err(LlmError::request)?;
+        // The Messages endpoint for v4-pro's search; Flash's web tools stay on Chat Completions.
+        let search = wants_search && web == WebTools::MessagesSearch;
 
         let mut applied = Vec::new();
         let mut settings = Vec::new();
@@ -277,6 +304,18 @@ impl Provider for DeepSeek {
                 source: source(user.tools.contains(&Tool::Search)).into(),
                 patch: json!({"tools": tools}),
             });
+        }
+        if web == WebTools::DeepSeek && (wants_search || wants_fetch) {
+            let mut tools = Vec::new();
+            for (tool, ty) in [(Tool::Search, "deepseek_web_search"), (Tool::Fetch, "deepseek_read_url")] {
+                if req.tools.contains(&tool) {
+                    tools.push(json!({"type": ty}));
+                    settings.push(tool.describe().to_string());
+                }
+            }
+            let by_user = user.tools.contains(&Tool::Search) || user.tools.contains(&Tool::Fetch);
+            body["tools"] = json!(tools);
+            applied.push(Applied { source: source(by_user).into(), patch: json!({"tools": tools}) });
         }
 
         if dialect == DIALECT {
@@ -344,7 +383,12 @@ impl Provider for DeepSeek {
             let outcome = CallOutcome { upstream_id: s.header_id, ..Default::default() };
             match s.result {
                 Err(e) => (Err(e), outcome),
-                Ok(()) => (Ok(s.parser.inner.native_payload()), outcome),
+                Ok(()) => {
+                    if s.parser.no_search() {
+                        priced.event(StreamEvent::Notice(NO_SEARCH.into()));
+                    }
+                    (Ok(s.parser.inner.native_payload()), outcome)
+                }
             }
         } else {
             let s = chatstream::run_with(
@@ -361,9 +405,18 @@ impl Provider for DeepSeek {
             )
             .await;
             let outcome = CallOutcome { upstream_id: s.header_id, ..Default::default() };
+            let native = chat_native(&s.parser);
+            let asked =
+                p.body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "deepseek_web_search"));
+            let no_search = asked && s.parser.no_search();
             match (s.result, s.parser.abnormal) {
                 (Err(e), _) | (Ok(()), Some(e)) => (Err(e), outcome),
-                (Ok(()), None) => (Ok(chat_native(&s.parser.inner)), outcome),
+                (Ok(()), None) => {
+                    if no_search {
+                        priced.event(StreamEvent::Notice(NO_SEARCH.into()));
+                    }
+                    (Ok(native), outcome)
+                }
             }
         }
     }
@@ -392,22 +445,30 @@ impl Provider for DeepSeek {
 
 // ------------------------------------------------------------------ history
 
-/// The assistant message replayed to the same model on Chat Completions.
+/// The assistant message replayed to the same model on Chat Completions; the
+/// web tools' `server_tool_calls` go back unchanged (guides/web_tools: read
+/// pages are restored from their `signature`).
 fn replay_chat(p: &Value) -> Value {
     let mut m = json!({"role": "assistant", "content": p.get("content").cloned().unwrap_or(json!(""))});
     if let Some(r) = p.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
         m["reasoning_content"] = json!(r);
     }
+    if let Some(c) = p.get("server_tool_calls").filter(|c| c.as_array().is_some_and(|a| !a.is_empty())) {
+        m["server_tool_calls"] = c.clone();
+    }
     m
 }
 
 /// The native payload of a Chat Completions answer: the assistant message as
-/// it is replayed (`content`, `reasoning_content`).
-fn chat_native(p: &ChunkParser) -> Value {
-    let n = p.native_payload();
+/// it is replayed (`content`, `reasoning_content`, `server_tool_calls`).
+fn chat_native(p: &ChatParser) -> Value {
+    let n = p.inner.native_payload();
     let mut m = json!({"role": "assistant", "content": n.get("content").cloned().unwrap_or(json!(""))});
     if let Some(r) = n.get("reasoning").and_then(Value::as_str).filter(|s| !s.is_empty()) {
         m["reasoning_content"] = json!(r);
+    }
+    if let Some(c) = &p.server_tool_calls {
+        m["server_tool_calls"] = c.clone();
     }
     m
 }
@@ -589,20 +650,52 @@ async fn messages_request(
 
 // ------------------------------------------------------------------ streams
 
-/// Chat Completions chunks, with DeepSeek's abnormal finishes.
+/// Chat Completions chunks, with DeepSeek's abnormal finishes and web tools.
 struct ChatParser {
     inner: ChunkParser,
     /// The answer was interrupted (`insufficient_system_resource`, `aborted`):
     /// the call fails (retryably) once the stream has ended.
     abnormal: Option<LlmError>,
+    /// The web tools' calls as the last chunk reports them (replayed unchanged).
+    server_tool_calls: Option<Value>,
+    /// A web search ran; the finish reason.
+    searched: bool,
+    finish: Option<String>,
 }
 
 impl ChatParser {
     fn new() -> Self {
         let mut inner = ChunkParser::default();
         inner.map_error = Some(error_from_json);
-        Self { inner, abnormal: None }
+        Self { inner, abnormal: None, server_tool_calls: None, searched: false, finish: None }
     }
+
+    /// The answer ended normally without a web search.
+    fn no_search(&self) -> bool {
+        !self.searched && matches!(self.finish.as_deref(), Some("stop" | "length"))
+    }
+}
+
+/// A web tool call as a tool call: `web_search` (searches, and opening or
+/// finding in pages during a deep search) or `read_url`, its `action` as the
+/// input and its `sources`, `page` or `error` as the output.
+fn web_tool_call(call: &Value) -> Option<ToolCall> {
+    let id = call.get("id").and_then(Value::as_str)?.to_string();
+    let name = match call.get("type").and_then(Value::as_str) {
+        Some("deepseek_read_url") => "read_url",
+        _ => "web_search",
+    };
+    let output = ["sources", "page", "error"].iter().find_map(|k| {
+        let v = call.get(*k)?;
+        Some(if *k == "page" { v.clone() } else { json!({ *k: v }) })
+    });
+    Some(ToolCall {
+        id: Some(id),
+        name: name.into(),
+        status: call.get("status").and_then(Value::as_str).map(str::to_string),
+        input: call.get("action").cloned(),
+        output,
+    })
 }
 
 /// The finish choice without its content: the provider's own account of the stop.
@@ -618,8 +711,29 @@ fn finish_choice(chunk: &Value) -> Value {
 
 impl EventParser for ChatParser {
     fn event(&mut self, _name: Option<&str>, data: &Value) -> Result<Vec<StreamEvent>, LlmError> {
+        let mut out = Vec::new();
+        // The web tools: a call when it starts (its action) and when it completes
+        // (its result), in the order they ran; the last chunk has them all again.
+        if let Some(ev) = data.pointer("/choices/0/server_tool_event") {
+            let started = ev.get("type").and_then(Value::as_str) == Some("call_started");
+            if let Some(mut t) = ev.get("call").and_then(web_tool_call) {
+                if started && t.status.is_none() {
+                    t.status = Some("in_progress".into());
+                }
+                self.searched |= t.name == "web_search";
+                out.push(StreamEvent::Tool(t));
+            }
+        }
+        if let Some(steps) = data.pointer("/choices/0/delta/server_tool_calls").filter(|v| v.is_array()) {
+            for call in steps.as_array().into_iter().flatten().filter_map(|s| s.get("calls")?.as_array()).flatten() {
+                if let Some(t) = web_tool_call(call) {
+                    self.searched |= t.name == "web_search";
+                    out.push(StreamEvent::Tool(t));
+                }
+            }
+            self.server_tool_calls = Some(steps.clone());
+        }
         let evs = self.inner.chunk(data)?;
-        let mut out = Vec::with_capacity(evs.len() + 1);
         for ev in evs {
             match ev {
                 StreamEvent::Finish { reason: Some(r), .. }
@@ -643,6 +757,7 @@ impl EventParser for ChatParser {
                     out.push(StreamEvent::Finish { reason: Some("error".into()), native: Some(r) });
                 }
                 StreamEvent::Finish { reason, native: None } => {
+                    self.finish = reason.clone();
                     out.push(StreamEvent::Finish { native: reason.clone(), reason })
                 }
                 other => out.push(other),
@@ -662,6 +777,16 @@ impl EventParser for ChatParser {
 #[derive(Default)]
 struct MessagesParser {
     inner: messages::EventParser,
+    /// A web search ran; the stop reason.
+    searched: bool,
+    stop: Option<String>,
+}
+
+impl MessagesParser {
+    /// The answer ended normally without a web search.
+    fn no_search(&self) -> bool {
+        !self.searched && matches!(self.stop.as_deref(), Some("end_turn" | "max_tokens"))
+    }
 }
 
 /// A summary of `web_search_tool_result` content (titles and URLs, or the
@@ -718,11 +843,17 @@ impl EventParser for MessagesParser {
         {
             evs.push(StreamEvent::Notice(n));
         }
+        if ty == Some("message_delta")
+            && let Some(r) = data.pointer("/delta/stop_reason").and_then(Value::as_str)
+        {
+            self.stop = Some(r.to_string());
+        }
         if ty == Some("content_block_start") {
             let cb = data.get("content_block").unwrap_or(&Value::Null);
             match cb.get("type").and_then(Value::as_str) {
                 // The query may come whole in the block start rather than as deltas.
                 Some("server_tool_use") => {
+                    self.searched = true;
                     if let Some(input) = cb.get("input").filter(|i| i.as_object().is_some_and(|o| !o.is_empty())) {
                         for ev in &mut evs {
                             if let StreamEvent::Tool(t) = ev {
@@ -790,13 +921,17 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
 // ------------------------------------------------------------------ cost
 
 /// Estimated cost in USD: tokens at the peak or off-peak CNY price (cache hits,
-/// misses, output incl. reasoning) plus successful searches.
+/// misses, output incl. reasoning) plus the billed searches, page fetches and
+/// image searches.
 pub fn estimate_cost(model: &str, u: &Usage, peak: bool, cny_per_usd: f64) -> Option<f64> {
     let s = model_spec(model)?;
     let price = if peak { s.peak } else { s.off_peak };
     let tokens = price.cost(u)?;
-    let searches = u.raw.pointer("/server_tool_use/tool_search").and_then(Value::as_u64).unwrap_or(0);
-    provider::usd(tokens + searches as f64 * SEARCH_CNY, Currency::Cny, cny_per_usd)
+    let billed: u64 = ["tool_search", "tool_fetch", "tool_image_search"]
+        .iter()
+        .filter_map(|k| u.raw.pointer(&format!("/server_tool_use/{k}")).and_then(Value::as_u64))
+        .sum();
+    provider::usd(tokens + billed as f64 * SEARCH_CNY, Currency::Cny, cny_per_usd)
 }
 
 fn unix_now() -> i64 {
@@ -985,7 +1120,6 @@ mod tests {
     async fn unsupported_options_are_errors() {
         let h = vec![Turn::user_text("hi")];
         let cases: &[(&str, &[OptionToken], &str)] = &[
-            ("deepseek-flash", &[flag("s")], "documented for deepseek-v4-pro only"),
             ("deepseek-v4-pro", &[flag("c")], "has no code execution"),
             ("deepseek-v4-pro", &[flag("u")], "has no URL fetching"),
             ("deepseek-v4-pro", &[flag("m")], "has no Google Maps"),
@@ -1003,6 +1137,129 @@ mod tests {
         }
         // `tier=default` changes nothing.
         assert!(prepare("deepseek-v4-pro", &[kv("tier", "default")], &h).await.is_ok());
+    }
+
+    /// Flash's web tools (2026-11-13) stay on Chat Completions (image input keeps working).
+    #[tokio::test]
+    async fn flash_web_tools_on_chat_completions() {
+        let h = vec![Turn::user_text("news? https://example.com/a")];
+        let p = prepare("deepseek-flash", &[flag("s")], &h).await.unwrap();
+        assert_eq!((p.dialect, p.url.as_str()), (DIALECT, "https://api.deepseek.com/chat/completions"));
+        assert_eq!(p.body["tools"], json!([{"type": "deepseek_web_search"}]));
+        assert_eq!(p.body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(p.body["reasoning_effort"], "max");
+        assert!(p.settings.contains(&"web search".to_string()), "{:?}", p.settings);
+        let p = prepare("deepseek-flash", &[flag("su")], &h).await.unwrap();
+        assert_eq!(p.body["tools"], json!([{"type": "deepseek_web_search"}, {"type": "deepseek_read_url"}]));
+        let p = prepare("deepseek-flash", &[flag("u")], &h).await.unwrap();
+        assert_eq!(p.body["tools"], json!([{"type": "deepseek_read_url"}]));
+        // Thinking off: plain web search (not the deep one).
+        let p = prepare("deepseek-flash", &[flag("s"), kv("e", "none")], &h).await.unwrap();
+        assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(p.body["tools"], json!([{"type": "deepseek_web_search"}]));
+    }
+
+    /// The web tools' stream (shapes as recorded 2026-11-13): each call shows when it
+    /// starts and is completed in place; the last chunk's `server_tool_calls` is replayed
+    /// unchanged; the citations are `url_citation` annotations.
+    #[test]
+    fn flash_web_tools_stream() {
+        let chunk = |choice: Value| json!({"id": "c1", "object": "chat.completion.chunk", "model": "deepseek-flash", "choices": [choice]});
+        let search = json!({"index": 0, "id": "srvtoolu_ds_00_a", "type": "deepseek_web_search", "kind": "deep_search",
+                            "action": {"type": "search", "queries": ["Rust 最新稳定版本号", "Rust latest stable version"]}});
+        let sources = json!([{"type": "url", "url": "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/",
+                              "title": "Announcing Rust 1.100.0 | Rust Blog", "snippet": "The Rust team is happy to announce 1.100.0."}]);
+        let open = json!({"index": 0, "id": "srvtoolu_ds_01_b", "type": "deepseek_web_search", "kind": "deep_search",
+                          "action": {"type": "open_page", "url": "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/"}});
+        let page = json!({"url": "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/", "title": "Announcing Rust 1.100.0 | Rust Blog"});
+        let mut done_search = search.clone();
+        done_search["status"] = json!("completed");
+        done_search["sources"] = sources.clone();
+        let mut done_open = open.clone();
+        done_open["status"] = json!("completed");
+        done_open["page"] = page.clone();
+        done_open["signature"] = json!("SIG");
+        let steps = json!([{"index": 0, "reasoning_content": "Search first.", "calls": [done_search]},
+                           {"index": 1, "reasoning_content": "Open the post.", "calls": [done_open]}]);
+        let text = "Rust 的最新稳定版本是 1.100.0。";
+        let chunks = [
+            chunk(
+                json!({"index": 0, "delta": {"role": "assistant", "reasoning_content": "Search first."}, "finish_reason": null}),
+            ),
+            chunk(
+                json!({"index": 0, "delta": {}, "server_tool_event": {"type": "step_reasoning_done", "step": 0}, "finish_reason": null}),
+            ),
+            chunk(
+                json!({"index": 0, "delta": {}, "server_tool_event": {"type": "call_started", "step": 0, "call": search}, "finish_reason": null}),
+            ),
+            chunk(json!({"index": 0, "delta": {}, "server_tool_event": {"type": "call_completed", "step": 0,
+                "call": {"index": 0, "id": "srvtoolu_ds_00_a", "status": "completed", "sources": sources}}, "finish_reason": null})),
+            chunk(json!({"index": 0, "delta": {"reasoning_content": "Open the post."}, "finish_reason": null})),
+            chunk(
+                json!({"index": 0, "delta": {}, "server_tool_event": {"type": "call_started", "step": 1, "call": open}, "finish_reason": null}),
+            ),
+            chunk(json!({"index": 0, "delta": {}, "server_tool_event": {"type": "call_completed", "step": 1,
+                "call": {"index": 0, "id": "srvtoolu_ds_01_b", "status": "completed", "page": page}}, "finish_reason": null})),
+            chunk(json!({"index": 0, "delta": {"content": text}, "finish_reason": null})),
+            json!({"id": "c1", "object": "chat.completion.chunk", "model": "deepseek-flash",
+                   "choices": [{"index": 0, "finish_reason": "stop", "delta": {"content": "", "server_tool_calls": steps,
+                       "annotations": [{"type": "url_citation", "url_citation": {"url": "https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/",
+                           "title": "Announcing Rust 1.100.0 | Rust Blog", "start_index": 0, "end_index": 20}}]}}],
+                   "usage": {"prompt_tokens": 6997, "completion_tokens": 251, "prompt_tokens_details": {"cached_tokens": 3456},
+                             "prompt_cache_hit_tokens": 3456, "prompt_cache_miss_tokens": 3541,
+                             "server_tool_use": {"tool_search": 2, "tool_fetch": 0, "tool_image_search": 0}}}),
+        ];
+        let mut p = ChatParser::new();
+        let evs = feed(&mut p, &chunks).unwrap();
+        let mut acc = crate::Accumulator::new();
+        for e in evs {
+            acc.apply(e);
+        }
+        let kinds: Vec<&str> = acc
+            .parts()
+            .iter()
+            .map(|p| match p {
+                Part::Reasoning(_) => "reasoning",
+                Part::ToolCall(_) => "tool",
+                Part::Text { .. } => "text",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["reasoning", "tool", "reasoning", "tool", "text"], "in the order they ran");
+        let Part::ToolCall(t) = &acc.parts()[1] else { panic!() };
+        assert_eq!((t.name.as_str(), t.status.as_deref()), ("web_search", Some("completed")));
+        assert_eq!(t.input.as_ref().unwrap()["queries"][1], "Rust latest stable version");
+        assert_eq!(t.output.as_ref().unwrap()["sources"][0]["title"], "Announcing Rust 1.100.0 | Rust Blog");
+        let Part::ToolCall(t) = &acc.parts()[3] else { panic!() };
+        assert_eq!(t.input.as_ref().unwrap()["type"], "open_page");
+        assert_eq!(t.output.as_ref().unwrap()["title"], "Announcing Rust 1.100.0 | Rust Blog");
+        let Part::Text { citations, .. } = &acc.parts()[4] else { panic!() };
+        assert_eq!(citations[0].url.as_deref(), Some("https://blog.rust-lang.org/2026/11/12/Rust-1.100.0/"));
+        assert!(!p.no_search(), "it searched");
+        let mut quiet = ChatParser::new();
+        feed(&mut quiet, &[chunk(json!({"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}))]).unwrap();
+        assert!(quiet.no_search(), "an answer without a search says so (when +s asked for one)");
+        // Replayed unchanged, signatures included.
+        let native = chat_native(&p);
+        assert_eq!(native["server_tool_calls"], steps);
+        assert_eq!(replay_chat(&native)["server_tool_calls"][1]["calls"][0]["signature"], "SIG");
+        assert!(replay_chat(&json!({"content": "x"})).get("server_tool_calls").is_none());
+        // Billed: the two query terms, at 5 CNY per 1000.
+        let u = acc.usage.clone().unwrap();
+        let tokens = (3541.0 * 2.0 + 3456.0 * 0.04 + 251.0 * 8.0) / 1e6;
+        assert!((estimate_cost("deepseek-flash", &u, true, 7.0).unwrap() - (tokens + 2.0 * 0.005) / 7.0).abs() < 1e-12);
+    }
+
+    /// Fetched pages and image searches are billed like searches.
+    #[test]
+    fn web_tool_fees() {
+        let u = Usage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            raw: json!({"server_tool_use": {"tool_search": 3, "tool_fetch": 1, "tool_image_search": 2}}),
+            ..Default::default()
+        };
+        assert!((estimate_cost("deepseek-flash", &u, false, 7.0).unwrap() - 6.0 * 0.005 / 7.0).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -1229,10 +1486,7 @@ mod tests {
             "prompt_cache_hit_tokens": 4, "prompt_cache_miss_tokens": 6}));
         assert_eq!(bare.cached_input_tokens, Some(4));
         assert!(p.abnormal.is_none());
-        assert_eq!(
-            chat_native(&p.inner),
-            json!({"role": "assistant", "content": "Hello", "reasoning_content": "Thinking."})
-        );
+        assert_eq!(chat_native(&p), json!({"role": "assistant", "content": "Hello", "reasoning_content": "Thinking."}));
     }
 
     #[test]
