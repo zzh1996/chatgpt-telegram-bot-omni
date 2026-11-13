@@ -436,7 +436,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 
 ::: The small text at the end, item by item
 - What was asked for: `effort max · web search` and the like.
-- `in 1,234 (incl. 1,000 cached)` — input tokens, including those read from the cache (billed at the cache price) or written to it.
+- `in 1,234 (cached 1,000)` — input tokens, of which 1,000 were read from the cache (billed at the cache price); `cache write` — written to it.
 - `out 567 (reasoning 400)` — output tokens, and how many were reasoning.
 - The cost in USD. `≈` means my estimate from the platform's prices (the platform reported none); `+ code execution` and the like name a charge the estimate leaves out.
 - How long it took.
@@ -470,7 +470,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 
 ::: 末尾小字的各项含义
 - 请求了什么：`effort max · web search` 之类。
-- `in 1,234 (incl. 1,000 cached)` — 输入 token，包括从缓存读的（按缓存价计费）和写入缓存的。
+- `in 1,234 (cached 1,000)` — 输入 token，其中 1,000 是从缓存读的（按缓存价计费）；`cache write` — 写入缓存的。
 - `out 567 (reasoning 400)` — 输出 token，其中多少是推理。
 - 费用（USD）。`≈` 表示是我按平台价格估算的（平台没有给出费用）；`+ code execution` 之类表示估算里没算进去的收费。
 - 用了多长时间。

@@ -741,21 +741,20 @@ fn footer_text(f: &[String], bold: Option<(usize, usize)>) -> RText {
 
 /// Usage in words: input (cache), output (reasoning), cost. The input count
 /// includes the tokens read from or written to the cache (every platform's
-/// counts are normalized so), which the parenthesis says: `in 326,770 (incl.
-/// 224,091 cached)`.
+/// counts are normalized so): `in 326,770 (cached 224,091)`.
 fn usage_parts(u: &Usage) -> Vec<String> {
     let mut f = Vec::new();
     if let Some(x) = u.input_tokens {
         let mut s = format!("in {}", fmt_tokens(x));
         let mut cache = Vec::new();
         if let Some(c) = u.cached_input_tokens.filter(|c| *c > 0) {
-            cache.push(format!("{} cached", fmt_tokens(c)));
+            cache.push(format!("cached {}", fmt_tokens(c)));
         }
         if let Some(c) = u.cache_write_tokens.filter(|c| *c > 0) {
-            cache.push(format!("{} written to the cache", fmt_tokens(c)));
+            cache.push(format!("cache write {}", fmt_tokens(c)));
         }
         if !cache.is_empty() {
-            s.push_str(&format!(" (incl. {})", cache.join(", ")));
+            s.push_str(&format!(" ({})", cache.join(", ")));
         }
         f.push(s);
     }

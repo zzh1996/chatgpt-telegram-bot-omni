@@ -207,7 +207,7 @@ Arr!
 ▸ 📚 Sources · 5                                    ← 紧跟它所属的那段回答
 ▸ ⚠️ Error: …                                      ← 没有正常完成时：完整的原始错误对象
 ℹ️ …                                               ← 小字：bot 的提示（参数映射、截断原因…）
-effort max · web search · in 1,234 (incl. 1,000 cached) · out 567 (reasoning 400) · ≈$0.012 · 12.3s    ← 小字
+effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) · ≈$0.012 · 12.3s    ← 小字
 ```
 
 - **正文在上**（`[render] answer_first = true`，默认）：回答只有一段连续正文（文字、图片、视频等）时，正文放在最上面，推理和工具调用放在它下面（它们之间仍按时间顺序），这样 Telegram 折叠长消息（"Show more"）时不会把正文藏在后面。正文和推理、工具调用互相穿插（不止一段正文）时按下面的时间顺序显示。生成中也一样：开始写正文后，之前的推理移到正文下面。`answer_first = false` 时一律按时间顺序。
