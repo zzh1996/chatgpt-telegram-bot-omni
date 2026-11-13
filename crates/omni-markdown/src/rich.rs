@@ -705,6 +705,29 @@ fn block(b: &Block) -> Vec<RBlock> {
 
 /// A block formula as Telegram formulas: one per line (see [`crate::latex`]).
 fn math_lines(tex: &str) -> Vec<RBlock> {
+    if let Some(t) = crate::latex::array_table(tex) {
+        let align = |i: usize| match t.align.get(i) {
+            Some('l') => CellAlign::Left,
+            Some('r') => CellAlign::Right,
+            _ => CellAlign::Center,
+        };
+        let rows = t
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(i, cell)| RCell {
+                        text: if cell.is_empty() { RText::plain("") } else { RText::Math(cell.clone()) },
+                        header: t.header && r == 0,
+                        align: align(i),
+                    })
+                    .collect()
+            })
+            .collect();
+        return vec![RBlock::Table { rows, bordered: true, striped: false }];
+    }
     crate::latex::display_lines(tex.trim()).into_iter().map(RBlock::Math).collect()
 }
 

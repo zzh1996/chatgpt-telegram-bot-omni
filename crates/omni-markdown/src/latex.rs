@@ -18,15 +18,18 @@
 //! [`for_telegram`] (inline) and [`display_lines`] (a block formula) rewrite
 //! what models write most into what all of them render, keeping the meaning:
 //! fraction and binomial styles become `\frac`/`\binom`, `\operatorname{f}`
-//! `\mathrm{f}`, `\pmod{p}` `\quad(\mathrm{mod}\,p)`, a box or a colour leaves
-//! its content, `\textbf` and friends `\text`, `f'` `f^{\prime}`, symbols such
-//! as `×` and `≤` their commands, other text beyond ASCII goes into `\text{}`,
-//! and small spellings get their common forms. A block formula of several lines
-//! (alignment environments, `\\`, a system in `\left\{ … \right.`, the rows of
-//! `cases`) becomes one formula per line, without `&` and equation tags. A
-//! formula that is neither (`array`) becomes a `matrix`. Anything else is sent
-//! as written: matrices stay (Android shows none), and so do `\underbrace`,
-//! `\overset` and `\xrightarrow` (iOS and macOS show their source).
+//! `\mathrm{f}`, `\pmod{p}` (or `\pmod p`: an argument may be one token, as TeX
+//! allows) `\quad(\mathrm{mod}\,p)`, a box or a colour leaves its content,
+//! `\textbf` and friends `\text`, `f'` `f^{\prime}`, symbols such as `×` and `≤`
+//! their commands, other text beyond ASCII goes into `\text{}`, symbols iOS and
+//! macOS lack (`\therefore`) their characters in `\text{}`, and small spellings
+//! get their common forms. A block formula of several lines (alignment
+//! environments, `\\`, a system in `\left\{ … \right.`, the rows of `cases`)
+//! becomes one formula per line, without `&` and equation tags; one that is
+//! only an `array` (a table of values) becomes a table ([`array_table`]); any
+//! other `array` a `matrix`. Anything else is sent as written: matrices stay
+//! (Android shows none), and so do `\underbrace`, `\overset` and `\xrightarrow`
+//! (iOS and macOS show their source).
 
 /// Alignment environments: their lines stay, the alignment goes.
 const ALIGN_ENVS: &[&str] = &[
@@ -75,6 +78,7 @@ const RENAMED: &[(&str, &str)] = &[
     ("hbox", "text"),
     ("mathscr", "mathcal"),
     ("bm", "boldsymbol"),
+    ("pmb", "boldsymbol"),
 ];
 
 /// Commands written another way (no arguments involved).
@@ -89,24 +93,54 @@ const RESPELLED: &[(&str, &str)] = &[
     ("rvert", "|"),
     ("lVert", "\\|"),
     ("rVert", "\\|"),
-    ("bmod", "\\mathrm{mod}"),
-    ("mod", "\\mathrm{mod}"),
+    // Spaced like amsmath's (a bare `\mathrm{mod}` would touch its neighbours).
+    ("bmod", "\\;\\mathrm{mod}\\;"),
+    ("mod", "\\quad\\mathrm{mod}\\;"),
+    ("lcm", "\\mathrm{lcm}"),
     ("impliedby", "\\;\\Longleftarrow\\;"),
     ("degree", "^{\\circ}"),
+    ("coloneqq", ":="),
+    ("eqqcolon", "=:"),
+    ("enspace", "\\;"),
+    ("hfill", "\\quad "),
+    ("newline", "\\\\"),
+    ("hline", ""),
     ("nonumber", ""),
     ("notag", ""),
+    ("dag", "\\dagger"),
+    ("ddag", "\\ddagger"),
+    ("vartriangle", "\\triangle"),
+    ("ldotp", "."),
+    // Symbols iOS and macOS lack, as the characters (drawn in `\text{}` everywhere).
+    ("therefore", "\\text{∴}"),
+    ("because", "\\text{∵}"),
+    ("blacksquare", "\\text{■}"),
+    ("checkmark", "\\text{✓}"),
+    ("complement", "\\text{∁}"),
+    ("triangleq", "\\text{≜}"),
+    ("rightleftharpoons", "\\text{⇌}"),
+    ("leftrightharpoons", "\\text{⇋}"),
+    ("lesssim", "\\text{≲}"),
+    ("gtrsim", "\\text{≳}"),
+    ("approxeq", "\\text{≊}"),
+    ("S", "\\text{§}"),
+    ("P", "\\text{¶}"),
 ];
 
 /// Commands that leave only their (last) argument, after skipping this many.
 const UNWRAPPED: &[(&str, usize)] =
     &[("boxed", 0), ("fbox", 0), ("framebox", 0), ("color", 1), ("textcolor", 1), ("colorbox", 1)];
 
-/// Commands replaced with their one argument: equation numbers and labels go,
-/// spacing becomes `\quad`.
+/// Commands replaced with their one argument: equation numbers, labels, table
+/// rules and invisible boxes go, spacing becomes `\quad`.
 const DROPPED: &[(&str, &str)] = &[
     ("tag", ""),
     ("tag*", ""),
     ("label", ""),
+    ("cline", ""),
+    ("phantom", ""),
+    ("hphantom", ""),
+    ("vphantom", ""),
     ("vspace", ""),
     ("vspace*", ""),
     ("hspace", "\\quad "),
@@ -337,6 +371,124 @@ fn wants_text(c: char) -> bool {
         && !SYMBOLS.iter().any(|(u, _)| *u == c)
 }
 
+/// A block formula that is only an `array`: a table of values, as models write
+/// tables in formulas. Android shows no environment and iOS and macOS no
+/// `array`, so it becomes a table with a formula in each cell.
+#[derive(Debug, PartialEq)]
+pub struct ArrayTable {
+    /// Each column's alignment: `l`, `c` or `r`.
+    pub align: Vec<char>,
+    /// A rule under the first row makes it the header.
+    pub header: bool,
+    /// The cells, as inline formulas ([`for_telegram`]; empty when empty).
+    pub rows: Vec<Vec<String>>,
+}
+
+/// The table of a block formula that is only an `array` (see [`ArrayTable`]).
+pub fn array_table(tex: &str) -> Option<ArrayTable> {
+    let chars: Vec<char> = tex.trim().chars().collect();
+    let open: Vec<char> = "\\begin{array}".chars().collect();
+    if !chars.starts_with(&open) {
+        return None;
+    }
+    let (env, body_start, body_end, end) = environment(&chars, "\\begin".len())?;
+    if env != "array" || end != chars.len() {
+        return None;
+    }
+    // The column spec without its arguments (`p{2cm}`, `@{}`): `l`, `c`, `r` are the columns.
+    let k = skip_spaces(&chars, open.len());
+    let mut align = Vec::new();
+    if chars.get(k) == Some(&'{') {
+        let e = group_end(&chars, k)?;
+        let mut j = k + 1;
+        while j < e - 1 {
+            match chars[j] {
+                '{' => j = group_end(&chars, j)?,
+                c @ ('l' | 'c' | 'r') => {
+                    align.push(c);
+                    j += 1;
+                }
+                'p' | 'm' | 'b' => {
+                    align.push('l');
+                    j += 1;
+                }
+                _ => j += 1,
+            }
+        }
+    }
+    let body: String = chars[body_start..body_end].iter().collect();
+    let mut header = false;
+    let mut rows = Vec::new();
+    for line in lines_of(&body) {
+        let mut row = line.as_str();
+        // `\hline` (and `\cline{…}`) rules: one before the second row makes a header.
+        loop {
+            let r = row.trim_start();
+            if let Some(rest) = r.strip_prefix("\\hline") {
+                header |= rows.len() == 1;
+                row = rest;
+            } else if let Some(rest) = r.strip_prefix("\\cline") {
+                let rc: Vec<char> = rest.chars().collect();
+                let s = skip_spaces(&rc, 0);
+                let e = if rc.get(s) == Some(&'{') { group_end(&rc, s)? } else { 0 };
+                row = &rest[rc[..e].iter().map(|c| c.len_utf8()).sum::<usize>()..];
+            } else {
+                row = r;
+                break;
+            }
+        }
+        if row.trim().is_empty() {
+            continue;
+        }
+        rows.push(cells_of(row).iter().map(|c| for_telegram(c.trim())).collect::<Vec<_>>());
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+    rows.iter_mut().for_each(|r| r.resize(width, String::new()));
+    align.resize(width, 'c');
+    Some(ArrayTable { align, header: header && rows.len() > 1, rows })
+}
+
+/// A row's cells: split at `&` outside braces and environments, not escaped.
+fn cells_of(row: &str) -> Vec<String> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let (mut braces, mut envs) = (0usize, 0usize);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && i + 1 < chars.len() {
+            let (name, after) = command(&chars, i + 1);
+            match name.as_str() {
+                "begin" => envs += 1,
+                "end" => envs = envs.saturating_sub(1),
+                _ => {}
+            }
+            let end = if name.is_empty() { i + 2 } else { after };
+            cur.extend(&chars[i..end]);
+            i = end;
+            continue;
+        }
+        match c {
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            '&' if braces == 0 && envs == 0 => {
+                cells.push(std::mem::take(&mut cur));
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        i += 1;
+    }
+    cells.push(cur);
+    cells
+}
+
 /// An inline formula in the LaTeX every Telegram app renders (see the module
 /// docs). Several lines become one, separated by `\quad`.
 pub fn for_telegram(tex: &str) -> String {
@@ -540,10 +692,28 @@ fn rewrite(chars: &[char], out: &mut String) {
                 continue;
             }
         }
-        if name == "pmod"
+        // The argument may be one token, as TeX allows: `\pmod p` (DeepSeek, 2026-11-14).
+        if let Some(template) = match name.as_str() {
+            "pmod" => Some("\\quad(\\mathrm{mod}\\,#)"),
+            "pod" => Some("\\quad(#)"),
+            "abs" | "abs*" => Some("\\left| # \\right|"),
+            "norm" | "norm*" => Some("\\left\\| # \\right\\|"),
+            _ => None,
+        } && let Some((arg, e)) = script_arg(chars, after)
+        {
+            out.push_str(&template.replace('#', &arg));
+            i = e;
+            continue;
+        }
+        // `\substack{i<j \\ j<k}` (under a sum): rows stacked with `\atop`.
+        if name == "substack"
             && let Some((arg, e)) = rewritten_group(chars, after)
         {
-            out.push_str(&format!("\\quad(\\mathrm{{mod}}\\,{arg})"));
+            let rows = lines_of(&arg);
+            let stacked = rows.iter().rev().fold(String::new(), |below, row| {
+                if below.is_empty() { row.clone() } else { format!("{{{row} \\atop {below}}}") }
+            });
+            out.push_str(&stacked);
             i = e;
             continue;
         }
@@ -571,7 +741,14 @@ fn rewrite(chars: &[char], out: &mut String) {
                         i = k;
                         continue;
                     }
-                    _ => {}
+                    // One token: `\boxed 5`.
+                    _ => {
+                        if let Some((arg, e)) = script_arg(chars, k) {
+                            out.push_str(&arg);
+                            i = e;
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -922,7 +1099,15 @@ mod tests {
         );
         assert_eq!(t(r"\operatorname{rank} A"), r"\mathrm{rank}\,A");
         assert_eq!(t(r"a \equiv b \pmod{p}"), r"a \equiv b \quad(\mathrm{mod}\,p)");
-        assert_eq!(t(r"a \bmod b"), r"a \mathrm{mod} b");
+        // One token as the argument (DeepSeek's `2^n\equiv -1\pmod p.`).
+        assert_eq!(t(r"2^n\equiv -1\pmod p."), r"2^n\equiv -1\quad(\mathrm{mod}\,p).");
+        assert_eq!(t(r"x \pmod{2^k} \pod\ell"), r"x \quad(\mathrm{mod}\,2^k) \quad(\ell)");
+        assert_eq!(t(r"a \bmod b = a \mod b"), r"a \;\mathrm{mod}\; b = a \quad\mathrm{mod}\; b");
+        assert_eq!(t(r"\lcm(a,b) \coloneqq c"), r"\mathrm{lcm}(a,b) := c");
+        assert_eq!(t(r"\abs{x} + \norm{v} + \abs*{y}"), r"\left| x \right| + \left\| v \right\| + \left| y \right|");
+        assert_eq!(t(r"\sum_{\substack{i<j \\ i,j \in S}} a_i"), r"\sum_{{i<j \atop i,j \in S}} a_i");
+        assert_eq!(t(r"\therefore x \rightleftharpoons y \S 2"), r"\text{∴} x \text{⇌} y \text{§} 2");
+        assert_eq!(t(r"\phantom{0}1 \boxed 5"), "1 5");
         assert_eq!(t(r"\textbf{bold} \textit{it} \mbox{box}"), r"\text{bold} \text{it} \text{box}");
         assert_eq!(t(r"\lvert x \rvert + \lVert v \rVert"), r"| x | + \| v \|");
         assert_eq!(t(r"1, 2, \dots, n"), r"1, 2, \ldots, n");
@@ -963,6 +1148,38 @@ mod tests {
         assert_eq!(t(r"\mathrm{最大}"), r"\mathrm{\text{最大}}");
         // Drawn as they are: accented Latin and Cyrillic.
         assert_eq!(t("é + д"), "é + д");
+    }
+
+    #[test]
+    fn a_formula_that_is_an_array_is_a_table() {
+        use super::{ArrayTable, array_table};
+        // DeepSeek's table of primes (2026-11-14), shortened.
+        let tex = "\n\\begin{array}{c|c}\np & n\\equiv\\pmod p\\\\ \\hline\n41 & 0,40\\\\\n43 & 1,41\n\\end{array}\n";
+        assert_eq!(
+            array_table(tex),
+            Some(ArrayTable {
+                align: vec!['c', 'c'],
+                header: true,
+                rows: vec![
+                    vec!["p".into(), r"n\equiv\quad(\mathrm{mod}\,p)".into()],
+                    vec!["41".into(), "0,40".into()],
+                    vec!["43".into(), "1,41".into()],
+                ],
+            })
+        );
+        // Column arguments skipped, short rows padded, no rule: no header.
+        assert_eq!(
+            array_table(r"\begin{array}{@{}r p{2cm}l@{}} 1 & \frac{a}{b} & x \\ 2 \end{array}"),
+            Some(ArrayTable {
+                align: vec!['r', 'l', 'l'],
+                header: false,
+                rows: vec![vec!["1".into(), r"\frac{a}{b}".into(), "x".into()], vec!["2".into(), "".into(), "".into()]],
+            })
+        );
+        // Not only an array: a formula.
+        assert_eq!(array_table(r"A = \begin{array}{cc} 1 & 2 \end{array}"), None);
+        assert_eq!(array_table(r"\begin{array}{cc} 1 & 2 \end{array}."), None);
+        assert_eq!(array_table(r"\begin{pmatrix} 1 & 2 \end{pmatrix}"), None);
     }
 
     #[test]
@@ -1012,6 +1229,12 @@ mod tests {
         );
         // Other delimiters stay when no line break is inside them.
         assert_eq!(d(r"\left( \frac{a}{b} \right)^2"), [r"\left( \frac{a}{b} \right)^2"]);
+        // `\newline` is a line break; table rules go.
+        assert_eq!(d(r"a \newline b"), ["a", "b"]);
+        assert_eq!(
+            d(r"\begin{array}{c|c} \hline 1 & 2 \\ \hline 3 & 4 \end{array}"),
+            [r"\begin{matrix}1 & 2 \\  3 & 4\end{matrix}"]
+        );
         // `array` otherwise: a matrix.
         assert_eq!(
             d(r"\left( \begin{array}{cc} 1 & 2 \\ 3 & 4 \end{array} \right)"),
