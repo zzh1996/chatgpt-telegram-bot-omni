@@ -1223,6 +1223,11 @@ mod tests {
             (u.input_tokens, u.cached_input_tokens, u.output_tokens, u.reasoning_tokens),
             (Some(10), Some(4), Some(20), Some(15))
         );
+        // `prompt_tokens_details` is optional in DeepSeek's reference; the required
+        // `prompt_cache_hit_tokens` stands in (else cache hits cost 30–50× too much).
+        let bare = crate::openrouter::chat::usage_from_json(&json!({"prompt_tokens": 10, "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 4, "prompt_cache_miss_tokens": 6}));
+        assert_eq!(bare.cached_input_tokens, Some(4));
         assert!(p.abnormal.is_none());
         assert_eq!(
             chat_native(&p.inner),

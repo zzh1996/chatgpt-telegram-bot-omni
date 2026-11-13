@@ -572,8 +572,10 @@ pub fn usage_from_json(u: &Value) -> omni_core::Usage {
         output_tokens: g("/completion_tokens").or_else(|| g("/output_tokens")),
         reasoning_tokens: g("/completion_tokens_details/reasoning_tokens")
             .or_else(|| g("/output_tokens_details/reasoning_tokens")),
+        // DeepSeek: `prompt_tokens_details` is optional, `prompt_cache_hit_tokens` required.
         cached_input_tokens: g("/prompt_tokens_details/cached_tokens")
-            .or_else(|| g("/input_tokens_details/cached_tokens")),
+            .or_else(|| g("/input_tokens_details/cached_tokens"))
+            .or_else(|| g("/prompt_cache_hit_tokens")),
         cache_write_tokens: g("/prompt_tokens_details/cache_write_tokens")
             .or_else(|| g("/input_tokens_details/cache_write_tokens")),
         cost_usd: u.get("cost").and_then(Value::as_f64),
