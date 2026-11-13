@@ -215,7 +215,6 @@ pub const MODELS: &[ModelSpec] = &[
         prices: &[short_reply(0.8, 2.0, 0.16), short(0.8, 6.0, 0.16), flat(1.2, 8.0, 0.24)],
         ..TEXT
     },
-    ModelSpec { id: "glm-4.5-flash", context: 131_072, max_output: 98_304, prices: &[FREE], ..TEXT },
 ];
 
 pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {

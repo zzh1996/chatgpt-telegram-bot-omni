@@ -6,9 +6,10 @@
 //! - **Chat Completions** (`moonshot.chat`) for every request without a tool.
 //!   The K3 series (`kimi-k3.1-pro`, `kimi-k3.1-pro-highspeed`, `kimi-k3`)
 //!   always thinks; `reasoning_effort` low | high | max (default max, sent
-//!   explicitly). `kimi-k2.6` switches thinking with `thinking.type`;
-//!   `kimi-k2.7-code` always thinks and takes no thinking parameter. Sampling
-//!   parameters are fixed by Moonshot (other values are errors): never sent.
+//!   explicitly). Two other shapes stay supported for future models (the
+//!   retired K2 series had them): thinking switched with `thinking.type`, and
+//!   always on with no thinking parameter. Sampling parameters are fixed by
+//!   Moonshot (other values are errors): never sent.
 //! - **Web search** (`+s`, K3 series only): the Responses API
 //!   (`moonshot.responses`, see [`responses`]) with its server-side
 //!   `web_search` tool and its sources (`include`); they become the answer's
@@ -65,9 +66,9 @@ const NO_SEARCH: &str = "no web search ran (Moonshot decides from the input whet
 pub enum Thinking {
     /// Always on; `reasoning_effort` low | high | max, default max (K3 series).
     Effort,
-    /// Always on (with Preserved Thinking); no switch, no levels (`kimi-k2.7-code`).
+    /// Always on (with Preserved Thinking); no switch, no levels (as the K2 code models were).
     Always,
-    /// `thinking.type` enabled (default) | disabled (`kimi-k2.6`).
+    /// `thinking.type` enabled (default) | disabled (as K2.6 was).
     Switch,
 }
 
@@ -183,7 +184,7 @@ fn check(spec: &ModelSpec, req: &Requested) -> Result<(), LlmError> {
 struct ReasoningSetting {
     /// `reasoning_effort` (Chat) / `reasoning.effort` (Responses) for the K3 series.
     effort: Option<String>,
-    /// `thinking` object (kimi-k2.6).
+    /// `thinking` object ([`Thinking::Switch`]).
     thinking: Option<Value>,
     described: String,
     by_user: bool,
