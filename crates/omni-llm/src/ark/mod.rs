@@ -355,6 +355,13 @@ impl Ark {
             settings.push(format!("tier {t}"));
             applied.push(Applied { source: "option".into(), patch: json!({"service_tier": t}) });
         }
+        // Routes the conversation's requests to the same implicit cache ("routing hint
+        // for implicit cache"; measured 2026-11-13: without it a 15K-token follow-up
+        // had no cache hit).
+        if let Some(k) = &input.session_id {
+            body["prompt_cache_key"] = json!(k);
+            applied.push(Applied { source: "default".into(), patch: json!({"prompt_cache_key": k}) });
+        }
         let mut warnings = Vec::new();
         // This model's own answers are replayed (with their reasoning); other turns go as their text.
         let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == input.model);
@@ -846,6 +853,10 @@ mod tests {
         assert_eq!(p.body["stream_options"]["include_usage"], true);
         assert_eq!(p.body["stream_options"]["chunk_include_usage"], true);
         assert!(p.body.get("user").is_none(), "Ark Chat has no `user` field");
+        assert!(p.body.get("prompt_cache_key").is_none(), "no conversation, no cache key");
+        let keyed = CallInput { session_id: Some("tg-9".into()), user: None, ..input };
+        let p = ark().prepare_chat(&keyed, &[], &NoBlobs).await.unwrap();
+        assert_eq!(p.body["prompt_cache_key"], "tg-9", "the conversation routes to one implicit cache");
         // Defaults without options: max effort, explicit max_tokens (answer only, capped).
         let input = CallInput { options: &[], ..input };
         let p = ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap();

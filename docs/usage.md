@@ -98,7 +98,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 **阿里云百炼**：`qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-max`、`qwen3.7-plus` 等。思考默认开；qwen3.8 默认 `reasoning_effort=xhigh`（`e=xhigh|medium|low`），`e=none` 关闭思考，`budget=<n>` 设思考预算（`thinking_budget`）。`+s`（联网搜索）、`+u`（网页抓取 `web_extractor`，只能和搜索一起用：`+su`，而且不能 `e=none`）、`+c`（代码解释器）都走百炼的 Responses API：搜索词和来源都显示（📚 Sources），每次搜索 0.004 元，没有搜索时注明；这个接口没有思考预算（带 `budget=` 报错），图片按默认分辨率发送（会注明），视频只能用公网 URL（带视频报错），对话超过上下文的 80% 报错。默认地址是旧版用的 `dashscope.aliyuncs.com`：2026-09-30 之后不再加新功能，请求 600 秒超时、请求体上限 16 MiB（几张 base64 大图或视频就可能超过）；建议把 `base_url` 设成工作空间域名 `https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。
 
-**火山方舟**（豆包，`ark:`）：示例配置里的 `db$`、`dbe$` 直连方舟 Chat API。选项与上面相同，方舟支持 `s`（豆包搜索，需先在方舟控制台开通；方舟报告的搜索次数显示为工具调用，每次按 0.02 元计入估算费用，没有搜索时注明）、`e=<high|medium|low>`、`e=none` 或 `e=minimal`（都是关闭思考）、`tier=flex`/`tier=fast`（`fast` 只给 `priority_users`）；`p=` 和其它选项报错。费用按方舟的价目表：按输入长度分档（2.0 系列和 character 分 32K/128K/256K 档，K = 1024，整个 prompt 含缓存命中）、按响应里实际用的档位（`service_tier`：常规、低延迟 `fast`、低优 `flex`；低优的缓存命中按常规价），音频输入按音频价（约为文字的 15 倍）。
+**火山方舟**（豆包，`ark:`）：示例配置里的 `db$`、`dbe$` 直连方舟 Chat API。选项与上面相同，方舟支持 `s`（豆包搜索，需先在方舟控制台开通；方舟报告的搜索次数显示为工具调用，每次按 0.02 元计入估算费用，没有搜索时注明）、`e=<high|medium|low>`、`e=none` 或 `e=minimal`（都是关闭思考）、`tier=flex`/`tier=fast`（`fast` 只给 `priority_users`）；`p=` 和其它选项报错。费用按方舟的价目表：按输入长度分档（2.0 系列和 character 分 32K/128K/256K 档，K = 1024，整个 prompt 含缓存命中）、按响应里实际用的档位（`service_tier`：常规、低延迟 `fast`、低优 `flex`；低优的缓存命中按常规价），音频输入按音频价（约为文字的 15 倍）。对话作为 `prompt_cache_key` 发送（隐式缓存的路由提示：同一对话的请求落到同一缓存，后续轮次才有缓存命中）。
 
 方舟默认 `max_tokens` 只有 4096 且会静默截断，所以 bot 总是显式发送：模型最大回答长度（受上下文限制），上限 65536（`[providers.ark].max_tokens_cap`；方舟按"输入 + max_tokens"预扣 TPM，设得过大会更快触发 429）。方舟响应不带费用，统计里的费用按价目表（人民币，最低档位）估算，汇率见 `cny_per_usd`。
 
