@@ -31,15 +31,10 @@ pub struct ResolvedSpec {
 }
 
 impl ResolvedSpec {
+    /// `provider:model`, also the model as shown in replies (`openai:gpt-6.1-sol`,
+    /// `openrouter:openai/gpt-6.1-sol`), so the route of an answer is always visible.
     pub fn canonical(&self) -> String {
         format!("{}:{}", self.provider, self.model)
-    }
-
-    /// The model as shown in replies: OpenRouter ids as they are
-    /// (`openai/gpt-6.1-sol`), the platforms' own APIs with their prefix
-    /// (`openai:gpt-6.1-sol`), so the route of an answer is always visible.
-    pub fn display_model(&self) -> String {
-        if self.provider == "openrouter" { self.model.clone() } else { self.canonical() }
     }
 
     pub fn options_syntax(&self) -> String {

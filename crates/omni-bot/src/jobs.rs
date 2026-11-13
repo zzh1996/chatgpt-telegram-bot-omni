@@ -379,7 +379,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
     };
     let max_attempts = app.cfg.retry.max_attempts.max(1);
     let base_state = RenderState {
-        model: spec.display_model(),
+        model: spec.canonical(),
         options: spec.options_syntax(),
         parts: Vec::new(),
         status: Status::Generating,

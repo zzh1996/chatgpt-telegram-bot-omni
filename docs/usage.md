@@ -62,7 +62,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 ### 直连各平台的官方 API
 
-配置了 key 的平台（`[providers.<id>]`，见示例配置）才有它的模型，写成 `<id>:<模型 ID>`（如 `openai:gpt-6.1-sol`、`deepseek:deepseek-v4-pro`），回复第一行也这样显示，经 OpenRouter 的则是 `author/model`，一眼能看出走的哪条路。**没有 key 的平台（OpenRouter 也一样）不提供它的模型**：`/models` 不列出它的前缀；直接写它的模型 ID 或用指向它的前缀，回复"没有配置"的错误（群里直接写 `author/model$` 这种 OpenRouter ID 时不回复，因为可能只是普通文字）；之前用它的对话继续时也报这个错。bot 照常运行，配上 key 重启就有了。直接写 `<id>:<模型 ID>$` 需要该 provider 的 `allow_unlisted_models = true`（默认 false：只能用前缀），而且只接受 bot 模型表里有的 ID。国内厂商接国内官网（和旧版一样）。
+配置了 key 的平台（`[providers.<id>]`，见示例配置）才有它的模型，写成 `<id>:<模型 ID>`（如 `openai:gpt-6.1-sol`、`deepseek:deepseek-v4-pro`），回复第一行也这样显示，经 OpenRouter 的是 `openrouter:author/model`（如 `openrouter:openai/gpt-6.1-sol`），一眼能看出走的哪条路。**没有 key 的平台（OpenRouter 也一样）不提供它的模型**：`/models` 不列出它的前缀；直接写它的模型 ID 或用指向它的前缀，回复"没有配置"的错误（群里直接写 `author/model$` 这种 OpenRouter ID 时不回复，因为可能只是普通文字）；之前用它的对话继续时也报这个错。bot 照常运行，配上 key 重启就有了。直接写 `<id>:<模型 ID>$` 需要该 provider 的 `allow_unlisted_models = true`（默认 false：只能用前缀），而且只接受 bot 模型表里有的 ID。国内厂商接国内官网（和旧版一样）。
 
 - 选项和上面一样按官方 API 校验，官方没有的报错；`p=` 只用于 OpenRouter，在这里报错。默认参数同样是官方允许的"最大"（各平台的具体值见下）。
 - 费用：各平台的响应基本都不带费用（xAI 例外），统计和限额用 bot 内置的价目表（按日期标注来源）估算：未缓存输入、缓存读/写、输出（推理按输出计），以及搜索等工具按次的费用；人民币价目按 `cny_per_usd` 折算。**只支持 bot 模型表里的模型**：表里没有的 ID 价格未知，直接不支持（防止被滥用）；即将下线和已经下线的模型也不在表里。价目表里没有的额外收费（如 Claude 代码执行的容器时间）在页脚费用后标注（`≈$0.008 + code execution`）；没有公布价格的功能不支持。
@@ -197,7 +197,7 @@ Arr!
 ## 3. 回答的样子
 
 ```
-🤖 anthropic/claude-opus-5.5                       ← 第一行：模型（小字，模型名加粗）
+🤖 anthropic:claude-opus-5-5                       ← 第一行：平台和模型（小字，加粗；经 OpenRouter 的是 openrouter:anthropic/claude-opus-5.5）
 ▸ ⚠️ Attempt 1 failed: …                           ← 之前失败的尝试（如有），按顺序折叠：当时的输出、完整错误、用量
 ▸ 💭 2 · 🔧 1                                       ← 连续的推理和工具调用合成一个折叠（小字写数量），里面依次是：
     ▸ 💭                                            ←   推理（标题只有一个小号的 💭）
