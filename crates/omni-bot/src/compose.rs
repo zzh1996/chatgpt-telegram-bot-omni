@@ -589,9 +589,11 @@ fn output_blocks(
                     let current = thinking_live && !parts[i..].iter().any(visible);
                     let open = open_thinking && current;
                     let thinking = (live && current).then(|| thinking_title(&text)).flatten();
+                    // "💭 Reasoning" (owner: back once the answer came first, 2026-11-13); while
+                    // the model thinks, also what about.
                     let title = match &thinking {
-                        Some(t) => format!("💭 {t}"),
-                        None => "💭".to_string(),
+                        Some(t) => format!("💭 Reasoning · {t}"),
+                        None => "💭 Reasoning".to_string(),
                     };
                     stretch.reasoning += 1;
                     stretch.thinking = thinking;
@@ -1120,11 +1122,11 @@ mod tests {
                 .unwrap()
         };
         // While generating: the heading; once the reply is done: a plain 💭.
-        assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭 Planning");
-        assert_eq!(title(&compose(&input(&parts, Status::Done))), "💭");
+        assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭 Reasoning · Planning");
+        assert_eq!(title(&compose(&input(&parts, Status::Done))), "💭 Reasoning");
         // Something after it (the answer): thinking is over.
         let parts = vec![reasoning("**Planning**\n\nSo"), Part::text("Answer")];
-        assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭");
+        assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭 Reasoning");
     }
 
     #[test]
@@ -1309,7 +1311,7 @@ mod tests {
         let dbg = format!("{blocks:?}");
         assert!(!dbg.contains("Underline") && !dbg.contains("Italic"), "{dbg}");
         // Reasoning collapsed; its token count (a total for the whole reply) is in the footer.
-        assert!(matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭"));
+        assert!(matches!(&blocks[1], RBlock::Details { open: false, title, .. } if title.to_plain() == "💭 Reasoning"));
         // The answer follows directly; everything after it is details/footer.
         let answer_end = blocks.iter().rposition(|b| !matches!(b, RBlock::Details { .. } | RBlock::Footer(_))).unwrap();
         for b in &blocks[2..=answer_end] {
@@ -1431,7 +1433,7 @@ mod tests {
         let parts = vec![reasoning("a"), Part::text("Ans"), reasoning("**Checking**\n\nb")];
         let blocks = compose(&input(&parts, Status::Generating));
         assert_eq!(blocks.iter().map(kind).collect::<Vec<_>>(), ["header", "p:Ans", "💭+", "footer"]);
-        assert!(matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "💭 Checking"));
+        assert!(matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "💭 Reasoning · Checking"));
         // Answers alternating with reasoning or tool calls: the order as produced.
         let parts = vec![reasoning("a"), Part::text("first"), tool_call(), Part::text("second")];
         assert_eq!(kinds(&parts, Status::Done), ["header", "💭", "p:first", "🔧", "p:second", "footer"]);

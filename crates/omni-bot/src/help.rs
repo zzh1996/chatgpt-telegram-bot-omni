@@ -415,7 +415,7 @@ Arr!
         commands: &["raw", "dump", "info", "retry", "continue"],
         who: Who::Everyone,
         body: r#"- **First line**: the platform and the model.
-- **💭** the model's reasoning. While it thinks, the title says what it is thinking about.
+- **💭 Reasoning**: the model's reasoning. While it thinks, the title also says what it is thinking about.
 - **🔧** tool calls (searches, code, pages read) with readable results. Several in a row are grouped: `💭 2 · 🔧 1`.
 - **📚 Sources**: the links the answer cites.
 - **ℹ️** a note from me, e.g. that a search was asked for but none ran.
@@ -449,7 +449,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 :::"#,
         title_zh: "📖 怎么看回答，以及针对回答的命令",
         body_zh: r#"- **第一行**：平台和模型。
-- **💭** 模型的推理。模型思考时，标题会写它此刻在想什么。
+- **💭 Reasoning**：模型的推理。模型思考时，标题后面还会写它此刻在想什么。
 - **🔧** 工具调用（搜索、代码、读取的网页），结果是可读的形式。连续的几段会合成一组：`💭 2 · 🔧 1`。
 - **📚 Sources**：回答引用的链接。
 - **ℹ️** 我加的提示，例如要求了搜索、但这次没有搜索。
