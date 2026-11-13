@@ -213,6 +213,25 @@ async fn save_checkpoint(app: &App, attempt_id: i64, cp: Option<&Checkpoint>) {
         .await;
 }
 
+/// When an attempt resumed after a restart began, and the upstream ids of its calls
+/// before the restart.
+async fn attempt_origin(app: &App, attempt_id: i64) -> (Option<i64>, Vec<String>) {
+    let row: Option<(Option<i64>, Option<String>)> = app
+        .db
+        .call(move |c| {
+            Ok(c.query_row("SELECT started_at, upstream_id FROM attempts WHERE id = ?1", params![attempt_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+        })
+        .await
+        .ok()
+        .flatten();
+    let (started, ids) = row.unwrap_or_default();
+    let ids = ids.map(|s| s.split(',').filter(|i| !i.is_empty()).map(String::from).collect()).unwrap_or_default();
+    (started, ids)
+}
+
 async fn load_checkpoint(app: &App, attempt_id: i64) -> Option<Checkpoint> {
     let s: Option<String> = app
         .db
@@ -364,6 +383,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         mode: app.cfg.render.markdown,
         prior: Vec::new(),
         previews: Vec::new(),
+        served: Vec::new(),
         retry_button: false,
         done: false,
     };
@@ -723,6 +743,15 @@ struct Sink<'a> {
     registered: Option<String>,
     /// Calls of this provider can be looked up afterwards (OpenRouter `/generation`).
     lookup_costs: bool,
+    /// What the upstream calls report about themselves (ids, served model and tier, headers).
+    meta: Arc<omni_llm::meta::Collector>,
+    /// Calls of this attempt made before a restart.
+    meta_before: Vec<omni_llm::meta::CallMeta>,
+    /// The request body and model the serving is compared with.
+    request: Value,
+    model: String,
+    /// From the attempt's start to its first output.
+    first_output: Option<Duration>,
 }
 
 impl Sink<'_> {
@@ -740,7 +769,47 @@ impl Sink<'_> {
                 s.notes.push(n.clone());
             }
         }
+        let (settings, served, notes) = self.served_view();
+        (s.settings, s.served) = (settings, served);
+        for n in notes {
+            if !s.notes.contains(&n) {
+                s.notes.push(n);
+            }
+        }
         s
+    }
+
+    /// The request settings with the served tier where it differs, the footer
+    /// facts about the serving (another model, tier, region) and notes (a
+    /// fallback, nearly exhausted rate limits).
+    fn served_view(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let sv = self.meta.served(&self.request, &self.model);
+        let mut settings = self.state.settings.clone();
+        let mut served = Vec::new();
+        if let Some((req, got)) = &sv.tier {
+            match req {
+                Some(r) => {
+                    let item = format!("tier {r}");
+                    match settings.iter_mut().find(|x| **x == item) {
+                        Some(x) => *x = format!("tier {r}→{got}"),
+                        None => served.push(format!("tier {r}→{got}")),
+                    }
+                }
+                None => served.push(format!("tier {got}")),
+            }
+        }
+        if let Some(m) = &sv.model {
+            served.push(format!("served {m}"));
+        }
+        served.extend(sv.flags);
+        (settings, served, sv.notes)
+    }
+
+    /// What the calls of this attempt reported, for `/info`.
+    fn meta_json(&self) -> Value {
+        let mut calls = self.meta_before.clone();
+        calls.extend(self.meta.calls());
+        json!({ "calls": calls, "first_output_ms": self.first_output.map(|d| d.as_millis() as u64) })
     }
 
     /// Bring the view's newest-version buffer up to date. Called for every
@@ -748,9 +817,18 @@ impl Sink<'_> {
     fn publish(&mut self) {
         let meta = std::mem::take(&mut self.meta_dirty);
         let usage = if meta { self.display_usage() } else { None };
+        let served = meta.then(|| self.served_view());
         let (acc, hops) = (&mut self.acc, self.hops);
         self.view.modify(|s| {
             acc.sync_parts(&mut s.parts);
+            if let Some((settings, served, notes)) = served {
+                (s.settings, s.served) = (settings, served);
+                for n in notes {
+                    if !s.notes.contains(&n) {
+                        s.notes.push(n);
+                    }
+                }
+            }
             if meta {
                 s.usage = usage;
                 s.previews = acc.previews.iter().map(|(_, b, d)| (b.clone(), *d)).collect();
@@ -806,13 +884,17 @@ impl Sink<'_> {
     }
 
     fn checkpoint_record(&self, item: Value, parts: Vec<Part>, at_budget: bool) -> Checkpoint {
-        let spent = self.spent_before + self.usage_done.as_ref().and_then(|u| u.output_tokens).unwrap_or(0);
+        // Everything billed so far, including the current hop up to this checkpoint (its
+        // usage arrives right before it): the call resumed after a restart is billed only
+        // from here on, so the count continues from this total.
+        let usage = self.total_usage();
+        let spent = self.spent_before + usage.as_ref().and_then(|u| u.output_tokens).unwrap_or(0);
         Checkpoint {
             item,
             parts,
-            usage: self.usage_done.clone(),
+            usage,
             hops: self.hops,
-            first_prompt: self.first_prompt,
+            first_prompt: self.first_prompt.or_else(|| self.hop_usage.as_ref().and_then(|u| u.input_tokens)),
             natives: self.natives.clone(),
             at_budget,
             append: self.append,
@@ -838,6 +920,13 @@ impl EventSink for Sink<'_> {
                 self.publish();
                 return;
             }
+            StreamEvent::Restart => {
+                // The whole output of this call comes again (recovered from a stored copy).
+                self.acc.apply(ev);
+                self.live_usage = None;
+                self.publish_full();
+                return;
+            }
             StreamEvent::Meta { upstream_id: Some(id), .. }
                 if self.lookup_costs && self.registered.as_ref() != Some(id) =>
             {
@@ -847,11 +936,16 @@ impl EventSink for Sink<'_> {
                 tokio::spawn(async move { crate::ledger::begin_call(&db, id, attempt).await });
             }
             StreamEvent::Checkpoint(item) => {
-                let parts = self.acc.parts().to_vec();
-                self.checkpoint = Some((item.clone(), parts.clone()));
-                let cp = self.checkpoint_record(item.clone(), parts, false);
+                // `null`: no longer resumable (e.g. a video job that failed for good).
+                let s = if item.is_null() {
+                    self.checkpoint = None;
+                    None
+                } else {
+                    let parts = self.acc.parts().to_vec();
+                    self.checkpoint = Some((item.clone(), parts.clone()));
+                    serde_json::to_string(&self.checkpoint_record(item.clone(), parts, false)).ok()
+                };
                 let (app, id) = (self.app, self.attempt_id);
-                let s = serde_json::to_string(&cp).ok();
                 let db = app.db.clone();
                 tokio::spawn(async move {
                     let _ = db
@@ -864,6 +958,18 @@ impl EventSink for Sink<'_> {
                 return;
             }
             _ => {}
+        }
+        if self.first_output.is_none()
+            && matches!(&ev, StreamEvent::Text(t) if !t.is_empty())
+                | matches!(
+                    &ev,
+                    StreamEvent::Reasoning { .. }
+                        | StreamEvent::Image { .. }
+                        | StreamEvent::PartialImage { .. }
+                        | StreamEvent::File { .. }
+                )
+        {
+            self.first_output = Some(self.state.started.elapsed());
         }
         let is_image = matches!(ev, StreamEvent::Image { .. } | StreamEvent::ThoughtImage { .. });
         let is_file = matches!(ev, StreamEvent::File { .. });
@@ -931,7 +1037,7 @@ async fn stream(
     provider: &str,
     p: &Prepared,
     sink: &mut dyn EventSink,
-    observer: &RawLog,
+    observer: &dyn omni_llm::Observer,
     cancel: &CancellationToken,
 ) -> (Result<Value, LlmError>, omni_llm::CallOutcome) {
     match provider {
@@ -1010,11 +1116,28 @@ async fn run_attempt(
             step: prepared.max_tokens().unwrap_or(DEFAULT_BUDGET),
             registered: None,
             lookup_costs: ctx.spec.provider == "openrouter",
+            meta: Arc::new(omni_llm::meta::Collector::new(prepared.dialect)),
+            meta_before: Vec::new(),
+            request: prepared.body.clone(),
+            model: prepared.model.clone(),
+            first_output: None,
         };
         let mut hop_req = prepared.clone();
+        let mut upstream_ids: Vec<String> = Vec::new();
         match &start {
             Start::Fresh => {}
             Start::Resume(cp) => {
+                // The same attempt goes on: its time and the calls made before the restart count.
+                let (started_at, ids) = attempt_origin(app, attempt.id).await;
+                if let Some(ms) = started_at {
+                    let ago = Duration::from_millis(crate::store::now_ms().saturating_sub(ms).max(0) as u64);
+                    sink.state.started = Instant::now().checked_sub(ago).unwrap_or_else(Instant::now);
+                }
+                upstream_ids = ids;
+                if let Ok(Some(m)) = conv::attempt_meta(&app.db, attempt.id).await {
+                    sink.meta_before = serde_json::from_value(m["calls"].clone()).unwrap_or_default();
+                    sink.first_output = m["first_output_ms"].as_u64().map(Duration::from_millis);
+                }
                 sink.acc.restore_parts(cp.parts.clone());
                 sink.usage_done = cp.usage.clone();
                 sink.hops = cp.hops;
@@ -1040,15 +1163,17 @@ async fn run_attempt(
         sink.publish_full();
         let rawlog = RawLog { blobs: app.blobs.clone() };
         let mut resumes = 0u32;
-        let mut upstream_ids: Vec<String> = Vec::new();
         let result: Result<bool, LlmError> = loop {
             sink.acc.finish_reason = None;
             sink.acc.native_finish_reason = None;
             sink.acc.finish_details = None;
             sink.acc.upstream_id = None;
             let cancel = CancellationToken::new();
+            sink.acc.begin_call();
+            let meta = sink.meta.clone();
+            let observer = meta.tee(&rawlog);
             let (result, call) = tokio::select! {
-                r = stream(app, &ctx.spec.provider, &hop_req, &mut sink, &rawlog, &cancel) => r,
+                r = stream(app, &ctx.spec.provider, &hop_req, &mut sink, &observer, &cancel) => r,
                 _ = app.shutdown.cancelled() => (Err(LlmError::cancelled()), Default::default()),
             };
             let hop_id = sink.acc.upstream_id.clone().or(call.upstream_id.clone());
@@ -1068,8 +1193,11 @@ async fn run_attempt(
                 // What the provider billed so far (e.g. Gemini up to its last checkpoint) is spent.
                 if let Some(u) = sink.end_hop() {
                     let meta = ctx.call_meta(attempt.id);
-                    let _ = crate::ledger::record_call(&app.db, &meta, hop_id.clone(), &u, "reported").await;
+                    let _ =
+                        crate::ledger::record_call(&app.db, &meta, hop_id.clone(), &u, crate::ledger::source_of(&u))
+                            .await;
                 }
+                let _ = conv::set_attempt_meta(&app.db, attempt.id, &sink.meta_json()).await;
                 // Leave the attempt "running": it is resumed (from its checkpoint, if any) after restart.
                 let out = serde_json::to_value(sink.acc.turn()).ok();
                 let up = Some(upstream_ids.join(",")).filter(|s| !s.is_empty());
@@ -1090,7 +1218,9 @@ async fn run_attempt(
             }
             if let Some(u) = sink.end_hop() {
                 let meta = ctx.call_meta(attempt.id);
-                if let Err(e) = crate::ledger::record_call(&app.db, &meta, hop_id.clone(), &u, "reported").await {
+                if let Err(e) =
+                    crate::ledger::record_call(&app.db, &meta, hop_id.clone(), &u, crate::ledger::source_of(&u)).await
+                {
                     warn!(error = %format!("{e:#}"), "failed to record usage");
                 }
             }
@@ -1161,6 +1291,7 @@ async fn run_attempt(
                 sink.acc.attach_image(b, dims, thought);
             }
         }
+        let _ = conv::set_attempt_meta(&app.db, attempt.id, &sink.meta_json()).await;
         let usage = sink.total_usage();
         let mut final_state = sink.render();
         // Previews only stand in for images still being generated.
@@ -1170,6 +1301,8 @@ async fn run_attempt(
         let spent_before = sink.spent_before;
         let natives = std::mem::take(&mut sink.natives);
         let first_prompt = sink.first_prompt;
+        // Exact, when the API reports it (also after server-side tools).
+        let context_size = sink.acc.context_size;
         let acc = sink.acc;
         match result {
             Ok(at_budget) => {
@@ -1199,9 +1332,11 @@ async fn run_attempt(
                     // The reported input counts every internal model call of a turn that used
                     // server-side tools (each search re-reads the context), far more than the
                     // conversation's size: then the next turn estimates instead.
-                    context_tokens: first_prompt
-                        .filter(|_| !turn.parts.iter().any(|p| matches!(p, Part::ToolCall(_))))
-                        .map(|p| p + spent_total),
+                    context_tokens: context_size.or_else(|| {
+                        first_prompt
+                            .filter(|_| !turn.parts.iter().any(|p| matches!(p, Part::ToolCall(_))))
+                            .map(|p| p + spent_total)
+                    }),
                 });
                 if at_budget {
                     final_state.notes.push(format!(

@@ -10,26 +10,53 @@
 //! - Summary-mode models (2.1, Evolving, 2.0-lite-260428) return a summary in
 //!   `reasoning_content` plus the encrypted original in `encrypted_content`;
 //!   both are replayed verbatim for the same model.
-//! - Images default to `detail: "xhigh"` (up to 9 MP).
+//! - Images default to `detail: "xhigh"` (up to 9 MP). Assistant messages
+//!   carry text only (`content` is a string): media other models generated in
+//!   earlier turns are not sent (a warning says what).
+//! - Web search (`+s`): Doubao Search through `web_search_options: {}`; the
+//!   model decides whether to search. Ark reports the searches it actually ran
+//!   only as a count (`usage.tool_usage.web_search`), so each becomes a
+//!   `web_search` call without query or results, where the count first shows
+//!   (before the answer if the count comes after it); the cited sources come
+//!   as `annotations` (title and URL). A searched answer whose usage reports
+//!   none says that no search ran.
 //! - Errors are `{"error":{"code","message","param","type"}}` with string codes.
-//! - No cost in responses: estimated from a CNY price table.
+//! - No cost in responses: estimated from a CNY price table, plus Doubao
+//!   Search's pay-as-you-go fee per reported search.
+//! - The served model, tier (`service_tier`) and a model fallback
+//!   (`service_status.model_fallback`) are read from the response envelope by
+//!   [`crate::meta`].
+//!
+//! Seedream image models (`doubao-seedream-…`) have no chat API: their ids go to
+//! Ark's image API ([`images`]).
+
+pub mod images;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use omni_core::Usage;
+use omni_core::content::{ToolCall, Turn};
 use omni_core::usage::CostSource;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::chatstream::EventParser;
 use crate::error::{ErrorKind, LlmError, Retry, retry_for_status};
 use crate::event::StreamEvent;
-use crate::openrouter::chat::{self, Flavor};
+use crate::openrouter::chat::{self, ChunkParser, Flavor};
 use crate::openrouter::options::Applied;
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared};
 
 pub const DIALECT: &str = "ark.chat";
 pub const DEFAULT_BASE_URL: &str = "https://ark.cn-beijing.volces.com/api/v3";
+/// Doubao Search (Custom) per executed search, pay-as-you-go: ¥0.020
+/// ("融合信息搜索Custom版-web搜索 0.020元/次", docs.volcengine.com
+/// `networked-search/online-search-product-billing`, 2026-11-13). The monthly
+/// packs are cheaper; the bot cannot see them, so this is an upper estimate.
+pub const WEB_SEARCH_CNY: f64 = 0.02;
+/// A `+s` answer whose usage reports no executed search.
+const NO_SEARCH: &str = "no web search ran (the model decides)";
 
 #[derive(Debug, Clone)]
 pub struct ArkConfig {
@@ -210,6 +237,9 @@ impl Ark {
             applied.push(Applied { source: "option".into(), patch: json!({"service_tier": t}) });
         }
         let mut warnings = Vec::new();
+        // This model's own answers are replayed (with their reasoning); other turns go as their text.
+        let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == input.model);
+        warnings.extend(crate::provider::unsent_media(input.history, own));
         if model_spec(input.model).is_none() {
             warnings.push(format!(
                 "`{}` is not in the bot's Ark model table: limits and price unknown (max_tokens {}; cost not estimated)",
@@ -242,13 +272,14 @@ impl Ark {
     ) -> (Result<Value, LlmError>, CallOutcome) {
         let rb = self.http.post(&p.url).bearer_auth(&self.cfg.api_key).json(&p.body);
         let mut priced = PricingSink { inner: sink, model: &p.model, cny_per_usd: self.cfg.cny_per_usd };
-        let crate::chatstream::Streamed { result, parser, header_id } = crate::chatstream::run(
+        let crate::chatstream::Streamed { result, parser, header_id } = crate::chatstream::run_with(
             rb,
             &p.url,
             &p.body,
             self.cfg.idle_timeout,
             Some("x-request-id"),
             error_from_json,
+            ChatParser::new(),
             &mut priced,
             observer,
             cancel,
@@ -257,7 +288,12 @@ impl Ark {
         let outcome = CallOutcome { upstream_id: header_id, ..Default::default() };
         match result {
             Err(e) => (Err(e), outcome),
-            Ok(()) => (Ok(parser.native_payload()), outcome),
+            Ok(()) => {
+                if p.body.get("web_search_options").is_some() && parser.no_search() {
+                    priced.event(StreamEvent::Notice(NO_SEARCH.into()));
+                }
+                (Ok(parser.inner.native_payload()), outcome)
+            }
         }
     }
 }
@@ -271,7 +307,7 @@ impl crate::provider::Provider for Ark {
         "Volcengine Ark"
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some()
+        model_spec(model).is_some() || images::spec(model).is_some()
     }
     async fn prepare(
         &self,
@@ -279,6 +315,9 @@ impl crate::provider::Provider for Ark {
         presets: &[crate::request::Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if images::is_image_model(input.model) {
+            return images::prepare(&self.cfg, input, presets, blobs).await;
+        }
         self.prepare_chat(input, presets, blobs).await
     }
     async fn stream(
@@ -288,19 +327,98 @@ impl crate::provider::Provider for Ark {
         observer: &dyn Observer,
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
+        if p.dialect == images::DIALECT {
+            return images::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
+        }
         self.stream_chat(p, sink, observer, cancel).await
     }
 }
 
-/// Estimated cost in USD from the list price (lowest input tier).
+/// Estimated cost in USD from the list price (lowest input tier), plus the
+/// searches the usage reports (`tool_usage.web_search`, [`WEB_SEARCH_CNY`] each).
 pub fn estimate_cost(model: &str, u: &Usage, cny_per_usd: f64) -> Option<f64> {
     let s = model_spec(model)?;
     let input = u.input_tokens? as f64;
     let output = u.output_tokens? as f64;
     let cached = u.cached_input_tokens.unwrap_or(0) as f64;
+    let searches = u.raw.pointer("/tool_usage/web_search").and_then(Value::as_u64).unwrap_or(0) as f64;
     let (pi, pc, po) = s.price_cny;
-    let cny = ((input - cached).max(0.0) * pi + cached * pc + output * po) / 1e6;
+    let cny = ((input - cached).max(0.0) * pi + cached * pc + output * po) / 1e6 + searches * WEB_SEARCH_CNY;
     (cny_per_usd > 0.0).then(|| cny / cny_per_usd)
+}
+
+// ------------------------------------------------------------------ stream
+
+/// Chat chunks, plus the searches Ark reports: `usage.tool_usage.web_search`
+/// ("本次请求内实际执行的联网搜索次数", the searches actually run), cumulative
+/// like the rest of the usage. Each new one is a `web_search` call (Ark gives
+/// no query or results): where the count rises, or before the answer when it
+/// rises after the answer began (the model answers after searching).
+struct ChatParser {
+    inner: ChunkParser,
+    /// Searches shown so far.
+    searches: u64,
+    /// Answer text has been streamed.
+    text: bool,
+    /// A usage object came (Ark sends one with every chunk).
+    usage: bool,
+    /// The answer cites search results (`annotations`).
+    cited: bool,
+    /// The finish reason.
+    finish: Option<String>,
+}
+
+impl ChatParser {
+    fn new() -> Self {
+        let mut inner = ChunkParser::default();
+        inner.map_error = Some(error_from_json);
+        Self { inner, searches: 0, text: false, usage: false, cited: false, finish: None }
+    }
+
+    /// The answer ended normally (or at the output limit) and the usage
+    /// reports no executed search (and nothing was cited).
+    fn no_search(&self) -> bool {
+        matches!(self.finish.as_deref(), Some("stop" | "length")) && self.usage && self.searches == 0 && !self.cited
+    }
+}
+
+impl EventParser for ChatParser {
+    fn event(&mut self, _name: Option<&str>, v: &Value) -> Result<Vec<StreamEvent>, LlmError> {
+        let evs = self.inner.chunk(v)?;
+        let mut out = Vec::with_capacity(evs.len() + 1);
+        if let Some(n) = v.pointer("/usage/tool_usage/web_search").and_then(Value::as_u64)
+            && n > self.searches
+        {
+            for i in self.searches + 1..=n {
+                let call = ToolCall {
+                    id: Some(format!("web_search_{i}")),
+                    name: "web_search".into(),
+                    status: Some("completed".into()),
+                    input: None,
+                    output: None,
+                };
+                out.push(if self.text { StreamEvent::ToolBefore(call) } else { StreamEvent::Tool(call) });
+            }
+            self.searches = n;
+        }
+        self.usage |= v.get("usage").is_some_and(Value::is_object);
+        for e in &evs {
+            match e {
+                StreamEvent::Text(_) => self.text = true,
+                StreamEvent::Citations(c) if !c.is_empty() => self.cited = true,
+                StreamEvent::Finish { reason: Some(r), .. } => self.finish = Some(r.clone()),
+                _ => {}
+            }
+        }
+        out.extend(evs);
+        Ok(out)
+    }
+    fn finished(&self) -> bool {
+        self.inner.finished
+    }
+    fn any_output(&self) -> bool {
+        self.inner.any_output()
+    }
 }
 
 struct PricingSink<'a> {
@@ -370,6 +488,8 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
 
 #[cfg(test)]
 mod tests {
+    use omni_core::content::{Part, Role};
+
     use super::*;
 
     #[test]
@@ -472,5 +592,253 @@ mod tests {
         let m = replay(&p);
         assert_eq!(m["reasoning_content"], "sum");
         assert_eq!(m["encrypted_content"], "abc");
+    }
+
+    const MODEL: &str = "doubao-seed-2-1-pro-260915";
+
+    /// A streamed Chat chunk with Ark's cumulative usage (`chunk_include_usage`).
+    fn chunk(delta: Value, finish: Option<&str>, prompt: u64, completion: u64, searches: Option<u64>) -> Value {
+        let mut usage = json!({"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion,
+                               "prompt_tokens_details": {"cached_tokens": 0}, "completion_tokens_details": {"reasoning_tokens": completion}});
+        if let Some(n) = searches {
+            usage["tool_usage"] = json!({"web_search": n});
+        }
+        json!({"id": "0217885", "object": "chat.completion.chunk", "created": 1788491002, "model": MODEL, "service_tier": "default",
+               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "usage": usage})
+    }
+
+    fn final_usage(prompt: u64, completion: u64, searches: Option<u64>) -> Value {
+        let mut c = chunk(json!({}), None, prompt, completion, searches);
+        c["choices"] = json!([]);
+        c
+    }
+
+    fn run(chunks: &[Value]) -> (ChatParser, crate::Accumulator, Vec<StreamEvent>) {
+        let mut p = ChatParser::new();
+        let mut acc = crate::Accumulator::new();
+        let mut all = Vec::new();
+        let model = MODEL.to_string();
+        let mut priced = |e: StreamEvent| all.push(e);
+        let mut sink = PricingSink { inner: &mut priced, model: &model, cny_per_usd: 7.0 };
+        for c in chunks {
+            for e in p.event(None, c).unwrap() {
+                sink.event(e);
+            }
+        }
+        for e in &all {
+            acc.apply(e.clone());
+        }
+        (p, acc, all)
+    }
+
+    fn kinds(acc: &crate::Accumulator) -> Vec<&'static str> {
+        acc.parts()
+            .iter()
+            .map(|p| match p {
+                Part::Reasoning(_) => "reasoning",
+                Part::ToolCall(_) => "tool",
+                Part::Text { .. } => "text",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// The count rises while the model thinks: the searches show where they ran.
+    #[test]
+    fn searches_from_the_live_usage() {
+        let (p, acc, _) = run(&[
+            chunk(json!({"role": "assistant", "reasoning_content": "需要搜索。"}), None, 40, 5, None),
+            chunk(json!({"reasoning_content": "结果显示……"}), None, 2710, 300, Some(2)),
+            chunk(json!({"content": "GPT-6 Astra 发布了。"}), None, 2710, 520, Some(2)),
+            chunk(
+                json!({"content": "", "annotations": [{"type": "url_citation", "url_citation": {"title": "OpenAI 发布 GPT-6", "url": "https://news.sina.cn/x.html"}}]}),
+                Some("stop"),
+                2710,
+                528,
+                Some(2),
+            ),
+            final_usage(2710, 528, Some(2)),
+        ]);
+        assert_eq!(kinds(&acc), ["reasoning", "tool", "tool", "reasoning", "text"]);
+        let Part::ToolCall(t) = &acc.parts()[1] else { panic!() };
+        assert_eq!(
+            (t.id.as_deref(), t.name.as_str(), t.status.as_deref()),
+            (Some("web_search_1"), "web_search", Some("completed"))
+        );
+        assert_eq!((t.input.as_ref(), t.output.as_ref()), (None, None), "Ark reports only the count");
+        let Some(Part::Text { citations, .. }) = acc.parts().last() else { panic!() };
+        assert_eq!(citations[0].title.as_deref(), Some("OpenAI 发布 GPT-6"));
+        assert!(!p.no_search());
+        // 2710 × ¥6/M + 528 × ¥30/M + 2 searches × ¥0.02, at 7 CNY/USD.
+        let cny = (2710.0 * 6.0 + 528.0 * 30.0) / 1e6 + 0.04;
+        assert!((acc.usage.unwrap().cost_usd.unwrap() - cny / 7.0).abs() < 1e-12);
+    }
+
+    /// The count only in the last usage (after the answer): the search goes before the answer.
+    #[test]
+    fn searches_reported_after_the_answer() {
+        let (_, acc, evs) = run(&[
+            chunk(json!({"role": "assistant", "reasoning_content": "想"}), None, 40, 1, None),
+            chunk(json!({"content": "答"}), None, 2710, 2, None),
+            chunk(json!({"content": ""}), Some("stop"), 2710, 2, None),
+            final_usage(2710, 2, Some(1)),
+        ]);
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::ToolBefore(_))));
+        assert_eq!(kinds(&acc), ["reasoning", "tool", "text"]);
+    }
+
+    /// `+s`, but the usage reports no search (turn 284 of 2026-11-13).
+    #[test]
+    fn no_search_reported() {
+        let (p, acc, _) = run(&[
+            chunk(json!({"role": "assistant", "content": "1.85.0"}), Some("stop"), 67, 3, None),
+            final_usage(67, 3, None),
+        ]);
+        assert!(p.no_search());
+        assert_eq!(kinds(&acc), ["text"]);
+        let (p, _, _) =
+            run(&[chunk(json!({"content": "x"}), Some("length"), 67, 3, Some(0)), final_usage(67, 3, Some(0))]);
+        assert!(p.no_search());
+        // A blocked answer is a failure: nothing to say about the search.
+        let (p, _, _) = run(&[chunk(json!({"content": ""}), Some("content_filter"), 67, 0, None)]);
+        assert!(!p.no_search());
+        // Cited search results mean a search ran, even without a count.
+        let (p, _, _) = run(&[chunk(
+            json!({"content": "x", "annotations": [{"type": "url_citation", "url_citation": {"title": "T", "url": "https://a.cn"}}]}),
+            Some("stop"),
+            67,
+            3,
+            None,
+        )]);
+        assert!(!p.no_search());
+    }
+
+    #[test]
+    fn cost_with_searches() {
+        let u = Usage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(100_000),
+            raw: json!({"tool_usage": {"web_search": 3}}),
+            ..Default::default()
+        };
+        // 6 + 3 CNY + 3 × 0.02 CNY at 7.0 CNY/USD
+        let c = estimate_cost(MODEL, &u, 7.0).unwrap();
+        assert!((c - 9.06 / 7.0).abs() < 1e-9);
+    }
+
+    /// Media other models generated in earlier turns: assistant messages carry text only.
+    #[tokio::test]
+    async fn generated_media_of_other_models_are_not_sent() {
+        let img = omni_core::BlobRef::for_bytes(b"\x89PNG", "image/png");
+        let earlier = Turn {
+            role: Role::Assistant,
+            origin: omni_core::Origin::Live,
+            parts: vec![
+                Part::text("画好了"),
+                Part::Image { blob: img.clone(), filename: None, generated: true, dims: None, thought: false },
+            ],
+            native: Some(omni_core::content::NativeOutput {
+                dialect: images::DIALECT.into(),
+                model: "doubao-seedream-5-5-261028".into(),
+                payload: json!({}),
+                context_tokens: None,
+            }),
+        };
+        let history = vec![Turn::user_text("画猫"), earlier, Turn::user_text("描述一下")];
+        let input = CallInput {
+            model: MODEL,
+            options: &[],
+            history: &history,
+            session_id: None,
+            user: None,
+            known_context: None,
+            max_tokens_override: None,
+        };
+        let p = ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap();
+        assert_eq!(
+            p.warnings,
+            vec!["1 image generated in an earlier turn was not sent: assistant messages here carry text only"]
+        );
+        assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "画好了"}));
+    }
+
+    /// One HTTP exchange on a local port: the base URL and a handle yielding the JSON body sent.
+    async fn serve(body: String) -> (String, tokio::task::JoinHandle<Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/api/v3", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let (mut buf, mut tmp) = (Vec::new(), [0u8; 8192]);
+            let sent = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                        .unwrap_or(0);
+                    while buf.len() < pos + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap();
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    break serde_json::from_slice(&buf[pos + 4..pos + 4 + len]).unwrap_or(Value::Null);
+                }
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+            sent
+        });
+        (base, server)
+    }
+
+    /// `+s` end to end: a notice when Ark reports no search; none when it ran one.
+    #[tokio::test]
+    async fn end_to_end_search_notice() {
+        let sse = |chunks: &[Value]| {
+            let mut b: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+            b.push_str("data: [DONE]\n\n");
+            b
+        };
+        let history = vec![omni_core::Turn::user_text("今天的新闻")];
+        let opts = [omni_core::trigger::OptionToken::Flag("s".into())];
+        for (searches, notice) in [(None, true), (Some(1), false)] {
+            let (base, server) = serve(sse(&[
+                chunk(json!({"role": "assistant", "content": "答"}), Some("stop"), 67, 3, searches),
+                final_usage(67, 3, searches),
+            ]))
+            .await;
+            let a = Ark::new(ArkConfig { base_url: base, ..ark().config().clone() }).unwrap();
+            let input = CallInput {
+                model: MODEL,
+                options: &opts,
+                history: &history,
+                session_id: None,
+                user: None,
+                known_context: None,
+                max_tokens_override: None,
+            };
+            let p = a.prepare_chat(&input, &[], &NoBlobs).await.unwrap();
+            let mut evs = Vec::new();
+            let (r, _) = a
+                .stream_chat(&p, &mut |e: StreamEvent| evs.push(e), &crate::NullObserver, &CancellationToken::new())
+                .await;
+            assert!(r.is_ok());
+            assert_eq!(server.await.unwrap()["web_search_options"], json!({}));
+            let notices: Vec<_> = evs
+                .iter()
+                .filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n.as_str()) } else { None })
+                .collect();
+            assert_eq!(
+                notices,
+                if notice { vec!["no web search ran (the model decides)"] } else { vec![] },
+                "{searches:?}"
+            );
+        }
     }
 }

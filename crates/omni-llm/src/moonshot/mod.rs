@@ -11,13 +11,18 @@
 //!   parameters are fixed by Moonshot (other values are errors): never sent.
 //! - **Web search** (`+s`, K3 series only): the Responses API
 //!   (`moonshot.responses`, see [`responses`]) with its server-side
-//!   `web_search` tool. Moonshot's Responses API keeps no state (`store`,
-//!   `previous_response_id` are fixed off).
+//!   `web_search` tool and its sources (`include`); they become the answer's
+//!   sources. Moonshot decides from the input whether to search: an answer
+//!   without a search says so. Moonshot's Responses API keeps no state
+//!   (`store`, `previous_response_id` are fixed off).
 //! - The output budget is `max_completion_tokens` (`max_tokens` is
 //!   deprecated); Moonshot lowers it itself when prompt + budget exceed the
 //!   window, so it never causes a context overflow.
 //! - `reasoning_content` is replayed verbatim for the same model (required
-//!   on K3: Preserved Thinking is always on).
+//!   on K3: Preserved Thinking is always on). Other assistant turns go as their
+//!   text: media other models generated there are not sent (a warning says
+//!   what; Moonshot describes its image and video parts as "用于多模态输入",
+//!   for input).
 //! - Only `data: [DONE]` ends a Chat stream ("do not use finish_reason",
 //!   Moonshot's streaming guide).
 //! - Images and videos go as base64 data URLs (public URLs are rejected by
@@ -51,6 +56,9 @@ const REQUEST_ID_HEADER: &str = "msh-request-id";
 /// One executed Responses-API web search (`web_search_call` in the output), CNY.
 /// platform.kimi.com/docs/pricing/websearch, 2026-11-12.
 pub const WEB_SEARCH_CNY: f64 = 0.03;
+/// A `+s` answer without a `web_search_call`: Moonshot judged that the input
+/// needs no search (platform.kimi.com/docs/api/responses, 2026-11-13).
+const NO_SEARCH: &str = "no web search ran (Moonshot decides from the input whether to search)";
 /// Shown with every `+s` answer (Moonshot's K3.1 Pro guide, 2026-11-12).
 const SEARCH_NOTE: &str =
     "Moonshot says its web search \"is being updated, not recommended for production workflows in the near term\"";
@@ -373,6 +381,13 @@ impl Moonshot {
             applied.push(Applied { source: "default".into(), patch: json!({"safety_identifier": u}) });
         }
         let mut warnings = Vec::new();
+        // This model's own answers are replayed (text and reasoning); other turns go as their text.
+        let own = |t: &Turn| {
+            t.native
+                .as_ref()
+                .is_some_and(|n| n.model == input.model && [DIALECT, RESPONSES_DIALECT].contains(&n.dialect.as_str()))
+        };
+        warnings.extend(crate::provider::unsent_media(input.history, own));
         if spec.is_none() {
             warnings.push(format!(
                 "`{}` is not in the bot's Moonshot model table: limits and price unknown (sent without reasoning \
@@ -424,7 +439,13 @@ impl Moonshot {
             let outcome = CallOutcome { upstream_id: header_id, ..Default::default() };
             return match result {
                 Err(e) => (Err(e), outcome),
-                Ok(()) => (Ok(parser.native_payload()), outcome),
+                Ok(()) => {
+                    let asked = p.body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "web_search"));
+                    if asked && parser.answered_without_search() {
+                        sink.event(StreamEvent::Notice(NO_SEARCH.into()));
+                    }
+                    (Ok(parser.native_payload()), outcome)
+                }
             };
         }
         let estimate = move |u: &Usage| estimate_cost(spec?, u, 0, rate);

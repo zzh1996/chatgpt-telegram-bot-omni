@@ -84,6 +84,8 @@ pub struct ComposeInput<'a> {
     pub prior: &'a [PriorAttempt],
     /// Previews of images still being generated, shown after the output.
     pub previews: &'a [(omni_core::BlobRef, Option<(u32, u32)>)],
+    /// How the reply was served where that differs from the request.
+    pub served: &'a [String],
 }
 
 /// The model output of `parts` as Markdown, exactly (reasoning in HTML comments).
@@ -193,6 +195,12 @@ fn tool_detail(t: &ToolCall) -> Option<String> {
             Value::Object(o) if depth < 3 => {
                 // Web search actions that are not searches (OpenAI, xAI).
                 let field = |k: &str| o.get(k).and_then(text);
+                // A file action (Claude's text editor): `create /tmp/plot.py`.
+                if let (Some(c), Some(p)) = (field("command"), field("path"))
+                    && !c.contains(char::is_whitespace)
+                {
+                    return Some(format!("{c} {p}"));
+                }
                 match o.get("type").and_then(Value::as_str) {
                     Some("open_page") if let Some(u) = field("url") => return Some(format!("open {u}")),
                     Some("find_in_page" | "find") if let Some(p) = field("pattern") => {
@@ -225,14 +233,19 @@ fn tool_detail(t: &ToolCall) -> Option<String> {
 /// opening (`🔧 web_search: rust release`, `🔧 web_search ×2: a; b`, mixed
 /// tools separated by ` · `), with any status other than completed.
 fn tools_title(calls: &[&ToolCall]) -> String {
-    let status = |t: &ToolCall| match t.status.as_deref() {
-        None | Some("completed" | "complete" | "success" | "succeeded" | "done") => String::new(),
-        Some(s) => format!(" ({s})"),
+    // How it ended (an exit code, an error code, a URL status), else a status other than completed.
+    let status = |t: &ToolCall| match (crate::toolview::outcome(t), t.status.as_deref()) {
+        (Some(o), _) => format!(" ({o})"),
+        (None, None | Some("completed" | "complete" | "success" | "succeeded" | "done")) => String::new(),
+        (None, Some(s)) => format!(" ({s})"),
     };
     let same = calls.len() > 1 && calls.windows(2).all(|w| w[0].name == w[1].name);
     let mut title = if same {
         let details: Vec<String> = calls.iter().filter_map(|t| tool_detail(t)).collect();
         let mut s = format!("🔧 {} ×{}", calls[0].name, calls.len());
+        let mut ends: Vec<String> = calls.iter().map(|t| status(t)).filter(|s| !s.is_empty()).collect();
+        ends.dedup();
+        s.push_str(&ends.concat());
         if !details.is_empty() {
             s.push_str(": ");
             s.push_str(&details.join("; "));
@@ -260,45 +273,141 @@ fn tool_item(t: &ToolCall) -> RItem {
         s.push_str(&format!(" [{st}]"));
     }
     let mut blocks = vec![RBlock::Paragraph(RText::bold(RText::plain(s)))];
-    if let Some(i) = &t.input {
-        blocks.push(RBlock::Pre { text: pretty(i), language: "json".into() });
-    }
-    if let Some(o) = &t.output {
-        blocks.push(RBlock::Pre { text: pretty(o), language: "json".into() });
-    }
+    // Readable where the shape is known, else the JSON (see `toolview`).
+    blocks.extend(crate::toolview::blocks(t));
     RItem { checkbox: None, blocks }
 }
 
-/// Emit the pending answer text, followed by the sources it cites.
+/// Emit the pending answer text, followed by the sources it cites: a fold of
+/// the links (with the quoted passage when the provider gives one), cited
+/// documents without a link (a PDF page), and Google's Search Suggestions as a
+/// visible line (Google's terms: grounded answers are shown with them).
 fn flush_answer(out: &mut Vec<RBlock>, answer: &mut String, citations: &mut Vec<Citation>, raw: bool, depth: usize) {
     if !answer.trim().is_empty() {
         out.extend(ai_blocks(answer, raw, depth));
     }
     answer.clear();
     let mut seen = std::collections::HashSet::new();
-    let sources: Vec<Citation> =
-        citations.drain(..).filter(|c| c.url.as_ref().is_some_and(|u| seen.insert(u.clone()))).collect();
-    if sources.is_empty() {
-        return;
+    let mut sources: Vec<Citation> = Vec::new();
+    let mut suggestions: Vec<(String, String)> = Vec::new();
+    for c in citations.drain(..) {
+        if let Some(sg) = c.extra.as_ref().and_then(|e| e.get("searchSuggestion")) {
+            let label = sg.get("text").and_then(|x| x.as_str()).map(str::to_string);
+            if let (Some(label), Some(url)) = (label, c.url.clone())
+                && seen.insert(format!("suggestion {url}"))
+            {
+                suggestions.push((label, url));
+            }
+            continue;
+        }
+        let key = match &c.url {
+            Some(u) => u.clone(),
+            None if c.title.is_some() || c.cited_text.is_some() => {
+                format!("{}\u{0}{}", c.title.as_deref().unwrap_or(""), c.cited_text.as_deref().unwrap_or(""))
+            }
+            None => continue,
+        };
+        if seen.insert(key) {
+            sources.push(c);
+        }
     }
-    let items = sources
-        .iter()
-        .map(|c| {
-            let url = c.url.clone().unwrap_or_default();
-            let title = c.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| url.clone());
-            let link = if omni_markdown::render::is_safe_url(&url) {
-                RText::Url { text: Box::new(RText::plain(title)), url }
+    if !sources.is_empty() {
+        let items = sources
+            .iter()
+            .map(|c| {
+                let mut line = match &c.url {
+                    Some(url) => {
+                        let title = c
+                            .title
+                            .as_deref()
+                            .map(plain_title)
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| url.clone());
+                        if omni_markdown::render::is_safe_url(url) {
+                            RText::Url { text: Box::new(RText::plain(title)), url: url.clone() }
+                        } else {
+                            RText::plain(title)
+                        }
+                    }
+                    None => RText::plain(c.title.clone().unwrap_or_else(|| "document".into())),
+                };
+                if let Some(at) = citation_place(c) {
+                    line = RText::Concat(vec![line, RText::plain(format!(" · {at}"))]);
+                }
+                let mut blocks = vec![RBlock::Paragraph(line)];
+                if let Some(q) = c.cited_text.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                    let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let q = if q.chars().count() > 150 {
+                        format!("{}…", q.chars().take(149).collect::<String>())
+                    } else {
+                        q
+                    };
+                    blocks.push(RBlock::Footer(RText::plain(format!("“{q}”"))));
+                }
+                RItem { checkbox: None, blocks }
+            })
+            .collect();
+        out.push(RBlock::Details {
+            open: false,
+            title: RText::plain(format!("📚 Sources · {}", sources.len())),
+            blocks: vec![RBlock::OrderedList { start: 1, items }],
+        });
+    }
+    if !suggestions.is_empty() {
+        let mut line = vec![RText::plain("Google Search: ")];
+        for (i, (label, url)) in suggestions.into_iter().enumerate() {
+            if i > 0 {
+                line.push(RText::plain(" · "));
+            }
+            line.push(if omni_markdown::render::is_safe_url(&url) {
+                RText::Url { text: Box::new(RText::plain(label)), url }
             } else {
-                RText::plain(title)
-            };
-            RItem { checkbox: None, blocks: vec![RBlock::Paragraph(link)] }
-        })
-        .collect();
-    out.push(RBlock::Details {
-        open: false,
-        title: RText::plain(format!("📚 Sources · {}", sources.len())),
-        blocks: vec![RBlock::OrderedList { start: 1, items }],
-    });
+                RText::plain(label)
+            });
+        }
+        out.push(RBlock::Footer(RText::Concat(line)));
+    }
+}
+
+/// A source title as text: some providers send markup in it (Google's image
+/// search: `<b>Oriental Pearl Tower</b> - Wikipedia`, `Shanghai&#39;s`); the
+/// raw title stays in `/dump`.
+fn plain_title(t: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in t.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    if in_tag {
+        // Not a tag after all (`a < b`): keep the text as it was.
+        return t.to_string();
+    }
+    for (e, c) in [("&#39;", "'"), ("&quot;", "\""), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " "), ("&amp;", "&")] {
+        out = out.replace(e, c);
+    }
+    out
+}
+
+/// Where in a cited document the passage is, when the provider says: a page
+/// (`p. 3`, `pp. 3–4`) or another location it names.
+fn citation_place(c: &Citation) -> Option<String> {
+    let e = c.extra.as_ref()?;
+    let n = |k: &str| e.get(k).and_then(|v| v.as_u64());
+    match (n("start_page_number"), n("end_page_number")) {
+        // Claude: the end page is exclusive.
+        (Some(a), Some(b)) if b > a + 1 => return Some(format!("pp. {a}–{}", b - 1)),
+        (Some(a), _) => return Some(format!("p. {a}")),
+        _ => {}
+    }
+    if let Some(p) = n("page") {
+        return Some(format!("p. {p}"));
+    }
+    e.get("location").and_then(|v| v.as_str()).map(str::to_string)
 }
 
 /// The model's output, strictly in the order it was produced: reasoning, tool
@@ -505,7 +614,9 @@ fn usage_parts(u: &Usage) -> Vec<String> {
         f.push(s);
     }
     if let Some(c) = u.cost_usd {
-        f.push(fmt_cost(c));
+        // `≈`: estimated from the bot's price table, not reported by the API.
+        let approx = if u.cost_source == omni_core::usage::CostSource::Estimated { "≈" } else { "" };
+        f.push(format!("{approx}{}", fmt_cost(c)));
     }
     f
 }
@@ -592,6 +703,7 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     if let Some(p) = inp.provider {
         f.push(format!("via {p}"));
     }
+    f.extend(inp.served.iter().cloned());
     if inp.hops > 0 {
         f.push(format!("long decode: {} hops", inp.hops + 1));
     }
@@ -807,6 +919,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_titles_lose_markup() {
+        assert_eq!(plain_title("<b>Oriental Pearl Tower</b> - Wikipedia"), "Oriental Pearl Tower - Wikipedia");
+        assert_eq!(plain_title("Shanghai&#39;s modern icon &amp; more"), "Shanghai's modern icon & more");
+        assert_eq!(plain_title("a < b"), "a < b");
+    }
+
+    #[test]
     fn tool_fold_titles_say_what_ran() {
         let call = |name: &str, input: serde_json::Value, status: &str| ToolCall {
             id: None,
@@ -894,6 +1013,7 @@ mod tests {
             continuation: false,
             attachments: &[],
             settings: &[],
+            served: &[],
             prior: &[],
             previews: &[],
         }

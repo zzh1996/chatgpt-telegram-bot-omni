@@ -7,6 +7,15 @@
 //! - `store: false` + `include: ["reasoning.encrypted_content"]`; earlier
 //!   turns of the same model replay all their output items verbatim
 //!   (reasoning with its encrypted content, messages, server tool calls).
+//!   Other assistant turns are an assistant message with their text and
+//!   their media where xAI takes them (a message's content takes
+//!   `input_image` and `input_file` whatever its role, `openapi.json`):
+//!   JPEG/PNG images, PDF and text files; what it cannot take (video, audio,
+//!   other files) is said in a warning. A broken stream is not recovered
+//!   from a stored copy as on OpenAI: xAI documents `GET
+//!   /v1/responses/{id}` for stored responses, but not that a response whose
+//!   stream broke is finished and stored, and advises against storing
+//!   requests with images ("the request may fail").
 //! - Defaults (D3): the model's highest `reasoning.effort` (grok-4.7/4.6
 //!   `xhigh`, grok-4.5 `high`, grok-4.3 `xhigh`); models without effort
 //!   levels get none. No `reasoning.summary`: xAI takes it "only for
@@ -15,19 +24,38 @@
 //!   (no output limit is documented): it is sent up to the context window.
 //!   Images at `detail: "high"`.
 //! - `+s` → `web_search` (+ `include: web_search_call.action.sources`), `+c`
-//!   → `code_interpreter` (+ `include: code_interpreter_call.outputs`). xAI's
-//!   `x_search` is not in the option vocabulary; there is no URL fetching.
+//!   → `code_interpreter` (+ `include: code_interpreter_call.outputs`), `+i`
+//!   → `image_generation` (docs.x.ai "Image Generation Tool": Grok Imagine
+//!   images inside the conversation, generated or edited; the tool takes no
+//!   size, ratio or quality — Grok picks the ratio, asked for in the prompt —
+//!   and streams no previews; its `image_generation_call` items carry the
+//!   image and the prompt Grok wrote, and replay in later turns, so a reply
+//!   edits in context). xAI's `x_search` is not in the option vocabulary;
+//!   there is no URL fetching.
 //!   `tier=priority` / `tier=fast` (the same, 2× price) → `service_tier`.
+//! - Bare Grok Imagine ids (`grok-imagine-image…`, `grok-imagine-video…`) go
+//!   to the Imagine image and video APIs instead ([`imagine`]).
 //! - `safety_identifier` = the hashed user, `prompt_cache_key` = the
 //!   conversation (routes it to the same server: cache hits).
-//! - Files: PDF and text-based files as inline `input_file`s, which xAI
-//!   reads with its `attachment_search` tool; other documents, audio and
-//!   video are errors.
+//! - Files: PDF and text-based files as inline `input_file`s; other
+//!   documents, audio and video are errors. xAI's docs say attached files
+//!   are read by its `attachment_search` tool (billed per call), but inline
+//!   files did not trigger it (2026-11-13): a notice says so only when the
+//!   usage reports document searches.
+//! - The conversation's exact size after a turn is `usage.context_details`
+//!   (input + output of the latest context, also after server-side tools),
+//!   kept for budgeting the next turn.
 //! - Cost: as billed (`usage.cost_in_usd_ticks`), else estimated from the
-//!   price table. Usage `output_tokens` exclude reasoning on xAI: normalized
-//!   to include it, as everywhere else.
+//!   price table. Usage `output_tokens` include the reasoning tokens in every
+//!   response seen (`total_tokens` = input + output; the REST reference's
+//!   example still counts them apart, which the total shows: see
+//!   [`wire::usage_from`]).
 //! - Errors: HTTP bodies are `{"code", "error"}` (probed 2026-11-12), kept
 //!   verbatim; billing 429s ("credits", "spending limit") are never retried.
+
+pub mod imagine;
+
+use std::time::Duration;
 
 use omni_core::Usage;
 use serde_json::{Value, json};
@@ -144,7 +172,7 @@ impl RouteCaps for Caps {
         NAME
     }
     fn tool(&self, tool: Tool) -> bool {
-        matches!(tool, Tool::Search | Tool::Code)
+        matches!(tool, Tool::Search | Tool::Code | Tool::Image)
     }
     fn efforts(&self) -> Option<Vec<String>> {
         let levels = match self.0 {
@@ -174,12 +202,14 @@ impl RouteCaps for Caps {
 pub struct Xai {
     cfg: DirectConfig,
     http: reqwest::Client,
+    /// How often video jobs are polled.
+    poll: Duration,
 }
 
 impl Xai {
     pub fn new(cfg: DirectConfig) -> anyhow::Result<Self> {
         let http = cfg.http()?;
-        Ok(Self { cfg, http })
+        Ok(Self { cfg, http, poll: imagine::POLL_EVERY })
     }
 
     async fn build(
@@ -199,10 +229,30 @@ impl Xai {
         if req.providers.is_some() {
             return Err(LlmError::request(format!("`p=` (provider choice) does not apply to {NAME}")));
         }
-        request::validate(model, &req, &Caps(spec)).map_err(LlmError::request)?;
+        // Bare Grok Imagine models: the Imagine APIs, no chat model.
+        if imagine::is_image_model(model) {
+            return imagine::prepare_image(&self.cfg, input, &req, &user, blobs).await;
+        }
+        if imagine::is_video_model(model) {
+            return imagine::prepare_video(&self.cfg, input, &req, &user, blobs).await;
+        }
+        // Sizes and ratios: `request::official` knows them only for Gemini.
+        let mut checked = req.clone();
+        checked.image_size = None;
+        checked.aspect_ratio = None;
+        request::validate(model, &checked, &Caps(spec)).map_err(LlmError::request)?;
+        if req.image_size.is_some() || req.aspect_ratio.is_some() {
+            return Err(LlmError::request(if req.tools.contains(&Tool::Image) {
+                "xAI's image generation tool takes no image size or aspect ratio: Grok picks the ratio (ask for it \
+                 in the prompt), or use a grok-imagine-image model"
+                    .to_string()
+            } else {
+                format!("`{model}` has no image size/aspect options")
+            }));
+        }
 
         let inputs = wire::Inputs { platform: Platform::Xai, model, image_detail: "high" };
-        let mut conv = wire::convert_history(input.history, &inputs, blobs).await?;
+        let conv = wire::convert_history(input.history, &inputs, blobs).await?;
         let mut body = json!({"model": model, "input": conv.input, "stream": true, "store": false});
         let src = |by_user: bool| if by_user { "option" } else { "default" };
         let mut applied = Vec::new();
@@ -248,19 +298,22 @@ impl Xai {
         let mut tools = Vec::new();
         for &t in &req.tools {
             let (tool, inc) = match t {
-                Tool::Search => (json!({"type": "web_search"}), "web_search_call.action.sources"),
-                Tool::Code => (json!({"type": "code_interpreter"}), "code_interpreter_call.outputs"),
-                Tool::Fetch | Tool::Maps | Tool::Image => {
+                Tool::Search => (json!({"type": "web_search"}), Some("web_search_call.action.sources")),
+                Tool::Code => (json!({"type": "code_interpreter"}), Some("code_interpreter_call.outputs")),
+                // The image comes in the `image_generation_call` item itself.
+                Tool::Image => (json!({"type": "image_generation"}), None),
+                Tool::Fetch | Tool::Maps => {
                     return Err(LlmError::request(format!("`{model}` has no {} (`+{}`)", t.describe(), t.letter())));
                 }
             };
-            applied.push(Applied {
-                source: src(user.tools.contains(&t)).into(),
-                patch: json!({"tools": [tool], "include": [inc]}),
-            });
+            let patch = match inc {
+                Some(inc) => json!({"tools": [tool], "include": [inc]}),
+                None => json!({"tools": [tool]}),
+            };
+            applied.push(Applied { source: src(user.tools.contains(&t)).into(), patch });
             settings.push(t.describe().to_string());
             tools.push(tool);
-            include.push(inc);
+            include.extend(inc);
         }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
@@ -276,12 +329,6 @@ impl Xai {
         if conv.images > 0 {
             applied.push(Applied { source: "default".into(), patch: json!({"input_image": {"detail": "high"}}) });
         }
-        if conv.files > 0 {
-            conv.notes.push(
-                "📎 xAI reads attached files through its attachment_search tool (a server-side search, billed per call)"
-                    .into(),
-            );
-        }
         if let Some(u) = &input.user {
             body["safety_identifier"] = json!(u);
         }
@@ -296,6 +343,7 @@ impl Xai {
                 body.get("max_output_tokens").map(|v| v.to_string()).unwrap_or_else(|| "not set".into())
             ));
         }
+        warnings.extend(conv.warnings);
         Ok(Prepared {
             dialect: DIALECT,
             model: model.to_string(),
@@ -324,7 +372,7 @@ impl Provider for Xai {
         NAME
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some()
+        model_spec(model).is_some() || imagine::image_spec(model).is_some() || imagine::video_spec(model).is_some()
     }
     async fn prepare(
         &self,
@@ -341,9 +389,32 @@ impl Provider for Xai {
         observer: &dyn Observer,
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
-        wire::stream(&self.http, &self.cfg.api_key, self.cfg.idle_timeout, &WIRE, p, sink, observer, cancel).await
+        match p.dialect {
+            imagine::IMAGE_DIALECT => imagine::stream_image(&self.http, &self.cfg, p, sink, observer, cancel).await,
+            imagine::VIDEO_DIALECT => {
+                imagine::stream_video(&self.http, &self.cfg, self.poll, p, sink, observer, cancel).await
+            }
+            _ => {
+                let run = wire::Run {
+                    http: &self.http,
+                    api_key: &self.cfg.api_key,
+                    idle_timeout: self.cfg.idle_timeout,
+                    recovery: None,
+                };
+                wire::stream(&run, &WIRE, p, sink, observer, cancel).await
+            }
+        }
     }
 }
+
+/// The request that resumes a video job after a restart or a dropped
+/// connection (see [`imagine::continuation_request`]).
+pub fn video_continuation(p: &Prepared, item: &Value) -> Prepared {
+    imagine::continuation_request(p, item)
+}
+
+/// The dialect of xAI's video jobs (resumable from a checkpoint).
+pub const VIDEO_DIALECT: &str = imagine::VIDEO_DIALECT;
 
 // ------------------------------------------------------------------ cost
 
@@ -351,6 +422,10 @@ impl Provider for Xai {
 const LONG_CONTEXT_FROM: u64 = 200_000;
 /// web_search, code_interpreter, attachment_search: $5 / 1k calls.
 const TOOL_CALL: f64 = 0.005;
+/// image_generation: "Imagine API rates" — grok-imagine-image-2.0's lowest
+/// tier ($0.04 per image) as the estimate (a lower bound; xAI reports the
+/// billed cost anyway).
+const IMAGE_TOOL_CALL: f64 = 0.04;
 
 /// Estimated cost in USD, for responses without `cost_in_usd_ticks`: tokens
 /// (long context, priority 2× when the response reports it) and the server
@@ -368,7 +443,8 @@ pub fn estimate_cost(model: &str, response: &Value, u: &Usage) -> Option<f64> {
     let tools = (n("web_search_calls") + n("code_interpreter_calls") + n("document_search_calls")) * TOOL_CALL
         + n("file_search_calls") * 0.0025
         + n("x_posts_fetched") * 0.005
-        + n("x_users_fetched") * 0.01;
+        + n("x_users_fetched") * 0.01
+        + n("image_generation_calls") * IMAGE_TOOL_CALL;
     Some(tokens + tools)
 }
 
@@ -401,7 +477,7 @@ pub fn error_from_json(err: &Value, status: Option<u16>, retry_after: Option<u64
 }
 
 /// HTTP errors: the `code` of the body (kept whole in `details`) as the type.
-fn refine(mut e: LlmError) -> LlmError {
+pub(crate) fn refine(mut e: LlmError) -> LlmError {
     if e.error_type.is_none()
         && let Some(code) = e.details.as_ref().and_then(|d| d.get("code")).and_then(Value::as_str)
     {
@@ -417,10 +493,10 @@ mod tests {
     use super::*;
     use crate::StreamEvent;
     use crate::openai::wire::tests::{MemBlobs, file, photo, serve, user};
-    use omni_core::Turn;
     use omni_core::content::{Part, ReasoningKind};
     use omni_core::trigger::OptionToken;
     use omni_core::usage::CostSource;
+    use omni_core::{BlobRef, Turn};
 
     fn cfg(base: &str) -> DirectConfig {
         DirectConfig {
@@ -568,7 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_and_the_attachment_search_note() {
+    async fn media_and_no_attachment_search_note_before_one_ran() {
         let (img, b1) = photo("image/png", b"\x89PNG");
         let (pdf, b2) = file("r.pdf", "application/pdf", b"%PDF");
         let blobs = MemBlobs(vec![b1, b2]);
@@ -577,7 +653,8 @@ mod tests {
         let content = &p.body["input"][0]["content"];
         assert_eq!(content[1]["detail"], "high");
         assert_eq!(content[2]["type"], "input_file");
-        assert!(p.notes[0].contains("attachment_search"), "{:?}", p.notes);
+        // Inline files did not trigger attachment_search (2026-11-13): said only when the usage reports it.
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
         assert!(p.applied.iter().any(|a| a.patch == json!({"input_image": {"detail": "high"}})));
     }
 
@@ -670,7 +747,8 @@ mod tests {
                 "usage": {"input_tokens": 900, "input_tokens_details": {"cached_tokens": 100}, "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 300},
                     "total_tokens": 1220, "num_sources_used": 0, "num_server_side_tools_used": 1, "cost_in_usd_ticks": 158500000,
                     "server_side_tool_usage_details": {"web_search_calls": 1, "x_search_calls": 0, "x_posts_fetched": 0, "x_users_fetched": 0,
-                        "code_interpreter_calls": 0, "file_search_calls": 0, "mcp_calls": 0, "document_search_calls": 0, "image_generation_calls": 0}}}}),
+                        "code_interpreter_calls": 0, "file_search_calls": 0, "mcp_calls": 0, "document_search_calls": 0, "image_generation_calls": 0},
+                    "context_details": {"input_tokens": 612, "output_tokens": 320}}}}),
         ];
         // xAI's OpenAPI text promises a `data: [DONE]` terminator: both are handled.
         let mut chunks: Vec<String> = events.iter().map(|e| format!("data: {e}\n\n")).collect();
@@ -692,6 +770,9 @@ mod tests {
         assert_eq!((usage.output_tokens, usage.reasoning_tokens), (Some(320), Some(300)));
         assert!((usage.cost_usd.unwrap() - 0.01585).abs() < 1e-12);
         assert_eq!(usage.cost_source, CostSource::Reported);
+        // The conversation's size after the turn, also after a search (not the billed 900 + 20).
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::ContextSize(932))));
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))), "no attachment_search ran");
         let mut acc = crate::Accumulator::new();
         evs.into_iter().for_each(|e| acc.apply(e));
         let parts = acc.parts();
@@ -713,5 +794,167 @@ mod tests {
         let next = prep_with(&xai(), "grok-4.7", &[], &history, &MemBlobs(vec![])).await;
         assert_eq!(next.body["input"].as_array().unwrap()[1..4], native["output"].as_array().unwrap()[..]);
         assert_eq!(next.body["input"].as_array().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_image_generation_tool_on_chat_models() {
+        let p = prep("grok-4.7", &[flag("si")]).await;
+        assert_eq!(p.body["tools"], json!([{"type": "web_search"}, {"type": "image_generation"}]));
+        assert_eq!(p.body["include"], json!(["reasoning.encrypted_content", "web_search_call.action.sources"]));
+        assert_eq!(p.settings, vec!["effort xhigh", "web search", "image generation"]);
+        assert!(p.applied.iter().any(|a| a.patch == json!({"tools": [{"type": "image_generation"}]})));
+        // The tool takes no size, ratio, quality or background.
+        assert!(err("grok-4.7", &[flag("iW")]).await.contains("takes no image size or aspect ratio"));
+        assert!(
+            err("grok-4.7", &[flag("i"), kv("q", "medium")])
+                .await
+                .contains("does not take an image quality (`q=`) via xAI")
+        );
+        assert!(err("grok-4.7", &[flag("i"), kv("bg", "opaque")]).await.contains("(`bg=`) via xAI"));
+        assert!(err("grok-4.7", &[flag("i"), kv("n", "2")]).await.contains("(`n=`) via xAI"));
+        // Bare Grok Imagine ids go to the Imagine APIs.
+        assert_eq!(prep("grok-imagine-image-2.0", &[]).await.dialect, imagine::IMAGE_DIALECT);
+        assert_eq!(prep("grok-imagine-video-1.5", &[]).await.dialect, imagine::VIDEO_DIALECT);
+        assert!(xai().knows("grok-imagine-video-1.5-preview") && xai().knows("grok-imagine-image"));
+    }
+
+    #[tokio::test]
+    async fn generated_images_stream_as_tool_calls_and_replay() {
+        let p = prep("grok-4.7", &[flag("i")]).await;
+        let jpeg = crate::provider::b64(b"\xff\xd8\xff\xe0-corgi");
+        let item = json!({"type": "image_generation_call", "id": "ig_d817_call-a1", "status": "completed",
+            "prompt": "A corgi surfing a big wave, Japanese woodblock print style", "result": jpeg});
+        let message = json!({"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": "Here you go.", "annotations": [], "logprobs": []}]});
+        let events = [
+            json!({"type": "response.created", "response": {"id": "r-1", "model": "grok-4.7", "status": "in_progress", "output": []}}),
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "image_generation_call", "id": "ig_d817_call-a1", "status": "in_progress"}}),
+            json!({"type": "response.image_generation_call.in_progress", "output_index": 0, "item_id": "ig_d817_call-a1"}),
+            json!({"type": "response.image_generation_call.generating", "output_index": 0, "item_id": "ig_d817_call-a1"}),
+            json!({"type": "response.image_generation_call.completed", "output_index": 0, "item_id": "ig_d817_call-a1"}),
+            json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+            json!({"type": "response.output_text.delta", "output_index": 1, "item_id": "msg_1", "content_index": 0, "delta": "Here you go."}),
+            json!({"type": "response.completed", "response": {"id": "r-1", "status": "completed", "output": [item, message],
+                "usage": {"input_tokens": 500, "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 90}, "total_tokens": 600,
+                    "num_server_side_tools_used": 1, "cost_in_usd_ticks": 420_000_000,
+                    "server_side_tool_usage_details": {"web_search_calls": 0, "image_generation_calls": 1}}}}),
+        ];
+        let chunks: Vec<String> = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        let (base, _) = serve(200, "text/event-stream", "", chunks).await;
+        let x = Xai::new(cfg(&base)).unwrap();
+        let p = Prepared { url: x.cfg.url("/responses"), ..p };
+        let mut evs = Vec::new();
+        let mut sink = |e: StreamEvent| evs.push(e);
+        let (r, _) = x.stream(&p, &mut sink, &crate::NullObserver, &CancellationToken::new()).await;
+        let native = r.unwrap();
+        // The JPEG where the call finished, then the answer; no previews on xAI.
+        let at = |f: &dyn Fn(&StreamEvent) -> bool| evs.iter().position(f).unwrap();
+        let image = at(&|e| matches!(e, StreamEvent::Image { mime, .. } if mime == "image/jpeg"));
+        let text = at(&|e| matches!(e, StreamEvent::Text(_)));
+        assert!(image < text);
+        assert!(matches!(&evs[image + 1], StreamEvent::PreviewDone { slot } if slot == "ig_d817_call-a1"));
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::PartialImage { .. })));
+        let usage =
+            evs.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(u.clone()) } else { None }).unwrap();
+        assert_eq!((usage.cost_usd, usage.cost_source), (Some(0.042), CostSource::Reported));
+        let mut acc = crate::Accumulator::new();
+        evs.into_iter().for_each(|e| acc.apply(e));
+        let Part::ToolCall(t) = &acc.parts()[0] else { panic!("{:?}", acc.parts()) };
+        assert_eq!(t.name, "image_generation");
+        assert_eq!(t.status.as_deref(), Some("completed"));
+        assert_eq!(t.input, Some(json!("A corgi surfing a big wave, Japanese woodblock print style")));
+        // Replayed verbatim (with its image) on the next turn.
+        let mut turn = acc.turn();
+        turn.native = Some(omni_core::content::NativeOutput {
+            dialect: DIALECT.into(),
+            model: "grok-4.7".into(),
+            payload: native,
+            context_tokens: None,
+        });
+        let history = vec![Turn::user_text("a corgi"), turn, Turn::user_text("now at night")];
+        let next = prep_with(&xai(), "grok-4.7", &[flag("i")], &history, &MemBlobs(vec![])).await;
+        assert_eq!(next.body["input"][1], item);
+    }
+
+    #[test]
+    fn the_context_size_and_document_searches_come_with_the_usage() {
+        fn none(_: &str, _: &Value, _: &Usage) -> Option<f64> {
+            None
+        }
+        let terminal = |usage: Value| {
+            let mut p = wire::Parser::new(Platform::Xai, "grok-4.3", none, error_from_json);
+            p.event(&json!({"type": "response.completed", "response": {"id": "r", "status": "completed", "output": [], "usage": usage}}))
+                .unwrap()
+        };
+        // Turn 279 (grok-4.3 +s, 2026-11-13): billed 19,962 in over three searches, the context 12,708 + 171.
+        let evs = terminal(
+            json!({"input_tokens": 19962, "input_tokens_details": {"cached_tokens": 6400}, "output_tokens": 526,
+            "output_tokens_details": {"reasoning_tokens": 422}, "total_tokens": 20488, "num_sources_used": 0, "num_server_side_tools_used": 3,
+            "cost_in_usd_ticks": 345475000, "server_side_tool_usage_details": {"web_search_calls": 3, "x_search_calls": 0,
+                "x_posts_fetched": 0, "x_users_fetched": 0, "code_interpreter_calls": 0, "file_search_calls": 0, "mcp_calls": 0,
+                "document_search_calls": 0, "image_generation_calls": 0},
+            "context_details": {"input_tokens": 12708, "output_tokens": 171}}),
+        );
+        assert!(matches!(&evs[0], StreamEvent::ContextSize(12879)));
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))));
+        // Files read by attachment_search: said, with the count (billed per call).
+        let evs = terminal(json!({"input_tokens": 3000, "output_tokens": 50, "total_tokens": 3050,
+            "server_side_tool_usage_details": {"document_search_calls": 2}}));
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Notice(n)
+            if n == "📎 xAI searched the attached files with its attachment_search tool (2 searches, billed per call)")));
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::ContextSize(_))), "none reported");
+    }
+
+    #[tokio::test]
+    async fn media_of_other_answers_go_in_the_assistant_message() {
+        let (png, png_bytes) = (BlobRef::for_bytes(b"\x89PNG-gen", "image/png"), b"\x89PNG-gen".to_vec());
+        let webp = BlobRef::for_bytes(b"RIFF----WEBPVP8 ", "image/webp");
+        let (pdf, pdf_bytes) = (BlobRef::for_bytes(b"%PDF-1.7", "application/pdf"), b"%PDF-1.7".to_vec());
+        let video = BlobRef::for_bytes(b"....ftypmp42", "video/mp4");
+        let other = Turn {
+            role: omni_core::Role::Assistant,
+            origin: omni_core::Origin::Live,
+            parts: vec![
+                Part::text("Here it is:"),
+                Part::Image { blob: png.clone(), filename: None, generated: true, dims: None, thought: false },
+                Part::Image { blob: webp, filename: None, generated: true, dims: None, thought: false },
+                Part::File { blob: pdf.clone(), filename: Some("report.pdf".into()), generated: true },
+                Part::File { blob: video, filename: Some("v.mp4".into()), generated: true },
+                Part::text("Enjoy."),
+            ],
+            native: None,
+        };
+        let history = vec![Turn::user_text("draw"), other, Turn::user_text("now blue")];
+        let blobs = MemBlobs(vec![(png, png_bytes), (pdf, pdf_bytes)]);
+        let p = prep_with(&xai(), "grok-4.7", &[], &history, &blobs).await;
+        let a = &p.body["input"][1];
+        assert_eq!(a["role"], "assistant");
+        let content = a["content"].as_array().unwrap();
+        let kinds: Vec<&str> = content.iter().map(|c| c["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["output_text", "input_image", "input_file", "output_text"]);
+        assert_eq!(content[1]["detail"], "high");
+        assert_eq!(
+            (content[2]["filename"].clone(), content[2]["mime_type"].clone()),
+            (json!("report.pdf"), json!("application/pdf"))
+        );
+        assert_eq!(
+            p.warnings,
+            [
+                "1 image from earlier answers was not sent: xAI takes JPEG or PNG images of up to 20 MiB",
+                "1 video from earlier answers was not sent: xAI takes no video input"
+            ]
+        );
+        // Text only: as before.
+        let history = vec![Turn::user_text("hi"), Turn::assistant_text("hello"), Turn::user_text("more")];
+        let p = prep_with(&xai(), "grok-4.7", &[], &history, &MemBlobs(vec![])).await;
+        assert_eq!(p.body["input"][1], json!({"type": "message", "role": "assistant", "content": "hello"}));
+        assert!(p.warnings.is_empty());
+    }
+
+    #[test]
+    fn image_tool_calls_are_estimated_without_a_billed_cost() {
+        let raw = json!({"server_side_tool_usage_details": {"image_generation_calls": 2}});
+        let c = estimate_cost("grok-4.7", &json!({}), &usage(0, 0, raw)).unwrap();
+        assert!((c - 0.08).abs() < 1e-9, "{c}");
     }
 }

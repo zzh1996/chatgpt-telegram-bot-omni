@@ -20,6 +20,7 @@ mod rawlog;
 mod reply;
 mod store;
 mod tg;
+mod toolview;
 mod view;
 
 use std::collections::{BTreeMap, HashSet};

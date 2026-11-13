@@ -5,11 +5,23 @@
 //! - in-band `error` events are classified with Anthropic's error types;
 //! - thinking text is a summary (the API never returns the raw chain of
 //!   thought): reasoning events are `ReasoningKind::Summary`;
-//! - tool results get a readable summary (search hits, fetched page, stdout,
-//!   error codes) without the opaque encrypted content, and failed results
-//!   are marked `failed`;
+//! - tool results are their API objects without the opaque encrypted content
+//!   (search hits, the fetched page without its body, stdout/stderr/return
+//!   code/`abort_reason` and output `file_id`s, file views and edits, error
+//!   codes), and failed results are marked `failed`; a call made by code
+//!   execution (programmatic tool calling, dynamic filtering: `caller.type`
+//!   other than `direct`) has its `caller` in the tool call's input;
+//! - citations of every kind: web search results (url, title, cited text),
+//!   and locations in documents (`char_location`, `page_location`,
+//!   `content_block_location`; user documents and pages fetched by
+//!   `web_fetch`) with the document's title, the fetched page's URL when the
+//!   document is one, the cited text, and the location in `extra`;
 //! - the upstream id is the `request-id` header (support uses it), not the
-//!   message id;
+//!   message id, which is kept in the native payload (`id`) for the next
+//!   turn's cache diagnostics; a cache miss the diagnostics attribute to a
+//!   change (`*_changed`) is a notice, the rest stays in the response (`/info`);
+//! - a refusal's `stop_details` (category, explanation) make the call's
+//!   failure ([`Parser::refusal`]);
 //! - usage is priced from the list (per request), and a refusal before any
 //!   output in a category Anthropic does not bill is free;
 //! - `pause_turn` (the server-tool loop paused) is not a finish: the caller
@@ -17,9 +29,9 @@
 //!   (content, usage and cost of all requests together).
 
 use omni_core::Usage;
-use omni_core::content::{ReasoningKind, ToolCall};
+use omni_core::content::{Citation, ReasoningKind, ToolCall};
 use omni_core::usage::CostSource;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::models::{ModelSpec, estimate_cost};
 use crate::error::{ErrorKind, LlmError, Retry, retry_for_status};
@@ -47,6 +59,26 @@ pub struct Parser {
     stop_reason: Option<String>,
     container: Option<String>,
     usage: Option<Usage>,
+    /// `id` of the current request's message (`msg_…`).
+    message_id: Option<String>,
+    /// `stop_details` of a refusal stop.
+    refusal: Option<Value>,
+    /// The documents citations can point at, by `document_index`: the
+    /// request's (user documents, pages fetched in earlier turns), then the
+    /// pages fetched in this turn.
+    docs: Vec<DocRef>,
+    /// Callers of tool calls made by code execution, by call id.
+    callers: Vec<(String, Value)>,
+    /// The request had citations on for every document and for `web_fetch`
+    /// (kept in the native payload: later turns keep the same setting).
+    citations: Option<bool>,
+}
+
+/// A document of the request (or fetched in it), for citations.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DocRef {
+    title: Option<String>,
+    url: Option<String>,
 }
 
 impl Parser {
@@ -64,7 +96,45 @@ impl Parser {
             stop_reason: None,
             container: None,
             usage: None,
+            message_id: None,
+            refusal: None,
+            docs: Vec::new(),
+            callers: Vec::new(),
+            citations: None,
         }
+    }
+
+    /// A parser for the turn that `body` (the first request) starts: the
+    /// documents its citations can point at, and its citation setting.
+    pub fn with_request(spec: Option<&'static ModelSpec>, body: &Value) -> Self {
+        let mut p = Self::new(spec);
+        p.docs = request_documents(body);
+        p.citations = Some(citations_on(body));
+        p
+    }
+
+    /// The `id` of the current request's message.
+    pub fn message_id(&self) -> Option<&str> {
+        self.message_id.as_deref()
+    }
+
+    /// The failure of a turn the model refused (`stop_reason: refusal`): titled
+    /// with the category (`refusal (bio)`), Anthropic's `stop_details` verbatim
+    /// as details. Not retried.
+    pub fn refusal(&self) -> Option<LlmError> {
+        if self.stop_reason.as_deref() != Some("refusal") {
+            return None;
+        }
+        let details = self.refusal.clone().unwrap_or_else(|| json!({"type": "refusal"}));
+        let message = match details.get("category").and_then(Value::as_str).filter(|c| !c.is_empty()) {
+            Some(c) => format!("refusal ({c})"),
+            None => "refusal".to_string(),
+        };
+        let mut e = LlmError::new(ErrorKind::InBand, Retry::Never, message);
+        e.error_type = Some("content_filter".into());
+        e.details = Some(details);
+        e.partial_output = crate::chatstream::EventParser::any_output(self);
+        Some(e)
     }
 
     /// The current request ended with `stop_reason: "pause_turn"`.
@@ -96,11 +166,13 @@ impl Parser {
         self.max_index = None;
         self.blocks = 0;
         self.stop_reason = None;
+        self.refusal = None;
     }
 
     /// The assistant turn for replay: all content blocks, the request's `tools`
-    /// (replay needs the same ones), and the number of blocks of each request
-    /// when the turn took more than one.
+    /// (replay needs the same ones), the number of blocks of each request
+    /// when the turn took more than one, the last message's `id` (cache
+    /// diagnostics of the next turn) and the citation setting.
     pub fn native_payload(&self, tools: Option<&Value>) -> Value {
         let current = self.content();
         let mut hops: Vec<usize> = self.earlier.iter().map(Vec::len).collect();
@@ -108,17 +180,24 @@ impl Parser {
         let mut content: Vec<Value> = self.earlier.iter().flatten().cloned().collect();
         content.extend(current);
         let mut p = json!({"role": "assistant", "content": content});
+        if let Some(id) = &self.message_id {
+            p["id"] = json!(id);
+        }
         if let Some(t) = tools {
             p["tools"] = t.clone();
         }
         if hops.len() > 1 {
             p["hops"] = json!(hops);
         }
+        if let Some(c) = self.citations {
+            p["citations"] = json!(c);
+        }
         p
     }
 
     pub fn event(&mut self, name: Option<&str>, v: &Value) -> Result<Vec<StreamEvent>, LlmError> {
         let ty = v.get("type").and_then(Value::as_str).or(name).unwrap_or("");
+        let mut out = Vec::new();
         match ty {
             "error" => {
                 let err = v.get("error").cloned().unwrap_or_else(|| v.clone());
@@ -131,11 +210,47 @@ impl Parser {
                 if let Some(c) = v.pointer("/message/container/id").and_then(Value::as_str) {
                     self.container = Some(c.to_string());
                 }
+                if let Some(id) = v.pointer("/message/id").and_then(Value::as_str).filter(|i| !i.is_empty()) {
+                    self.message_id = Some(id.to_string());
+                }
+                if let Some(n) = v.pointer("/message/diagnostics/cache_miss_reason").and_then(cache_miss_notice) {
+                    out.push(StreamEvent::Notice(n));
+                }
             }
             "content_block_start" => {
                 self.blocks += 1;
                 if let Some(i) = v.get("index").and_then(Value::as_u64) {
                     self.max_index = Some(self.max_index.map_or(i as usize, |m| m.max(i as usize)));
+                }
+                let cb = &v["content_block"];
+                match cb.get("type").and_then(Value::as_str) {
+                    Some("server_tool_use") => {
+                        if let (Some(id), Some(caller)) =
+                            (cb.get("id").and_then(Value::as_str), cb.get("caller").filter(|c| is_nested(c)))
+                        {
+                            self.callers.push((id.to_string(), caller.clone()));
+                        }
+                    }
+                    // A fetched page is a document that later text can cite.
+                    Some("web_fetch_tool_result") => {
+                        if let Some(d) = fetched_document(cb) {
+                            self.docs.push(d);
+                        }
+                    }
+                    // Citations that come with the block instead of as deltas.
+                    Some("text") => {
+                        let cs: Vec<Citation> = cb
+                            .get("citations")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .map(|c| self.citation(c))
+                            .collect();
+                        if !cs.is_empty() {
+                            out.push(StreamEvent::Citations(cs));
+                        }
+                    }
+                    _ => {}
                 }
             }
             // A tool input often starts with an empty chunk; skipping it changes
@@ -153,11 +268,13 @@ impl Parser {
                 }
                 if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     self.stop_reason = Some(r.to_string());
+                    if r == "refusal" {
+                        self.refusal = v.pointer("/delta/stop_details").filter(|d| d.is_object()).cloned();
+                    }
                 }
             }
             _ => {}
         }
-        let mut out = Vec::new();
         for ev in self.inner.event(name, v)? {
             match ev {
                 // The request-id header is the upstream id; keep the served model.
@@ -173,7 +290,14 @@ impl Parser {
                     if ty == "content_block_start" {
                         refine_tool(&mut call, &v["content_block"]);
                     }
+                    self.with_caller(&mut call);
                     out.push(StreamEvent::Tool(call));
+                }
+                // Every kind of citation (the shared parser knows web search results only).
+                StreamEvent::Citations(_) => {
+                    if let Some(c) = v.pointer("/delta/citation") {
+                        out.push(StreamEvent::Citations(vec![self.citation(c)]));
+                    }
                 }
                 StreamEvent::LiveUsage(u) => {
                     let mut live = combine(self.earlier_usage.as_ref(), &self.earlier_raw, u);
@@ -192,6 +316,55 @@ impl Parser {
             }
         }
         Ok(out)
+    }
+
+    /// A call made by code execution: its `caller` goes into the call's input.
+    fn with_caller(&self, call: &mut ToolCall) {
+        let Some(id) = call.id.as_deref() else { return };
+        let Some((_, caller)) = self.callers.iter().find(|(x, _)| x == id) else { return };
+        if let Some(o) = call.input.as_mut().and_then(Value::as_object_mut) {
+            o.insert("caller".into(), caller.clone());
+        }
+    }
+
+    /// One of Anthropic's citations: a web search result (url, title, cited
+    /// text), or a location in a document (its title, the page's URL for a
+    /// fetched page, the cited text; the location and the rest in `extra`).
+    fn citation(&self, c: &Value) -> Citation {
+        let field = |k: &str| c.get(k).and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+        let cited_text = field("cited_text");
+        if c.get("type").and_then(Value::as_str) == Some("web_search_result_location") {
+            return Citation { url: field("url"), title: field("title"), cited_text, range: None, extra: None };
+        }
+        let doc = self.document(c);
+        let source_url = field("source").filter(|s| s.starts_with("https://") || s.starts_with("http://"));
+        let url = field("url").or(source_url).or_else(|| doc.and_then(|d| d.url.clone()));
+        let title = field("document_title").or_else(|| field("title")).or_else(|| doc.and_then(|d| d.title.clone()));
+        let mut extra = c.clone();
+        if let Some(o) = extra.as_object_mut() {
+            o.remove("cited_text");
+        }
+        Citation { url, title, cited_text, range: None, extra: Some(extra) }
+    }
+
+    /// The document a citation points at: the one at its `document_index`
+    /// when the titles agree, else the only one with its title.
+    fn document(&self, c: &Value) -> Option<&DocRef> {
+        let title = c.get("document_title").and_then(Value::as_str).filter(|t| !t.is_empty());
+        let agrees = |d: &&DocRef| match (title, d.title.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let at = c.get("document_index").and_then(Value::as_u64).and_then(|i| self.docs.get(i as usize));
+        if let Some(d) = at.filter(agrees) {
+            return Some(d);
+        }
+        let title = title?;
+        let mut same = self.docs.iter().filter(|d| d.title.as_deref() == Some(title));
+        match (same.next(), same.next()) {
+            (Some(d), None) => Some(d),
+            _ => None,
+        }
     }
 
     /// This request's usage with its estimated cost.
@@ -274,27 +447,33 @@ fn refine_tool(call: &mut ToolCall, block: &Value) {
     call.output = Some(result_summary(content));
 }
 
-/// What a tool result shows: search hits (title, url, page age), the fetched
-/// page (url, title, type, time), stdout/stderr/return code and output files,
-/// file views and edits, or the error code. Encrypted content (only the API
-/// can read it) and fetched document bodies are left out.
+/// A tool result's content as the API sent it (search hits with their page
+/// age, the fetch result with its URL, title, type and `retrieved_at`,
+/// stdout/stderr/return code/`abort_reason` and output `file_id`s, file
+/// views and edits, `error_code`s and `error_message`s), without what only
+/// the model reads: encrypted content (`encrypted_*`), the fetched page's
+/// body and the bytes of a viewed image or PDF (each replaced by its length).
 fn result_summary(content: &Value) -> Value {
-    if content.get("type").and_then(Value::as_str) == Some("web_fetch_result") {
-        let doc = &content["content"];
-        let mut o = Map::new();
-        for (k, v) in [
-            ("url", content.get("url")),
-            ("title", doc.get("title")),
-            ("media_type", doc.pointer("/source/media_type")),
-            ("retrieved_at", content.get("retrieved_at")),
-        ] {
-            if let Some(v) = v.filter(|v| !v.is_null()) {
-                o.insert(k.into(), v.clone());
-            }
+    let mut v = without_opaque(content);
+    match v.get("type").and_then(Value::as_str) {
+        Some("web_fetch_result") => elide(&mut v, "/content/source/data"),
+        Some("text_editor_code_execution_view_result")
+            if v.get("file_type").and_then(Value::as_str).is_some_and(|t| t != "text") =>
+        {
+            elide(&mut v, "/content")
         }
-        return Value::Object(o);
+        _ => {}
     }
-    without_opaque(content)
+    v
+}
+
+/// The string at `ptr` replaced by a note of its length.
+fn elide(v: &mut Value, ptr: &str) {
+    if let Some(slot) = v.pointer_mut(ptr)
+        && let Some(n) = slot.as_str().map(|s| s.chars().count())
+    {
+        *slot = json!(format!("({n} characters, sent back to the model in later turns; not shown)"));
+    }
 }
 
 fn without_opaque(v: &Value) -> Value {
@@ -308,6 +487,102 @@ fn without_opaque(v: &Value) -> Value {
         Value::Array(a) => Value::Array(a.iter().map(without_opaque).collect()),
         other => other.clone(),
     }
+}
+
+/// A `caller` of a call that code execution made (not `direct`).
+fn is_nested(caller: &Value) -> bool {
+    caller.get("type").and_then(Value::as_str).is_some_and(|t| t != "direct")
+}
+
+/// The page a `web_fetch_tool_result` holds, as a citable document.
+fn fetched_document(block: &Value) -> Option<DocRef> {
+    let c = block.get("content")?;
+    if c.get("type").and_then(Value::as_str) != Some("web_fetch_result") {
+        return None;
+    }
+    let s = |v: Option<&Value>| v.and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+    Some(DocRef { title: s(c.pointer("/content/title")), url: s(c.get("url")) })
+}
+
+/// The documents of a request in order (citations count "all document
+/// content blocks in the request, spanning across all messages"): user
+/// documents, and pages fetched in earlier turns (their `web_fetch` results
+/// go back in the assistant messages).
+fn request_documents(body: &Value) -> Vec<DocRef> {
+    let mut out = Vec::new();
+    for m in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
+        for b in m.get("content").and_then(Value::as_array).into_iter().flatten() {
+            match b.get("type").and_then(Value::as_str) {
+                Some("document") => {
+                    let s = |v: Option<&Value>| v.and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_string);
+                    let url = (b.pointer("/source/type").and_then(Value::as_str) == Some("url"))
+                        .then(|| s(b.pointer("/source/url")))
+                        .flatten();
+                    out.push(DocRef { title: s(b.get("title")), url });
+                }
+                Some("web_fetch_tool_result") => out.extend(fetched_document(b)),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Every user document of the request and its `web_fetch` tool (if any)
+/// have citations on: the setting the request was made with.
+pub fn citations_on(body: &Value) -> bool {
+    let enabled = |v: &Value| v.pointer("/citations/enabled").and_then(Value::as_bool) == Some(true);
+    let docs = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .flat_map(|m| m.get("content").and_then(Value::as_array).into_iter().flatten())
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("document"))
+        .all(enabled);
+    let fetch = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|t| t.get("name").and_then(Value::as_str) == Some("web_fetch"))
+        .all(enabled);
+    docs && fetch
+}
+
+/// A notice for a cache miss that the cache diagnostics attribute to a change
+/// in the request (`model_changed`, `system_changed`, `tools_changed`,
+/// `messages_changed`); the other results (`previous_message_not_found`,
+/// `unavailable`, a pending `null`) stay in the response for `/info`.
+fn cache_miss_notice(reason: &Value) -> Option<String> {
+    let ty = reason.get("type").and_then(Value::as_str)?;
+    let what = match ty {
+        "model_changed" => "the model or speed differs from the previous request's",
+        "system_changed" => "the system prompt differs from the previous request's",
+        "tools_changed" => "the tools differ from the previous request's",
+        "messages_changed" => "an earlier message differs from the previous request's",
+        _ => return None,
+    };
+    let tokens = reason
+        .get("cache_missed_input_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| format!("; about {} input tokens were not read from the cache", thousands(n)))
+        .unwrap_or_default();
+    Some(format!("Anthropic's cache diagnostics: {ty} ({what}){tokens}"))
+}
+
+/// `41850` → `41,850`.
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Classify Anthropic's error objects (`{"type", "message", "details"?}`; the

@@ -65,6 +65,8 @@ pub struct RenderState {
     pub prior: Vec<PriorAttempt>,
     /// Latest previews of images still being generated (streamed partial images).
     pub previews: Vec<(omni_core::BlobRef, Option<(u32, u32)>)>,
+    /// How the reply was served where that differs from the request (`served <model>`, `tier …`, `geo us`).
+    pub served: Vec<String>,
     /// The reply finally failed: a "🔁 Retry" button under its last message.
     pub retry_button: bool,
     /// Final state: sync it and stop.
@@ -97,6 +99,7 @@ impl RenderState {
             settings: &self.settings,
             prior: &self.prior,
             previews: &self.previews,
+            served: &self.served,
         })
     }
 }

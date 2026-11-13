@@ -419,4 +419,8 @@ CREATE TABLE chat_prefixes (
     PRIMARY KEY (bot, chat_id, name)
 );
 "#,
+    // ---- v9: what each upstream call of an attempt reported about itself
+    r#"
+ALTER TABLE attempts ADD COLUMN meta TEXT;  -- JSON {calls: [omni_llm::meta::CallMeta], first_output_ms}
+"#,
 ];

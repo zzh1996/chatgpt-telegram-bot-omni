@@ -14,10 +14,20 @@
 //!   preceded it (preserved thinking, docs/research/anthropic.md §2.2): a turn
 //!   made with other tools would fail that check, and sending it as text keeps
 //!   every request's prefix identical to the one each replayed block was made
-//!   with.
+//!   with. Images and files generated in an answer sent as text cannot go
+//!   with it (assistant messages carry the model's own content blocks; the
+//!   docs show no media in them, and a `document` there is a 400 since API
+//!   version 2026-10-21): a warning says what was left out (nothing is moved
+//!   into a user message).
 //! - User content: text; images (JPEG, PNG, GIF, WebP) and PDFs as base64;
 //!   text files as plain-text `document` blocks (the API's own text-document
 //!   input, so nothing is inlined, D6). Other media are errors.
+//! - Citations: every document has `citations: {enabled: true}` (the API
+//!   wants all or none), from a conversation's first turn on, so earlier
+//!   messages never change ([`citations_allowed`]: a conversation whose
+//!   earlier answers were made without them keeps them off). The native
+//!   payload records the setting (`citations`) and the message id (`id`, for
+//!   the cache diagnostics of the next request, [`previous_message_id`]).
 
 use omni_core::content::{Part, Role, Turn};
 use serde_json::{Value, json};
@@ -36,6 +46,10 @@ pub struct Converted {
     pub system: Option<Value>,
     pub messages: Vec<Value>,
     pub notes: Vec<String>,
+    /// What could not be sent (generated media of answers sent as text).
+    pub warnings: Vec<String>,
+    /// The user messages have documents.
+    pub documents: bool,
 }
 
 enum Replay {
@@ -46,19 +60,22 @@ enum Replay {
 }
 
 /// Convert `history` for `model`. `tools`: the request's `tools` (replayed
-/// turns must have been made with the same ones).
+/// turns must have been made with the same ones); `cite`: documents get
+/// citations ([`citations_allowed`]).
 pub async fn convert(
     history: &[Turn],
     model: &str,
     spec: Option<&ModelSpec>,
     tools: Option<&Value>,
+    cite: bool,
     blobs: &dyn BlobLoader,
 ) -> Result<Converted, LlmError> {
     let mut system: Vec<Value> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     let mut started = false;
     let mut other_tools = false;
-    let mut images_left_out = false;
+    let mut as_text: Vec<&Turn> = Vec::new();
+    let mut documents = false;
     for turn in history {
         match turn.role {
             Role::System => {
@@ -84,13 +101,16 @@ pub async fn convert(
                     Replay::Native(msgs) => messages.extend(msgs),
                     other => {
                         other_tools |= matches!(other, Replay::OtherTools);
-                        images_left_out |= turn.parts.iter().any(|p| matches!(p, Part::Image { .. }));
+                        as_text.push(turn);
                         let text = turn.answer_text();
                         if text.is_empty() {
+                            let media = media_not_sent([turn], ASSISTANT_TEXT_ONLY)
+                                .map(|m| format!("; {m}"))
+                                .unwrap_or_default();
                             return Err(LlmError::request(format!(
                                 "an earlier answer in this conversation has no text to give `{model}` \
                                  (its thinking and tool calls go back only to the model that made them, \
-                                 with the same tools)"
+                                 with the same tools{media})"
                             )));
                         }
                         messages.push(json!({"role": "assistant", "content": [{"type": "text", "text": text}]}));
@@ -99,7 +119,9 @@ pub async fn convert(
             }
             Role::User => {
                 started = true;
-                messages.push(json!({"role": "user", "content": user_content(turn, model, blobs).await?}));
+                let content = user_content(turn, model, cite, blobs).await?;
+                documents |= content.iter().any(|b| b["type"] == "document");
+                messages.push(json!({"role": "user", "content": content}));
             }
         }
     }
@@ -111,12 +133,61 @@ pub async fn convert(
                 .to_string(),
         );
     }
-    if images_left_out {
-        notes.push(format!(
-            "images in earlier answers are not sent (an answer from another model goes to `{model}` as its text)"
-        ));
+    if documents && !cite {
+        notes.push(
+            "documents are sent without citations in this conversation: its earlier answers were made without \
+             them, and turning them on now would change the messages those answers' thinking is bound to"
+                .to_string(),
+        );
     }
-    Ok(Converted { system: (!system.is_empty()).then_some(Value::Array(system)), messages, notes })
+    let warnings = media_not_sent(as_text, ASSISTANT_TEXT_ONLY).into_iter().collect();
+    Ok(Converted { system: (!system.is_empty()).then_some(Value::Array(system)), messages, notes, warnings, documents })
+}
+
+const ASSISTANT_TEXT_ONLY: &str = "Claude's assistant messages carry text only";
+
+pub use crate::provider::media_not_sent;
+
+/// Documents may have citations on: no earlier answer that goes back natively
+/// (its thinking is bound to the messages before it) was made without them
+/// after a document (the native payload's `citations`; older answers have none).
+pub fn citations_allowed(history: &[Turn], model: &str) -> bool {
+    let mut documents = false;
+    for t in history {
+        match t.role {
+            Role::User => documents |= t.parts.iter().any(is_document),
+            Role::Assistant => {
+                let native = t.native.as_ref().filter(|n| n.dialect == DIALECT && n.model == model);
+                if documents
+                    && let Some(n) = native
+                    && n.payload.get("citations").and_then(Value::as_bool) != Some(true)
+                {
+                    return false;
+                }
+            }
+            Role::System => {}
+        }
+    }
+    true
+}
+
+/// A user part sent as a `document` block (PDFs and text files).
+fn is_document(p: &Part) -> bool {
+    match p {
+        Part::File { blob, filename, .. } => {
+            matches!(classify_mime(&blob.mime, filename.as_deref()), MediaClass::Pdf | MediaClass::Text)
+        }
+        _ => false,
+    }
+}
+
+/// The message id (`msg_…`) of the latest answer of `model` on this API: the
+/// previous request for the cache diagnostics (`null` without one).
+pub fn previous_message_id(history: &[Turn], model: &str) -> Option<String> {
+    history.iter().rev().find_map(|t| {
+        let n = t.native.as_ref().filter(|n| t.role == Role::Assistant && n.dialect == DIALECT && n.model == model)?;
+        n.payload.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string)
+    })
 }
 
 fn replay(turn: &Turn, model: &str, tools: Option<&Value>) -> Replay {
@@ -153,7 +224,7 @@ fn tool_set(tools: Option<&Value>) -> Option<&Value> {
     tools.filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
 }
 
-async fn user_content(turn: &Turn, model: &str, blobs: &dyn BlobLoader) -> Result<Vec<Value>, LlmError> {
+async fn user_content(turn: &Turn, model: &str, cite: bool, blobs: &dyn BlobLoader) -> Result<Vec<Value>, LlmError> {
     let mut out = Vec::new();
     for part in &turn.parts {
         match part {
@@ -172,7 +243,7 @@ async fn user_content(turn: &Turn, model: &str, blobs: &dyn BlobLoader) -> Resul
                     MediaClass::Pdf => {
                         let bytes = load(blobs, blob).await?;
                         let source = json!({"type": "base64", "media_type": "application/pdf", "data": b64(&bytes)});
-                        out.push(document(source, name));
+                        out.push(document(source, name, cite));
                     }
                     MediaClass::Text => {
                         let bytes = load(blobs, blob).await?;
@@ -182,7 +253,11 @@ async fn user_content(turn: &Turn, model: &str, blobs: &dyn BlobLoader) -> Resul
                                 name.unwrap_or("the file")
                             ))
                         })?;
-                        out.push(document(json!({"type": "text", "media_type": "text/plain", "data": text}), name));
+                        out.push(document(
+                            json!({"type": "text", "media_type": "text/plain", "data": text}),
+                            name,
+                            cite,
+                        ));
                     }
                     MediaClass::Audio | MediaClass::Video | MediaClass::Document | MediaClass::Other => {
                         return Err(LlmError::request(format!(
@@ -224,10 +299,13 @@ async fn image(
     Ok(json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64(&bytes)}}))
 }
 
-fn document(source: Value, title: Option<&str>) -> Value {
+fn document(source: Value, title: Option<&str>, cite: bool) -> Value {
     let mut d = json!({"type": "document", "source": source});
     if let Some(t) = title {
         d["title"] = json!(t);
+    }
+    if cite {
+        d["citations"] = json!({"enabled": true});
     }
     d
 }

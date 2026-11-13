@@ -1,12 +1,31 @@
 //! The Gemini API models the bot knows: limits, thinking controls, built-in
 //! tools, service tiers, input modalities and image output options.
 //!
-//! Sources (fetched 2026-11-12): the model pages
+//! Sources (fetched 2026-11-12, re-checked 2026-11-13): the model pages
 //! `https://aistudio.google.com/docs/models/<id>`, the thinking guide (levels
 //! per model), the image generation guide (sizes, aspect ratios, thinking
 //! levels of the image models), the Maps / Search / URL context guides
 //! (supported models), the deprecation page (auto-routed ids) and
-//! docs/research/gemini.md §0.1.
+//! docs/research/gemini.md §0.1. Gemini 4 Hydrogen: model page and "What's new
+//! in Gemini 4 Hydrogen" (GA 2026-11-12).
+//!
+//! **Image generation** on the Gemini API is the Nano Banana models only
+//! (`generateContent`, images as parts; edits are conversational: earlier
+//! images and their thought signatures are replayed). Imagen (`:predict`) is
+//! shut down: the last Imagen 4 ids (`imagen-4.0-{generate,ultra-generate,
+//! fast-generate}-001`) on 2026-08-17 (deprecations page), and the Imagen
+//! guide reads "Imagen models are shut down. Use Nano Banana for image
+//! generation" (2026-11-13). The image models take no image count
+//! (`candidateCount` is unsupported on Gemini 3 and later; "The model won't
+//! always follow the exact number of image outputs that the user explicitly
+//! asks for"), no quality and no background option, and `imageConfig` has
+//! only `aspectRatio` and `imageSize` (no person-generation or safety
+//! setting; the adjustable safety filters are off by default since 2.5).
+//!
+//! **Tool traces**: on Gemini 3 and 4 the built-in tools' own calls and
+//! results can come back as parts (`toolConfig.includeServerSideToolInvocations`,
+//! preview; [`ModelSpec::tool_invocations`]); Nano Banana 2.1 and 3.1 Flash
+//! Image search images as well as the web ([`ModelSpec::image_search`]).
 //!
 //! Ids are matched exactly: Google's ids are short and many share prefixes
 //! (`gemini-3.8-flash` vs `gemini-3.8-flash-tts`). Unknown ids get a
@@ -35,6 +54,8 @@ pub enum Thinking {
     Budget { min: u64, max: u64, can_disable: bool },
     /// Always thinks, nothing to set but `includeThoughts` (Gemini 3 Pro Image).
     AlwaysOn,
+    /// No thinking at all (Gemini 2.5 Flash Image): nothing is sent.
+    Unsupported,
     /// Unknown model outside the Gemini 3/4 families: only what the user asks for is sent.
     Unknown,
 }
@@ -78,6 +99,16 @@ pub struct ModelSpec {
     /// Google Search and Google Maps grounding in one request ("Gemini 3.5
     /// Flash and later").
     pub search_with_maps: bool,
+    /// The response can carry the built-in tools' own calls and results
+    /// (`toolCall` / `toolResponse` parts) with
+    /// `toolConfig.includeServerSideToolInvocations` (preview, "Gemini 4 and
+    /// Gemini 3 models": the tool-combination guide; the image models are not
+    /// named there).
+    pub tool_invocations: bool,
+    /// Google Search for images besides web search (`googleSearch.searchTypes`:
+    /// "only available for the Gemini Nano Banana 2.1 and Gemini 3.1 Flash
+    /// Image models").
+    pub image_search: bool,
     /// Service tiers besides the default (`service_tier`).
     pub tiers: &'static [&'static str],
     pub inputs: Inputs,
@@ -95,6 +126,9 @@ const TIERS: &[&str] = &["flex", "priority"];
 const NO_TIERS: &[&str] = &[];
 
 const LEVELS_HML: &[&str] = &["high", "medium", "low"];
+/// Gemini 4 Hydrogen: "a fourth thinking level, `xhigh`, alongside `low`,
+/// `medium`, and the default `high`"; `minimal` is rejected.
+const LEVELS_XHML: &[&str] = &["xhigh", "high", "medium", "low"];
 const LEVELS_ALL: &[&str] = &["high", "medium", "low", "minimal"];
 
 const FULL: Inputs = Inputs { image: true, pdf: true, audio: true, video: true, office: true };
@@ -125,6 +159,8 @@ const fn text_model(
         thinking: Thinking::Levels(levels),
         tools: ALL_TOOLS,
         search_with_maps,
+        tool_invocations: matches!(family, Family::Gemini3 | Family::Gemini4),
+        image_search: false,
         tiers: TIERS,
         inputs: FULL,
         image_out: None,
@@ -161,6 +197,8 @@ const fn image_model(
         thinking,
         tools,
         search_with_maps: false,
+        tool_invocations: false,
+        image_search: false,
         tiers: NO_TIERS,
         inputs,
         image_out: Some(image_out),
@@ -186,6 +224,7 @@ const GEMINI_36_FLASH: ModelSpec = text_model("gemini-3.6-flash", Family::Gemini
 /// tools from the model pages' capability lists and the tools' "supported
 /// models" tables; Search together with Maps on "Gemini 3.5 Flash and later".
 pub const MODELS: &[ModelSpec] = &[
+    ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), ..gemini4("gemini-4-hydrogen") },
     gemini4("gemini-4-carbon"),
     gemini4("gemini-4-argon"),
     GEMINI_38_FLASH,
@@ -201,24 +240,30 @@ pub const MODELS: &[ModelSpec] = &[
     text_model("gemini-3.1-pro-preview", Family::Gemini3, LEVELS_HML, false),
     text_model("gemini-3.1-flash-lite", Family::Gemini3, LEVELS_ALL, false),
     text_model("gemini-3-flash-preview", Family::Gemini3, LEVELS_ALL, false),
-    image_model(
-        "gemini-nano-banana-2.1",
-        131_072,
-        32_768,
-        Thinking::Levels(&["high", "medium", "minimal"]),
-        SEARCH_ONLY,
-        IMAGE_MODEL,
-        ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_EXTENDED },
-    ),
-    image_model(
-        "gemini-3.1-flash-image",
-        131_072,
-        32_768,
-        Thinking::Levels(&["high", "minimal"]),
-        SEARCH_ONLY,
-        IMAGE_MODEL,
-        ImageOut { sizes: &["512", "1K", "2K", "4K"], ratios: RATIOS_EXTENDED },
-    ),
+    ModelSpec {
+        image_search: true,
+        ..image_model(
+            "gemini-nano-banana-2.1",
+            131_072,
+            32_768,
+            Thinking::Levels(&["high", "medium", "minimal"]),
+            SEARCH_ONLY,
+            IMAGE_MODEL,
+            ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_EXTENDED },
+        )
+    },
+    ModelSpec {
+        image_search: true,
+        ..image_model(
+            "gemini-3.1-flash-image",
+            131_072,
+            32_768,
+            Thinking::Levels(&["high", "minimal"]),
+            SEARCH_ONLY,
+            IMAGE_MODEL,
+            ImageOut { sizes: &["512", "1K", "2K", "4K"], ratios: RATIOS_EXTENDED },
+        )
+    },
     // "Supported image_size values: 1024px (1K). (Note: 2K and 4K are unsupported)";
     // the model page lists the ten base ratios (while also saying "14").
     image_model(
@@ -239,6 +284,21 @@ pub const MODELS: &[ModelSpec] = &[
         PRO_IMAGE,
         ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_BASE },
     ),
+    // Legacy (shut down on 2027-03-15; replacement gemini-3.1-flash-lite-image): input
+    // "Image and Text", 65,536 / 32,768 tokens, no thinking, no grounding, no Flex or
+    // Priority; one size ("up to 1024x1024px"), the ten base ratios.
+    ModelSpec {
+        family: Family::Gemini25,
+        ..image_model(
+            "gemini-2.5-flash-image",
+            65_536,
+            32_768,
+            Thinking::Unsupported,
+            NO_TOOLS,
+            PRO_IMAGE,
+            ImageOut { sizes: &[], ratios: RATIOS_BASE },
+        )
+    },
     // Gemini 2.5 (deprecated, access limited to earlier users; routed to 3.8 Flash /
     // 3.5 Flash-Lite from 2026-12-01). Budget ranges from the thinking guide.
     gemini25("gemini-2.5-pro", 128, 32_768, false),
@@ -287,6 +347,8 @@ fn guess(model: &str) -> ModelSpec {
         thinking,
         tools: ALL_TOOLS,
         search_with_maps: true,
+        tool_invocations: matches!(family, Family::Gemini4 | Family::Gemini3) && !image,
+        image_search: false,
         tiers: TIERS,
         inputs: FULL,
         image_out: image.then_some(ImageOut { sizes: &["512", "1K", "2K", "4K"], ratios: RATIOS_EXTENDED }),
@@ -309,14 +371,14 @@ impl RouteCaps for Caps<'_> {
         match self.0.thinking {
             Thinking::Levels(l) => Some(l.iter().map(|s| s.to_string()).collect()),
             Thinking::Unknown => Some(LEVELS_ALL.iter().map(|s| s.to_string()).collect()),
-            Thinking::Budget { .. } | Thinking::AlwaysOn => None,
+            Thinking::Budget { .. } | Thinking::AlwaysOn | Thinking::Unsupported => None,
         }
     }
     fn can_disable_reasoning(&self) -> bool {
         match self.0.thinking {
             Thinking::Budget { can_disable, .. } => can_disable,
             Thinking::Unknown => true,
-            Thinking::Levels(_) | Thinking::AlwaysOn => false,
+            Thinking::Levels(_) | Thinking::AlwaysOn | Thinking::Unsupported => false,
         }
     }
     fn budget(&self) -> bool {

@@ -5,17 +5,33 @@
 //!
 //! - History: earlier turns of the same dialect and model replay their output
 //!   items verbatim (encrypted reasoning, messages with `phase`, hosted tool
-//!   calls); other assistant turns become plain text; user parts become
-//!   `input_text` / `input_image` / `input_file` per what each API takes.
+//!   calls); other assistant turns become an assistant message with their
+//!   text. Their media (an image another model generated, a file a code run
+//!   wrote) go along only where the API takes them in an assistant message:
+//!   xAI's message content takes images and files whatever the role
+//!   (`openapi.json`); OpenAI's assistant messages carry text only (its own
+//!   `image_generation_call` items replay only with the model's own turns).
+//!   What is not sent is said in a warning. User parts become `input_text` /
+//!   `input_image` / `input_file` per what each API takes.
 //! - Stream: OpenRouter's Responses parser ([`responses::EventParser`], the
 //!   same OpenAI event format) wrapped with what the direct APIs add: search
-//!   sources and code outputs on tool calls, usage normalized across the two
-//!   APIs with the cost (reported by xAI, estimated for OpenAI), the
-//!   platform's own in-band error classification, and generated images of
-//!   code runs.
+//!   sources and results and code outputs on tool calls, usage normalized
+//!   across the two APIs with the cost (reported by xAI, estimated for
+//!   OpenAI), the platform's own in-band error classification, generated
+//!   images of code runs, the files they wrote in their container (OpenAI,
+//!   fetched where cited: [`super::files`]), notices for what the response
+//!   reports about its input (OpenAI `input_transformations` and prompt cache
+//!   misses due to a changed conversation or tools; xAI documents searched
+//!   with `attachment_search`), xAI's exact context size
+//!   (`usage.context_details`), and the `image_generation` tool (`+i`): each
+//!   call's progress and prompt as a tool call, its partial images as
+//!   previews (OpenAI) and its final image where the call finished.
+//! - A broken OpenAI stream is recovered from the stored copy of its
+//!   response ([`super::recover`]): the whole output again, as the stream
+//!   would have given it.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omni_core::content::{Citation, Part, Role, ToolCall, Turn};
 use omni_core::usage::CostSource;
@@ -23,6 +39,8 @@ use omni_core::{BlobRef, Usage};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::files::{Fetch, Fetcher, Gate, Queued};
+use super::recover;
 use crate::error::{ErrorKind, LlmError, Retry};
 use crate::event::StreamEvent;
 use crate::openrouter::chat::{ErrorMapper, decode_data_url};
@@ -68,9 +86,14 @@ pub(crate) struct Converted {
     pub input: Vec<Value>,
     /// Shown with the answer (e.g. a text file the bot inlined).
     pub notes: Vec<String>,
+    /// Media of earlier answers the API cannot take (see [`Unsent`]).
+    pub warnings: Vec<String>,
     pub images: usize,
     pub pdfs: usize,
     pub files: usize,
+    /// The response id of the latest turn replayed natively (OpenAI's prompt
+    /// cache diagnostics compare the request with it).
+    pub last_response_id: Option<String>,
 }
 
 /// The conversation as Responses `input` items.
@@ -80,6 +103,7 @@ pub(crate) async fn convert_history(
     blobs: &dyn BlobLoader,
 ) -> Result<Converted, LlmError> {
     let mut c = Converted::default();
+    let mut unsent = Unsent::default();
     for turn in history {
         match turn.role {
             Role::System => c.input.push(json!({
@@ -95,9 +119,12 @@ pub(crate) async fn convert_history(
                     && let Some(items) = n.payload.get("output").and_then(Value::as_array)
                 {
                     c.input.extend(items.iter().cloned());
+                    if let Some(id) = n.payload.get("id").and_then(Value::as_str) {
+                        c.last_response_id = Some(id.to_string());
+                    }
                     continue;
                 }
-                c.input.push(json!({"type": "message", "role": "assistant", "content": turn.answer_text()}));
+                assistant_turn(turn, inp, blobs, &mut c, &mut unsent).await?;
             }
             Role::User => {
                 let mut content = Vec::new();
@@ -108,7 +135,122 @@ pub(crate) async fn convert_history(
             }
         }
     }
+    c.warnings = unsent.warnings();
     Ok(c)
+}
+
+/// What media of earlier answers were not sent, by reason (warnings).
+#[derive(Debug, Default)]
+struct Unsent(Vec<(&'static str, [usize; 4])>);
+
+impl Unsent {
+    /// One medium (`kind`: image, video, audio, other file) not sent, and why.
+    fn add(&mut self, kind: usize, why: &'static str) {
+        match self.0.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, n)) => n[kind] += 1,
+            None => {
+                let mut n = [0; 4];
+                n[kind] = 1;
+                self.0.push((why, n));
+            }
+        }
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        const NAMES: [(&str, &str); 4] =
+            [("image", "images"), ("video", "videos"), ("audio file", "audio files"), ("file", "files")];
+        self.0
+            .iter()
+            .map(|(why, n)| {
+                let what: Vec<String> = n
+                    .iter()
+                    .zip(NAMES)
+                    .filter(|(k, _)| **k > 0)
+                    .map(|(k, (one, many))| format!("{k} {}", if *k == 1 { one } else { many }))
+                    .collect();
+                let list = match what.split_last() {
+                    Some((last, [])) => last.clone(),
+                    Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                    None => String::new(),
+                };
+                let verb = if n.iter().sum::<usize>() == 1 { "was" } else { "were" };
+                format!("{list} from earlier answers {verb} not sent: {why}")
+            })
+            .collect()
+    }
+}
+
+const IMAGE: usize = 0;
+const VIDEO: usize = 1;
+const AUDIO: usize = 2;
+const FILE: usize = 3;
+
+/// An answer this API and model did not produce (another model or
+/// platform): its text, and its media where the API takes them in an
+/// assistant message, in their order. Drafts made while thinking are
+/// reasoning, not part of the answer.
+async fn assistant_turn(
+    turn: &Turn,
+    inp: &Inputs<'_>,
+    blobs: &dyn BlobLoader,
+    c: &mut Converted,
+    unsent: &mut Unsent,
+) -> Result<(), LlmError> {
+    let kind = |p: &Part| match p {
+        Part::Image { thought: false, .. } => Some(IMAGE),
+        Part::File { blob, filename, .. } => Some(match classify_mime(&blob.mime, filename.as_deref()) {
+            MediaClass::Image => IMAGE,
+            MediaClass::Video => VIDEO,
+            MediaClass::Audio => AUDIO,
+            _ => FILE,
+        }),
+        _ => None,
+    };
+    let plain = json!({"type": "message", "role": "assistant", "content": turn.answer_text()});
+    if inp.platform == Platform::OpenAi {
+        // Assistant content is `output_text` or `refusal` only.
+        for k in turn.parts.iter().filter_map(kind) {
+            unsent.add(k, "OpenAI's assistant messages carry text only");
+        }
+        c.input.push(plain);
+        return Ok(());
+    }
+    // xAI: a message's content takes text, images and files, whatever its role.
+    let mut content = Vec::new();
+    let mut media = 0;
+    for part in &turn.parts {
+        match (part, kind(part)) {
+            (Part::Text { text, .. }, _) if !text.is_empty() => {
+                content.push(json!({"type": "output_text", "text": text}));
+            }
+            (Part::Image { blob, filename, .. } | Part::File { blob, filename, .. }, Some(IMAGE)) => {
+                let mime = base_mime(&blob.mime);
+                if !matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/jpg") || blob.size > XAI_IMAGE_MAX {
+                    unsent.add(IMAGE, "xAI takes JPEG or PNG images of up to 20 MiB");
+                    continue;
+                }
+                content.push(image(blob, filename.as_deref(), inp, blobs).await?);
+                c.images += 1;
+                media += 1;
+            }
+            (Part::File { blob, filename, .. }, Some(k)) => {
+                let class = classify_mime(&blob.mime, filename.as_deref());
+                match (k, class) {
+                    (_, MediaClass::Pdf | MediaClass::Text) => {
+                        let name = filename.clone().unwrap_or_else(|| default_name(&blob.mime));
+                        xai_file(blob, &name, class, inp, blobs, &mut content, c).await?;
+                        media += 1;
+                    }
+                    (VIDEO, _) => unsent.add(VIDEO, "xAI takes no video input"),
+                    (AUDIO, _) => unsent.add(AUDIO, "xAI takes no audio input"),
+                    _ => unsent.add(FILE, "xAI reads PDF and text-based files only"),
+                }
+            }
+            _ => {}
+        }
+    }
+    c.input.push(if media > 0 { json!({"type": "message", "role": "assistant", "content": content}) } else { plain });
+    Ok(())
 }
 
 async fn user_part(
@@ -632,18 +774,21 @@ pub(crate) fn token_cost(p: &Price, u: &Usage, written_12h: u64, s: Scale) -> Op
 
 /// Normalized usage of a Responses `usage` object (kept verbatim in `raw`).
 ///
-/// OpenAI's `output_tokens` include the reasoning tokens; xAI's do not
-/// (`total_tokens` = input + output + reasoning): the reasoning is added, so
-/// that output counts everything billed at the output rate on both. xAI
-/// reports the billed cost (`cost_in_usd_ticks`, 10^10 per USD).
-pub(crate) fn usage_from(platform: Platform, u: &Value) -> Usage {
+/// `output_tokens` include the reasoning tokens on OpenAI and, in every xAI
+/// response seen (2026-11-13: `total_tokens` = input + output), on xAI too;
+/// xAI's REST reference example still shows them apart (`total_tokens` =
+/// input + output + reasoning). The total tells which: reasoning reported
+/// apart is added, so that output counts everything billed at the output
+/// rate. Without a total, output is taken to include it. xAI reports the
+/// billed cost (`cost_in_usd_ticks`, 10^10 per USD).
+pub(crate) fn usage_from(u: &Value) -> Usage {
     let g = |p: &str| u.pointer(p).and_then(Value::as_u64);
     let input = g("/input_tokens");
     let output = g("/output_tokens");
     let reasoning = g("/output_tokens_details/reasoning_tokens");
     let reasoning_apart = match (g("/total_tokens"), input, output, reasoning) {
         (Some(t), Some(i), Some(o), Some(r)) if r > 0 => t == i + o + r,
-        _ => platform == Platform::Xai,
+        _ => false,
     };
     let output_tokens = match (output, reasoning) {
         (Some(o), Some(r)) if reasoning_apart => Some(o + r),
@@ -697,17 +842,36 @@ pub(crate) fn tool_call(item: &Value) -> Option<ToolCall> {
     let named = |default: &str| item.get("name").and_then(Value::as_str).unwrap_or(default).to_string();
     let (name, input, output) = match ty {
         "web_search_call" => {
-            // Every source consulted (`include: web_search_call.action.sources`) is the call's result.
+            // What the search returned is the call's result: every source consulted
+            // (`include: web_search_call.action.sources`) and the image results
+            // (`include: web_search_call.results`), verbatim.
             let mut action = field("action");
             let sources = action.as_mut().and_then(Value::as_object_mut).and_then(|a| a.remove("sources"));
-            ("web_search".to_string(), action, sources.filter(|s| !s.is_null()).map(|s| json!({"sources": s})))
+            let mut out = serde_json::Map::new();
+            if let Some(s) = sources.filter(|s| !s.is_null()) {
+                out.insert("sources".into(), s);
+            }
+            if let Some(r) = field("results") {
+                out.insert("results".into(), r);
+            }
+            ("web_search".to_string(), action, (!out.is_empty()).then_some(Value::Object(out)))
         }
         "code_interpreter_call" => ("code_interpreter".to_string(), field("code"), field("outputs").map(shown_outputs)),
         "file_search_call" => ("file_search".to_string(), field("queries"), field("results")),
         "custom_tool_call" => (named("custom_tool"), field("input"), field("output")),
         "mcp_call" => (named("mcp"), field("arguments"), field("output").or_else(|| field("error"))),
         "function_call" => (named("function"), field("arguments"), None),
-        "image_generation_call" => ("image_generation".to_string(), field("revised_prompt"), None),
+        "image_generation_call" => {
+            // The prompt the image model got (OpenAI's `revised_prompt`, xAI's `prompt`); what it
+            // used (size, quality, background, format, action) or its error as the output.
+            let mut used = item.as_object().cloned().unwrap_or_default();
+            for k in ["id", "type", "status", "result", "revised_prompt", "prompt"] {
+                used.remove(k);
+            }
+            used.retain(|_, v| !v.is_null());
+            let input = field("revised_prompt").or_else(|| field("prompt"));
+            ("image_generation".to_string(), input, (!used.is_empty()).then_some(Value::Object(used)))
+        }
         t if t.ends_with("_call") => (t.trim_end_matches("_call").to_string(), None, None),
         _ => return None,
     };
@@ -721,7 +885,7 @@ pub(crate) fn tool_call(item: &Value) -> Option<ToolCall> {
 }
 
 /// Code outputs for display: images given as data URLs are shown as images
-/// (see [`code_images`]), so their bytes are not repeated in the JSON.
+/// (see [`code_outputs`]), so their bytes are not repeated in the JSON.
 fn shown_outputs(mut outputs: Value) -> Value {
     for o in outputs.as_array_mut().into_iter().flatten() {
         if let Some(url) = o.get("url").and_then(Value::as_str)
@@ -733,19 +897,33 @@ fn shown_outputs(mut outputs: Value) -> Value {
     outputs
 }
 
-/// Images a code run produced as data URLs.
-fn code_images(item: &Value) -> Vec<StreamEvent> {
+/// What a finished code run showed, in order: images given as data URLs
+/// (`include: code_interpreter_call.outputs`) as images, images given by URL
+/// fetched (with `files`, else nothing).
+fn code_outputs(item: &Value, files: Option<&Fetcher>) -> Vec<Queued> {
     if item.get("type").and_then(Value::as_str) != Some("code_interpreter_call") {
         return Vec::new();
     }
-    item.get("outputs")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|o| o.get("type").and_then(Value::as_str) == Some("image"))
-        .filter_map(|o| decode_data_url(o.get("url").and_then(Value::as_str)?))
-        .map(|(mime, data)| StreamEvent::Image { data, mime })
-        .collect()
+    let mut out = Vec::new();
+    for o in item.get("outputs").and_then(Value::as_array).into_iter().flatten() {
+        if o.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        let Some(url) = o.get("url").and_then(Value::as_str) else { continue };
+        match decode_data_url(url) {
+            Some((mime, data)) => {
+                if let Some(f) = files {
+                    f.shown(&data);
+                }
+                out.push(Queued::Event(StreamEvent::Image { data, mime }));
+            }
+            None if files.is_some() && (url.starts_with("https://") || url.starts_with("http://")) => {
+                out.push(Queued::Fetch(Fetch::Image { url: url.to_string() }));
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 /// Retry for an error reported inside a stream (`response.failed`, `error`
@@ -778,6 +956,63 @@ fn finish(ty: &str, r: &Value) -> (String, Option<String>) {
     (norm.to_string(), Some(why.to_string()))
 }
 
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// OpenAI's `input_transformations` (earlier inputs withheld from the model:
+/// `{id, type: "reasoning", action: "removed", reason}`), when any was for a
+/// reason other than `turn_boundary` (expected with `reasoning.context:
+/// "current_turn"`): `organization_mismatch`, `end_user_mismatch`,
+/// `model_mismatch`, `prefix_mismatch` (the conversation changed before it).
+fn withheld(r: &Value) -> Option<String> {
+    let mut reasons: Vec<(String, usize)> = Vec::new();
+    for t in r.get("input_transformations").and_then(Value::as_array).into_iter().flatten() {
+        let reason = t.get("reason").and_then(Value::as_str).unwrap_or("no reason given");
+        if reason == "turn_boundary" {
+            continue;
+        }
+        let what = match t.get("type").and_then(Value::as_str) {
+            Some("reasoning") | None => reason.to_string(),
+            Some(ty) => format!("{ty} {reason}"),
+        };
+        match reasons.iter_mut().find(|(w, _)| *w == what) {
+            Some((_, n)) => *n += 1,
+            None => reasons.push((what, 1)),
+        }
+    }
+    let n: usize = reasons.iter().map(|(_, n)| n).sum();
+    (n > 0).then(|| {
+        let list: Vec<String> =
+            reasons.iter().map(|(w, k)| if *k == 1 { w.clone() } else { format!("{w} ×{k}") }).collect();
+        format!("ℹ️ OpenAI withheld {n} earlier reasoning item{} from the model: {}", plural(n), list.join(", "))
+    })
+}
+
+/// OpenAI's `prompt_cache_diagnostics` against the previous turn, when the
+/// cache missed because the conversation or the tools sent changed (the bot
+/// replays them unchanged, so this shows a replay problem or a change of
+/// tools); other outcomes stay in the response (`/info`).
+fn cache_miss(r: &Value) -> Option<String> {
+    let d = r.get("prompt_cache_diagnostics")?;
+    if d.get("type").and_then(Value::as_str) != Some("cache_miss") {
+        return None;
+    }
+    let reason = d.get("reason").and_then(Value::as_str)?;
+    let what = match reason {
+        "input_changed" => "the earlier conversation sent differs from the previous turn's",
+        "tools_changed" => "the tools differ from the previous turn's",
+        _ => return None,
+    };
+    let n = |k: &str| d.get(k).and_then(Value::as_u64);
+    let counts = match (n("cache_missed_tokens"), n("comparison_reusable_tokens")) {
+        (Some(m), Some(of)) => format!(", {m} of {of} reusable tokens missed"),
+        (Some(m), None) => format!(", {m} tokens missed"),
+        _ => String::new(),
+    };
+    Some(format!("ℹ️ prompt cache miss: {what} ({reason}{counts})"))
+}
+
 /// Streaming state of one call: OpenRouter's Responses parser plus what the
 /// official APIs add.
 pub(crate) struct Parser {
@@ -790,6 +1025,16 @@ pub(crate) struct Parser {
     pub response_id: Option<String>,
     /// Usage of a failed response (billed): emitted after the error.
     pub failed_usage: Option<Usage>,
+    /// Image generation calls whose image was emitted.
+    images_done: BTreeSet<String>,
+    /// Image generation calls with a preview shown (until their image).
+    previews: BTreeSet<String>,
+    /// Fetches what the stream cites (OpenAI's container files; see [`super::files`]).
+    files: Option<Fetcher>,
+    /// Container files asked for (one cited twice is shown once).
+    cited: BTreeSet<String>,
+    /// The withheld inputs were noted.
+    withheld_noted: bool,
 }
 
 impl Parser {
@@ -802,7 +1047,18 @@ impl Parser {
             map_error,
             response_id: None,
             failed_usage: None,
+            images_done: BTreeSet::new(),
+            previews: BTreeSet::new(),
+            files: None,
+            cited: BTreeSet::new(),
+            withheld_noted: false,
         }
+    }
+
+    /// Fetch the files the stream cites with `files`.
+    pub fn with_files(mut self, files: Option<Fetcher>) -> Self {
+        self.files = files;
+        self
     }
 
     pub fn finished(&self) -> bool {
@@ -810,21 +1066,99 @@ impl Parser {
     }
 
     pub fn any_output(&self) -> bool {
-        crate::chatstream::EventParser::any_output(&self.inner)
+        crate::chatstream::EventParser::any_output(&self.inner) || !self.images_done.is_empty()
     }
 
-    /// The output items, for replay.
+    /// The image of a finished `image_generation_call` item (its base64
+    /// `result`), once, and the end of its previews.
+    fn generated_image(&mut self, item: &Value) -> Vec<StreamEvent> {
+        if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+            return Vec::new();
+        }
+        let id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let mut evs = Vec::new();
+        if !self.images_done.contains(&id)
+            && let Some(data) = item.get("result").and_then(Value::as_str).and_then(super::media::decode_b64)
+        {
+            let mime = super::media::sniff_image(&data, &super::images::format_mime(item.get("output_format")));
+            evs.push(StreamEvent::Image { data, mime });
+            self.images_done.insert(id.clone());
+        }
+        // Also when the call failed after previews: they end too.
+        if self.previews.remove(&id) || !evs.is_empty() {
+            evs.push(StreamEvent::PreviewDone { slot: id });
+        }
+        evs
+    }
+
+    /// `response.image_generation_call.*`: the call's progress, and its
+    /// partial images (OpenAI, `partial_images`) as previews.
+    fn image_progress(&mut self, ty: &str, v: &Value) -> Vec<StreamEvent> {
+        let id = v.get("item_id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let what = ty.rsplit('.').next().unwrap_or_default();
+        if what != "partial_image" {
+            return vec![StreamEvent::Tool(ToolCall {
+                id: Some(id),
+                name: "image_generation".into(),
+                status: Some(what.to_string()),
+                input: None,
+                output: None,
+            })];
+        }
+        let Some(data) = v.get("partial_image_b64").and_then(Value::as_str).and_then(super::media::decode_b64) else {
+            return Vec::new();
+        };
+        let mime = super::media::sniff_image(&data, &super::images::format_mime(v.get("output_format")));
+        self.previews.insert(id.clone());
+        vec![StreamEvent::PartialImage { data, mime, slot: id }]
+    }
+
+    /// The output items, for replay, and the response's `id` (OpenAI's prompt
+    /// cache diagnostics compare the next request with it).
     pub fn native_payload(&self) -> Value {
-        self.inner.native_payload()
+        let mut p = self.inner.native_payload();
+        if let Some(id) = &self.response_id {
+            p["id"] = json!(id);
+        }
+        p
     }
 
     fn usage(&self, response: &Value, u: &Value) -> Usage {
-        let mut usage = usage_from(self.platform, u);
+        let mut usage = usage_from(u);
         if usage.cost_usd.is_none() {
             usage.cost_usd = (self.price)(&self.model, response, &usage);
             usage.cost_source = if usage.cost_usd.is_some() { CostSource::Estimated } else { CostSource::Unknown };
         }
         usage
+    }
+
+    /// The notice about inputs OpenAI withheld, once (they are reported from `response.in_progress` on).
+    fn note_withheld(&mut self, r: &Value) -> Option<StreamEvent> {
+        if self.withheld_noted {
+            return None;
+        }
+        let n = withheld(r)?;
+        self.withheld_noted = true;
+        Some(StreamEvent::Notice(n))
+    }
+
+    /// `evs` in order with the fetches among them: handed to the fetcher as
+    /// they are (they go out from there in this order, see [`Gate`]), or
+    /// returned when nothing has to be fetched.
+    fn release(&self, items: Vec<Queued>) -> Vec<StreamEvent> {
+        match &self.files {
+            Some(f) if items.iter().any(|i| matches!(i, Queued::Fetch(_))) => {
+                f.enqueue(items);
+                Vec::new()
+            }
+            _ => items
+                .into_iter()
+                .filter_map(|i| match i {
+                    Queued::Event(e) => Some(e),
+                    Queued::Fetch(_) => None,
+                })
+                .collect(),
+        }
     }
 
     /// One SSE event.
@@ -842,6 +1176,9 @@ impl Parser {
             _ => {}
         }
         let mut evs = self.inner.event(v)?;
+        if let Some(r) = v.get("response").filter(|r| r.is_object()) {
+            evs.extend(self.note_withheld(r));
+        }
         match ty {
             "response.output_item.added" | "response.output_item.done" => {
                 evs.retain(|e| !matches!(e, StreamEvent::Tool(_)));
@@ -850,10 +1187,14 @@ impl Parser {
                         evs.push(StreamEvent::Tool(t));
                     }
                     if ty == "response.output_item.done" {
-                        evs.extend(code_images(item));
+                        let mut items: Vec<Queued> = evs.drain(..).map(Queued::Event).collect();
+                        items.extend(code_outputs(item, self.files.as_ref()));
+                        items.extend(self.generated_image(item).into_iter().map(Queued::Event));
+                        return Ok(self.release(items));
                     }
                 }
             }
+            t if t.starts_with("response.image_generation_call.") => evs.extend(self.image_progress(t, v)),
             "response.output_text.annotation.added" => {
                 if self.platform == Platform::Xai {
                     for e in &mut evs {
@@ -862,14 +1203,22 @@ impl Parser {
                         }
                     }
                 }
-                // Files a code run created live in its container (downloadable for ~20 minutes with the API key).
+                // A file the code wrote in its container: fetched now, shown here.
                 if let Some(a) = v.get("annotation")
                     && a.get("type").and_then(Value::as_str) == Some("container_file_citation")
+                    && let (Some(container_id), Some(file_id)) =
+                        (a.get("container_id").and_then(Value::as_str), a.get("file_id").and_then(Value::as_str))
+                    && self.files.is_some()
+                    && self.cited.insert(format!("{container_id}/{file_id}"))
                 {
-                    let name = a.get("filename").and_then(Value::as_str).unwrap_or("a file");
-                    evs.push(StreamEvent::Notice(format!(
-                        "📎 the code interpreter created {name} in its container; the bot does not download container files"
-                    )));
+                    let filename = a.get("filename").and_then(Value::as_str).unwrap_or(file_id).to_string();
+                    let mut items: Vec<Queued> = evs.drain(..).map(Queued::Event).collect();
+                    items.push(Queued::Fetch(Fetch::ContainerFile {
+                        container_id: container_id.to_string(),
+                        file_id: file_id.to_string(),
+                        filename,
+                    }));
+                    return Ok(self.release(items));
                 }
             }
             _ => {}
@@ -881,9 +1230,32 @@ impl Parser {
         // The inner parser keeps the final output items (replay) and marks the stream finished.
         let inner = self.inner.event(v)?;
         let r = v.get("response").unwrap_or(&Value::Null);
+        // Images only in the final output (not in an `output_item.done` seen before).
         let mut evs: Vec<StreamEvent> =
-            inner.into_iter().filter(|e| matches!(e, StreamEvent::FinishDetails(_))).collect();
+            items_of(r, "image_generation_call").flat_map(|i| self.generated_image(i)).collect::<Vec<_>>();
+        evs.extend(inner.into_iter().filter(|e| matches!(e, StreamEvent::FinishDetails(_))));
+        evs.extend(self.note_withheld(r));
+        evs.extend(cache_miss(r).map(StreamEvent::Notice));
         if let Some(u) = r.get("usage").filter(|u| u.is_object()) {
+            if self.platform == Platform::Xai {
+                // The conversation's size now (prompt and completion of the latest context), not
+                // the billed sum over the internal calls of server-side tools.
+                let ctx = |k: &str| u.pointer(&format!("/context_details/{k}")).and_then(Value::as_u64);
+                if let (Some(i), Some(o)) = (ctx("input_tokens"), ctx("output_tokens")) {
+                    evs.push(StreamEvent::ContextSize(i + o));
+                }
+                // Files are read by attachment_search only sometimes (not for inline files so far).
+                if let Some(n) = u
+                    .pointer("/server_side_tool_usage_details/document_search_calls")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n > 0)
+                {
+                    evs.push(StreamEvent::Notice(format!(
+                        "📎 xAI searched the attached files with its attachment_search tool ({n} search{}, billed per call)",
+                        if n == 1 { "" } else { "es" }
+                    )));
+                }
+            }
             evs.push(StreamEvent::Usage(self.usage(r, u)));
         }
         let (reason, native) = finish(ty, r);
@@ -946,50 +1318,148 @@ pub(crate) struct Wire {
     pub refine: fn(LlmError) -> LlmError,
 }
 
-/// Run a prepared request: `POST`, then the SSE stream through [`Parser`].
-#[allow(clippy::too_many_arguments)]
+/// Per request of a container file fetch or a poll of a stored response.
+const SIDE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How a stream is run: the API key, the idle timeout, and for OpenAI how a
+/// broken stream is recovered from the stored response (`None`: never).
+pub(crate) struct Run<'a> {
+    pub http: &'a reqwest::Client,
+    pub api_key: &'a str,
+    pub idle_timeout: Duration,
+    pub recovery: Option<&'a recover::Backoff>,
+}
+
+/// Run a prepared request: `POST`, then the SSE stream through [`Parser`];
+/// on OpenAI the files the stream cites are fetched where cited, and a stream
+/// that broke after the response started is recovered from OpenAI's stored
+/// copy (see [`super::recover`]).
 pub(crate) async fn stream(
-    http: &reqwest::Client,
-    api_key: &str,
-    idle_timeout: Duration,
+    run: &Run<'_>,
     wire: &Wire,
     p: &Prepared,
     sink: &mut dyn EventSink,
     observer: &dyn Observer,
     cancel: &CancellationToken,
 ) -> (Result<Value, LlmError>, CallOutcome) {
-    let rb = http.post(&p.url).bearer_auth(api_key).json(&p.body);
-    let parser = Parser::new(wire.platform, &p.model, wire.price, wire.map_error);
+    let base = p.url.strip_suffix("/responses").unwrap_or(&p.url);
+    let files = (wire.platform == Platform::OpenAi)
+        .then(|| Fetcher::new(run.http.clone(), run.api_key, base, run.idle_timeout.min(SIDE_TIMEOUT)));
+    let mut gate = Gate::new(sink, files.clone());
+    let sent = Instant::now();
+    let rb = run.http.post(&p.url).bearer_auth(run.api_key).json(&p.body);
+    let parser = Parser::new(wire.platform, &p.model, wire.price, wire.map_error).with_files(files.clone());
     let crate::chatstream::Streamed { result, parser, header_id } = crate::chatstream::run_with(
         rb,
         &p.url,
         &p.body,
-        idle_timeout,
+        run.idle_timeout,
         Some("x-request-id"),
         wire.map_error,
         parser,
-        sink,
+        &mut gate,
         observer,
         cancel,
     )
     .await;
+    gate.flush(cancel).await;
     let outcome = CallOutcome { upstream_id: parser.response_id.clone().or(header_id), ..Default::default() };
-    let result = match result {
+    let e = match result {
         // `data: [DONE]` without `response.completed`/`.incomplete`: cut off.
         Ok(()) if !parser.finished() => {
             let mut e = LlmError::network("stream ended without response.completed");
             e.partial_output = parser.any_output();
-            Err(e)
+            e
         }
-        Ok(()) => Ok(parser.native_payload()),
-        Err(e) => {
-            if let Some(u) = parser.failed_usage.clone() {
-                sink.event(StreamEvent::Usage(u));
-            }
-            Err((wire.refine)(e))
-        }
+        Ok(()) => return (Ok(parser.native_payload()), outcome),
+        Err(e) => e,
     };
-    (result, outcome)
+    if let Some(u) = parser.failed_usage.clone() {
+        gate.event(StreamEvent::Usage(u));
+    }
+    // Broken after the response started (not an error OpenAI reported, not a cancellation):
+    // OpenAI may still finish it and store it.
+    if let (Some(b), Some(id)) = (run.recovery, parser.response_id.as_deref())
+        && matches!(e.kind, ErrorKind::Network | ErrorKind::Timeout)
+    {
+        let broke = sent.elapsed();
+        let h = super::media::Http {
+            client: run.http,
+            api_key: run.api_key,
+            idle_timeout: run.idle_timeout.min(SIDE_TIMEOUT),
+            map_error: wire.map_error,
+            refine: wire.refine,
+            observer,
+            cancel,
+        };
+        let include: Vec<String> = p
+            .body
+            .get("include")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.as_str().map(str::to_string))
+            .collect();
+        let url = format!("{}/{id}", p.url);
+        match recover::stored(&h, &url, &include, b, recover::window(b, broke), cancel).await {
+            Ok(Some(r)) => return (replay(&r, &e, broke, wire, p, files, &mut gate, cancel).await, outcome),
+            Ok(None) => {}
+            Err(cancelled) => return (Err(cancelled), outcome),
+        }
+    }
+    (Err((wire.refine)(e)), outcome)
+}
+
+/// The stored copy `r` of a response whose stream broke with `e` after
+/// `broke`: the call's output again (from a fresh parser, as a stream of it
+/// would have given it), or the error it ended with.
+#[allow(clippy::too_many_arguments)]
+async fn replay(
+    r: &Value,
+    e: &LlmError,
+    broke: Duration,
+    wire: &Wire,
+    p: &Prepared,
+    files: Option<Fetcher>,
+    gate: &mut Gate<'_>,
+    cancel: &CancellationToken,
+) -> Result<Value, LlmError> {
+    let mut parser = Parser::new(wire.platform, &p.model, wire.price, wire.map_error).with_files(files);
+    if r.get("status").and_then(Value::as_str) == Some("cancelled") {
+        // No stream ends that way: nothing to show; what it used is billed.
+        if let Some(u) = r.get("usage").filter(|u| u.is_object()) {
+            gate.event(StreamEvent::Usage(parser.usage(r, u)));
+        }
+        let mut e = e.clone();
+        e.message = format!("{} (OpenAI's stored copy of the response is cancelled)", e.message);
+        return Err((wire.refine)(e));
+    }
+    gate.event(StreamEvent::Restart);
+    gate.event(StreamEvent::Notice(format!(
+        "ℹ️ the stream broke after {}s ({}): the answer is OpenAI's stored copy of the response",
+        broke.as_secs(),
+        e.message
+    )));
+    let mut failed = None;
+    for ev in recover::events(r) {
+        match parser.event(&ev) {
+            Ok(evs) => evs.into_iter().for_each(|x| gate.event(x)),
+            Err(err) => {
+                failed = Some(err);
+                break;
+            }
+        }
+    }
+    gate.flush(cancel).await;
+    match failed {
+        Some(err) => {
+            if let Some(u) = parser.failed_usage.clone() {
+                gate.event(StreamEvent::Usage(u));
+            }
+            Err((wire.refine)(err))
+        }
+        None => Ok(parser.native_payload()),
+    }
 }
 
 #[cfg(test)]
@@ -1261,24 +1731,34 @@ pub(crate) mod tests {
     fn usage_is_normalized_across_the_two_apis() {
         // OpenAI: output includes reasoning (total = input + output).
         let u = usage_from(
-            Platform::OpenAi,
             &json!({"input_tokens": 75, "input_tokens_details": {"cached_tokens": 10, "cache_write_tokens": 5},
                     "output_tokens": 1186, "output_tokens_details": {"reasoning_tokens": 1024}, "total_tokens": 1261}),
         );
         assert_eq!((u.input_tokens, u.output_tokens, u.reasoning_tokens), (Some(75), Some(1186), Some(1024)));
         assert_eq!((u.cached_input_tokens, u.cache_write_tokens), (Some(10), Some(5)));
         assert_eq!((u.cost_usd, u.cost_source), (None, CostSource::Unknown));
-        // xAI (REST reference example): total = input + output + reasoning; the cost is reported in ticks.
+        // xAI as it answers (turn 238, grok-4.7): output includes reasoning too; the cost is billed in ticks.
         let x = usage_from(
-            Platform::Xai,
-            &json!({"input_tokens": 32, "input_tokens_details": {"cached_tokens": 8}, "output_tokens": 9,
-                    "output_tokens_details": {"reasoning_tokens": 110}, "total_tokens": 151,
-                    "num_sources_used": 0, "num_server_side_tools_used": 0, "cost_in_usd_ticks": 37756000}),
+            &json!({"input_tokens": 1254, "input_tokens_details": {"cached_tokens": 1152}, "output_tokens": 1324,
+                    "output_tokens_details": {"reasoning_tokens": 1322}, "total_tokens": 2578, "num_sources_used": 0,
+                    "num_server_side_tools_used": 0, "cost_in_usd_ticks": 87240000,
+                    "context_details": {"input_tokens": 1254, "output_tokens": 1331}}),
         );
-        assert_eq!((x.output_tokens, x.reasoning_tokens), (Some(119), Some(110)));
-        assert!((x.cost_usd.unwrap() - 0.0037756).abs() < 1e-12);
+        assert_eq!((x.output_tokens, x.reasoning_tokens), (Some(1324), Some(1322)));
+        assert!((x.cost_usd.unwrap() - 0.008724).abs() < 1e-12);
         assert_eq!(x.cost_source, CostSource::Reported);
+        // xAI's REST reference example counts reasoning apart (total = input + output + reasoning): added.
+        let x =
+            usage_from(&json!({"input_tokens": 32, "input_tokens_details": {"cached_tokens": 8}, "output_tokens": 9,
+                    "output_tokens_details": {"reasoning_tokens": 110}, "total_tokens": 151,
+                    "num_sources_used": 0, "num_server_side_tools_used": 0, "cost_in_usd_ticks": 37756000}));
+        assert_eq!((x.output_tokens, x.reasoning_tokens), (Some(119), Some(110)));
         assert_eq!(x.raw["output_tokens"], 9, "raw stays verbatim");
+        // Without a total: output is taken to include the reasoning (as in every response seen).
+        let x = usage_from(
+            &json!({"input_tokens": 5, "output_tokens": 40, "output_tokens_details": {"reasoning_tokens": 30}}),
+        );
+        assert_eq!(x.output_tokens, Some(40));
     }
 
     #[test]
@@ -1347,9 +1827,9 @@ pub(crate) mod tests {
         );
         let Part::Text { text, citations } = &parts[3] else { panic!("{:?}", parts[3]) };
         assert_eq!((text.as_str(), citations.len(), citations[0].title.as_deref()), ("Paris", 1, Some("France")));
-        // The container file the run created: a notice, not a silent drop.
-        assert_eq!(acc.notices.len(), 1);
-        assert!(acc.notices[0].contains("created plot.png"), "{}", acc.notices[0]);
+        // The container file is fetched by the stream (see `container_files_are_shown_where_cited`):
+        // a parser without a fetcher shows nothing for it.
+        assert!(acc.notices.is_empty(), "{:?}", acc.notices);
         assert!(!p.finished());
     }
 

@@ -75,6 +75,8 @@ Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::u
 
 **Attachments**: photos, files or an album with the prefix in the caption, or a prefixed reply to a photo, file, album or location message, go to the model with the text. A location is the user's position for Gemini's Google Maps (`google:` models with `+m`); other models reject it.
 
+**Images and videos**: chat models that draw (Gemini's Nano Banana) answer with images; OpenAI and Grok chat models draw with `+i`. An image or video model's id (e.g. `openai:gpt-image-2.6-sunburst$`, `xai:grok-imagine-video-1.5$`) calls the platform's image or video API directly, with no chat model. Reply to a generated image (or attach images) to edit it. Options: `q=` quality, `n=` how many, `bg=` background, `sec=` video length, sizes `1 2 4` and ratios; the defaults are the highest quality, the largest size and no watermark. /raw gives the original files.
+
 **Continue**: reply to any of my messages. The whole reply is the next message, exactly as typed (marker lines are plain text there), except that a leading `\` is removed, so `\/raw` sends the text `/raw`. Replying to a failed message is rejected; use /retry on it.
 
 **Prefixes of this chat**: anyone allowed here (and not banned) can make a custom chatbot for this chat: a model with its options, a system prompt and a history put before every new message. `/prefix name prefix$::system …` (with `::user` / `::assistant` lines for the history) creates `name$`; or reply `/prefix name` to one of my answers to turn that conversation into one. Names: 3–16 letters and digits, not taken. Anyone here can use it; replies, billing and stats are the model's own. /prefix lists this chat's, /prefix `name` shows one, /unprefix `name` deletes one (its creator or an admin; replies to its answers keep working).
@@ -1196,15 +1198,23 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
     let mut dump = json!({"turn": t.id, "attempts": []});
     for a in &attempts {
         let (req, _out, err, up, usage) = conv::attempt_json(&app.db, a.id).await?;
+        let meta = conv::attempt_meta(&app.db, a.id).await.ok().flatten();
+        let mut line = format!("attempt {} · {}", a.n, a.status);
+        if let Some(ms) = meta.as_ref().and_then(|m| m["first_output_ms"].as_u64()) {
+            line.push_str(&format!(" · first output {:.1}s", ms as f64 / 1000.0));
+        }
+        if let Some(u) = up.as_deref().filter(|u| !u.is_empty()) {
+            line.push_str(&format!(" · {u}"));
+        }
+        let calls: Vec<omni_llm::meta::CallMeta> =
+            meta.as_ref().and_then(|m| serde_json::from_value(m["calls"].clone()).ok()).unwrap_or_default();
+        let mut lines = vec![line];
+        lines.extend(calls.iter().filter_map(call_line));
+        blocks.push(RBlock::Paragraph(RText::plain(lines.join("\n"))));
         dump["attempts"].as_array_mut().unwrap().push(json!({
             "n": a.n, "status": a.status, "upstream_id": up, "usage": usage, "error": err, "request": req,
+            "calls": meta.as_ref().map(|m| m["calls"].clone()),
         }));
-        blocks.push(RBlock::Paragraph(RText::plain(format!(
-            "attempt {} · {} · {}",
-            a.n,
-            a.status,
-            up.unwrap_or_default()
-        ))));
     }
     // One message: the summary and the full request/response dump attached.
     let name = format!("request-{}.json", t.id);
@@ -1217,6 +1227,76 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
         say(app, bot, ib, &format!("⚠️ {e:#}")).await;
     }
     Ok(())
+}
+
+/// One upstream call in `/info`: its ids, how it was served, its timing and
+/// rate limits (everything else is in the attached JSON).
+fn call_line(c: &omni_llm::meta::CallMeta) -> Option<String> {
+    let r = &c.response;
+    let str_at = |path: &[&str]| {
+        let mut v = r.get(path[0])?;
+        for k in &path[1..] {
+            v = v.get(k)?;
+        }
+        v.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    let mut f = Vec::new();
+    if let Some(s) = c.status.filter(|s| *s != 200) {
+        f.push(format!("HTTP {s}"));
+    }
+    let id = str_at(&["id"]).or_else(|| str_at(&["responseId"]));
+    match (c.request_id(), id) {
+        (Some(req), Some(id)) if req != id => f.push(format!("request {req} · response {id}")),
+        (Some(req), _) => f.push(format!("request {req}")),
+        (None, Some(id)) => f.push(format!("response {id}")),
+        (None, None) => {}
+    }
+    if let Some(m) = str_at(&["model"]).or_else(|| str_at(&["modelVersion"])) {
+        f.push(format!("model {m}"));
+    }
+    let tier = str_at(&["service_tier"])
+        .or_else(|| str_at(&["usage", "service_tier"]))
+        .or_else(|| str_at(&["usageMetadata", "serviceTier"]))
+        .or_else(|| c.header("x-gemini-service-tier").map(str::to_string));
+    if let Some(t) = tier {
+        f.push(format!("tier {t}"));
+    }
+    if let Some(g) = str_at(&["usage", "inference_geo"]) {
+        f.push(format!("geo {g}"));
+    }
+    if let Some(fp) = str_at(&["system_fingerprint"]) {
+        f.push(format!("fingerprint {fp}"));
+    }
+    let secs = |ms: u64| format!("{:.1}s", ms as f64 / 1000.0);
+    match (c.ms_headers, c.ms_first_event) {
+        (Some(h), Some(e)) => f.push(format!("headers {} · first event {}", secs(h), secs(e))),
+        (Some(h), None) => f.push(format!("headers {}", secs(h))),
+        _ => {}
+    }
+    if let Some(p) = c.header("openai-processing-ms").and_then(|v| v.parse::<u64>().ok()) {
+        f.push(format!("processing {}", secs(p)));
+    }
+    // Rate limits: remaining / limit per dimension.
+    let mut limits = Vec::new();
+    for (k, v) in &c.headers {
+        let dim = k
+            .strip_prefix("x-ratelimit-remaining-")
+            .map(|d| (d.to_string(), format!("x-ratelimit-limit-{d}")))
+            .or_else(|| {
+                k.strip_prefix("anthropic-ratelimit-")
+                    .and_then(|x| x.strip_suffix("-remaining"))
+                    .map(|d| (d.to_string(), format!("anthropic-ratelimit-{d}-limit")))
+            });
+        if let Some((d, lim)) = dim
+            && let Some(l) = c.header(&lim)
+        {
+            limits.push(format!("{v}/{l} {}", d.replace('-', " ")));
+        }
+    }
+    if !limits.is_empty() {
+        f.push(format!("rate limits {}", limits.join(", ")));
+    }
+    (!f.is_empty()).then(|| format!("  {}", f.join(" · ")))
 }
 
 async fn cmd_retry(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {

@@ -105,6 +105,12 @@ impl Provider for Google {
             continuation: parser.continuation().cloned(),
             ..Default::default()
         };
+        // A stream Google stopped (blocked prompt, content filter, error finish) fails
+        // with Google's own words (`finishMessage`), after its usage was billed.
+        let result = match (result, parser.abnormal()) {
+            (Ok(()), Some(e)) => Err(e.clone()),
+            (r, _) => r,
+        };
         (result.map(|()| parser.native_payload()), outcome)
     }
 }

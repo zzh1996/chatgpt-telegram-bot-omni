@@ -59,6 +59,16 @@ pub async fn begin_call(db: &Db, generation_id: String, attempt_id: i64) {
 
 /// Record a call's usage (once per generation id). Charges spend limits when
 /// the row is new. Returns whether it was new.
+/// The ledger's `cost_source` for a usage: estimated from a price table, or reported by the API.
+pub fn source_of(u: &Usage) -> &'static str {
+    match u.cost_source {
+        omni_core::usage::CostSource::Reported => "reported",
+        omni_core::usage::CostSource::Fetched => "fetched",
+        omni_core::usage::CostSource::Estimated => "estimated",
+        omni_core::usage::CostSource::Unknown => "unknown",
+    }
+}
+
 pub async fn record_call(
     db: &Db,
     meta: &CallMeta,

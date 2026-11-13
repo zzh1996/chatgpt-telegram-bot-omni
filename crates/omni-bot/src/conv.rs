@@ -355,6 +355,25 @@ pub async fn update_attempt(db: &Db, id: i64, u: AttemptUpdate) -> Result<()> {
     .await
 }
 
+/// Store what the upstream calls of an attempt reported about themselves (`/info`).
+pub async fn set_attempt_meta(db: &Db, id: i64, meta: &Value) -> Result<()> {
+    let m = meta.to_string();
+    db.call(move |c| {
+        c.execute("UPDATE attempts SET meta = ?1 WHERE id = ?2", params![m, id])?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn attempt_meta(db: &Db, id: i64) -> Result<Option<Value>> {
+    let s: Option<String> = db
+        .call(move |c| {
+            Ok(c.query_row("SELECT meta FROM attempts WHERE id = ?1", params![id], |r| r.get(0)).optional()?.flatten())
+        })
+        .await?;
+    Ok(s.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
 /// Attempts of a turn: (id, n, status).
 pub async fn attempts_of(db: &Db, turn_id: i64) -> Result<Vec<AttemptRow>> {
     db.call(move |c| {

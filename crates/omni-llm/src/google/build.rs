@@ -9,6 +9,21 @@
 //! Not sent: safety settings (every adjustable filter is off by default on
 //! Gemini 2.5 and later: the safety guide, "If the threshold is not set, the
 //! default block threshold is Off"), sampling parameters, `store`.
+//!
+//! Tools: `+s` is Google Search (web and image search on the models that have
+//! image search), `+c` code execution, `+u` URL context, `+m` Google Maps
+//! (with the latest location as `toolConfig.retrievalConfig.latLng`). On the
+//! Gemini 3 and 4 text models, `toolConfig.includeServerSideToolInvocations`
+//! asks for the search, Maps and URL-context calls and results as parts of
+//! the answer where they ran (preview; sent with those tools, and whenever
+//! the conversation already holds such parts: Google's replay rule says the
+//! flag goes with them). Their parts go back verbatim in later turns, where
+//! they count as input tokens (Google Search excepted).
+//!
+//! Which model served a deprecated id that Google routes automatically
+//! (`gemini-3.7-flash` → `gemini-3.8-flash`, `gemini-2.5-pro` → `gemini-3.8-flash`
+//! from 2026-12-01, …) is read from the response's `modelVersion` by the bot
+//! (the footer's served model), not predicted here.
 
 use serde_json::{Map, Value, json};
 
@@ -58,7 +73,11 @@ fn check_more(model: &str, spec: &ModelSpec, req: &Requested) -> Result<(), LlmE
         if let Some(s) = &req.image_size
             && !img.sizes.contains(&s.as_str())
         {
-            return Err(err(format!("image size {s} is not available for `{model}`; sizes: {}", img.sizes.join(", "))));
+            return Err(err(if img.sizes.is_empty() {
+                format!("`{model}` has no image size option (one output size)")
+            } else {
+                format!("image size {s} is not available for `{model}`; sizes: {}", img.sizes.join(", "))
+            }));
         }
         if let Some(a) = &req.aspect_ratio
             && !img.ratios.contains(&a.as_str())
@@ -84,6 +103,7 @@ fn thinking(spec: &ModelSpec, req: &Requested) -> Option<(Value, String)> {
             _ => budget(req.budget.unwrap_or(max)),
         }),
         Thinking::AlwaysOn => Some((json!({"includeThoughts": true}), "reasoning on".to_string())),
+        Thinking::Unsupported => None,
         Thinking::Unknown => match (req.effort.as_deref(), req.budget) {
             (Some("none"), _) => Some(off()),
             (Some(e), _) => Some(level(e)),
@@ -143,7 +163,7 @@ pub async fn prepare(
     let src = |by_user: bool| if by_user { "option" } else { "default" }.to_string();
     let mut applied = Vec::new();
     let mut settings = Vec::new();
-    let mut warnings = Vec::new();
+    let mut warnings = conv.warnings.clone();
     let mut generation = Map::new();
 
     // Output budget: the model's maximum per request; on Gemini 4 the total of all
@@ -188,9 +208,13 @@ pub async fn prepare(
     }
 
     let mut tools = Vec::new();
-    let mut tool_config = None;
+    let mut tool_config = Map::new();
     for t in &req.tools {
         let tool = match t {
+            // Web and image search where the model has both (the default is web only).
+            Tool::Search if spec.image_search => {
+                json!({"googleSearch": {"searchTypes": {"webSearch": {}, "imageSearch": {}}}})
+            }
             Tool::Search => json!({"googleSearch": {}}),
             Tool::Code => json!({"codeExecution": {}}),
             Tool::Fetch => json!({"urlContext": {}}),
@@ -205,13 +229,27 @@ pub async fn prepare(
         settings.push(match (t, conv.location) {
             (Tool::Maps, Some((lat, lng))) => format!("Google Maps near {lat:.4},{lng:.4}"),
             (Tool::Maps, None) => "Google Maps (no position sent)".to_string(),
+            (Tool::Search, _) if spec.image_search => "web and image search".to_string(),
             _ => t.describe().to_string(),
         });
         if let (Tool::Maps, Some((lat, lng))) = (t, conv.location) {
-            let tc = json!({"retrievalConfig": {"latLng": {"latitude": lat, "longitude": lng}}});
-            applied.push(Applied { source: src(user.tools.contains(t)), patch: json!({"toolConfig": tc}) });
-            tool_config = Some(tc);
+            let rc = json!({"latLng": {"latitude": lat, "longitude": lng}});
+            applied.push(Applied {
+                source: src(user.tools.contains(t)),
+                patch: json!({"toolConfig": {"retrievalConfig": rc}}),
+            });
+            tool_config.insert("retrievalConfig".into(), rc);
         }
+    }
+    // The built-in tools' calls and results as parts, where they ran; and with
+    // a conversation that holds such parts already.
+    let traced = req.tools.iter().any(|t| matches!(t, Tool::Search | Tool::Maps | Tool::Fetch));
+    if spec.tool_invocations && (traced || convert::has_tool_invocations(&conv.contents)) {
+        tool_config.insert("includeServerSideToolInvocations".into(), json!(true));
+        applied.push(Applied {
+            source: "default".into(),
+            patch: json!({"toolConfig": {"includeServerSideToolInvocations": true}}),
+        });
     }
     if maps && conv.media.multimodal() {
         warnings.push(
@@ -268,8 +306,8 @@ pub async fn prepare(
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }
-    if let Some(tc) = tool_config {
-        body["toolConfig"] = tc;
+    if !tool_config.is_empty() {
+        body["toolConfig"] = Value::Object(tool_config);
     }
     if !generation.is_empty() {
         body["generationConfig"] = Value::Object(generation);
@@ -282,15 +320,6 @@ pub async fn prepare(
         body["labels"] = json!({ "safety_identifier": l });
     }
 
-    if let Some(target) = spec.routes_to {
-        warnings.push(format!("Google serves `{model}` with `{target}` (a deprecated id it routes automatically)"));
-    }
-    if spec.family == Family::Gemini25 && spec.known && now_unix() >= super::pricing::DEC_1_2026 {
-        let target = if model == "gemini-2.5-pro" { "gemini-3.8-flash" } else { "gemini-3.5-flash-lite" };
-        if model != "gemini-2.5-flash-lite" {
-            warnings.push(format!("since 2026-12-01 Google routes `{model}` to `{target}`"));
-        }
-    }
     if !spec.known {
         let defaults = match spec.family {
             Family::Gemini4 => format!(

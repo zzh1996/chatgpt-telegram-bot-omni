@@ -1,8 +1,9 @@
 //! Cost estimate from the Gemini API price list (the API reports no cost).
 //!
-//! Prices: <https://aistudio.google.com/docs/pricing>, fetched 2026-11-12,
-//! paid tier, USD per 1M tokens, by service tier (Standard / Flex /
-//! Priority). Dated changes are applied by the date of the call (UTC):
+//! Prices: <https://aistudio.google.com/docs/pricing>, fetched 2026-11-12
+//! (Gemini 4 Hydrogen and Gemini 2.5 Flash Image from the page as
+//! re-fetched 2026-11-13), paid tier, USD per 1M tokens, by service tier
+//! (Standard / Flex / Priority). Dated changes are applied by the date of the call (UTC):
 //! Gemini 4 doubles on 2026-12-01 (end of the introductory price), 3.8 / 3.6
 //! Flash double on 2027-01-01, and 2.5 Pro / 2.5 Flash are routed to (and
 //! billed as) 3.8 Flash / 3.5 Flash-Lite from 2026-12-01.
@@ -12,7 +13,7 @@
 //! model has one), cached tokens at the cache rate, `toolUsePromptTokenCount`
 //! at the input rate, `candidatesTokenCount + thoughtsTokenCount` at the
 //! output rate (image tokens of `candidatesTokensDetails` at the image output
-//! rate), the >200K-token rates when `promptTokenCount` exceeds 200,000,
+//! rate, see [`estimate`]), the >200K-token rates when `promptTokenCount` exceeds 200,000,
 //! the tier actually served (`usageMetadata.serviceTier`), plus grounding:
 //! Gemini 3 and newer $14 per 1,000 executed (unique, non-empty) search
 //! queries for Google Search and Google Maps alike; Gemini 2.5 $35 (Search)
@@ -84,6 +85,14 @@ pub enum Tier {
 }
 
 impl Tier {
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Standard => "standard",
+            Tier::Flex => "flex",
+            Tier::Priority => "priority",
+        }
+    }
+
     /// From a request's `service_tier` or a response's `usageMetadata.serviceTier`
     /// (`unspecified` = standard).
     pub fn parse(s: &str) -> Option<Tier> {
@@ -125,6 +134,12 @@ pub fn price(model: &str, tier: Tier, now: i64) -> Option<Price> {
         })
     };
     Some(match model {
+        // No introductory price; flat across the 1M window, implicit cache reads at 5%.
+        "gemini-4-hydrogen" => single(match tier {
+            Standard => r(1.50, 0.075, 7.50),
+            Flex => r(0.75, 0.0375, 3.75),
+            Priority => r(2.70, 0.135, 13.50),
+        }),
         "gemini-4-carbon" | "gemini-4-argon" => single(match (tier, intro_g4) {
             (Standard, true) => r(2.00, 0.10, 10.00),
             (Flex, true) => r(1.00, 0.05, 5.00),
@@ -161,6 +176,9 @@ pub fn price(model: &str, tier: Tier, now: i64) -> Option<Price> {
         "gemini-3.1-flash-image" if tier == Standard => single(ri(0.50, 3.00, 60.00)),
         "gemini-3.1-flash-lite-image" if tier == Standard => single(ri(0.25, 1.50, 30.00)),
         "gemini-3-pro-image" if tier == Standard => single(ri(2.00, 12.00, 120.00)),
+        // "$0.039 per image": $30 per 1M image tokens, 1,290 tokens per image; "Text
+        // input and output is priced the same as 2.5 Flash".
+        "gemini-2.5-flash-image" if tier == Standard => single(ri(0.30, 2.50, 30.00)),
         "gemini-2.5-pro" if !intro_g4 => flash_38(tier),
         "gemini-2.5-pro" => {
             let (base, over) = match tier {
@@ -220,8 +238,25 @@ fn modality(u: &Value, key: &str, m: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a `*TokensDetails` list has an entry for modality `m`.
+fn has_modality(u: &Value, key: &str, m: &str) -> bool {
+    u.get(key)
+        .and_then(Value::as_array)
+        .is_some_and(|l| l.iter().any(|d| d.get("modality").and_then(Value::as_str) == Some(m)))
+}
+
 /// Estimated cost in USD of one response's `usageMetadata` (`requested`: the
 /// tier the request asked for, used when the response does not say).
+///
+/// Image output follows the price list: an image costs the IMAGE tokens of
+/// `candidatesTokensDetails` at the image rate (the list's per-image amounts:
+/// 1,120 tokens for a 1K image, 1,680 for 2K, 3,780 / 2,520 for 4K, 747 for
+/// 512 px, 1,290 on 2.5 Flash Image), the rest of the answer (its TEXT tokens,
+/// or what `candidatesTokenCount` has beyond the image tokens) at the text
+/// output rate. UNVERIFIED which count Google bills: on 2026-11-12
+/// `gemini-3.1-flash-lite-image` responses reported `candidatesTokenCount` 305
+/// and 325 with `candidatesTokensDetails` `[{IMAGE: 1120}]` (and a
+/// `totalTokenCount` built from 305); the estimate takes the 1,120 of the list.
 pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g: &GroundingUse) -> Option<f64> {
     let served = usage.get("serviceTier").and_then(Value::as_str).and_then(Tier::parse);
     let tier = served.or(requested).unwrap_or(Tier::Standard);
@@ -239,15 +274,21 @@ pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g
     let audio_uncached = modality(usage, "promptTokensDetails", "AUDIO").saturating_sub(audio_cached);
     let uncached = prompt - cached;
     let audio_uncached = audio_uncached.min(uncached);
-    let image_out = modality(usage, "candidatesTokensDetails", "IMAGE").min(candidates);
+    let image_out = modality(usage, "candidatesTokensDetails", "IMAGE");
+    let text_out = if image_out == 0 {
+        candidates
+    } else {
+        let text = modality(usage, "candidatesTokensDetails", "TEXT");
+        let rest = candidates.saturating_sub(image_out);
+        if has_modality(usage, "candidatesTokensDetails", "TEXT") { text.max(rest) } else { rest }
+    };
     let f = |n: u64| n as f64;
     let input = f(uncached - audio_uncached) * rates.input
         + f(audio_uncached) * rates.input_audio.unwrap_or(rates.input)
         + f(cached - audio_cached) * rates.cached
         + f(audio_cached) * rates.cached_audio.unwrap_or(rates.cached)
         + f(tool) * rates.input;
-    let output =
-        f(candidates - image_out + thoughts) * rates.output + f(image_out) * rates.image_output.unwrap_or(rates.output);
+    let output = f(text_out + thoughts) * rates.output + f(image_out) * rates.image_output.unwrap_or(rates.output);
     let fees = match p.grounding {
         Grounding::PerQuery(q) => g.queries as f64 * q,
         // A prompt counts as grounded when it returned sources of that kind.

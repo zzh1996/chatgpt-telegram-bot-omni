@@ -48,7 +48,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 
 1. **入站**：grammers 以 `catch_up` 模式运行，使用我们基于同一 SQLite 实现的 `Session`。需要处理的消息写入 `inbound`（唯一键 bot+chat+msg_id）。持久化的 pts/qts/channel pts 只在"携带该状态的所有 update 都已处理完"之后才推进——grammers 给同一批 getDifference 结果的所有消息打上的是整批的最终状态，所以我们在看到一个**不同**的状态时才保存上一个状态。崩溃最多导致已处理的 update 被重新投递（被唯一键吸收），永远不会跳过未处理的。关机时也不会把内存中的状态写回（它可能包含已缓冲未处理的 update）。
 2. **处理**：`inbound.status = new` 的行在启动时重新分发；handler 先查该 inbound 是否已建过回合，已建则只重启任务（幂等）。
-3. **生成**：启动时所有 pending/running 的 assistant 回合重新运行。running 的最后一次尝试标记为 `interrupted`，其消息被改写为"已被重启中断"（保留已生成的部分），再开新尝试（中断不计入重试次数）。OpenRouter 不支持断线续流（见 openrouter-gaps.md），所以除 Gemini 4 long decode（从落盘的 checkpoint 在原消息上接着写）外只能重新生成；流断开后会用 generation id 查询实际费用并入账。
+3. **生成**：启动时所有 pending/running 的 assistant 回合重新运行。running 的最后一次尝试标记为 `interrupted`，其消息被改写为"已被重启中断"（保留已生成的部分），再开新尝试（中断不计入重试次数）。OpenRouter 不支持断线续流（见 openrouter-gaps.md），所以除 Gemini 4 long decode（从落盘的 checkpoint 在原消息上接着写）和异步任务（接着查同一个任务）外只能重新生成；流断开后会用 generation id 查询实际费用并入账。从 checkpoint 接着写时，checkpoint 里记的是到它为止已计费的全部用量（包括被打断的那次调用），连同原来的开始时间和上游 ID 一起恢复，所以页脚、`/info` 和 `/continue` 的预算都不会少算。
 4. **发送**：每条待发消息先在 `outbox` 写入随机 `random_id` 再调用 `messages.sendMessage`。Telegram 永不遗忘用过的 random_id：重发同一个 id 返回已发出的那条消息而不是重复发送；`RANDOM_ID_DUPLICATE` 表示前一次仍在进行，退避后重试。编辑天然幂等（`MESSAGE_NOT_MODIFIED` 视为成功）。
 
 ## 4. 多 bot
@@ -65,7 +65,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 
 - 输入（`intake`、`handler`、`media`、`tg::richin`）：消息的文字（富消息转成 Markdown）、媒体（照片、文件，富消息里的图片和文件）、位置（定位/地点/实时位置，富消息的地图块）记入 `inbound`；相册每张一条，等 1.5 秒后只由第一条被记录的消息处理（`conv::album_leader`），附上整个相册和其它张的说明；被回复的非 bot 消息只附上它的媒体和位置。
 - `prefixes`：本聊天的前缀（自定义 chatbot，表 `chat_prefixes`，按 bot + 聊天）：创建时把模型和选项解析定死，内存里缓存；`App::resolve_spec` 先查 bot 的前缀，再查本聊天的；新对话里每个这样的前缀单独一条链（它的 system prompt 和历史以 synthetic 回合写在用户消息前面），所以删除前缀不影响已有对话。
-- `compose`：把回合状态组装为富消息块（头部、折叠的推理/工具/来源、正文、提示、错误、页脚），每条消息第一行是 bot 的头部（小字），bot 生成的其它部分只用模型 Markdown 永远不会产生的块（details、footer），保证模型输出无法冒充。
+- `compose`：把回合状态组装为富消息块（头部、折叠的推理/工具/来源、正文、提示、错误、页脚），每条消息第一行是 bot 的头部（小字），bot 生成的其它部分只用模型 Markdown 永远不会产生的块（details、footer），保证模型输出无法冒充。工具调用的内容由 `toolview` 按常见格式（搜索、来源、网页、代码输出、文件、错误）显示成可读的块，认不出的、没展示的字段显示为 JSON（D60）。
 - `paginate`：按 32640 字 / 499 块切成多条消息（富消息上限 32768 / 500，留出续页头部的位置），超大块按结构拆分（代码按行、列表按项、表格按行并重复表头、折叠块按子块）。
 - `view`：每次尝试一个同步任务，只渲染最新状态（watch 通道合并中间状态）；与已发出内容哈希比较，只编辑变化的分段，新增分段回复前一段发送；最终状态多余的分段删除。
 - 降级链：富消息被拒（400 类内容错误）→ 模型部分改为原始 Markdown 块 → 仍被拒则纯文本 entities。
@@ -84,6 +84,9 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 - `omni_llm::provider`：`Provider` trait（`prepare` → `Prepared`，`stream` → 事件，`knows` 模型表，`balance` 余额）、`DirectConfig`、价目表工具（`TokenPrice`、`PricingSink` 给没有费用的用量估价）、`PROVIDERS`（id、名字、key 的环境变量、默认地址）。bot 启动时为每个有 key 的 `[providers.<id>]` 建一个，`App.direct` 按 id 查；`jobs` 按回合的 provider 分派。
 - 每个平台一个模块：自己的模型表（上下文、最大输出、推理档位、价格）、`RouteCaps`（官方能力即通道能力）、历史转换（同方言同模型原样回放 native，否则只发文本）、请求体、错误分类。流解析复用三种方言的解析器（OpenRouter 的 Responses / Messages `EventParser`、Chat Completions `ChunkParser`，各自包一层补上平台特有的事件）和 `chatstream`；Gemini 是自己的 generateContent 解析器（含 long decode 的续写和 checkpoint：`Prepared::with_continuation`、`merge_natives` 按方言分派）。
 - 一个平台有两种接口时（DeepSeek 的 Chat + Anthropic 兼容、Moonshot 的 Chat + Responses、百炼的 Chat + Responses），两种方言分开记 native，只在同方言同模型时回放。
+- 出图/视频接口也是方言（OpenAI Images、xAI Imagine 图片和视频、方舟 Seedream、智谱、百炼），由同一个 provider 按模型 ID 分派；异步任务（xAI 视频、GLM-Image）建好就发 `Checkpoint`，`with_continuation` 把它变成"查询同一个任务"的请求。
+- `omni_llm::meta`：每次调用经过一个 `Collector`（包住 raw 日志的 `Observer`），按接口家族（Responses、Messages、generateContent、Chat Completions）收集去掉内容的响应信封、一部分响应头和耗时，不需要各 provider 解析；`jobs` 把它存进 `attempts.meta`（`/info` 显示），并据此算出页脚里"和请求不同"的服务事实（模型、等级、地域、推理强度）和提示（D59）。重试提示（`retry-after-ms`、`x-should-retry`）在 `chatstream::run_with` 里统一处理。
+- 流事件 `Restart`：provider 要把这次调用的全部输出重新发一遍（OpenAI 断流后从保存的结果恢复，D61），bot 丢掉这次调用已收到的部分；`ContextSize`：API 报告的精确上下文大小（xAI），下一轮的上下文直接用它。
 
 ## 8. 日志
 

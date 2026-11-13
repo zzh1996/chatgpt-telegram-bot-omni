@@ -29,9 +29,19 @@
 //!   execution, Anthropic's own server tools, at their latest versions
 //!   (`web_search_20260318`, `web_fetch_20260318` with dynamic filtering on
 //!   Claude 4.6 and later, the basic `_20250305` / `_20250910` before;
-//!   `code_execution_20260521`), with their defaults. No container is reused
-//!   across turns (stateless, D28); within a turn the container goes along
-//!   with a `pause_turn` continuation, as the API requires.
+//!   `code_execution_20260521`), with their defaults, except that web fetch
+//!   has citations on (`citations: {enabled: true}`, off by default) like
+//!   every document (see [`history`]). No container is reused across turns
+//!   (stateless, D28); within a turn the container goes along with a
+//!   `pause_turn` continuation, as the API requires. Files that code
+//!   execution writes are fetched from the Files API as their tool result
+//!   arrives and shown there ([`files`]).
+//! - **Cache diagnostics**: `diagnostics: {previous_message_id}` with the
+//!   message id of the latest answer of the same model in the conversation
+//!   (`null` without one; a `pause_turn` continuation names the paused
+//!   message). Free and stable on the Claude API; it changes nothing the model
+//!   sees. A miss the API attributes to a change in the request is a notice;
+//!   the result is in the response either way (`/info`).
 //! - **Prompt caching**: automatic caching (top-level `cache_control`,
 //!   5-minute TTL) plus one breakpoint at the end of the previous user turn,
 //!   where the previous request's cache entry is. Caching never changes the
@@ -53,11 +63,15 @@
 //!   assistant message (and the container), up to [`MAX_REQUESTS`] requests.
 //!
 //! Costs are estimated from the list prices in [`models`]; errors are
-//! classified in [`stream::error_from_json`].
+//! classified in [`stream::error_from_json`]; a refusal (`stop_reason:
+//! refusal`) fails with its `stop_details` ([`stream::Parser::refusal`]).
 
+pub mod files;
 pub mod history;
 pub mod models;
 pub mod stream;
+
+use std::collections::VecDeque;
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -177,8 +191,9 @@ impl RouteCaps for Caps {
 }
 
 /// The server tools for the requested options, in a fixed order (the tool
-/// list is part of what replayed thinking is checked against).
-fn tool_defs(spec: Option<&ModelSpec>, wanted: &[Tool]) -> Vec<Value> {
+/// list is part of what replayed thinking is checked against); `cite`: web
+/// fetch with citations.
+fn tool_defs(spec: Option<&ModelSpec>, wanted: &[Tool], cite: bool) -> Vec<Value> {
     let dynamic = spec.is_none_or(|s| s.dynamic_web);
     let mut out = Vec::new();
     if wanted.contains(&Tool::Search) {
@@ -187,7 +202,11 @@ fn tool_defs(spec: Option<&ModelSpec>, wanted: &[Tool]) -> Vec<Value> {
     }
     if wanted.contains(&Tool::Fetch) {
         let ty = if dynamic { "web_fetch_20260318" } else { "web_fetch_20250910" };
-        out.push(json!({"type": ty, "name": "web_fetch"}));
+        let mut t = json!({"type": ty, "name": "web_fetch"});
+        if cite {
+            t["citations"] = json!({"enabled": true});
+        }
+        out.push(t);
     }
     if wanted.contains(&Tool::Code) {
         out.push(json!({"type": "code_execution_20260521", "name": "code_execution"}));
@@ -330,11 +349,12 @@ impl Provider for Anthropic {
         let mut settings = Vec::new();
 
         let max_tokens = input.max_tokens_override.unwrap_or_else(|| self.auto_max_tokens(input, spec));
-        let tools = tool_defs(spec, &req.tools);
+        let cite = history::citations_allowed(input.history, model);
+        let tools = tool_defs(spec, &req.tools, cite);
         let interleaved = spec.is_some_and(|s| s.interleaved_beta) && !tools.is_empty();
         let think = plan_thinking(model, spec, &req, max_tokens, interleaved).map_err(LlmError::request)?;
         let tools_value = (!tools.is_empty()).then(|| Value::Array(tools.clone()));
-        let mut conv = history::convert(input.history, model, spec, tools_value.as_ref(), blobs).await?;
+        let mut conv = history::convert(input.history, model, spec, tools_value.as_ref(), cite, blobs).await?;
         let marker = history::mark_previous_user_turn(&mut conv.messages);
 
         let mut body = json!({"model": model, "max_tokens": max_tokens, "stream": true});
@@ -378,6 +398,15 @@ impl Provider for Anthropic {
         if let Some(at) = marker {
             applied.push(Applied { source: "default".into(), patch: json!({format!("{at}.cache_control"): cache}) });
         }
+        if conv.documents && cite {
+            applied.push(Applied {
+                source: "default".into(),
+                patch: json!({"messages[].content[document].citations": {"enabled": true}}),
+            });
+        }
+        let diagnostics = json!({"previous_message_id": history::previous_message_id(input.history, model)});
+        body["diagnostics"] = diagnostics.clone();
+        applied.push(Applied { source: "default".into(), patch: json!({"diagnostics": diagnostics}) });
         if let Some(u) = &input.user {
             body["metadata"] = json!({"user_id": u});
         }
@@ -401,7 +430,7 @@ impl Provider for Anthropic {
                     .into(),
             );
         }
-        let mut warnings = Vec::new();
+        let mut warnings = std::mem::take(&mut conv.warnings);
         if spec.is_none() {
             warnings.push(format!(
                 "`{model}` is not in the bot's {NAME} model table: limits, capabilities and price unknown \
@@ -432,9 +461,10 @@ impl Provider for Anthropic {
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
         let tools = p.body.get("tools").cloned();
-        let mut parser = stream::Parser::new(models::model_spec(&p.model));
+        let mut parser = stream::Parser::with_request(models::model_spec(&p.model), &p.body);
         let mut body = p.body.clone();
-        let mut out = IdSink { inner: sink, ids: Vec::new() };
+        let files = files::Fetcher::new(self.http.clone(), &self.cfg.base_url, &self.cfg.api_key, API_VERSION);
+        let mut out = TurnSink::new(sink, files);
         let mut requests = 0;
         loop {
             requests += 1;
@@ -453,11 +483,16 @@ impl Provider for Anthropic {
             )
             .await;
             parser = back;
+            // Files still being fetched come before anything that follows.
+            out.drain(cancel).await;
             let outcome = CallOutcome { upstream_id: out.joined(), ..Default::default() };
             if let Err(e) = result {
                 return (Err(e), outcome);
             }
             if !parser.paused() {
+                if let Some(e) = parser.refusal() {
+                    return (Err(e), outcome);
+                }
                 return (Ok(parser.native_payload(tools.as_ref())), outcome);
             }
             let content = parser.content();
@@ -477,6 +512,12 @@ impl Provider for Anthropic {
             if let Some(c) = parser.container() {
                 body["container"] = json!(c);
             }
+            // The paused message is the previous request now.
+            if let Some(id) = parser.message_id()
+                && body.get("diagnostics").is_some()
+            {
+                body["diagnostics"] = json!({"previous_message_id": id});
+            }
             out.event(StreamEvent::Notice(
                 "the API paused its server-tool loop (pause_turn); the bot continued the turn with another request"
                     .into(),
@@ -486,29 +527,116 @@ impl Provider for Anthropic {
     }
 }
 
-/// Upstream ids: the `request-id` of every request of the turn.
-struct IdSink<'a> {
+/// The turn's events on their way to the bot: the upstream ids of all its
+/// requests (the `request-id` of each, joined), and the files that code
+/// execution wrote, fetched as soon as their tool result arrives. Events
+/// after such a result wait until its files are in (strict order, D30); the
+/// stream itself is read on meanwhile.
+struct TurnSink<'a> {
     inner: &'a mut dyn EventSink,
     ids: Vec<String>,
+    files: files::Fetcher,
+    queue: VecDeque<Queued>,
 }
 
-impl IdSink<'_> {
+// Each event passes through the queue once; boxing it would allocate for every one.
+#[allow(clippy::large_enum_variant)]
+enum Queued {
+    Event(StreamEvent),
+    /// The events of a file-fetching task, due here.
+    Files(tokio::task::JoinHandle<Vec<StreamEvent>>),
+}
+
+impl<'a> TurnSink<'a> {
+    fn new(inner: &'a mut dyn EventSink, files: files::Fetcher) -> Self {
+        Self { inner, ids: Vec::new(), files, queue: VecDeque::new() }
+    }
+
     fn joined(&self) -> Option<String> {
         (!self.ids.is_empty()).then(|| self.ids.join(","))
     }
+
+    /// Pass on what is due: events up to the first fetch still running.
+    fn pump(&mut self) {
+        loop {
+            let ready = match self.queue.front() {
+                None => return,
+                Some(Queued::Event(_)) => true,
+                Some(Queued::Files(h)) => h.is_finished(),
+            };
+            if !ready {
+                return;
+            }
+            match self.queue.pop_front() {
+                Some(Queued::Event(e)) => self.inner.event(e),
+                Some(Queued::Files(mut h)) => match futures::FutureExt::now_or_never(&mut h) {
+                    Some(r) => {
+                        for e in files::joined(r) {
+                            self.inner.event(e);
+                        }
+                    }
+                    None => {
+                        self.queue.push_front(Queued::Files(h));
+                        return;
+                    }
+                },
+                None => return,
+            }
+        }
+    }
+
+    /// Wait for the fetches still running (stopped when cancelled) and pass everything on.
+    async fn drain(&mut self, cancel: &CancellationToken) {
+        while let Some(q) = self.queue.pop_front() {
+            match q {
+                Queued::Event(e) => self.inner.event(e),
+                Queued::Files(mut h) => {
+                    let evs = tokio::select! {
+                        r = &mut h => files::joined(r),
+                        _ = cancel.cancelled() => {
+                            h.abort();
+                            Vec::new()
+                        }
+                    };
+                    for e in evs {
+                        self.inner.event(e);
+                    }
+                }
+            }
+        }
+    }
 }
 
-impl EventSink for IdSink<'_> {
+impl Drop for TurnSink<'_> {
+    fn drop(&mut self) {
+        for q in &self.queue {
+            if let Queued::Files(h) = q {
+                h.abort();
+            }
+        }
+    }
+}
+
+impl EventSink for TurnSink<'_> {
     fn event(&mut self, ev: StreamEvent) {
-        match ev {
+        let ev = match ev {
             StreamEvent::Meta { upstream_id: Some(id), provider, model } => {
                 if !self.ids.contains(&id) {
                     self.ids.push(id);
                 }
-                self.inner.event(StreamEvent::Meta { upstream_id: self.joined(), provider, model });
+                StreamEvent::Meta { upstream_id: self.joined(), provider, model }
             }
-            other => self.inner.event(other),
+            other => other,
+        };
+        let fetch = match &ev {
+            StreamEvent::Tool(call) => self.files.start(call),
+            _ => None,
+        };
+        self.queue.push_back(Queued::Event(ev));
+        if let Some(h) = fetch {
+            self.queue.push_back(Queued::Files(h));
         }
+        self.pump();
     }
 }
 

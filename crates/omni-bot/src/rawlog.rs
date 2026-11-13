@@ -54,6 +54,16 @@ impl Observer for RawLog {
         trace!(target: "raw", data, "sse data");
     }
     fn body_text(&self, text: &str) {
+        if !enabled!(target: "raw", Level::TRACE) {
+            return;
+        }
+        // A JSON body with images or video (an image API's answer): blobs stored, not logged inline.
+        if text.len() > omni_core::json::BLOB_THRESHOLD
+            && let Ok(v) = serde_json::from_str::<Value>(text)
+        {
+            trace!(target: "raw", body = %self.redact(&v), "upstream body");
+            return;
+        }
         trace!(target: "raw", body = text, "upstream body");
     }
 }

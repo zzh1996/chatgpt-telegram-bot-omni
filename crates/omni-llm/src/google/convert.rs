@@ -9,7 +9,12 @@
 //!   switching models is to "still resend the previous model's thought blocks.
 //!   The backend manages compatibility" (Interactions API; none for
 //!   generateContent: docs/research/gemini.md §3.3). Any other assistant turn:
-//!   its answer text.
+//!   its answer text, and the images and files it generated as `inlineData`
+//!   parts where they were (model turns take any part; thought signatures are
+//!   required only on function calls, so none is made up), at the same media
+//!   resolution as user media; a kind of media the model does not take is
+//!   left out with a warning. Drafts made while thinking are reasoning and
+//!   stay out.
 //! - User parts: text; images, PDFs, Office/OpenDocument files, audio and
 //!   video as `inlineData` (with the file name as `displayName`); text files
 //!   natively as text `inlineData` (`text/plain` unless their type is one
@@ -98,6 +103,27 @@ pub struct Converted {
     /// The latest location in the conversation (latitude, longitude).
     pub location: Option<(f64, f64)>,
     pub media: MediaSeen,
+    /// What could not be sent (generated media of a kind the model does not take).
+    pub warnings: Vec<String>,
+}
+
+/// Model turns of `contents` hold the built-in tools' own calls or results
+/// (`toolCall` / `toolResponse` parts, returned with
+/// `toolConfig.includeServerSideToolInvocations`).
+pub fn has_tool_invocations(contents: &[Value]) -> bool {
+    contents.iter().filter(|c| c.get("role").and_then(Value::as_str) == Some("model")).any(|c| {
+        c.get("parts")
+            .and_then(Value::as_array)
+            .is_some_and(|ps| ps.iter().any(|p| p.get("toolCall").is_some() || p.get("toolResponse").is_some()))
+    })
+}
+
+/// The media class of a file as the API takes it (Office files by type or extension).
+fn file_class(mime: &str, filename: Option<&str>) -> (MediaClass, Option<&'static str>) {
+    match office_mime(mime, filename) {
+        Some(m) => (MediaClass::Document, Some(m)),
+        None => (classify_mime(mime, filename), None),
+    }
 }
 
 fn inline(mime: &str, bytes: &[u8], name: Option<&str>) -> Value {
@@ -130,6 +156,8 @@ pub async fn convert(
     let mut system: Vec<Value> = Vec::new();
     let res = |level: &'static str| spec.per_part_media_resolution.then_some(level);
     let last_user = history.iter().rposition(|t| t.role == Role::User);
+    // Generated media of other answers the model does not take: (an image part, its kind).
+    let mut left_out: Vec<(bool, String)> = Vec::new();
     for (idx, turn) in history.iter().enumerate() {
         match turn.role {
             Role::System => {
@@ -154,9 +182,76 @@ pub async fn convert(
                     out.contents.push(json!({"role": "model", "parts": parts}));
                     continue;
                 }
-                let text = turn.answer_text();
-                if !text.is_empty() {
-                    out.contents.push(json!({"role": "model", "parts": [{"text": text}]}));
+                // Another API's answer: its text, with what it generated where it was.
+                let mut parts: Vec<Value> = Vec::new();
+                let mut text = String::new();
+                let flush = |text: &mut String, parts: &mut Vec<Value>| {
+                    if !text.is_empty() {
+                        parts.push(json!({ "text": std::mem::take(text) }));
+                    }
+                };
+                for part in &turn.parts {
+                    match part {
+                        Part::Text { text: t, .. } => text.push_str(t),
+                        Part::Image { thought: true, .. } => {}
+                        Part::Image { blob, filename, .. } => {
+                            if !spec.inputs.image {
+                                left_out.push((true, "image".into()));
+                                continue;
+                            }
+                            flush(&mut text, &mut parts);
+                            let bytes = load(blobs, blob).await?;
+                            out.media.image = true;
+                            parts.push(with_resolution(
+                                inline(&blob.mime, &bytes, filename.as_deref()),
+                                res(RES_ULTRA_HIGH),
+                            ));
+                        }
+                        Part::File { blob, filename, .. } => {
+                            let fname = filename.as_deref();
+                            let (class, office) = file_class(&blob.mime, fname);
+                            let (taken, kind, level, mime) = match class {
+                                MediaClass::Image => (spec.inputs.image, "image", res(RES_ULTRA_HIGH), None),
+                                MediaClass::Pdf => (spec.inputs.pdf, "PDF", res(RES_HIGH), Some("application/pdf")),
+                                MediaClass::Video => (spec.inputs.video, "video", res(RES_HIGH), None),
+                                MediaClass::Audio => (spec.inputs.audio, "audio", None, None),
+                                MediaClass::Document => (spec.inputs.office, "Office/OpenDocument", None, office),
+                                MediaClass::Text => (true, "text", None, None),
+                                MediaClass::Other => (false, blob.mime.as_str(), None, None),
+                            };
+                            if !taken {
+                                left_out.push((false, kind.to_string()));
+                                continue;
+                            }
+                            let bytes = load(blobs, blob).await?;
+                            let mime = match class {
+                                MediaClass::Text => {
+                                    let m = blob.mime.to_ascii_lowercase();
+                                    TEXT_MIMES.iter().find(|t| **t == m).copied().unwrap_or("text/plain").to_string()
+                                }
+                                _ => mime.map(str::to_string).unwrap_or_else(|| blob.mime.clone()),
+                            };
+                            match class {
+                                MediaClass::Image => out.media.image = true,
+                                MediaClass::Pdf => out.media.pdf = true,
+                                MediaClass::Video => out.media.video = true,
+                                MediaClass::Audio => out.media.audio = true,
+                                MediaClass::Document => out.media.office = true,
+                                _ => out.media.text_file = true,
+                            }
+                            flush(&mut text, &mut parts);
+                            parts.push(with_resolution(inline(&mime, &bytes, fname), level));
+                        }
+                        Part::RemoteMedia { .. }
+                        | Part::Location { .. }
+                        | Part::Reasoning(_)
+                        | Part::ToolCall(_)
+                        | Part::Refusal { .. } => {}
+                    }
+                }
+                flush(&mut text, &mut parts);
+                if !parts.is_empty() {
+                    out.contents.push(json!({"role": "model", "parts": parts}));
                 }
             }
             Role::User => {
@@ -181,12 +276,7 @@ pub async fn convert(
                         }
                         Part::File { blob, filename, .. } => {
                             let name = filename.as_deref().unwrap_or("file");
-                            let office = office_mime(&blob.mime, filename.as_deref());
-                            let class = if office.is_some() {
-                                MediaClass::Document
-                            } else {
-                                classify_mime(&blob.mime, filename.as_deref())
-                            };
+                            let (class, office) = file_class(&blob.mime, filename.as_deref());
                             let fname = filename.as_deref();
                             match class {
                                 MediaClass::Image => {
@@ -291,6 +381,27 @@ pub async fn convert(
     }
     if !system.is_empty() {
         out.system = Some(json!({ "parts": system }));
+    }
+    if !left_out.is_empty() {
+        let images = left_out.iter().filter(|(image, _)| *image).count();
+        let files = left_out.len() - images;
+        let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let mut what = Vec::new();
+        if images > 0 {
+            what.push(count(images, "image", "images"));
+        }
+        if files > 0 {
+            what.push(count(files, "file", "files"));
+        }
+        let mut kinds: Vec<&str> = left_out.iter().map(|(_, k)| k.as_str()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        out.warnings.push(format!(
+            "{} generated in earlier turns {} not sent: `{model}` does not take {} input",
+            what.join(" and "),
+            if left_out.len() == 1 { "was" } else { "were" },
+            kinds.join(", ")
+        ));
     }
     Ok(out)
 }

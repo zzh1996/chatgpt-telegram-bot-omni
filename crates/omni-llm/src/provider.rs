@@ -290,6 +290,57 @@ pub fn no_location(model: &str, via: &str) -> LlmError {
     ))
 }
 
+/// What other models generated in `turns` — earlier answers that go to the API
+/// as their text, so their images and files are not sent — as a warning ending
+/// with `why`: `2 images and 1 video generated in earlier turns were not sent:
+/// assistant messages here carry text only`. Drafts made while thinking are
+/// reasoning, which never goes to another model, and are not counted.
+pub fn media_not_sent<'a>(turns: impl IntoIterator<Item = &'a omni_core::Turn>, why: &str) -> Option<String> {
+    use omni_core::content::Part;
+    let mut kinds =
+        [("image", "images", 0usize), ("video", "videos", 0), ("audio file", "audio files", 0), ("file", "files", 0)];
+    let mut with_media = 0usize;
+    for t in turns {
+        let before: usize = kinds.iter().map(|k| k.2).sum();
+        for part in &t.parts {
+            let k = match part {
+                Part::Image { generated: true, thought: false, .. } => 0,
+                Part::File { generated: true, blob, .. } => match blob.mime.split('/').next() {
+                    Some("image") => 0,
+                    Some("video") => 1,
+                    Some("audio") => 2,
+                    _ => 3,
+                },
+                _ => continue,
+            };
+            kinds[k].2 += 1;
+        }
+        with_media += usize::from(kinds.iter().map(|k| k.2).sum::<usize>() > before);
+    }
+    let n: usize = kinds.iter().map(|k| k.2).sum();
+    let what: Vec<String> = kinds
+        .iter()
+        .filter(|k| k.2 > 0)
+        .map(|(one, many, n)| format!("{n} {}", if *n == 1 { one } else { many }))
+        .collect();
+    let what = match what.split_last()? {
+        (last, []) => last.clone(),
+        (last, rest) => format!("{} and {last}", rest.join(", ")),
+    };
+    let turns = if with_media == 1 { "an earlier turn" } else { "earlier turns" };
+    Some(format!("{what} generated in {turns} {} not sent: {why}", if n == 1 { "was" } else { "were" }))
+}
+
+/// [`media_not_sent`] for the assistant turns of `history` that are not `own`
+/// (the model's own answers, replayed natively), in Chat Completions APIs whose
+/// assistant messages carry text only.
+pub fn unsent_media(history: &[omni_core::Turn], own: impl Fn(&omni_core::Turn) -> bool) -> Option<String> {
+    media_not_sent(
+        history.iter().filter(|t| t.role == omni_core::Role::Assistant && !own(t)),
+        "assistant messages here carry text only",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

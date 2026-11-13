@@ -3,6 +3,8 @@
 //! - [`sse`]: SSE parser.
 //! - [`error`]: errors with retry classification; upstream payloads kept verbatim.
 //! - [`event`]: normalized stream events and the turn accumulator.
+//! - [`meta`]: what each call reports about itself (ids, served model and
+//!   tier, headers, timings), collected from the raw traffic.
 //! - [`openrouter`]: OpenRouter client (catalog, Chat Completions / Responses /
 //!   Messages skins, options).
 //! - [`provider`]: the platforms' own APIs behind one interface
@@ -21,6 +23,7 @@ pub mod event;
 #[cfg(test)]
 mod fixtures;
 pub mod google;
+pub mod meta;
 pub mod moonshot;
 pub mod openai;
 pub mod openrouter;
@@ -123,6 +126,12 @@ impl Prepared {
     pub fn with_continuation(&self, item: &Value) -> Prepared {
         if self.dialect == google::DIALECT {
             return google::continuation_request(self, item);
+        }
+        if self.dialect == xai::VIDEO_DIALECT {
+            return xai::video_continuation(self, item);
+        }
+        if self.dialect == zhipu::images::DIALECT {
+            return zhipu::images::continuation_request(self, item);
         }
         let mut p = self.clone();
         if let Some(msgs) = p.body.get_mut("messages").and_then(Value::as_array_mut) {

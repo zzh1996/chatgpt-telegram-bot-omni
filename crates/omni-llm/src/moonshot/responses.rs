@@ -7,9 +7,17 @@
 //! replayed `web_search_call` is ignored by Moonshot: "the results are carried
 //! by the assistant message that follows"), Chat turns of the same model as
 //! their reasoning (`reasoning_text`, required on K3) plus message, other turns
-//! as text. Moonshot's reasoning items carry the reasoning itself (the API
-//! calls it 推理内容, "reasoning content") in `summary[]`, so it is shown as
-//! reasoning, not as a summary.
+//! as text (assistant messages carry `output_text` only). Moonshot's reasoning
+//! items carry the reasoning itself (the API calls it 推理内容, "reasoning
+//! content") in `summary[]`, so it is shown as reasoning, not as a summary.
+//!
+//! The search: Moonshot first judges from the input whether one is needed
+//! ("服务端会先根据输入判断是否需要搜索"); if so it runs it and puts one
+//! `web_search_call` at the start of the output, with its query and (asked for
+//! with `include`) its sources, which become the answer's sources: the
+//! answer's `annotations` (their shape is unspecified) were empty in every
+//! answer seen (2026-11-13). No `web_search_call` means no search ran (and
+//! none is billed).
 
 use omni_core::Usage;
 use omni_core::content::{Citation, ReasoningKind, Role, ToolCall, Turn};
@@ -129,23 +137,56 @@ pub(super) fn to_chat_message(payload: &Value) -> Value {
 }
 
 /// Responses events: the shared parser plus Moonshot's specifics (errors,
-/// search calls with their query and sources, reasoning kind, cost).
+/// search calls with their query and sources, the sources as the answer's
+/// sources, reasoning kind, cost).
 pub(super) struct Parser {
     inner: EventParser,
     spec: Option<&'static ModelSpec>,
     cny_per_usd: f64,
-    /// Citations came as `response.output_text.annotation.added` events.
-    annotation_events: bool,
+    /// Citations came as `response.output_text.annotation.added` events or in
+    /// the answer's `annotations`: the search sources stay with the search.
+    annotated: bool,
+    /// Ids of the `web_search_call` items.
+    searches: Vec<String>,
+    /// Search sources not attached to an answer yet.
+    sources: Vec<Citation>,
+    /// Every URL taken as a source (each is cited once).
+    cited: Vec<String>,
+    /// Answer text was streamed.
+    text: bool,
+    /// The normalized finish reason.
+    finish: Option<String>,
 }
 
 impl Parser {
     pub(super) fn new(spec: Option<&'static ModelSpec>, cny_per_usd: f64) -> Self {
-        Self { inner: EventParser::default(), spec, cny_per_usd, annotation_events: false }
+        Self {
+            inner: EventParser::default(),
+            spec,
+            cny_per_usd,
+            annotated: false,
+            searches: Vec::new(),
+            sources: Vec::new(),
+            cited: Vec::new(),
+            text: false,
+            finish: None,
+        }
     }
 
     /// The output items, for replay.
     pub(super) fn native_payload(&self) -> Value {
         self.inner.native_payload()
+    }
+
+    /// Whether a web search ran (Moonshot returns a `web_search_call` exactly then).
+    pub(super) fn searched(&self) -> bool {
+        !self.searches.is_empty()
+    }
+
+    /// The response ended normally (completed, or cut at the output limit) and
+    /// ran no search: worth a note when one was asked for.
+    pub(super) fn answered_without_search(&self) -> bool {
+        matches!(self.finish.as_deref(), Some("stop" | "length")) && !self.searched()
     }
 
     /// A `response.failed` / `error` event as Moonshot's error, verbatim in `details`.
@@ -162,21 +203,58 @@ impl Parser {
     }
 
     /// The cost of the response: tokens plus one fee per executed search
-    /// (each `web_search_call` in the output).
+    /// (each `web_search_call` in the output, else in the stream).
     fn price(&self, v: &Value, u: &mut Usage) {
         let searches = v.pointer("/response/output").and_then(Value::as_array).map_or(0, |o| {
             o.iter().filter(|i| i.get("type").and_then(Value::as_str) == Some("web_search_call")).count()
         });
+        let searches = searches.max(self.searches.len());
         u.cost_usd = self.spec.and_then(|s| super::estimate_cost(s, u, searches as u64, self.cny_per_usd));
         u.cost_source = if u.cost_usd.is_some() { CostSource::Estimated } else { CostSource::Unknown };
     }
+
+    /// A search item (`index`: its output index): its id, and its sources
+    /// (once per URL) for the answer.
+    fn search_item(&mut self, item: &Value, index: Option<u64>) {
+        let key = match item.get("id").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => format!("#{}", index.unwrap_or(0)),
+        };
+        if !self.searches.contains(&key) {
+            self.searches.push(key);
+        }
+        for s in item.pointer("/action/sources").and_then(Value::as_array).into_iter().flatten() {
+            let Some(url) = s.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()) else { continue };
+            if self.cited.iter().any(|c| c == url) {
+                continue;
+            }
+            self.cited.push(url.to_string());
+            self.sources.push(Citation {
+                url: Some(url.to_string()),
+                title: s.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string),
+                cited_text: None,
+                range: None,
+                extra: None,
+            });
+        }
+    }
+
+    /// The search sources not attached yet, as the answer's sources (unless
+    /// the answer cites itself).
+    fn sources_event(&mut self) -> Option<StreamEvent> {
+        (!self.annotated && self.text && !self.sources.is_empty())
+            .then(|| StreamEvent::Citations(std::mem::take(&mut self.sources)))
+    }
 }
 
-/// A search call with its query as input and its sources as output.
+/// A search call: its `action` (the query) as input, its sources as output.
 fn search_call(item: &Value, mut t: ToolCall) -> ToolCall {
-    let action = item.get("action");
-    t.input = action.and_then(|a| a.get("query")).filter(|q| !q.is_null()).map(|q| json!({"query": q}));
-    t.output = action.and_then(|a| a.get("sources")).filter(|s| !s.is_null()).map(|s| json!({"sources": s}));
+    if let Some(action) = item.get("action").and_then(Value::as_object) {
+        let mut action = action.clone();
+        let sources = action.remove("sources").filter(|s| !s.is_null());
+        t.input = Some(Value::Object(action));
+        t.output = sources.map(|s| json!({"sources": s}));
+    }
     t
 }
 
@@ -210,33 +288,48 @@ impl chatstream::EventParser for Parser {
         match ty {
             // Only separates summary parts; Moonshot's reasoning is one text.
             "response.reasoning_summary_part.done" => return Ok(Vec::new()),
-            "response.output_text.annotation.added" => self.annotation_events = true,
+            "response.output_text.annotation.added" => self.annotated = true,
             _ => {}
         }
         let item = v.get("item");
+        if let Some(i) = item.filter(|i| i.get("type").and_then(Value::as_str) == Some("web_search_call")) {
+            self.search_item(i, v.get("output_index").and_then(Value::as_u64));
+        }
         let mut out = Vec::with_capacity(evs.len() + 1);
         for ev in evs {
-            out.push(match ev {
+            match ev {
                 StreamEvent::Reasoning { kind: ReasoningKind::Summary, text, block } => {
-                    StreamEvent::Reasoning { kind: ReasoningKind::Text, text, block }
+                    out.push(StreamEvent::Reasoning { kind: ReasoningKind::Text, text, block })
                 }
-                StreamEvent::Tool(t) if t.name == "web_search" => StreamEvent::Tool(match item {
+                StreamEvent::Tool(t) if t.name == "web_search" => out.push(StreamEvent::Tool(match item {
                     Some(i) => search_call(i, t),
                     None => t,
-                }),
+                })),
                 StreamEvent::Usage(mut u) => {
                     self.price(v, &mut u);
-                    StreamEvent::Usage(u)
+                    out.push(StreamEvent::Usage(u));
                 }
-                other => other,
-            });
+                StreamEvent::Text(t) => {
+                    self.text = true;
+                    out.push(StreamEvent::Text(t));
+                }
+                // Sources still waiting (no finished answer item came) go to the answer before the end.
+                StreamEvent::Finish { reason, native } => {
+                    out.extend(self.sources_event());
+                    self.finish.clone_from(&reason);
+                    out.push(StreamEvent::Finish { reason, native });
+                }
+                other => out.push(other),
+            }
         }
         if ty == "response.output_item.done"
-            && !self.annotation_events
             && let Some(i) = item.filter(|i| i.get("type").and_then(Value::as_str) == Some("message"))
         {
-            let cites = citations(i);
-            if !cites.is_empty() {
+            let cites = if self.annotated { Vec::new() } else { citations(i) };
+            if cites.is_empty() {
+                out.extend(self.sources_event());
+            } else {
+                self.annotated = true;
                 out.push(StreamEvent::Citations(cites));
             }
         }

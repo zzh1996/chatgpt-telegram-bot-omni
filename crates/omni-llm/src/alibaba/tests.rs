@@ -95,12 +95,12 @@ fn model_table() {
         assert!(model_spec(id).is_some(), "{id}");
     }
     let m = model_spec("qwen3.8-max-0902").unwrap();
-    assert!(m.vision && m.effort && m.search == "max");
+    assert!(m.vision && m.effort);
     assert_eq!((m.context, m.max_output, m.max_cot), (1_000_000, 131_072, Some(262_144)));
     let p = m.tiers[0].price;
     assert_eq!((p.input, p.cached_input, p.output), (12.0, 1.5, 36.0));
     let q37 = model_spec("qwen3.7-max").unwrap();
-    assert!(!q37.vision && !q37.effort && q37.search == "agent");
+    assert!(!q37.vision && !q37.effort);
     assert_eq!(q37.tiers[0].price.cached_input, 2.4);
     assert_eq!(model_spec("qwen3.7-max-preview").unwrap().thinking, Thinking::Always);
     assert!(model_spec("qwen3.7-max-2026-06-08").unwrap().vision);
@@ -185,6 +185,11 @@ async fn invalid_options_are_rejected() {
     assert!(e.contains("needs thinking mode"), "{e}");
     let e = prepare_err("qwen3.8-max", &[flag("c"), kv("budget", "1000")]).await;
     assert!(e.contains("no thinking budget") && e.contains("e=xhigh|medium|low"), "{e}");
+    let e = prepare_err("qwen3.8-max", &[flag("s"), kv("budget", "1000")]).await;
+    assert!(e.contains("web search (`+s`) needs Alibaba's Responses API, which has no thinking budget"), "{e}");
+    let e = prepare_err("qwen3.7-max", &[flag("sc"), kv("budget", "1000")]).await;
+    assert!(e.contains("web search (`+s`) and the code interpreter (`+c`) need"), "{e}");
+    assert!(!e.contains("e=xhigh"), "Qwen3.7 has no effort levels: {e}");
     let e = prepare_err("qwen3.8-max", &[kv("v", "low")]).await;
     assert!(e.contains("no verbosity"), "{e}");
     let e = prepare_err("qwen9", &[flag("s")]).await;
@@ -216,19 +221,39 @@ async fn output_budget() {
     assert_eq!(p.max_tokens(), Some(65_536));
 }
 
+/// `+s` goes to the Responses API: only there do the searches come back.
 #[tokio::test]
-async fn web_search() {
+async fn web_search_uses_the_responses_api() {
     let p = prepare("qwen3.8-max", &[flag("s")]).await.unwrap();
-    assert_eq!(p.body["enable_search"], true);
-    assert_eq!(p.body["search_options"], json!({"search_strategy": "max"}));
-    assert_eq!(p.body["include_tool_usage"], true);
-    assert_eq!(p.settings, vec!["effort xhigh", "web search (max)"]);
-    assert!(p.notes.iter().any(|n| n.contains("returns no sources")));
-    let p = prepare("qwen3.7-max", &[flag("s")]).await.unwrap();
-    assert_eq!(p.body["search_options"], json!({"search_strategy": "agent"}));
-    let p = prepare("qwen3.8-max", &[flag("su")]).await.unwrap();
-    assert_eq!(p.body["search_options"], json!({"search_strategy": "agent_max"}));
-    assert_eq!(p.settings[1], "web search + web extractor (agent_max)");
+    assert_eq!(p.dialect, RESPONSES_DIALECT);
+    assert_eq!(p.url, "https://dashscope.aliyuncs.com/compatible-mode/v1/responses");
+    assert_eq!(p.body["tools"], json!([{"type": "web_search"}]));
+    assert_eq!(p.body["reasoning"], json!({"effort": "xhigh"}));
+    assert_eq!(p.body["store"], false);
+    for k in ["enable_search", "search_options", "include_tool_usage", "messages", "enable_thinking"] {
+        assert!(p.body.get(k).is_none(), "{k}");
+    }
+    assert_eq!(p.settings, vec!["effort xhigh", "web search"]);
+    assert!(p.notes.is_empty() && p.warnings.is_empty(), "{:?} {:?}", p.notes, p.warnings);
+    assert!(p.applied.iter().any(|a| a.source == "option" && a.patch == json!({"tools": [{"type": "web_search"}]})));
+    // Qwen3.7: the thinking switch on this API; with the web extractor.
+    let p = prepare("qwen3.7-max", &[flag("su")]).await.unwrap();
+    assert_eq!(p.body["tools"], json!([{"type": "web_search"}, {"type": "web_extractor"}]));
+    assert_eq!(p.body["enable_thinking"], true);
+    assert_eq!(p.settings, vec!["thinking on", "web search", "web extractor"]);
+    // Thinking off is fine for the search alone.
+    let p = prepare("qwen3.8-flash", &[flag("s"), kv("e", "none")]).await.unwrap();
+    assert_eq!(p.body["reasoning"], json!({"effort": "none"}));
+    // A preset's search is a default.
+    let (blobs, _) = Blobs::new(&[]);
+    let preset = crate::request::parse(&[flag("s")]).unwrap();
+    let h = [Turn::user_text("hi")];
+    let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &h), &[preset], &blobs).await.unwrap();
+    assert!(p.applied.iter().any(|a| a.source == "default" && a.patch["tools"][0]["type"] == "web_search"));
+    // What the Responses API lacks: the reason names the search.
+    let long = [Turn::user_text("字".repeat(700_000))];
+    let e = alibaba(None).prepare(&input("qwen3.8-max", &[flag("s")], &long), &[], &blobs).await.unwrap_err();
+    assert!(e.message.contains("silently truncate") && e.message.contains("web search (`+s`) needs that API"));
 }
 
 #[tokio::test]
@@ -325,6 +350,63 @@ async fn media() {
     assert!(p.notes.iter().any(|n| n.contains("default resolution")));
     let e = alibaba(None).prepare(&input("qwen3.8-max", &[flag("c")], &h), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("videos only as public URLs"), "{}", e.message);
+    // The same for web search, which also needs the Responses API.
+    let p = alibaba(None).prepare(&input("qwen3.8-max", &[flag("s")], &h2), &[], &blobs).await.unwrap();
+    assert!(p.body.get("vl_high_resolution_images").is_none());
+    assert_eq!(
+        p.notes,
+        vec![
+            "images at Alibaba's default resolution: web search (`+s`) needs the Responses API, which has no \
+             high-resolution switch"
+        ]
+    );
+    let e = alibaba(None).prepare(&input("qwen3.8-max", &[flag("s")], &h), &[], &blobs).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "`qwen3.8-max`: web search (`+s`) needs Alibaba's Responses API, which takes videos only as public URLs"
+    );
+}
+
+/// Media other models generated in earlier turns: assistant messages carry text only (both APIs).
+#[tokio::test]
+async fn generated_media_of_other_models_are_not_sent() {
+    let (blobs, refs) = Blobs::new(&[b"\x89PNG".to_vec(), b"\x00\x00mp4".to_vec()]);
+    let with = |mime: &str, r: &BlobRef| BlobRef { mime: mime.into(), ..r.clone() };
+    let image = |thought| Part::Image {
+        blob: with("image/png", &refs[0]),
+        filename: None,
+        generated: true,
+        dims: None,
+        thought,
+    };
+    let video = Part::File { blob: with("video/mp4", &refs[1]), filename: Some("v.mp4".into()), generated: true };
+    let gemini = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![image(true), Part::text("Here:"), image(false), image(false), video],
+        native: Some(NativeOutput {
+            dialect: "google.generate".into(),
+            model: "gemini-nano-banana-2.1".into(),
+            payload: json!({}),
+            context_tokens: None,
+        }),
+    };
+    let h = [Turn::user_text("draw"), gemini, Turn::user_text("describe them")];
+    for opts in [vec![], vec![flag("s")]] {
+        let p = alibaba(None).prepare(&input("qwen3.8-max", &opts, &h), &[], &blobs).await.unwrap();
+        assert_eq!(
+            p.warnings,
+            vec![
+                "2 images and 1 video generated in an earlier turn were not sent: assistant messages here carry text only"
+            ],
+            "{opts:?}"
+        );
+    }
+    let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &h), &[], &blobs).await.unwrap();
+    assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here:"}));
+    // Nothing to say without generated media.
+    let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &[Turn::user_text("hi")]), &[], &blobs).await.unwrap();
+    assert!(p.warnings.is_empty());
 }
 
 #[tokio::test]
@@ -375,7 +457,7 @@ fn run_chat(chunks: &[Value]) -> (ChatParser, crate::Accumulator) {
     (p, acc)
 }
 
-/// The qwen3.8-max stream of the Chat Completions reference (with search usage).
+/// The qwen3.8-max stream of the Chat Completions reference.
 #[test]
 fn chat_stream() {
     let id = "chatcmpl-730609ad-25b4-9809-8bd2-29b3fb280cb9";
@@ -391,8 +473,7 @@ fn chat_stream() {
         json!({"id": id, "object": "chat.completion.chunk", "created": 1794384861, "model": "qwen3.8-max", "choices": [],
                "usage": {"prompt_tokens": 2883, "total_tokens": 2962, "completion_tokens": 79,
                          "prompt_tokens_details": {"cached_tokens": 0, "text_tokens": 2883},
-                         "completion_tokens_details": {"reasoning_tokens": 58, "text_tokens": 79},
-                         "x_tools": {"search": {"count": 1, "strategy": "turbo"}}}}),
+                         "completion_tokens_details": {"reasoning_tokens": 58, "text_tokens": 79}}}),
     ];
     let (p, acc) = run_chat(&chunks);
     assert!(p.finished());
@@ -404,10 +485,11 @@ fn chat_stream() {
     assert_eq!(acc.upstream_id.as_deref(), Some(id));
     assert_eq!(p.native_payload(), json!({"role": "assistant", "content": "我是通义", "reasoning_content": "用户"}));
     let u = acc.usage.unwrap();
-    assert_eq!(search_calls(&u), 1);
-    // 2883 × ¥12/M + 79 × ¥36/M + one turbo search × ¥0.003
-    let c = estimate_cost(model_spec("qwen3.8-max").unwrap(), &u, 1, "max", 7.0).unwrap();
-    let cny = 2883.0 * 12.0 / 1e6 + 79.0 * 36.0 / 1e6 + 0.003;
+    // The per-modality split stays in the raw usage.
+    assert_eq!(u.raw["prompt_tokens_details"]["text_tokens"], 2883);
+    // 2883 × ¥12/M + 79 × ¥36/M
+    let c = estimate_cost(model_spec("qwen3.8-max").unwrap(), &u, 0, 7.0).unwrap();
+    let cny = 2883.0 * 12.0 / 1e6 + 79.0 * 36.0 / 1e6;
     assert!((c - cny / 7.0).abs() < 1e-12, "{c}");
 }
 
@@ -540,6 +622,231 @@ fn responses_stream() {
     assert_eq!(p.native_payload()["output"].as_array().unwrap().len(), 4);
 }
 
+/// Events of a Responses stream with two searches, shaped like the reference's
+/// web-search example; `annotations` is the answer's (Alibaba: "usually empty").
+fn search_stream(annotations: Value, tool_usage: Value, x_tools: Option<Value>) -> Vec<Value> {
+    let search = |id: &str, query: &str, sources: Value| json!({"action": {"sources": sources, "type": "search", "query": query}, "id": id, "type": "web_search_call", "status": "completed"});
+    let ws1 = search(
+        "msg_a8a686b1",
+        "阿里云官网",
+        json!([{"type": "url", "url": "https://cn.aliyun.com/"}, {"type": "url", "url": "https://www.aliyun.com/"}]),
+    );
+    let ws2 = search(
+        "msg_b2",
+        "阿里云 帮助中心",
+        json!([{"type": "url", "url": "https://www.aliyun.com/"}, {"type": "url", "url": "https://help.aliyun.com/"}]),
+    );
+    let message = json!({"id": "msg_final", "type": "message", "role": "assistant", "status": "completed",
+                         "content": [{"annotations": annotations, "text": "阿里云官网是 https://cn.aliyun.com/", "type": "output_text", "logprobs": null}]});
+    let mut usage = json!({"input_tokens": 3000, "output_tokens": 200, "total_tokens": 3200,
+                           "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 80}});
+    if let Some(x) = x_tools {
+        usage["x_tools"] = x;
+    }
+    let mut seq = 0;
+    let mut ev = |mut v: Value| {
+        v["sequence_number"] = json!(seq);
+        seq += 1;
+        v
+    };
+    vec![
+        ev(
+            json!({"type": "response.created", "response": {"output": [], "model": "", "id": "863df8d9", "tools": [], "object": "response", "status": "queued"}}),
+        ),
+        ev(
+            json!({"type": "response.in_progress", "response": {"output": [], "id": "863df8d9", "status": "in_progress"}}),
+        ),
+        ev(
+            json!({"type": "response.output_item.added", "output_index": 0, "item": {"summary": [], "type": "reasoning", "id": "msg_r"}}),
+        ),
+        ev(
+            json!({"type": "response.reasoning_text.delta", "output_index": 0, "item_id": "msg_r", "delta": "先搜索阿里云官网。"}),
+        ),
+        ev(json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"summary": [{"type": "summary_text", "text": "先搜索阿里云官网。"}], "type": "reasoning", "id": "msg_r"}})),
+        ev(json!({"type": "response.output_item.added", "output_index": 1,
+                   "item": {"action": {"type": "search", "query": "阿里云官网"}, "id": "msg_a8a686b1", "type": "web_search_call", "status": "in_progress"}})),
+        ev(json!({"type": "response.web_search_call.in_progress", "output_index": 1, "item_id": "msg_a8a686b1"})),
+        ev(json!({"type": "response.web_search_call.searching", "output_index": 1, "item_id": "msg_a8a686b1"})),
+        ev(json!({"type": "response.web_search_call.completed", "output_index": 1, "item_id": "msg_a8a686b1"})),
+        ev(json!({"type": "response.output_item.done", "output_index": 1, "item": ws1})),
+        ev(json!({"type": "response.output_item.added", "output_index": 2,
+                   "item": {"action": {"type": "search", "query": "阿里云 帮助中心"}, "id": "msg_b2", "type": "web_search_call", "status": "in_progress"}})),
+        ev(json!({"type": "response.web_search_call.completed", "output_index": 2, "item_id": "msg_b2"})),
+        ev(json!({"type": "response.output_item.done", "output_index": 2, "item": ws2})),
+        ev(json!({"type": "response.output_item.added", "output_index": 3,
+                   "item": {"content": [{"type": "text", "text": ""}], "type": "message", "id": "msg_final", "role": "assistant"}})),
+        ev(
+            json!({"type": "response.output_text.delta", "output_index": 3, "item_id": "msg_final", "delta": "阿里云官网是 https://cn.aliyun.com/"}),
+        ),
+        ev(json!({"type": "response.output_item.done", "output_index": 3, "item": message})),
+        ev(
+            json!({"type": "response.completed", "response": {"id": "863df8d9", "model": "qwen3.8-max", "status": "completed",
+                   "output": [], "tool_usage": tool_usage, "usage": usage}}),
+        ),
+    ]
+}
+
+fn run_responses(events: &[Value]) -> (responses::Parser, crate::Accumulator) {
+    let mut p = responses::Parser::new(model_spec("qwen3.8-max"), 7.0);
+    let mut acc = crate::Accumulator::new();
+    for e in events {
+        for x in p.event(None, e).unwrap() {
+            acc.apply(x);
+        }
+    }
+    (p, acc)
+}
+
+/// `+s` on the Responses API: each search is a tool call with its query and
+/// sources, the sources become the answer's, and the billed searches are costed.
+#[test]
+fn responses_web_search() {
+    let events =
+        search_stream(json!([]), json!({"web_search": {"num_requests": 2}}), Some(json!({"web_search": {"count": 2}})));
+    let (p, acc) = run_responses(&events);
+    assert!(p.finished() && p.searched());
+    let parts = acc.parts();
+    assert_eq!(parts.len(), 4, "{parts:?}");
+    assert!(matches!(&parts[0], Part::Reasoning(_)));
+    let Part::ToolCall(t) = &parts[1] else { panic!("{parts:?}") };
+    assert_eq!(
+        (t.id.as_deref(), t.name.as_str(), t.status.as_deref()),
+        (Some("msg_a8a686b1"), "web_search", Some("completed"))
+    );
+    assert_eq!(t.input, Some(json!({"type": "search", "query": "阿里云官网"})));
+    assert_eq!(
+        t.output,
+        Some(
+            json!({"sources": [{"type": "url", "url": "https://cn.aliyun.com/"}, {"type": "url", "url": "https://www.aliyun.com/"}]})
+        )
+    );
+    assert!(
+        matches!(&parts[2], Part::ToolCall(t) if t.input == Some(json!({"type": "search", "query": "阿里云 帮助中心"})))
+    );
+    let Part::Text { text, citations } = &parts[3] else { panic!("{parts:?}") };
+    assert_eq!(text, "阿里云官网是 https://cn.aliyun.com/");
+    let urls: Vec<_> = citations.iter().map(|c| c.url.as_deref().unwrap()).collect();
+    assert_eq!(
+        urls,
+        ["https://cn.aliyun.com/", "https://www.aliyun.com/", "https://help.aliyun.com/"],
+        "each URL once"
+    );
+    assert!(citations.iter().all(|c| c.title.is_none()), "Alibaba's sources have no titles");
+    // 3000 × ¥12/M + 200 × ¥36/M + 2 billed searches × ¥0.004.
+    let u = acc.usage.unwrap();
+    let cny = (3000.0 * 12.0 + 200.0 * 36.0) / 1e6 + 0.008;
+    assert!((u.cost_usd.unwrap() - cny / 7.0).abs() < 1e-12, "{:?}", u.cost_usd);
+    // The billed count wins over the calls and the usage's count.
+    let events =
+        search_stream(json!([]), json!({"web_search": {"num_requests": 1}}), Some(json!({"web_search": {"count": 2}})));
+    let (_, acc) = run_responses(&events);
+    let cny = (3000.0 * 12.0 + 200.0 * 36.0) / 1e6 + 0.004;
+    assert!((acc.usage.unwrap().cost_usd.unwrap() - cny / 7.0).abs() < 1e-12);
+    // Without counts: one fee per call.
+    let (_, acc) = run_responses(&search_stream(json!([]), json!({}), None));
+    let cny = (3000.0 * 12.0 + 200.0 * 36.0) / 1e6 + 0.008;
+    assert!((acc.usage.unwrap().cost_usd.unwrap() - cny / 7.0).abs() < 1e-12);
+    // An answer with its own citations keeps them; the sources stay with the searches.
+    let cite = json!([{"type": "url_citation", "url": "https://cn.aliyun.com/", "title": "阿里云", "start_index": 6, "end_index": 28}]);
+    let (_, acc) = run_responses(&search_stream(cite, json!({}), None));
+    let Some(Part::Text { citations, .. }) = acc.parts().last() else { panic!() };
+    assert_eq!(citations.len(), 1);
+    assert_eq!(citations[0].title.as_deref(), Some("阿里云"));
+}
+
+/// The model answered without searching: no call, no count, `tool_usage: {}`.
+#[test]
+fn responses_without_a_search() {
+    let mut events = search_stream(json!([]), json!({}), None);
+    events.retain(|e| {
+        let ty = e["type"].as_str().unwrap();
+        !ty.starts_with("response.web_search_call") && e["item"]["type"] != "web_search_call"
+    });
+    let (p, acc) = run_responses(&events);
+    assert!(p.finished());
+    assert!(!p.searched());
+    assert!(acc.parts().iter().all(|p| !matches!(p, Part::ToolCall(_))));
+    assert!(matches!(acc.parts().last(), Some(Part::Text { citations, .. }) if citations.is_empty()));
+    // A reported count alone means a search ran.
+    let mut done = events.last().unwrap().clone();
+    done["response"]["usage"]["x_tools"] = json!({"web_search": {"count": 1}});
+    let mut p = responses::Parser::new(model_spec("qwen3.8-max"), 7.0);
+    p.event(None, &done).unwrap();
+    assert!(p.searched());
+}
+
+/// `+s` end to end: a notice when the model ran no search, none when it did.
+#[tokio::test]
+async fn end_to_end_search_notice() {
+    let mut without = search_stream(json!([]), json!({}), None);
+    without.retain(|e| {
+        !e["type"].as_str().unwrap().starts_with("response.web_search_call") && e["item"]["type"] != "web_search_call"
+    });
+    let with = search_stream(json!([]), json!({"web_search": {"num_requests": 2}}), None);
+    let h = [Turn::user_text("阿里云官网是什么？")];
+    let cases = [
+        ("s", without.clone(), vec![NO_SEARCH], json!([{"type": "web_search"}])),
+        ("s", with, vec![], json!([{"type": "web_search"}])),
+        // The code interpreter alone asks for no search: nothing to say.
+        ("c", without, vec![], json!([{"type": "code_interpreter"}])),
+    ];
+    for (opt, events, want, tools) in cases {
+        // Alibaba precedes every event with an `:HTTP_STATUS/200` comment.
+        let body: String = events
+            .iter()
+            .map(|e| format!(":HTTP_STATUS/200\nevent: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect();
+        let (base, server) = serve(body).await;
+        let a = Alibaba::new(DirectConfig { base_url: base, ..alibaba(None).cfg.clone() }).unwrap();
+        let (blobs, _) = Blobs::new(&[]);
+        let p = a.prepare(&input("qwen3.8-max", &[flag(opt)], &h), &[], &blobs).await.unwrap();
+        let mut evs = Vec::new();
+        let (r, _) =
+            a.stream(&p, &mut |e: StreamEvent| evs.push(e), &crate::NullObserver, &CancellationToken::new()).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(server.await.unwrap()["tools"], tools);
+        let notices: Vec<_> =
+            evs.iter().filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n.as_str()) } else { None }).collect();
+        assert_eq!(notices, want, "+{opt}");
+    }
+}
+
+/// One HTTP exchange on a local port: the base URL and a handle yielding the JSON body sent.
+async fn serve(body: String) -> (String, tokio::task::JoinHandle<Value>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/compatible-mode/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (mut buf, mut tmp) = (Vec::new(), [0u8; 8192]);
+        let sent = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                    .unwrap_or(0);
+                while buf.len() < pos + 4 + len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                break serde_json::from_slice(&buf[pos + 4..pos + 4 + len]).unwrap_or(Value::Null);
+            }
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        let _ = sock.shutdown().await;
+        sent
+    });
+    (base, server)
+}
+
 #[test]
 fn responses_errors_and_incomplete() {
     let mut p = responses::Parser::new(model_spec("qwen3.8-max"), 7.0);
@@ -637,10 +944,11 @@ fn tiered_cost() {
     let spec = model_spec("qwen3.7-plus").unwrap();
     let u = |input| Usage { input_tokens: Some(input), output_tokens: Some(1_000), ..Default::default() };
     // ≤256K input: ¥2 / ¥8; above: ¥6 / ¥24 for all tokens of the request.
-    let c = estimate_cost(spec, &u(100_000), 0, "agent", 1.0).unwrap();
+    let c = estimate_cost(spec, &u(100_000), 0, 1.0).unwrap();
     assert!((c - (0.1 * 2.0 + 0.001 * 8.0)).abs() < 1e-12, "{c}");
-    let c = estimate_cost(spec, &u(300_000), 0, "agent", 1.0).unwrap();
+    let c = estimate_cost(spec, &u(300_000), 0, 1.0).unwrap();
     assert!((c - (0.3 * 6.0 + 0.001 * 24.0)).abs() < 1e-12, "{c}");
-    assert_eq!(search_fee_cny("turbo"), 0.003);
-    assert_eq!(search_fee_cny("agent_max"), 0.004);
+    // Web searches: ¥4 per 1000 (billed like the `agent` strategy).
+    let c = estimate_cost(spec, &u(100_000), 3, 1.0).unwrap();
+    assert!((c - (0.1 * 2.0 + 0.001 * 8.0 + 0.012)).abs() < 1e-12, "{c}");
 }

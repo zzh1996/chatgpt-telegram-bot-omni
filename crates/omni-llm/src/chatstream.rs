@@ -63,6 +63,46 @@ pub async fn run(
     run_with(rb, url, body, idle_timeout, id_header, map_error, cp, sink, observer, cancel).await
 }
 
+/// What a response says about retrying: the delay (`retry-after-ms`, else
+/// `retry-after` in seconds, fractional, or an HTTP date), rounded up to whole
+/// seconds, and `x-should-retry` (`true`/`false`), the explicit hint the
+/// official SDKs follow.
+pub fn retry_hints(h: &reqwest::header::HeaderMap) -> (Option<u64>, Option<bool>) {
+    let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
+    let secs = |x: f64| (x.is_finite() && x >= 0.0).then(|| x.ceil() as u64);
+    let after = get("retry-after-ms")
+        .and_then(|v| v.parse::<f64>().ok())
+        .and_then(|ms| secs(ms / 1000.0))
+        .or_else(|| get("retry-after").and_then(|v| v.parse::<f64>().ok().and_then(secs).or_else(|| http_date_in(v))));
+    let should = match get("x-should-retry") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    (after, should)
+}
+
+/// Seconds from now until an IMF-fixdate (`Wed, 21 Oct 2015 07:28:00 GMT`); 0 if past.
+fn http_date_in(v: &str) -> Option<u64> {
+    let p: Vec<&str> = v.split_whitespace().collect();
+    let [_, day, mon, year, time, "GMT"] = p.as_slice() else { return None };
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let m = MONTHS.iter().position(|x| x == mon)? as i64 + 1;
+    let (d, y): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let hms: Vec<i64> = time.split(':').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let [hh, mm, ss] = hms.as_slice() else { return None };
+    // Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let at = days * 86400 + hh * 3600 + mm * 60 + ss;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some((at - now).max(0) as u64)
+}
+
 /// The error for a non-2xx response before streaming started (`text`: the body).
 /// The whole body is kept as the error's details.
 pub fn http_error(status: u16, retry_after: Option<u64>, text: &str, map_error: ErrorMapper) -> LlmError {
@@ -126,12 +166,19 @@ pub async fn run_with<P: EventParser>(
     if let Some(g) = &header_id {
         sink.event(StreamEvent::Meta { upstream_id: Some(g.clone()), provider: None, model: None });
     }
-    let retry_after =
-        resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|s| s.trim().parse::<u64>().ok());
+    let (retry_after, should_retry) = retry_hints(resp.headers());
     if !(200..300).contains(&status) {
         let text = resp.text().await.unwrap_or_default();
         observer.body_text(&text);
-        let err = http_error(status, retry_after, &text, map_error);
+        let mut err = http_error(status, retry_after, &text, map_error);
+        // The server's explicit hint wins, as in the official SDKs.
+        match should_retry {
+            Some(false) => err.retry = Retry::Never,
+            Some(true) if err.retry == Retry::Never => {
+                err.retry = retry_after.map_or(Retry::Backoff, Retry::After);
+            }
+            _ => {}
+        }
         return Streamed { result: Err(err), parser: cp, header_id };
     }
 
@@ -246,4 +293,34 @@ fn handle_items<P: EventParser>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::*;
+
+    fn h(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn retry_hints_from_headers() {
+        assert_eq!(retry_hints(&h(&[("retry-after", "7")])), (Some(7), None));
+        assert_eq!(retry_hints(&h(&[("retry-after", "1.2")])), (Some(2), None));
+        // Milliseconds win over seconds.
+        assert_eq!(retry_hints(&h(&[("retry-after-ms", "1500"), ("retry-after", "9")])), (Some(2), None));
+        assert_eq!(retry_hints(&h(&[("x-should-retry", "false")])), (None, Some(false)));
+        assert_eq!(retry_hints(&h(&[("x-should-retry", "true")])), (None, Some(true)));
+        // A date in the past means now.
+        assert_eq!(retry_hints(&h(&[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")])), (Some(0), None));
+        let soon = http_date_in("Fri, 01 Jan 2100 00:00:00 GMT").unwrap();
+        assert!(soon > 2_000_000_000, "{soon}");
+        assert_eq!(retry_hints(&h(&[("retry-after", "soon")])), (None, None));
+    }
 }

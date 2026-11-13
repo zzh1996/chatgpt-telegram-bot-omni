@@ -56,8 +56,18 @@ pub enum StreamEvent {
     /// router-side transformation was detected). Shown in the bot info area.
     Notice(String),
     /// A resumable checkpoint (e.g. a Gemini long-decode continuation item):
-    /// generation can be resumed from here after a drop or restart.
+    /// generation can be resumed from here after a drop or restart. `Null`
+    /// clears it: the call can no longer be resumed (e.g. its job failed for
+    /// good), so an error after it is retried as a new attempt, not resumed.
     Checkpoint(Value),
+    /// The provider sends this call's whole output again, recovered from a stored
+    /// copy after the stream broke (OpenAI `store: true`): what the call produced
+    /// so far is discarded (see [`Accumulator::begin_call`]).
+    Restart,
+    /// The conversation's exact size in tokens after this call (its input plus
+    /// output), when the API reports it (xAI `usage.context_details`): the next
+    /// turn's context, also after server-side tools.
+    ContextSize(u64),
 }
 
 /// The latest preview of an image still being generated: (slot, blob, pixel size).
@@ -78,6 +88,10 @@ pub struct Accumulator {
     pub notices: Vec<String>,
     /// Native replay payload, maintained by the adapter.
     pub native: Option<NativeOutput>,
+    /// See [`StreamEvent::ContextSize`].
+    pub context_size: Option<u64>,
+    /// The parts when the current upstream call began ([`StreamEvent::Restart`]).
+    call_start: Vec<Part>,
     /// Images to store: (bytes, MIME type, made while thinking).
     pending_images: Vec<(Vec<u8>, String, bool)>,
     /// Other generated files to store: (bytes, MIME type, file name).
@@ -221,6 +235,18 @@ impl Accumulator {
                 self.pending_previews.retain(|(s, ..)| *s != slot);
                 self.previews.retain(|(s, ..)| *s != slot);
             }
+            StreamEvent::Restart => {
+                let start = self.call_start.clone();
+                self.restore_parts(start);
+                self.pending_images.clear();
+                self.pending_files.clear();
+                self.pending_previews.clear();
+                self.previews.clear();
+                self.finish_reason = None;
+                self.native_finish_reason = None;
+                self.finish_details = None;
+            }
+            StreamEvent::ContextSize(n) => self.context_size = Some(n),
             StreamEvent::Tool(call) => {
                 // Update an existing call with the same id, else append.
                 if let Some(id) = &call.id {
@@ -303,6 +329,11 @@ impl Accumulator {
     }
 
     /// Replace the accumulated parts (resume from a checkpoint snapshot).
+    /// A new upstream call begins: [`StreamEvent::Restart`] returns to this point.
+    pub fn begin_call(&mut self) {
+        self.call_start = self.parts.clone();
+    }
+
     pub fn restore_parts(&mut self, parts: Vec<Part>) {
         self.parts = parts;
         self.last_reasoning_block = None;

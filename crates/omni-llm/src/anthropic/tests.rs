@@ -325,9 +325,10 @@ async fn server_tools_at_their_current_versions() {
         p.body["tools"],
         json!([
             {"type": "web_search_20260318", "name": "web_search"},
-            {"type": "web_fetch_20260318", "name": "web_fetch"},
+            {"type": "web_fetch_20260318", "name": "web_fetch", "citations": {"enabled": true}},
             {"type": "code_execution_20260521", "name": "code_execution"}
-        ])
+        ]),
+        "web fetch cites the fetched pages (off by default)"
     );
     assert_eq!(p.settings, vec!["effort max", "web search", "URL fetching", "code execution"]);
     // Code execution alone is billed by container time, which the estimate leaves out.
@@ -338,7 +339,8 @@ async fn server_tools_at_their_current_versions() {
     let p = prep_ok("claude-opus-4-5", &["su"]).await;
     assert_eq!(
         p.body["tools"],
-        json!([{"type": "web_search_20250305", "name": "web_search"}, {"type": "web_fetch_20250910", "name": "web_fetch"}])
+        json!([{"type": "web_search_20250305", "name": "web_search"},
+               {"type": "web_fetch_20250910", "name": "web_fetch", "citations": {"enabled": true}}])
     );
     assert_eq!(betas("claude-opus-4-5", &p.body), vec![INTERLEAVED_THINKING_BETA]);
     assert_eq!(
@@ -550,18 +552,24 @@ async fn user_media_is_sent_natively() {
         json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(b"\xff\xd8\xff jpeg")}})
     );
     assert_eq!(c[1]["source"]["media_type"], "image/jpeg");
+    // Every document can be cited (all or none, from the first turn on).
     assert_eq!(
         c[2],
-        json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64(b"%PDF-1.7 doc")}, "title": "paper.pdf"})
+        json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": b64(b"%PDF-1.7 doc")},
+               "title": "paper.pdf", "citations": {"enabled": true}})
     );
     assert_eq!(
         c[3],
-        json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "第一行\nline 2"}, "title": "notes.txt"})
+        json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "第一行\nline 2"},
+               "title": "notes.txt", "citations": {"enabled": true}})
     );
     assert_eq!(c[4]["source"]["data"], "fn main() {}");
+    assert_eq!(c[4]["citations"], json!({"enabled": true}));
     assert_eq!(c[5], json!({"type": "text", "text": "Compare them."}));
     assert!(p.notes.is_empty(), "text files are native documents, nothing is inlined");
-    assert!(!p.body.to_string().contains("citations"), "document citations stay off (the API default)");
+    assert!(c[0].get("citations").is_none() && c[1].get("citations").is_none(), "images are not documents");
+    assert!(p.applied.iter().any(|a| a.patch.get("messages[].content[document].citations").is_some()));
+    assert!(super::stream::citations_on(&p.body));
 
     let one = |part: Part| vec![Turn { role: Role::User, origin: Origin::Live, parts: vec![part], native: None }];
     let mut blobs = Blobs::default();
@@ -614,22 +622,58 @@ async fn user_media_is_sent_natively() {
 }
 
 #[tokio::test]
-async fn generated_images_of_other_models_are_noted() {
+async fn generated_media_of_other_models_is_a_warning() {
     let mut blobs = Blobs::default();
     let png = blobs.add(b"png", "image/png");
+    let draft = blobs.add(b"draft", "image/png");
+    let mp4 = blobs.add(b"....ftypmp42", "video/mp4");
     let answer = Turn {
         role: Role::Assistant,
         origin: Origin::Live,
         parts: vec![
+            Part::Image { blob: draft, filename: None, generated: true, dims: None, thought: true },
             Part::text("Here it is."),
             Part::Image { blob: png, filename: None, generated: true, dims: None, thought: false },
         ],
         native: None,
     };
-    let history = vec![Turn::user_text("draw"), answer, Turn::user_text("describe it")];
+    let history = vec![Turn::user_text("draw"), answer.clone(), Turn::user_text("describe it")];
     let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    // The text only: nothing is moved into a user message.
     assert_eq!(p.body["messages"][1]["content"], json!([{"type": "text", "text": "Here it is."}]));
-    assert!(p.notes[0].contains("images in earlier answers are not sent"), "{:?}", p.notes);
+    assert_eq!(p.body["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        p.warnings,
+        vec!["1 image generated in an earlier turn was not sent: Claude's assistant messages carry text only"],
+        "the draft made while thinking is reasoning, not counted"
+    );
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    // Two answers with media.
+    let mut video = answer.clone();
+    video.parts.push(Part::File { blob: mp4, filename: Some("clip.mp4".into()), generated: true });
+    let history = vec![Turn::user_text("draw"), answer, Turn::user_text("film it"), video, Turn::user_text("more")];
+    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    assert_eq!(
+        p.warnings,
+        vec![
+            "2 images and 1 video generated in earlier turns were not sent: Claude's assistant messages carry text only"
+        ]
+    );
+    // An answer that is only an image has nothing Claude can take.
+    let only = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![Part::Image {
+            blob: blobs.add(b"x", "image/png"),
+            filename: None,
+            generated: true,
+            dims: None,
+            thought: false,
+        }],
+        native: None,
+    };
+    let e = prep("claude-opus-5-5", &[], &[Turn::user_text("draw"), only, Turn::user_text("?")]).await.unwrap_err();
+    assert!(e.message.contains("no text to give") && e.message.contains("1 image generated"), "{e}");
 }
 
 // ------------------------------------------------------------------ stream
@@ -682,14 +726,17 @@ fn summarized_thinking_and_text() {
     // 1200 × $4 + 800 × $0.20 + 300 × $20, per million.
     assert!(close(u.cost_usd.unwrap(), (1200.0 * 4.0 + 800.0 * 0.20 + 300.0 * 20.0) / 1e6));
     assert_eq!(u.cost_source, CostSource::Estimated);
+    // The message id is kept for the next turn's cache diagnostics.
+    assert_eq!(p.message_id(), Some("msg_01XFDUDYJgAACzvnptvVoYEL"));
     let native = p.native_payload(None);
     assert_eq!(
         native,
-        json!({"role": "assistant", "content": [
+        json!({"role": "assistant", "id": "msg_01XFDUDYJgAACzvnptvVoYEL", "content": [
             {"type": "thinking", "thinking": "The user asks for the GCD.", "signature": "EqQBCgIYAhIM1gbcDa9GJwZA2b3h"},
             {"type": "text", "text": "The GCD is 21."}
         ]})
     );
+    assert!(p.refusal().is_none());
 }
 
 /// The docs' trace under `display: "omitted"`: the block is kept (empty
@@ -876,10 +923,13 @@ fn code_execution_and_fetch_results() {
         by("srvtoolu_c", "completed").unwrap().output,
         Some(json!({"type": "encrypted_code_execution_result", "stderr": "", "return_code": 0, "content": []}))
     );
+    // The fetch result as sent, without the page's body (only its length).
     assert_eq!(
         by("srvtoolu_f", "completed").unwrap().output,
         Some(
-            json!({"url": "https://example.com/article", "title": "Article Title", "media_type": "text/plain", "retrieved_at": "2025-08-25T10:30:00Z"})
+            json!({"type": "web_fetch_result", "url": "https://example.com/article", "retrieved_at": "2025-08-25T10:30:00Z",
+            "content": {"type": "document", "title": "Article Title", "source": {"type": "text", "media_type": "text/plain",
+            "data": "(35 characters, sent back to the model in later turns; not shown)"}}})
         )
     );
     let acc = accumulate(&evs);
@@ -1268,7 +1318,11 @@ async fn streams_with_the_documented_headers() {
     let h = [Turn::user_text("hi")];
     let prepared = p.prepare(&input("claude-opus-5", &o, &h), &[], &Blobs::default()).await.unwrap();
     let (r, outcome, evs) = run(&p, &prepared).await;
-    assert_eq!(r.unwrap(), json!({"role": "assistant", "content": [{"type": "text", "text": "Hi"}]}));
+    assert_eq!(
+        r.unwrap(),
+        json!({"role": "assistant", "id": "msg_01XFDUDYJgAACzvnptvVoYEL", "citations": true,
+               "content": [{"type": "text", "text": "Hi"}]})
+    );
     assert_eq!(outcome.upstream_id.as_deref(), Some("req_011CA"));
     assert!(evs.contains(&StreamEvent::Meta { upstream_id: Some("req_011CA".into()), provider: None, model: None }));
     let seen = seen.lock().unwrap();
@@ -1325,9 +1379,12 @@ async fn a_paused_turn_is_continued_as_documented() {
         assert_eq!(seen.len(), 2);
         seen[1].body.clone()
     };
-    // Same request, the paused content appended as an assistant message, the container kept.
+    // Same request, the paused content appended as an assistant message, the container kept;
+    // the paused message is the previous request for the cache diagnostics.
     assert_eq!(again["tools"], prepared.body["tools"]);
     assert_eq!(again["container"], "container_abc");
+    assert_eq!(prepared.body["diagnostics"], json!({"previous_message_id": null}));
+    assert_eq!(again["diagnostics"], json!({"previous_message_id": "msg_01XFDUDYJgAACzvnptvVoYEL"}));
     let msgs = again["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 2);
     assert_eq!(
@@ -1393,4 +1450,524 @@ async fn http_errors_over_the_wire() {
     let (r, _, _) = run(&p, &prepared).await;
     let e = r.unwrap_err();
     assert_eq!((e.kind, e.retry), (ErrorKind::Network, Retry::Backoff));
+}
+
+// ------------------------------------------------------------------ files, citations, diagnostics
+
+/// A fake API answering by request line (`GET /v1/files/x`), one connection
+/// each and concurrently (fetches run while the stream is read); records the
+/// request lines and heads in order of arrival.
+async fn serve_routes(routes: Vec<(&'static str, u16, &'static str, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let routes = Arc::new(routes);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let routes = routes.clone();
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 16384];
+                let head = loop {
+                    let n = sock.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < pos + 4 + len {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    break head;
+                };
+                let line: String = head.lines().next().unwrap_or("").split(' ').take(2).collect::<Vec<_>>().join(" ");
+                log.lock().unwrap().push(head.clone());
+                let (status, ctype, body) =
+                    routes.iter().find(|(r, ..)| *r == line).map(|(_, s, c, b)| (*s, *c, b.clone())).unwrap_or((
+                        404,
+                        "application/json",
+                        br#"{"type":"error","error":{"type":"not_found_error","message":"no route"}}"#.to_vec(),
+                    ));
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nrequest-id: req_files\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}/v1"), seen)
+}
+
+fn file_meta(id: &str, name: &str, mime: &str, size: u64) -> Vec<u8> {
+    json!({"id": id, "type": "file", "filename": name, "mime_type": mime, "size_bytes": size,
+           "created_at": "2026-11-12T22:25:00.000000Z", "downloadable": true, "expires_at": null})
+    .to_string()
+    .into_bytes()
+}
+
+/// Turn 352's shape (Haiku 5.5 `+c`, "plot sin(x)"): the plot's `file_id`
+/// arrives in the bash result mid-stream; the file is fetched and shown right
+/// there, before the answer that follows it.
+#[tokio::test]
+async fn code_execution_files_are_fetched_where_they_were_reported() {
+    let png = b"\x89PNG\r\n\x1a\n-sin-plot".to_vec();
+    let csv = b"x,sin(x)\n0,0\n".to_vec();
+    let result = json!({"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_01", "content": {
+        "type": "bash_code_execution_result",
+        "stdout": "Copied image to /files/output/f674dc156d3ddd58/sin_plot.png\n", "stderr": "", "return_code": 0,
+        "content": [{"type": "bash_code_execution_output", "file_id": "file_01RWNjFD5Lh7fs5XXFzxJzHy"},
+                    {"type": "bash_code_execution_output", "file_id": "file_csv"}]}});
+    let events = [
+        message_start(
+            "claude-haiku-5-5",
+            json!({"input_tokens": 4, "cache_creation_input_tokens": 2910, "output_tokens": 4}),
+        ),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_01", "name": "bash_code_execution", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"python /tmp/plot_sin.py\"}"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": result}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "It's exported as `sin_plot.png`."}}),
+        json!({"type": "content_block_stop", "index": 2}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null,
+               "container": {"id": "container_01P9V7", "expires_at": "2026-11-12T23:25:42.169215Z"}},
+               "usage": {"output_tokens": 7449, "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0}}}),
+        stop(),
+    ];
+    let (url, seen) = serve_routes(vec![
+        ("POST /v1/messages", 200, "text/event-stream", sse(&events).into_bytes()),
+        (
+            "GET /v1/files/file_01RWNjFD5Lh7fs5XXFzxJzHy",
+            200,
+            "application/json",
+            file_meta("file_01RWNjFD5Lh7fs5XXFzxJzHy", "sin_plot.png", "image/png", png.len() as u64),
+        ),
+        ("GET /v1/files/file_01RWNjFD5Lh7fs5XXFzxJzHy/content", 200, "image/png", png.clone()),
+        ("GET /v1/files/file_csv", 200, "application/json", file_meta("file_csv", "data.csv", "text/csv", 14)),
+        ("GET /v1/files/file_csv/content", 200, "text/csv", csv.clone()),
+    ])
+    .await;
+    let p = provider_at(&url, None);
+    let o = opts(&["c"]);
+    let h = [Turn::user_text("plot sin(x) and show the image")];
+    let prepared = p.prepare(&input("claude-haiku-5-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, _, evs) = run(&p, &prepared).await;
+    let native = r.unwrap();
+    // The result block goes back verbatim (its file ids, no metadata added).
+    assert_eq!(native["content"][1], result);
+    let at = |pred: &dyn Fn(&StreamEvent) -> bool| evs.iter().position(pred).unwrap_or_else(|| panic!("{evs:#?}"));
+    let result_at = at(&|e| matches!(e, StreamEvent::Tool(t) if t.status.as_deref() == Some("completed")));
+    let image_at = at(&|e| matches!(e, StreamEvent::Image { data, mime } if *data == png && mime == "image/png"));
+    let file_at = at(
+        &|e| matches!(e, StreamEvent::File { data, mime, name } if *data == csv && mime == "text/csv" && name.as_deref() == Some("data.csv")),
+    );
+    let text_at = at(&|e| matches!(e, StreamEvent::Text(_)));
+    assert!(result_at < image_at && image_at < file_at && file_at < text_at, "{evs:#?}");
+    // The call's output names the files (Files API metadata), in place.
+    let update = evs[result_at + 1..image_at]
+        .iter()
+        .find_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None })
+        .expect("the call with the files' metadata");
+    let items = update.output.as_ref().unwrap()["content"].as_array().unwrap().clone();
+    assert_eq!(items[0]["file"]["filename"], "sin_plot.png");
+    assert_eq!(items[1]["file"]["mime_type"], "text/csv");
+    assert_eq!(items[0]["file_id"], "file_01RWNjFD5Lh7fs5XXFzxJzHy");
+    let acc = accumulate(&evs);
+    let Part::ToolCall(call) = &acc.parts()[0] else { panic!("{:?}", acc.parts()) };
+    assert_eq!(call.output.as_ref().unwrap()["content"][0]["file"]["size_bytes"], png.len());
+    assert_eq!(
+        call.output.as_ref().unwrap()["stdout"],
+        "Copied image to /files/output/f674dc156d3ddd58/sin_plot.png\n"
+    );
+    assert!(acc.notices.is_empty(), "{:?}", acc.notices);
+    // The Files API calls: the key and version, no beta header.
+    let seen = seen.lock().unwrap();
+    let files: Vec<&String> = seen.iter().filter(|h| h.starts_with("GET /v1/files/")).collect();
+    assert_eq!(files.len(), 4, "{seen:#?}");
+    for h in files {
+        let h = h.to_ascii_lowercase();
+        assert!(h.contains("x-api-key: sk-ant-test") && h.contains("anthropic-version: 2026-10-21"), "{h}");
+        assert!(!h.contains("anthropic-beta"), "{h}");
+    }
+}
+
+#[tokio::test]
+async fn files_that_cannot_be_fetched_are_notices() {
+    let result = json!({"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_02", "content": {
+        "type": "bash_code_execution_result", "stdout": "", "stderr": "", "return_code": 0,
+        "content": [{"type": "bash_code_execution_output", "file_id": "file_big"},
+                    {"type": "bash_code_execution_output", "file_id": "file_gone"}]}});
+    let events = [
+        message_start("claude-haiku-5-5", json!({"input_tokens": 4, "output_tokens": 4})),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_02", "name": "bash_code_execution", "input": {"command": "make"}}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": result}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "Done."}}),
+        json!({"type": "content_block_stop", "index": 2}),
+        delta_end("end_turn", json!({"output_tokens": 10})),
+        stop(),
+    ];
+    let (url, _) = serve_routes(vec![
+        ("POST /v1/messages", 200, "text/event-stream", sse(&events).into_bytes()),
+        ("GET /v1/files/file_big", 200, "application/json", file_meta("file_big", "video.mp4", "video/mp4", 60 << 20)),
+        (
+            "GET /v1/files/file_gone",
+            404,
+            "application/json",
+            br#"{"type":"error","error":{"type":"not_found_error","message":"File `file_gone` not found."},"request_id":"req_011CQFYcrRp7mCHLDsAYT8Qt"}"#.to_vec(),
+        ),
+    ])
+    .await;
+    let p = provider_at(&url, None);
+    let o = opts(&["c"]);
+    let h = [Turn::user_text("render")];
+    let prepared = p.prepare(&input("claude-haiku-5-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, _, evs) = run(&p, &prepared).await;
+    assert!(r.is_ok(), "a file that cannot be fetched is no failure of the answer");
+    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Image { .. } | StreamEvent::File { .. })));
+    let acc = accumulate(&evs);
+    assert_eq!(
+        acc.notices,
+        vec![
+            "the file video.mp4 (file_big) that code execution wrote was not downloaded: 60.0 MB is more than the \
+             bot's limit of 50.0 MB",
+            "the file file_gone that code execution wrote was not downloaded: HTTP 404: File `file_gone` not found.",
+        ]
+    );
+    assert_eq!(acc.turn().answer_text(), "Done.");
+}
+
+#[test]
+fn file_ids_of_every_code_result_kind() {
+    let out = |ty: &str, item: &str| json!({"type": ty, "stderr": "", "return_code": 0, "content": [{"type": item, "file_id": "file_1"}]});
+    for (ty, item) in [
+        ("bash_code_execution_result", "bash_code_execution_output"),
+        ("code_execution_result", "code_execution_output"),
+        ("encrypted_code_execution_result", "code_execution_output"),
+    ] {
+        assert_eq!(files::file_ids(&out(ty, item)), vec!["file_1"], "{ty}");
+    }
+    assert!(files::file_ids(&json!({"type": "bash_code_execution_result", "content": []})).is_empty());
+    assert!(files::file_ids(&json!([{"type": "web_search_result", "url": "https://x"}])).is_empty());
+}
+
+/// Programmatic tool calling and dynamic filtering (turn 292): a call made
+/// from inside a code run carries its `caller`, which goes into the input.
+#[test]
+fn calls_made_by_code_execution_carry_their_caller() {
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    let caller = json!({"type": "code_execution_20260120", "tool_id": "srvtoolu_01KBhi"});
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 10, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "server_tool_use", "id": "srvtoolu_01KBhi", "name": "code_execution", "input": {}, "caller": {"type": "direct"}}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"code\": \"r = await web_fetch({'url': 'https://www.rust-lang.org/'})\"}"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "server_tool_use", "id": "srvtoolu_02", "name": "web_fetch", "input": {"url": "https://www.rust-lang.org/"}, "caller": caller}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_02", "caller": caller, "content": {
+                "type": "web_fetch_result", "url": "https://www.rust-lang.org/", "retrieved_at": "2026-11-12T05:15:38+00:00",
+                "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Rust"}, "title": "Rust Programming Language"}}}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "content_block_start", "index": 3, "content_block": {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_01KBhi", "content": {
+                "type": "code_execution_result", "stdout": "1.100", "stderr": "", "return_code": 0, "content": [], "abort_reason": null}}}),
+            json!({"type": "content_block_stop", "index": 3}),
+        ],
+    );
+    let acc = accumulate(&evs);
+    let calls: Vec<&ToolCall> =
+        acc.parts().iter().filter_map(|p| if let Part::ToolCall(t) = p { Some(t) } else { None }).collect();
+    assert_eq!(calls[0].input, Some(json!({"code": "r = await web_fetch({'url': 'https://www.rust-lang.org/'})"})));
+    assert_eq!(calls[1].input, Some(json!({"url": "https://www.rust-lang.org/", "caller": caller})));
+    assert_eq!(calls[1].output.as_ref().unwrap()["retrieved_at"], "2026-11-12T05:15:38+00:00");
+    // The code's result as sent, undocumented fields included.
+    assert_eq!(
+        calls[0].output,
+        Some(
+            json!({"type": "code_execution_result", "stdout": "1.100", "stderr": "", "return_code": 0, "content": [], "abort_reason": null})
+        )
+    );
+    // Nothing of this goes into the replayed blocks.
+    assert!(p.content()[1].get("caller") == Some(&caller) && p.content()[1]["input"].get("caller").is_none());
+}
+
+#[test]
+fn viewed_images_and_errors_stay_as_sent() {
+    let mut p = Parser::new(spec("claude-sonnet-5-5"));
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-sonnet-5-5", json!({"input_tokens": 10, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_v", "content": {
+                "type": "text_editor_code_execution_view_result", "file_type": "image", "content": "iVBORw0KGgoAAAANSUhEUg", "num_lines": null}}}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_s", "content": {
+                "type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}}}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_e", "content": {
+                "type": "text_editor_code_execution_tool_result_error", "error_code": "invalid_tool_input", "error_message": "path must be absolute"}}}),
+        ],
+    );
+    let out: Vec<(Option<&str>, &Value)> = evs
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Tool(t) => Some((t.status.as_deref(), t.output.as_ref().unwrap())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(out[0].1["content"], "(22 characters, sent back to the model in later turns; not shown)");
+    assert_eq!(out[0].1["file_type"], "image");
+    assert_eq!(
+        out[1],
+        (Some("failed"), &json!({"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}))
+    );
+    assert_eq!(out[2].1["error_message"], "path must be absolute");
+}
+
+/// Citations of the documents a request has (user documents, pages fetched
+/// earlier) and of a page fetched in the stream, per the citations guide's shapes.
+#[test]
+fn document_and_fetched_page_citations() {
+    let body = json!({"messages": [
+        {"role": "user", "content": [
+            {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "The grass is green. The sky is blue."}, "title": "notes.txt", "citations": {"enabled": true}},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0x"}, "citations": {"enabled": true}},
+            {"type": "text", "text": "Summarize, and read https://example.com/a"}]},
+    ], "tools": [{"type": "web_fetch_20260318", "name": "web_fetch", "citations": {"enabled": true}}]});
+    let mut p = Parser::with_request(spec("claude-opus-5-5"), &body);
+    let char_loc = json!({"type": "char_location", "cited_text": "The grass is green. ", "document_index": 0,
+        "document_title": "notes.txt", "start_char_index": 0, "end_char_index": 20, "file_id": null});
+    let page_loc = json!({"type": "page_location", "cited_text": "Water is essential for life.", "document_index": 1,
+        "document_title": null, "start_page_number": 5, "end_page_number": 6});
+    let fetched = json!({"type": "char_location", "cited_text": "Example A is an example.", "document_index": 2,
+        "document_title": "Example A", "start_char_index": 0, "end_char_index": 24});
+    let by_title = json!({"type": "char_location", "cited_text": "is an example", "document_index": 7,
+        "document_title": "Example A", "start_char_index": 10, "end_char_index": 23});
+    let blocks = json!({"type": "content_block_location", "cited_text": "These are important findings.", "document_index": 0,
+        "document_title": "notes.txt", "start_block_index": 0, "end_block_index": 1});
+    let delta = |i: u64, c: &Value| json!({"type": "content_block_delta", "index": i, "delta": {"type": "citations_delta", "citation": c}});
+    let evs = feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 10, "output_tokens": 1})),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "", "citations": []}}),
+            delta(0, &char_loc),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "the grass is green"}}),
+            delta(0, &page_loc),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "server_tool_use", "id": "srvtoolu_f", "name": "web_fetch", "input": {"url": "https://example.com/a"}}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f", "content": {
+                "type": "web_fetch_result", "url": "https://example.com/a", "retrieved_at": "2026-11-13T01:00:00Z",
+                "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "Example A is an example."}, "title": "Example A", "citations": {"enabled": true}}}}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "content_block_start", "index": 3, "content_block": {"type": "text", "text": ""}}),
+            json!({"type": "content_block_delta", "index": 3, "delta": {"type": "text_delta", "text": "Example A is an example"}}),
+            delta(3, &fetched),
+            delta(3, &by_title),
+            delta(3, &blocks),
+            json!({"type": "content_block_stop", "index": 3}),
+        ],
+    );
+    let cites: Vec<Citation> = evs
+        .iter()
+        .filter_map(|e| if let StreamEvent::Citations(c) = e { Some(c.clone()) } else { None })
+        .flatten()
+        .collect();
+    assert_eq!(cites.len(), 5);
+    // A user document: its title, the cited text, the location in `extra` (no URL).
+    assert_eq!(
+        cites[0],
+        Citation {
+            url: None,
+            title: Some("notes.txt".into()),
+            cited_text: Some("The grass is green. ".into()),
+            range: None,
+            extra: Some(json!({"type": "char_location", "document_index": 0, "document_title": "notes.txt",
+                               "start_char_index": 0, "end_char_index": 20, "file_id": null})),
+        }
+    );
+    // A PDF without a title: pages 5 to 6 (exclusive), no title to show.
+    assert_eq!((cites[1].url.as_deref(), cites[1].title.as_deref()), (None, None));
+    assert_eq!(cites[1].extra.as_ref().unwrap()["start_page_number"], 5);
+    // The page fetched in this turn: its URL.
+    assert_eq!(
+        (cites[2].url.as_deref(), cites[2].title.as_deref()),
+        (Some("https://example.com/a"), Some("Example A"))
+    );
+    // An index that does not fit, a title only one document has.
+    assert_eq!(cites[3].url.as_deref(), Some("https://example.com/a"));
+    assert_eq!(cites[4].extra.as_ref().unwrap()["end_block_index"], 1);
+    // All on the answer text, in order; the blocks keep them verbatim for replay.
+    let acc = accumulate(&evs);
+    let texts: Vec<usize> = acc
+        .parts()
+        .iter()
+        .filter_map(|p| if let Part::Text { citations, .. } = p { Some(citations.len()) } else { None })
+        .collect();
+    assert_eq!(texts, vec![2, 3]);
+    assert_eq!(p.content()[3]["citations"][0], fetched);
+    assert_eq!(p.native_payload(None)["citations"], true);
+}
+
+#[tokio::test]
+async fn citations_stay_off_in_conversations_made_without_them() {
+    let mut blobs = Blobs::default();
+    let pdf = blobs.add(b"%PDF-1.7 old", "application/pdf");
+    let doc_turn = Turn {
+        role: Role::User,
+        origin: Origin::Live,
+        parts: vec![Part::File { blob: pdf, filename: Some("old.pdf".into()), generated: false }, Part::text("read")],
+        native: None,
+    };
+    let fetch = json!([{"type": "web_fetch_20260318", "name": "web_fetch"}]);
+    let legacy = json!({"role": "assistant", "tools": fetch, "content": [
+        {"type": "thinking", "thinking": "", "signature": "sig"}, {"type": "text", "text": "It says hi."}]});
+    let history =
+        vec![doc_turn.clone(), assistant("claude-opus-5-5", legacy.clone(), "It says hi."), Turn::user_text("more")];
+    let o = opts(&["u"]);
+    let p = provider().prepare(&input("claude-opus-5-5", &o, &history), &[], &blobs).await.unwrap();
+    // As before: no citations on the document or on web fetch, so the old answer replays natively.
+    assert!(p.body["messages"][0]["content"][0].get("citations").is_none());
+    assert_eq!(p.body["tools"], fetch);
+    assert_eq!(p.body["messages"][1]["content"][0]["signature"], "sig");
+    assert!(p.notes.iter().any(|n| n.contains("without citations")), "{:?}", p.notes);
+    assert!(!super::stream::citations_on(&p.body));
+    // Answers made with citations on: on.
+    let mut current = legacy.clone();
+    current["citations"] = json!(true);
+    current["tools"] = json!([{"type": "web_fetch_20260318", "name": "web_fetch", "citations": {"enabled": true}}]);
+    let history = vec![doc_turn.clone(), assistant("claude-opus-5-5", current, "It says hi."), Turn::user_text("more")];
+    let p = provider().prepare(&input("claude-opus-5-5", &o, &history), &[], &blobs).await.unwrap();
+    assert_eq!(p.body["messages"][0]["content"][0]["citations"], json!({"enabled": true}));
+    assert_eq!(p.body["messages"][1]["content"][0]["signature"], "sig");
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    // An old answer before any document, or one of another model: no reason to keep them off.
+    let history = vec![Turn::user_text("hi"), assistant("claude-opus-5-5", legacy, "Hi."), doc_turn];
+    let p = provider().prepare(&input("claude-opus-5-5", &o, &history), &[], &blobs).await.unwrap();
+    assert_eq!(p.body["messages"][2]["content"][0]["citations"], json!({"enabled": true}));
+}
+
+#[tokio::test]
+async fn cache_diagnostics_name_the_previous_answer() {
+    // The first turn opts in with null.
+    let p = prep_ok("claude-opus-5-5", &[]).await;
+    assert_eq!(p.body["diagnostics"], json!({"previous_message_id": null}));
+    assert!(p.applied.iter().any(|a| a.patch.get("diagnostics").is_some()));
+    // Later: the latest answer of the same model on this API.
+    let earlier = assistant(
+        "claude-opus-5-5",
+        json!({"role": "assistant", "id": "msg_1", "content": [{"type": "text", "text": "a"}]}),
+        "a",
+    );
+    let later = assistant(
+        "claude-opus-5-5",
+        json!({"role": "assistant", "id": "msg_2", "content": [{"type": "text", "text": "b"}]}),
+        "b",
+    );
+    let mut other = assistant("claude-sonnet-5-5", json!({"role": "assistant", "id": "msg_3", "content": []}), "c");
+    other.native.as_mut().unwrap().model = "claude-sonnet-5-5".into();
+    let history = vec![
+        Turn::user_text("1"),
+        earlier,
+        Turn::user_text("2"),
+        later,
+        Turn::user_text("3"),
+        other,
+        Turn::user_text("4"),
+    ];
+    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    assert_eq!(p.body["diagnostics"], json!({"previous_message_id": "msg_2"}));
+    // A miss the API attributes to a change is a notice; the other results are not.
+    let start = |d: Value| {
+        let mut m = message_start(
+            "claude-opus-5-5",
+            json!({"input_tokens": 42, "cache_creation_input_tokens": 41850, "output_tokens": 1}),
+        );
+        m["message"]["diagnostics"] = d;
+        m
+    };
+    let notices = |d: Value| -> Vec<String> {
+        let mut p = Parser::new(spec("claude-opus-5-5"));
+        feed(&mut p, &[start(d)])
+            .into_iter()
+            .filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n) } else { None })
+            .collect()
+    };
+    assert_eq!(
+        notices(json!({"cache_miss_reason": {"type": "messages_changed", "cache_missed_input_tokens": 41850}})),
+        vec![
+            "Anthropic's cache diagnostics: messages_changed (an earlier message differs from the previous request's); \
+             about 41,850 input tokens were not read from the cache"
+        ]
+    );
+    assert_eq!(
+        notices(json!({"cache_miss_reason": {"type": "tools_changed", "cache_missed_input_tokens": 7}})).len(),
+        1
+    );
+    for quiet in [
+        json!(null),
+        json!({"cache_miss_reason": null}),
+        json!({"cache_miss_reason": {"type": "previous_message_not_found"}}),
+        json!({"cache_miss_reason": {"type": "unavailable"}}),
+    ] {
+        assert!(notices(quiet.clone()).is_empty(), "{quiet}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_fails_with_its_category() {
+    let events = [
+        message_start("claude-opus-5-5", json!({"input_tokens": 272, "output_tokens": 0})),
+        json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_sequence": null, "stop_details": {
+            "type": "refusal", "category": "bio", "explanation": "API integrators: you can reduce refusals for your users by configuring a fallback model — see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback"}},
+            "usage": {"output_tokens": 272, "output_tokens_details": {"thinking_tokens": 272}}}),
+        stop(),
+    ];
+    let (url, _) = serve(vec![(200, vec![("request-id", "req_r".into())], sse(&events))]).await;
+    let p = provider_at(&url, None);
+    let o = opts(&[]);
+    let h = [Turn::user_text("the NATO alphabet")];
+    let prepared = p.prepare(&input("claude-opus-5-5", &o, &h), &[], &Blobs::default()).await.unwrap();
+    let (r, outcome, evs) = run(&p, &prepared).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.message, "refusal (bio)");
+    assert_eq!((e.kind, e.retry, e.error_type.as_deref()), (ErrorKind::InBand, Retry::Never, Some("content_filter")));
+    assert_eq!(e.details.as_ref().unwrap()["category"], "bio");
+    assert!(e.details.as_ref().unwrap()["explanation"].as_str().unwrap().starts_with("API integrators"));
+    assert_eq!(outcome.upstream_id.as_deref(), Some("req_r"));
+    // Billed (bio is billed before any output) and finished as a content filter stop.
+    let acc = accumulate(&evs);
+    assert_eq!(acc.finish_reason.as_deref(), Some("content_filter"));
+    assert!(acc.usage.unwrap().cost_usd.unwrap() > 0.0);
+    // Without a category.
+    let mut p = Parser::new(spec("claude-opus-5-5"));
+    feed(
+        &mut p,
+        &[
+            message_start("claude-opus-5-5", json!({"input_tokens": 1, "output_tokens": 0})),
+            json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_details": {"type": "refusal", "category": null, "explanation": null}}, "usage": {"output_tokens": 0}}),
+            stop(),
+        ],
+    );
+    assert_eq!(p.refusal().unwrap().message, "refusal");
 }

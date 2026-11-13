@@ -121,6 +121,7 @@ fn table_covers_the_configured_aliases() {
     // The `g g4 g31 gf g38f g37f g36f g35f gi` aliases of config/omni.example.toml.
     let g = google();
     for id in [
+        "gemini-4-hydrogen",
         "gemini-4-carbon",
         "gemini-4-argon",
         "gemini-3.1-pro-preview",
@@ -129,6 +130,7 @@ fn table_covers_the_configured_aliases() {
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-nano-banana-2.1",
+        "gemini-2.5-flash-image",
     ] {
         assert!(g.knows(id), "{id}");
         assert!(pricing::price(id, Tier::Standard, NOW).is_some(), "{id}");
@@ -217,8 +219,32 @@ async fn per_model_thinking_and_output_defaults() {
     assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal");
     assert_eq!(p.settings, vec!["effort minimal"]);
 
+    // The routing of a deprecated id is reported from the response (modelVersion), not guessed.
     let p = prep("gemini-3.7-flash", &[], &hi()).await.unwrap();
-    assert!(p.warnings[0].contains("`gemini-3.8-flash`"), "{:?}", p.warnings);
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+
+    // Gemini 4 Hydrogen: the highest of its four levels; long decode like Carbon and Argon.
+    let p = prep("gemini-4-hydrogen", &[], &hi()).await.unwrap();
+    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "xhigh");
+    assert_eq!(p.body["generationConfig"]["maxOutputTokens"], 393_216);
+    assert!(p.long_decode);
+    assert_eq!(p.settings, vec!["effort xhigh"]);
+    assert!(prep("gemini-4-hydrogen", &[kv("e", "medium")], &hi()).await.is_ok());
+    let e = prep_err("gemini-4-hydrogen", &[kv("e", "minimal")], &hi()).await;
+    assert!(e.contains("levels: xhigh, high, medium, low"), "{e}");
+
+    // Gemini 2.5 Flash Image: no thinking, ratios only.
+    let p = prep("gemini-2.5-flash-image", &[flag("W")], &hi()).await.unwrap();
+    let g = &p.body["generationConfig"];
+    assert!(g.get("thinkingConfig").is_none(), "{g}");
+    assert_eq!(g["imageConfig"], json!({"aspectRatio": "16:9"}));
+    assert_eq!(g["maxOutputTokens"], 32_768);
+    let e = prep_err("gemini-2.5-flash-image", &[flag("4")], &hi()).await;
+    assert!(e.contains("has no image size option"), "{e}");
+    let e = prep_err("gemini-2.5-flash-image", &[kv("e", "high")], &hi()).await;
+    assert!(e.contains("no reasoning effort"), "{e}");
+    let e = prep_err("gemini-2.5-flash-image", &[flag("s")], &hi()).await;
+    assert!(e.contains("has no web search"), "{e}");
 }
 
 #[tokio::test]
@@ -257,14 +283,29 @@ async fn options_outside_the_api_are_rejected() {
 async fn tools_tiers_and_their_validation() {
     let p = prep("gemini-4-carbon", &[flag("scu"), kv("tier", "flex")], &hi()).await.unwrap();
     assert_eq!(p.body["tools"], json!([{"googleSearch": {}}, {"codeExecution": {}}, {"urlContext": {}}]));
+    // The search and URL-context calls come back as parts, where they ran.
+    assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}));
+    assert!(p.applied.iter().any(|a| a.patch.pointer("/toolConfig/includeServerSideToolInvocations").is_some()));
     assert_eq!(p.body["service_tier"], "flex");
     assert_eq!(p.settings, vec!["effort high", "web search", "code execution", "URL fetching", "tier flex"]);
+    // Code execution reports its parts anyway; no tools, nothing to ask for.
+    assert!(prep("gemini-4-carbon", &[flag("c")], &hi()).await.unwrap().body.get("toolConfig").is_none());
+    assert!(prep("gemini-3.8-flash", &[], &hi()).await.unwrap().body.get("toolConfig").is_none());
+    // Not on Gemini 2.5, nor on the image models (the tool-combination guide names Gemini 3 and 4).
+    assert!(prep("gemini-2.5-flash", &[flag("s")], &hi()).await.unwrap().body.get("toolConfig").is_none());
     let p = prep("gemini-3.8-flash", &[kv("tier", "priority")], &hi()).await.unwrap();
     assert_eq!(p.body["service_tier"], "priority");
     let p = prep("gemini-3.8-flash", &[kv("tier", "default")], &hi()).await.unwrap();
     assert!(p.body.get("service_tier").is_none());
-    let p = prep("gemini-nano-banana-2.1", &[flag("s")], &hi()).await.unwrap();
-    assert_eq!(p.body["tools"], json!([{"googleSearch": {}}]));
+    // Web and image search on the models that have both.
+    for model in ["gemini-nano-banana-2.1", "gemini-3.1-flash-image"] {
+        let p = prep(model, &[flag("s")], &hi()).await.unwrap();
+        assert_eq!(p.body["tools"], json!([{"googleSearch": {"searchTypes": {"webSearch": {}, "imageSearch": {}}}}]));
+        assert_eq!(p.settings, vec!["effort high", "web and image search"], "{model}");
+        assert!(p.body.get("toolConfig").is_none(), "{model}");
+    }
+    let p = prep("gemini-3-pro-image", &[flag("s")], &hi()).await.unwrap();
+    assert_eq!(p.body["tools"], json!([{"googleSearch": {}}]), "web search only");
     let p = prep("gemini-3.8-flash", &[flag("sm")], &hi()).await.unwrap();
     assert_eq!(p.body["tools"], json!([{"googleSearch": {}}, {"googleMaps": {}}]));
 
@@ -326,7 +367,8 @@ async fn maps_takes_the_latest_location() {
     assert_eq!(p.body["tools"], json!([{"googleMaps": {}}]));
     assert_eq!(
         p.body["toolConfig"],
-        json!({"retrievalConfig": {"latLng": {"latitude": 31.2304, "longitude": 121.4737}}})
+        json!({"retrievalConfig": {"latLng": {"latitude": 31.2304, "longitude": 121.4737}},
+               "includeServerSideToolInvocations": true})
     );
     assert_eq!(p.settings, vec!["effort high", "Google Maps near 31.2304,121.4737"]);
     // A location has no content form: only the text is sent.
@@ -338,7 +380,7 @@ async fn maps_takes_the_latest_location() {
     assert!(e.contains("has no Google Maps grounding"), "{e}");
 
     let p = prep("gemini-4-argon", &[flag("m")], &hi()).await.unwrap();
-    assert!(p.body.get("toolConfig").is_none());
+    assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}), "no position");
     assert_eq!(p.settings, vec!["effort high", "Google Maps (no position sent)"]);
 
     let only_location = vec![user_turn(vec![location(1.0, 2.0)])];
@@ -879,6 +921,7 @@ fn blocks_and_abnormal_finishes() {
                        "modelVersion": "gemini-3.8-flash", "responseId": "r"});
     let evs = run(&mut p, &[block]);
     assert!(p.finished);
+    assert_eq!(p.abnormal().unwrap().message, "the prompt was blocked: PROHIBITED_CONTENT");
     assert!(evs.contains(&StreamEvent::FinishDetails(json!({"blockReason": "PROHIBITED_CONTENT"}))));
     assert!(evs.contains(&StreamEvent::Finish {
         reason: Some("content_filter".into()),
@@ -901,16 +944,24 @@ fn blocks_and_abnormal_finishes() {
     assert!(
         evs.contains(&StreamEvent::Finish { reason: Some("content_filter".into()), native: Some("SAFETY".into()) })
     );
+    let e = p.abnormal().unwrap();
+    assert_eq!(e.message, "SAFETY: stopped by the provider's content filter");
+    assert_eq!((e.kind, e.retry, e.error_type.as_deref()), (ErrorKind::InBand, Retry::Never, Some("content_filter")));
+    assert!(e.partial_output);
+    assert_eq!(e.details.as_ref().unwrap()["safetyRatings"], ratings);
 
     let mut p = parser("gemini-3.8-flash", json!({}));
     let evs = run(
         &mut p,
         &[json!({"candidates": [{"content": {"parts": [{"text": "def f():"}]}, "finishReason": "RECITATION",
-        "citationMetadata": {"citationSources": [{"startIndex": 0, "endIndex": 8, "uri": "https://github.com/x/y", "license": "mit"}]}}]})],
+        "citationMetadata": {"citationSources": [
+            {"startIndex": 0, "endIndex": 8, "uri": "", "license": ""},
+            {"startIndex": 0, "endIndex": 8, "uri": "https://github.com/x/y", "license": "mit"}]}}]})],
     );
     let cites = evs.iter().find_map(|e| if let StreamEvent::Citations(c) = e { Some(c) } else { None }).unwrap();
+    assert_eq!(cites.len(), 1, "a recitation without a link is not listed: {cites:?}");
     assert_eq!(cites[0].url.as_deref(), Some("https://github.com/x/y"));
-    assert_eq!(cites[0].title.as_deref(), Some("https://github.com/x/y (license: mit)"));
+    assert_eq!(cites[0].title.as_deref(), Some("https://github.com/x/y (recitation, license: mit)"));
     assert_eq!(cites[0].range, Some((0, 8)));
     assert!(
         evs.contains(&StreamEvent::Finish { reason: Some("content_filter".into()), native: Some("RECITATION".into()) })
@@ -933,7 +984,20 @@ fn blocks_and_abnormal_finishes() {
             evs.iter().any(|e| matches!(e, StreamEvent::FinishDetails(d) if d["finishMessage"] == "why")),
             "{native}"
         );
+        // The failure is told in Google's words.
+        let e = p.abnormal().unwrap();
+        assert_eq!((e.message.as_str(), e.error_type.as_deref()), (format!("{native}: why").as_str(), Some(reason)));
     }
+    // A normal finish with a message: shown as a note, no failure.
+    let mut p = parser("gemini-3.8-flash", json!({}));
+    let evs = run(
+        &mut p,
+        &[
+            json!({"candidates": [{"content": {"parts": [{"text": "x"}]}, "finishReason": "MAX_TOKENS", "finishMessage": "Reached the limit."}]}),
+        ],
+    );
+    assert!(p.abnormal().is_none());
+    assert!(evs.contains(&StreamEvent::Notice("Google (MAX_TOKENS): Reached the limit.".into())));
 
     // An error object inside the stream.
     let mut p = parser("gemini-3.8-flash", json!({}));
@@ -944,6 +1008,436 @@ fn blocks_and_abnormal_finishes() {
     assert_eq!((e.kind, e.retry, e.status), (ErrorKind::InBand, Retry::Backoff, Some(500)));
     assert!(e.partial_output);
     assert_eq!(e.error_type.as_deref(), Some("INTERNAL"));
+}
+
+#[test]
+fn search_suggestions_from_the_rendered_chips() {
+    let chip1 =
+        "https://www.google.com/search?q=latest+stable+Rust+version&client=app-vertex-grounding&safesearch=active";
+    let chip2 = "https://www.google.com/search?q=rust+1.100&client=app-vertex-grounding";
+    let html = "<style>.container { align-items: center; }</style><div class=\"container\"><div class=\"headline\">\
+        <svg class=\"logo-light\"></svg></div><div class=\"carousel\"><a class=\"chip\" \
+        href=\"https://www.google.com/search?q=latest+stable+Rust+version&amp;client=app-vertex-grounding&amp;safesearch=active\">\
+        latest stable Rust version</a><a href=\"https://www.google.com/about\">not a chip</a>\
+        <a class='chip extra' href='https://www.google.com/search?q=rust+1.100&#38;client=app-vertex-grounding'>rust <b>1.100</b> \
+        release&#39;s notes</a></div></div>";
+    let text = "Rust 1.100.0 is the latest stable version.";
+    let chunks = [
+        json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP",
+        "groundingMetadata": {
+            "webSearchQueries": ["latest stable Rust version"],
+            "searchEntryPoint": {"renderedContent": html},
+            "groundingChunks": [{"web": {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x", "title": "releases.rs"}}],
+            "groundingSupports": [{"segment": {"endIndex": text.len(), "text": text}, "groundingChunkIndices": [0]}]}}],
+        "usageMetadata": {"promptTokenCount": 22, "candidatesTokenCount": 10},
+        "modelVersion": "gemini-3.8-flash", "responseId": "r"}),
+    ];
+    let mut p = parser("gemini-3.8-flash", json!({"tools": [{"googleSearch": {}}]}));
+    let evs = run(&mut p, &chunks);
+    let tool = evs.iter().find_map(|e| if let StreamEvent::ToolBefore(t) = e { Some(t) } else { None }).unwrap();
+    assert_eq!(
+        tool.output,
+        Some(json!({"search_suggestions": [
+            {"text": "latest stable Rust version", "url": chip1},
+            {"text": "rust 1.100 release's notes", "url": chip2}
+        ]}))
+    );
+    // Listed with the sources, links exactly as Google gave them.
+    let cites = evs.iter().find_map(|e| if let StreamEvent::Citations(c) = e { Some(c) } else { None }).unwrap();
+    let listed: Vec<(Option<&str>, Option<&str>)> =
+        cites.iter().map(|c| (c.title.as_deref(), c.url.as_deref())).collect();
+    assert_eq!(
+        listed,
+        vec![
+            (Some("releases.rs"), Some("https://vertexaisearch.cloud.google.com/grounding-api-redirect/x")),
+            (Some("Google Search: latest stable Rust version"), Some(chip1)),
+            (Some("Google Search: rust 1.100 release's notes"), Some(chip2)),
+        ]
+    );
+    let a = accumulate(&evs);
+    assert!(matches!(&a.parts()[1], Part::Text { citations, .. } if citations.len() == 3));
+    assert!(
+        super::stream::search_chips("<a class=\"chip\" href=\"\">empty</a><a class=\"chipped\" href=\"x\">no</a>")
+            .is_empty()
+    );
+}
+
+#[test]
+fn what_served_the_request_is_the_footers_and_odd_states_are_noted() {
+    let chunk = |model: &str, tier: &str| {
+        json!({"candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}],
+               "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "serviceTier": tier},
+               "modelVersion": model, "responseId": "r"})
+    };
+    let notices = |evs: &[StreamEvent]| -> Vec<String> {
+        evs.iter().filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n.clone()) } else { None }).collect()
+    };
+    // Another model, another tier: the footer's (from the response envelope), not notices.
+    let mut p = parser("gemini-3.7-flash", json!({}));
+    let evs = run(&mut p, &[chunk("gemini-3.8-flash", "standard")]);
+    assert!(notices(&evs).is_empty(), "{:?}", notices(&evs));
+    assert!(matches!(&evs[0], StreamEvent::Meta { model: Some(m), .. } if m == "gemini-3.8-flash"));
+    let mut p = parser("gemini-3.8-flash", json!({"service_tier": "priority"}));
+    let evs = run(&mut p, &[chunk("gemini-3.8-flash", "standard")]);
+    assert!(notices(&evs).is_empty());
+    // Priced as served.
+    assert!((usages(&evs)[0].cost_usd.unwrap() - (3.0 * 0.75 + 1.0 * 3.75) / 1e6).abs() < 1e-12);
+    // A model status other than STABLE.
+    let mut c = chunk("gemini-2.5-flash-image", "standard");
+    c["modelStatus"] = json!({"modelStage": "LEGACY", "retirementTime": "2027-03-15T00:00:00Z", "message": "Use gemini-3.1-flash-lite-image."});
+    let mut p = parser("gemini-2.5-flash-image", json!({}));
+    assert_eq!(
+        notices(&run(&mut p, &[c])),
+        vec![
+            "Google: `gemini-2.5-flash-image` is LEGACY, retiring 2027-03-15T00:00:00Z: Use gemini-3.1-flash-lite-image."
+        ]
+    );
+}
+
+#[test]
+fn safety_ratings_are_noted_when_they_matter() {
+    let notices = |evs: &[StreamEvent]| -> Vec<String> {
+        evs.iter().filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n.clone()) } else { None }).collect()
+    };
+    // The image models' ratings of 2026-11-12: NEGLIGIBLE, nothing to say.
+    let mut p = parser("gemini-nano-banana-2.1", json!({}));
+    let evs = run(
+        &mut p,
+        &[json!({"candidates": [{"content": {"parts": [{"text": "a cat"}]}, "finishReason": "STOP",
+            "safetyRatings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "NEGLIGIBLE"},
+                              {"category": "HARM_CATEGORY_HARASSMENT", "probability": "LOW"}]}]})],
+    );
+    assert!(notices(&evs).is_empty());
+    // MEDIUM or HIGH, or blocked, of the prompt or the answer: once each.
+    let mut p = parser("gemini-3.8-flash", json!({}));
+    let rated = json!({"candidates": [{"content": {"parts": [{"text": "x"}]},
+        "safetyRatings": [{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "probability": "MEDIUM"}]}],
+        "promptFeedback": {"safetyRatings": [{"category": "HARM_CATEGORY_HARASSMENT", "probability": "HIGH"},
+                                             {"category": "HARM_CATEGORY_HATE_SPEECH", "probability": "LOW", "blocked": true}]}});
+    let mut end = rated.clone();
+    end["candidates"][0]["finishReason"] = json!("STOP");
+    let evs = run(&mut p, &[rated, end]);
+    assert_eq!(
+        notices(&evs),
+        vec![
+            "Google's safety rating of the prompt: HARM_CATEGORY_HARASSMENT HIGH",
+            "Google's safety rating of the prompt: HARM_CATEGORY_HATE_SPEECH LOW (blocked)",
+            "Google's safety rating of the answer: HARM_CATEGORY_DANGEROUS_CONTENT MEDIUM",
+        ]
+    );
+    assert!(p.abnormal().is_none(), "a rating alone is no failure");
+}
+
+#[test]
+fn live_usage_adds_up_internal_calls() {
+    // The shapes of a code-execution turn of the 2026-11-12 traffic: the chunk with the
+    // result has no output counts and the next internal call counts from zero again.
+    let chunks = [
+        json!({"candidates": [{"content": {"parts": [{"executableCode": {"language": "PYTHON", "code": "print(2**100)", "id": "c1"}}]}}],
+               "usageMetadata": {"promptTokenCount": 21, "candidatesTokenCount": 22, "thoughtsTokenCount": 86}}),
+        json!({"candidates": [{"content": {"parts": [{"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1267650600228229401496703205376\n", "id": "c1"}}]}}],
+               "usageMetadata": {"promptTokenCount": 21, "totalTokenCount": 21}}),
+        json!({"candidates": [{"content": {"parts": [{"text": "1267"}]}}],
+               "usageMetadata": {"promptTokenCount": 21, "candidatesTokenCount": 4, "thoughtsTokenCount": 88}}),
+        json!({"candidates": [{"content": {"parts": [{"text": "650600228229401496703205376"}]}, "finishReason": "STOP"}],
+               "usageMetadata": {"promptTokenCount": 107, "candidatesTokenCount": 53, "toolUsePromptTokenCount": 159, "thoughtsTokenCount": 174}}),
+    ];
+    let mut p = parser("gemini-3.8-flash", json!({"tools": [{"codeExecution": {}}]}));
+    let evs = run(&mut p, &chunks);
+    let live: Vec<(Option<u64>, Option<u64>)> = evs
+        .iter()
+        .filter_map(
+            |e| if let StreamEvent::LiveUsage(u) = e { Some((u.output_tokens, u.reasoning_tokens)) } else { None },
+        )
+        .collect();
+    assert_eq!(live, vec![(Some(108), Some(86)), (Some(108), Some(86)), (Some(200), Some(174))]);
+    // The final usage is Google's own total (the sum of the calls).
+    let u = usages(&evs)[0];
+    assert_eq!((u.input_tokens, u.output_tokens, u.reasoning_tokens), (Some(266), Some(227), Some(174)));
+}
+
+#[test]
+fn files_written_by_code_execution() {
+    let csv = b"a,b\n1,2\n";
+    let chunks = [json!({"candidates": [{"content": {"parts": [
+        {"inlineData": {"mimeType": "text/csv", "data": base64::engine::general_purpose::STANDARD.encode(csv), "displayName": "output_1.csv"}},
+        {"text": "Done."}]}, "finishReason": "STOP"}]})];
+    let mut p = parser("gemini-3.8-flash", json!({}));
+    let evs = run(&mut p, &chunks);
+    assert!(evs.contains(&StreamEvent::File {
+        data: csv.to_vec(),
+        mime: "text/csv".into(),
+        name: Some("output_1.csv".into())
+    }));
+    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))));
+}
+
+/// `toolConfig.includeServerSideToolInvocations` (the tool-combination
+/// guide's shapes): the search call and its result are parts where they ran,
+/// replacing the call made up from the grounding metadata; sources and
+/// Search Suggestions still come from the metadata.
+#[test]
+fn server_side_tool_parts_are_the_tool_calls() {
+    let html = "<div class=\"carousel\"><a class=\"chip\" href=\"https://www.google.com/search?q=latest+stable+Rust+version&amp;client=app-vertex-grounding\">latest stable Rust version</a></div>";
+    let text = "Rust 1.100.0 is the latest stable version.";
+    let chunks = [
+        json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "**Searching**", "thought": true}]}}],
+               "usageMetadata": {"promptTokenCount": 22, "thoughtsTokenCount": 30}, "responseId": "r1", "modelVersion": "gemini-3.8-flash"}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"thoughtSignature": "SIG1", "toolCall": {"toolType": "GOOGLE_SEARCH_WEB", "args": {"queries": ["latest stable Rust version"]}, "id": "a7b3k9p2"}}]}}]}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"thoughtSignature": "SIG2", "toolResponse": {"toolType": "GOOGLE_SEARCH_WEB", "response": {"search_suggestions": html}, "id": "a7b3k9p2"}}]}}]}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP",
+            "groundingMetadata": {
+                "webSearchQueries": ["latest stable Rust version"],
+                "searchEntryPoint": {"renderedContent": html},
+                "groundingChunks": [{"web": {"uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x", "title": "releases.rs"}}],
+                "groundingSupports": [{"segment": {"partIndex": 3, "endIndex": text.len(), "text": text}, "groundingChunkIndices": [0]}]}}],
+            "usageMetadata": {"promptTokenCount": 196, "candidatesTokenCount": 38, "thoughtsTokenCount": 408}}),
+    ];
+    let mut p = parser(
+        "gemini-3.8-flash",
+        json!({"tools": [{"googleSearch": {}}], "toolConfig": {"includeServerSideToolInvocations": true}}),
+    );
+    let evs = run(&mut p, &chunks);
+    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::ToolBefore(_))), "no made-up call: {evs:#?}");
+    let tools: Vec<&ToolCall> =
+        evs.iter().filter_map(|e| if let StreamEvent::Tool(t) = e { Some(t) } else { None }).collect();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(
+        (tools[0].id.as_deref(), tools[0].name.as_str(), tools[0].status.as_deref()),
+        (Some("a7b3k9p2"), "google_search", Some("in_progress"))
+    );
+    assert_eq!(tools[0].input, Some(json!({"queries": ["latest stable Rust version"]})));
+    assert_eq!(tools[1].id, tools[0].id, "the result is paired with its call");
+    assert_eq!(tools[1].output, Some(json!({"search_suggestions": html})));
+    // In stream order: thought, the search, the answer with its sources and suggestions.
+    let a = accumulate(&evs);
+    let kinds: Vec<&str> = a
+        .parts()
+        .iter()
+        .map(|p| match p {
+            Part::Reasoning(_) => "reasoning",
+            Part::ToolCall(_) => "tool",
+            Part::Text { .. } => "text",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["reasoning", "tool", "text"]);
+    let Part::Text { citations, .. } = &a.parts()[2] else { panic!() };
+    assert_eq!(citations.len(), 2, "{citations:?}");
+    assert_eq!(citations[0].range, Some((0, text.len())), "partIndex counts the tool parts");
+    assert_eq!(citations[1].title.as_deref(), Some("Google Search: latest stable Rust version"));
+    // One billed query; the parts go back verbatim, signatures included.
+    let u = usages(&evs)[0];
+    assert!((u.cost_usd.unwrap() - ((196.0 * 0.75 + 446.0 * 3.75) / 1e6 + 0.014)).abs() < 1e-12);
+    assert_eq!(p.native_payload()["parts"][1], chunks[1]["candidates"][0]["content"]["parts"][0]);
+    assert_eq!(p.native_payload()["parts"][2]["thoughtSignature"], "SIG2");
+}
+
+#[test]
+fn every_kind_of_tool_part() {
+    let part = |key: &str, v: Value| json!({"candidates": [{"content": {"parts": [{key: v}]}}]});
+    let chunks = [
+        // URL context: no URL retrieved, a failure.
+        part(
+            "toolCall",
+            json!({"toolType": "URL_CONTEXT", "args": {"urls": ["https://example.com/paywalled"]}, "id": "u1"}),
+        ),
+        part(
+            "toolResponse",
+            json!({"toolType": "URL_CONTEXT", "id": "u1", "response": {"url_metadata": [
+            {"retrieved_url": "https://example.com/paywalled", "url_retrieval_status": "URL_RETRIEVAL_STATUS_PAYWALL"}]}}),
+        ),
+        // Maps, without ids: paired by type.
+        part("toolCall", json!({"toolType": "GOOGLE_MAPS", "args": {"queries": ["cafes near me"]}})),
+        part(
+            "toolResponse",
+            json!({"toolType": "GOOGLE_MAPS", "response": {"places": [{"place_id": "ChIJ"}], "google_maps_widget_context_token": "w"}}),
+        ),
+        // Image search and media processing (snake_case spelling too).
+        part(
+            "tool_call",
+            json!({"tool_type": "GOOGLE_SEARCH_IMAGE", "args": {"queries": ["timareta butterfly"]}, "id": "i1"}),
+        ),
+        part("toolCall", json!({"toolType": "MEDIA_PROCESSING", "id": "m1"})),
+        json!({"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP",
+            "urlContextMetadata": {"urlMetadata": [{"retrievedUrl": "https://example.com/paywalled", "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_PAYWALL"}]},
+            "groundingMetadata": {"webSearchQueries": ["cafes near me"], "imageSearchQueries": ["timareta butterfly"]}}],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2}}),
+    ];
+    let mut p = parser("gemini-3.8-flash", json!({"tools": [{"urlContext": {}}, {"googleMaps": {}}]}));
+    let evs = run(&mut p, &chunks);
+    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::ToolBefore(_))));
+    let a = accumulate(&evs);
+    let calls: Vec<&ToolCall> =
+        a.parts().iter().filter_map(|p| if let Part::ToolCall(t) = p { Some(t) } else { None }).collect();
+    let names: Vec<(&str, Option<&str>)> = calls.iter().map(|c| (c.name.as_str(), c.status.as_deref())).collect();
+    assert_eq!(
+        names,
+        vec![
+            ("url_context", Some("failed")),
+            ("google_maps", Some("completed")),
+            ("google_search_image", Some("in_progress")),
+            ("media_processing", Some("in_progress")),
+        ]
+    );
+    assert_eq!(calls[1].output.as_ref().unwrap()["places"][0]["place_id"], "ChIJ");
+    // One web (Maps) query and one image query.
+    let u = usages(&evs)[0];
+    assert!((u.cost_usd.unwrap() - ((10.0 * 0.75 + 2.0 * 3.75) / 1e6 + 2.0 * 0.014)).abs() < 1e-12);
+}
+
+#[test]
+fn live_counts_that_go_on_after_a_tool_response_are_not_added_twice() {
+    let chunks = [
+        json!({"candidates": [{"content": {"parts": [{"toolCall": {"toolType": "GOOGLE_SEARCH_WEB", "args": {"queries": ["q"]}, "id": "t"}}]}}],
+               "usageMetadata": {"promptTokenCount": 20, "thoughtsTokenCount": 30}}),
+        json!({"candidates": [{"content": {"parts": [{"toolResponse": {"toolType": "GOOGLE_SEARCH_WEB", "response": {}, "id": "t"}}]}}],
+               "usageMetadata": {"promptTokenCount": 20, "thoughtsTokenCount": 30}}),
+        json!({"candidates": [{"content": {"parts": [{"text": "x"}]}}],
+               "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 1, "thoughtsTokenCount": 50}}),
+    ];
+    let mut p = parser("gemini-3.8-flash", json!({"tools": [{"googleSearch": {}}]}));
+    let live: Vec<Option<u64>> = run(&mut p, &chunks)
+        .iter()
+        .filter_map(|e| if let StreamEvent::LiveUsage(u) = e { Some(u.reasoning_tokens) } else { None })
+        .collect();
+    assert_eq!(live, vec![Some(30), Some(30), Some(50)], "cumulative counts stay as they are");
+}
+
+#[test]
+fn search_suggestions_from_the_tool_response_when_the_metadata_has_none() {
+    let html = "<a class=\"chip\" href=\"https://www.google.com/search?q=euro+2024\">euro 2024</a>";
+    let chunks = [
+        json!({"candidates": [{"content": {"parts": [{"toolCall": {"toolType": "GOOGLE_SEARCH_WEB", "args": {"queries": ["euro 2024"]}, "id": "s1"}}]}}]}),
+        json!({"candidates": [{"content": {"parts": [{"toolResponse": {"toolType": "GOOGLE_SEARCH_WEB", "response": {"search_suggestions": html}, "id": "s1"}}]}}]}),
+        json!({"candidates": [{"content": {"parts": [{"text": "Spain."}]}, "finishReason": "STOP"}]}),
+    ];
+    let mut p = parser("gemini-4-carbon", json!({"tools": [{"googleSearch": {}}]}));
+    let evs = run(&mut p, &chunks);
+    let cites = evs.iter().find_map(|e| if let StreamEvent::Citations(c) = e { Some(c) } else { None }).unwrap();
+    assert_eq!(cites[0].url.as_deref(), Some("https://www.google.com/search?q=euro+2024"));
+    assert_eq!(cites[0].extra.as_ref().unwrap()["searchSuggestion"]["text"], "euro 2024");
+}
+
+#[tokio::test]
+async fn tool_parts_in_the_history_keep_the_flag_on() {
+    let parts = json!([
+        {"thoughtSignature": "S1", "toolCall": {"toolType": "GOOGLE_SEARCH_WEB", "args": {"queries": ["q"]}, "id": "t1"}},
+        {"thoughtSignature": "S2", "toolResponse": {"toolType": "GOOGLE_SEARCH_WEB", "response": {"search_suggestions": "<a></a>"}, "id": "t1"}},
+        {"text": "Answer.", "thoughtSignature": "S3"}
+    ]);
+    let history =
+        vec![Turn::user_text("q?"), native_turn("gemini-3.8-flash", parts.clone()), Turn::user_text("thanks")];
+    // No tools now: the parts go back as they were, with the flag their replay needs.
+    let p = prep("gemini-3.8-flash", &[], &history).await.unwrap();
+    assert_eq!(p.body["contents"][1]["parts"], parts);
+    assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}));
+    assert!(p.body.get("tools").is_none());
+    // A model without tool traces (Gemini 2.5): no flag.
+    let p = prep("gemini-2.5-flash", &[], &history).await.unwrap();
+    assert!(p.body.get("toolConfig").is_none());
+    assert_eq!(p.body["contents"][1]["parts"], parts);
+}
+
+#[test]
+fn web_and_image_queries_are_billed_apart() {
+    let chunk = json!({"candidates": [{"content": {"parts": [{"text": "x"}]}, "finishReason": "STOP",
+        "groundingMetadata": {"webSearchQueries": ["timareta butterfly", "timareta butterfly"], "imageSearchQueries": ["timareta butterfly", ""],
+            "groundingChunks": [{"image": {"sourceUri": "https://example.org/butterflies", "imageUri": "https://example.org/b.jpg",
+                                            "title": "Butterflies of Peru", "domain": "example.org"}}]}}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 1120,
+                          "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}]}});
+    let mut p = parser(
+        "gemini-nano-banana-2.1",
+        json!({"tools": [{"googleSearch": {"searchTypes": {"webSearch": {}, "imageSearch": {}}}}]}),
+    );
+    let evs = run(&mut p, &[chunk]);
+    let tool = evs.iter().find_map(|e| if let StreamEvent::ToolBefore(t) = e { Some(t) } else { None }).unwrap();
+    assert_eq!(
+        tool.input,
+        Some(json!({"queries": ["timareta butterfly"], "image_queries": ["timareta butterfly", ""]}))
+    );
+    // The image's source is the page that has it (Google's attribution rule).
+    let cites = evs.iter().find_map(|e| if let StreamEvent::Citations(c) = e { Some(c) } else { None }).unwrap();
+    assert_eq!(
+        (cites[0].url.as_deref(), cites[0].title.as_deref()),
+        (Some("https://example.org/butterflies"), Some("Butterflies of Peru"))
+    );
+    // One web and one image query at $14 per 1,000 each; 1,120 image tokens at $30/M.
+    let u = usages(&evs)[0];
+    let expected = (10.0 * 1.50 + 1120.0 * 30.0) / 1e6 + 2.0 * 0.014;
+    assert!((u.cost_usd.unwrap() - expected).abs() < 1e-12, "{:?}", u.cost_usd);
+}
+
+#[tokio::test]
+async fn media_other_models_generated_goes_in_the_model_turn() {
+    let mut b = Blobs::none();
+    let png = b.add(b"\x89PNG-made-by-another-model", "image/png");
+    let draft = b.add(b"\x89PNG-draft", "image/png");
+    let wav = b.add(b"RIFF....WAVE", "audio/wav");
+    let csv = b.add(b"a,b\n1,2\n", "text/csv");
+    let answer = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![
+            Part::Image { blob: draft, filename: None, generated: true, dims: None, thought: true },
+            Part::text("Here is the cat."),
+            Part::Image { blob: png.clone(), filename: None, generated: true, dims: Some((64, 64)), thought: false },
+            Part::text(" And the data:"),
+            Part::File { blob: csv, filename: Some("data.csv".into()), generated: true },
+            Part::File { blob: wav, filename: Some("meow.wav".into()), generated: true },
+        ],
+        native: None,
+    };
+    let history = vec![Turn::user_text("a cat"), answer.clone(), Turn::user_text("make it blue")];
+    let b64 = |x: &[u8]| base64::engine::general_purpose::STANDARD.encode(x);
+    // A text model takes everything: in order, at the highest resolution; no signature is made up.
+    let p = prep_full(&google(), "gemini-3.8-flash", &[], &history, &[], &b, None).await.unwrap();
+    assert_eq!(
+        p.body["contents"][1],
+        json!({"role": "model", "parts": [
+            {"text": "Here is the cat."},
+            {"inlineData": {"mimeType": "image/png", "data": b64(b"\x89PNG-made-by-another-model")}, "mediaResolution": {"level": "MEDIA_RESOLUTION_ULTRA_HIGH"}},
+            {"text": " And the data:"},
+            {"inlineData": {"mimeType": "text/csv", "data": b64(b"a,b\n1,2\n"), "displayName": "data.csv"}},
+            {"inlineData": {"mimeType": "audio/wav", "data": b64(b"RIFF....WAVE"), "displayName": "meow.wav"}}
+        ]})
+    );
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    // An image model edits the image (no per-part resolution there); it takes no audio.
+    let p = prep_full(&google(), "gemini-nano-banana-2.1", &[], &history, &[], &b, None).await.unwrap();
+    let parts = p.body["contents"][1]["parts"].as_array().unwrap().clone();
+    assert_eq!(
+        parts[1],
+        json!({"inlineData": {"mimeType": "image/png", "data": b64(b"\x89PNG-made-by-another-model")}})
+    );
+    assert_eq!(parts.len(), 4, "{parts:?}");
+    assert_eq!(
+        p.warnings,
+        vec!["1 file generated in earlier turns was not sent: `gemini-nano-banana-2.1` does not take audio input"]
+    );
+    // An answer that is only an image is a model turn with the image.
+    let only = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![Part::Image { blob: png, filename: None, generated: true, dims: None, thought: false }],
+        native: None,
+    };
+    let p = prep_full(
+        &google(),
+        "gemini-3-pro-image",
+        &[],
+        &[Turn::user_text("cat"), only, Turn::user_text("bluer")],
+        &[],
+        &b,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.body["contents"][1]["parts"].as_array().unwrap().len(), 1);
+    assert_eq!(p.body["contents"][1]["role"], "model");
 }
 
 // ------------------------------------------------------------------ errors
@@ -1103,6 +1597,27 @@ fn prices_by_tier_date_and_modality() {
     assert!((after - 0.75).abs() < 1e-9);
     assert!(pricing::estimate("gemini-9", &json!({}), None, NOW, &GroundingUse::default()).is_none());
     assert!(pricing::price("gemini-nano-banana-2.1", Tier::Flex, NOW).is_none(), "image models have no flex tier");
+
+    // Gemini 4 Hydrogen: flat, no introductory price.
+    let m = |tier, now| {
+        pricing::estimate("gemini-4-hydrogen", &million_in, Some(tier), now, &GroundingUse::default()).unwrap()
+    };
+    assert!((m(Tier::Standard, NOW) - 1.50).abs() < 1e-9);
+    assert!((m(Tier::Standard, pricing::JAN_1_2027) - 1.50).abs() < 1e-9);
+    assert!((m(Tier::Flex, NOW) - 0.75).abs() < 1e-9);
+    assert!((m(Tier::Priority, NOW) - 2.70).abs() < 1e-9);
+
+    // Image output at the price list's tokens per image, also when `candidatesTokenCount`
+    // says less (as logged on 2026-11-12: 305 against IMAGE 1,120).
+    let u = json!({"promptTokenCount": 11, "candidatesTokenCount": 305, "thoughtsTokenCount": 287,
+                   "totalTokenCount": 603, "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}]});
+    let c = pricing::estimate("gemini-3.1-flash-lite-image", &u, None, NOW, &GroundingUse::default()).unwrap();
+    assert!((c - (11.0 * 0.25 + 287.0 * 1.50 + 1120.0 * 30.0) / 1e6).abs() < 1e-12, "{c}");
+    // Gemini 2.5 Flash Image: $0.039 per 1,290-token image.
+    let u = json!({"promptTokenCount": 10, "candidatesTokenCount": 1290,
+                   "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1290}]});
+    let c = pricing::estimate("gemini-2.5-flash-image", &u, None, NOW, &GroundingUse::default()).unwrap();
+    assert!((c - (10.0 * 0.30 / 1e6 + 0.0387)).abs() < 1e-9, "{c}");
 }
 
 // ------------------------------------------------------------------ HTTP path (local fake server)
@@ -1255,4 +1770,26 @@ async fn http_errors_and_unfinished_streams() {
     let e = r.unwrap_err();
     assert_eq!(e.kind, ErrorKind::Network);
     assert!(e.message.contains("without a finish reason"), "{e}");
+}
+
+#[tokio::test]
+async fn a_stopped_answer_fails_in_googles_words_after_billing() {
+    let message = "Unable to show the generated image. The image was filtered out because it violated Google's \
+                   Generative AI Prohibited Use policy. You will not be charged for this request.";
+    let end = json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "", "thoughtSignature": "S"}]},
+                      "finishReason": "IMAGE_RECITATION", "finishMessage": message, "index": 0}],
+                     "usageMetadata": {"promptTokenCount": 11, "totalTokenCount": 11},
+                     "modelVersion": "gemini-3.1-flash-lite-image", "responseId": "img1"});
+    let (base, _) = serve(vec![Reply { status: 200, pieces: vec![sse(end)], complete: true }]).await;
+    let g = Google::new(cfg(&base)).unwrap();
+    let p = prep_full(&g, "gemini-3.1-flash-lite-image", &[], &hi(), &[], &Blobs::none(), None).await.unwrap();
+    let mut evs = Vec::new();
+    let mut sink = |e: StreamEvent| evs.push(e);
+    let (r, outcome) = g.stream(&p, &mut sink, &NullObserver, &CancellationToken::new()).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.message, format!("IMAGE_RECITATION: {message}"));
+    assert_eq!((e.kind, e.retry, e.error_type.as_deref()), (ErrorKind::InBand, Retry::Never, Some("content_filter")));
+    assert_eq!(e.details.as_ref().unwrap()["finishMessage"], message);
+    assert_eq!(outcome.upstream_id.as_deref(), Some("img1"));
+    assert_eq!(usages(&evs).len(), 1, "the usage is billed before the failure");
 }

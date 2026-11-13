@@ -387,13 +387,13 @@ pub fn validate(model: &str, r: &Requested, route: &dyn RouteCaps) -> Result<(),
     }
     let g = route.generation();
     for (asked, ok, what, opt) in [
-        (r.quality.is_some(), g.quality, "image quality", "q="),
-        (r.count.is_some(), g.count, "a choice of the number of images", "n="),
-        (r.background.is_some(), g.background, "a background option", "bg="),
+        (r.quality.is_some(), g.quality, "an image quality", "q="),
+        (r.count.is_some(), g.count, "a number of images", "n="),
+        (r.background.is_some(), g.background, "a background", "bg="),
         (r.seconds.is_some(), g.seconds, "a video length", "sec="),
     ] {
         if asked && !ok {
-            return Err(format!("`{model}` has no {what} (`{opt}`) via {via}"));
+            return Err(format!("`{model}` does not take {what} (`{opt}`) via {via}"));
         }
     }
     if let Some(t) = &r.tier

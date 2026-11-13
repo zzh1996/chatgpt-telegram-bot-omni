@@ -1,18 +1,27 @@
-//! Alibaba's Responses API (`POST /compatible-mode/v1/responses`), used for the
-//! code interpreter (and, together with it, web search and the web extractor):
-//! help.aliyun.com/zh/model-studio/qwen-api-via-openai-responses, 2026-11-12.
+//! Alibaba's Responses API (`POST /compatible-mode/v1/responses`), used for web
+//! search and the code interpreter (and the web extractor, which needs web
+//! search): help.aliyun.com/zh/model-studio/qwen-api-via-openai-responses and
+//! `web-search`, 2026-11-13.
 //!
 //! - Sent with `store: false` (storing is the default), so nothing is kept on
 //!   Alibaba's side and the whole history goes with every request.
 //! - Input: text and images (data URLs). Videos and PDFs are only taken as
-//!   public URLs here: rejected.
+//!   public URLs here: rejected. Assistant messages carry `output_text` only.
 //! - Replay: the output items of the same model that the API takes back as
 //!   input (`message`, `reasoning`, `web_search_call`); code-interpreter and
 //!   web-extractor calls are no input item type (their results are in the
 //!   answer). Chat turns go as text: a `reasoning` input item needs the id of a
 //!   response.
 //! - Stream: `response.*` events (reasoning as `reasoning_text` deltas); tool
-//!   calls carry their code and logs, queries and sources, URLs and extracts.
+//!   calls carry their code and logs, URLs and extracts, and each search its
+//!   `action` (the query; the sources come with the finished item). The
+//!   answer's `annotations` are "usually empty", so when it has no
+//!   `url_citation` the sources of the searches before it are its sources.
+//! - Searches: the model decides whether and how often to search. Each one is
+//!   a `web_search_call`; the billed count is `tool_usage.web_search.num_requests`
+//!   (else `usage.x_tools.web_search.count`, else the calls). A response
+//!   without a search has neither calls nor counts ([`Parser::searched`]): the
+//!   answer then notes that none ran.
 
 use omni_core::Usage;
 use omni_core::content::{Citation, Role, ToolCall, Turn};
@@ -29,10 +38,12 @@ use crate::{BlobLoader, chatstream};
 const REPLAYED: &[&str] = &["message", "reasoning", "web_search_call"];
 
 /// The conversation as Responses `input` items; also whether it has images.
+/// `why`: what needs this API ("web search (`+s`) needs"), for errors.
 pub(super) async fn input_items(
     history: &[Turn],
     model: &str,
     spec: &ModelSpec,
+    why: &str,
     blobs: &dyn BlobLoader,
     notes: &mut Vec<String>,
 ) -> Result<(Vec<Value>, bool), LlmError> {
@@ -56,8 +67,7 @@ pub(super) async fn input_items(
                         }
                         Content::Video(_) => {
                             return Err(LlmError::request(format!(
-                                "`{model}`: the code interpreter (`+c`) needs Alibaba's Responses API, which takes \
-                                 videos only as public URLs"
+                                "`{model}`: {why} Alibaba's Responses API, which takes videos only as public URLs"
                             )));
                         }
                     });
@@ -125,22 +135,59 @@ pub(super) fn to_chat_message(payload: &Value) -> Value {
 }
 
 /// Responses events: the shared parser plus Alibaba's specifics (errors, tool
-/// call details, cost).
+/// call details, search sources as the answer's sources, cost).
 pub(super) struct Parser {
     inner: EventParser,
     spec: Option<&'static ModelSpec>,
     cny_per_usd: f64,
-    annotation_events: bool,
+    /// Citations came as `response.output_text.annotation.added` events or in
+    /// the answer's `annotations`: the search sources stay with the searches.
+    annotated: bool,
+    /// Ids of the `web_search_call` items.
+    searches: Vec<String>,
+    /// The searches the finished response counts (see [`reported_searches`]).
+    counted: u64,
+    /// Search sources not attached to an answer yet.
+    sources: Vec<Citation>,
+    /// Every URL taken as a source (each is cited once).
+    cited: Vec<String>,
+    /// Answer text was streamed.
+    text: bool,
+    /// The normalized finish reason.
+    finish: Option<String>,
 }
 
 impl Parser {
     pub(super) fn new(spec: Option<&'static ModelSpec>, cny_per_usd: f64) -> Self {
-        Self { inner: EventParser::default(), spec, cny_per_usd, annotation_events: false }
+        Self {
+            inner: EventParser::default(),
+            spec,
+            cny_per_usd,
+            annotated: false,
+            searches: Vec::new(),
+            counted: 0,
+            sources: Vec::new(),
+            cited: Vec::new(),
+            text: false,
+            finish: None,
+        }
     }
 
     /// The output items, for replay.
     pub(super) fn native_payload(&self) -> Value {
         self.inner.native_payload()
+    }
+
+    /// Whether a web search ran: a `web_search_call`, or a search count in the
+    /// finished response (neither when the model did not search).
+    pub(super) fn searched(&self) -> bool {
+        !self.searches.is_empty() || self.counted > 0
+    }
+
+    /// The response ended normally (completed, or cut at the output limit) and
+    /// ran no search: worth a note when one was asked for.
+    pub(super) fn answered_without_search(&self) -> bool {
+        matches!(self.finish.as_deref(), Some("stop" | "length")) && !self.searched()
     }
 
     fn error(&self, v: &Value) -> LlmError {
@@ -155,35 +202,72 @@ impl Parser {
         e
     }
 
-    /// Tokens plus web searches (billed like the `agent` strategy).
+    /// Tokens plus the billed web searches (billed like the `agent` strategy).
     fn price(&self, v: &Value, u: &mut Usage) {
-        let r = v.get("response");
-        let searches = u
-            .raw
-            .pointer("/x_tools/web_search/count")
-            .or_else(|| r.and_then(|r| r.pointer("/x_tools/web_search/count")))
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| {
-                r.and_then(|r| r.get("output"))
-                    .and_then(Value::as_array)
-                    .map_or(0, |o| o.iter().filter(|i| i["type"] == "web_search_call").count() as u64)
-            });
-        u.cost_usd = self.spec.and_then(|s| super::estimate_cost(s, u, searches, "agent", self.cny_per_usd));
+        let in_output = v.pointer("/response/output").and_then(Value::as_array).map_or(0, |o| {
+            o.iter().filter(|i| i.get("type").and_then(Value::as_str) == Some("web_search_call")).count()
+        });
+        let searches = reported_searches(v).unwrap_or(self.searches.len().max(in_output) as u64);
+        u.cost_usd = self.spec.and_then(|s| super::estimate_cost(s, u, searches, self.cny_per_usd));
         u.cost_source = if u.cost_usd.is_some() { CostSource::Estimated } else { CostSource::Unknown };
+    }
+
+    /// A search item (`index`: its output index): its id, and its sources
+    /// (once per URL) for the answer.
+    fn search_item(&mut self, item: &Value, index: Option<u64>) {
+        let key = match item.get("id").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => format!("#{}", index.unwrap_or(0)),
+        };
+        if !self.searches.contains(&key) {
+            self.searches.push(key);
+        }
+        for s in item.pointer("/action/sources").and_then(Value::as_array).into_iter().flatten() {
+            let Some(url) = s.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()) else { continue };
+            if self.cited.iter().any(|c| c == url) {
+                continue;
+            }
+            self.cited.push(url.to_string());
+            self.sources.push(Citation {
+                url: Some(url.to_string()),
+                title: s.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string),
+                cited_text: None,
+                range: None,
+                extra: None,
+            });
+        }
+    }
+
+    /// The search sources not attached yet, as the answer's sources (unless
+    /// the answer cites itself).
+    fn sources_event(&mut self) -> Option<StreamEvent> {
+        (!self.annotated && self.text && !self.sources.is_empty())
+            .then(|| StreamEvent::Citations(std::mem::take(&mut self.sources)))
     }
 }
 
-/// Tool details from a full output item: search query and sources, extracted
-/// URLs and content.
+/// The searches a finished response (`response.completed`/`incomplete`)
+/// counts: the billed ones (`tool_usage.web_search.num_requests`, "计费搜索次数"),
+/// else `usage.x_tools.web_search.count`.
+fn reported_searches(v: &Value) -> Option<u64> {
+    let r = v.get("response")?;
+    r.pointer("/tool_usage/web_search/num_requests")
+        .or_else(|| r.pointer("/usage/x_tools/web_search/count"))
+        .and_then(Value::as_u64)
+}
+
+/// Tool details from a full output item: the search action (the query; its
+/// sources as the output), extracted URLs and content.
 fn enrich(item: &Value, mut t: ToolCall) -> ToolCall {
     let get = |k: &str| item.get(k).filter(|v| !v.is_null());
     match item.get("type").and_then(Value::as_str) {
         Some("web_search_call") => {
-            let action = item.get("action");
-            let field = |k: &str| action.and_then(|a| a.get(k)).filter(|v| !v.is_null());
-            t.input =
-                field("query").map(|q| json!({"query": q})).or_else(|| field("queries").map(|q| json!({"queries": q})));
-            t.output = field("sources").map(|s| json!({"sources": s}));
+            if let Some(action) = item.get("action").and_then(Value::as_object) {
+                let mut action = action.clone();
+                let sources = action.remove("sources").filter(|s| !s.is_null());
+                t.input = Some(Value::Object(action));
+                t.output = sources.map(|s| json!({"sources": s}));
+            }
         }
         Some("web_extractor_call") => {
             let mut input = serde_json::Map::new();
@@ -228,30 +312,46 @@ impl chatstream::EventParser for Parser {
         match ty {
             // Summary-part separators (OpenAI's multi-part summaries) do not apply: Qwen streams `reasoning_text`.
             "response.reasoning_summary_part.done" => return Ok(Vec::new()),
-            "response.output_text.annotation.added" => self.annotation_events = true,
+            "response.output_text.annotation.added" => self.annotated = true,
+            "response.completed" | "response.incomplete" => self.counted = reported_searches(v).unwrap_or(0),
             _ => {}
         }
         let item = v.get("item");
+        if let Some(i) = item.filter(|i| i.get("type").and_then(Value::as_str) == Some("web_search_call")) {
+            self.search_item(i, v.get("output_index").and_then(Value::as_u64));
+        }
         let mut out = Vec::with_capacity(evs.len() + 1);
         for ev in evs {
-            out.push(match ev {
-                StreamEvent::Tool(t) => StreamEvent::Tool(match item {
+            match ev {
+                StreamEvent::Tool(t) => out.push(StreamEvent::Tool(match item {
                     Some(i) => enrich(i, t),
                     None => t,
-                }),
+                })),
                 StreamEvent::Usage(mut u) => {
                     self.price(v, &mut u);
-                    StreamEvent::Usage(u)
+                    out.push(StreamEvent::Usage(u));
                 }
-                other => other,
-            });
+                StreamEvent::Text(t) => {
+                    self.text = true;
+                    out.push(StreamEvent::Text(t));
+                }
+                // Sources still waiting (no finished answer item came) go to the answer before the end.
+                StreamEvent::Finish { reason, native } => {
+                    out.extend(self.sources_event());
+                    self.finish.clone_from(&reason);
+                    out.push(StreamEvent::Finish { reason, native });
+                }
+                other => out.push(other),
+            }
         }
         if ty == "response.output_item.done"
-            && !self.annotation_events
             && let Some(i) = item.filter(|i| i.get("type").and_then(Value::as_str) == Some("message"))
         {
-            let cites = citations(i);
-            if !cites.is_empty() {
+            let cites = if self.annotated { Vec::new() } else { citations(i) };
+            if cites.is_empty() {
+                out.extend(self.sources_event());
+            } else {
+                self.annotated = true;
                 out.push(StreamEvent::Citations(cites));
             }
         }

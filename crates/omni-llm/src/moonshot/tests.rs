@@ -430,17 +430,21 @@ fn run_responses(events: &[Value]) -> (responses::Parser, crate::Accumulator, Ve
     (p, acc, all)
 }
 
-/// A Responses stream with a web search, per platform.kimi.com/docs/api/responses.
-#[test]
-fn responses_stream_with_search() {
-    let search_done = json!({"type": "web_search_call", "id": "ws_1", "status": "completed",
-        "action": {"type": "search", "query": "2026年9月3日 重大新闻",
-                   "sources": [{"type": "url", "url": "https://example.com/news/1", "title": "新闻标题"}]}});
+/// A Responses stream with a web search, per platform.kimi.com/docs/api/responses
+/// and turn 282 of 2026-11-13 (the sources already complete when the search
+/// item is added; `annotations` empty); `search: false`: no search ran.
+fn search_stream(search: bool, annotations: Value) -> Vec<Value> {
+    let sources = json!([
+        {"type": "url", "url": "https://example.com/news/1", "title": "新闻标题"},
+        {"type": "url", "url": "https://example.com/news/2", "title": "另一条"},
+        {"type": "url", "url": "https://example.com/news/1", "title": "新闻标题"},
+    ]);
+    let action = json!({"type": "search", "query": "2026年9月3日 重大新闻", "sources": sources});
+    let search_done = json!({"type": "web_search_call", "id": "ws_1", "status": "completed", "action": action});
     let reasoning_done = json!({"type": "reasoning", "id": "rs_1", "status": "completed",
         "summary": [{"type": "summary_text", "text": "Think."}], "encrypted_content": null});
     let message_done = json!({"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
-        "content": [{"type": "output_text", "text": "News: …", "annotations": [
-            {"type": "url_citation", "url": "https://example.com/news/1", "title": "新闻标题", "start_index": 0, "end_index": 4}]}]});
+        "content": [{"type": "output_text", "text": "News: …", "annotations": annotations, "logprobs": []}]});
     let usage = json!({"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                        "output_tokens": 200, "output_tokens_details": {"reasoning_tokens": 50}, "total_tokens": 1200});
     let mut n = 0;
@@ -449,19 +453,25 @@ fn responses_stream_with_search() {
         n += 1;
         v
     };
-    let events = [
+    let mut events = vec![
         ev(
             json!({"type": "response.created", "response": {"id": "resp_1", "model": "kimi-k3", "status": "in_progress", "output": []}}),
         ),
         ev(
             json!({"type": "response.in_progress", "response": {"id": "resp_1", "model": "kimi-k3", "status": "in_progress"}}),
         ),
-        ev(json!({"type": "response.output_item.added", "output_index": 0,
-                   "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"}})),
-        ev(json!({"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": "ws_1"})),
-        ev(json!({"type": "response.web_search_call.searching", "output_index": 0, "item_id": "ws_1"})),
-        ev(json!({"type": "response.web_search_call.completed", "output_index": 0, "item_id": "ws_1"})),
-        ev(json!({"type": "response.output_item.done", "output_index": 0, "item": search_done})),
+    ];
+    if search {
+        events.extend([
+            ev(json!({"type": "response.output_item.added", "output_index": 0,
+                       "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress", "action": action}})),
+            ev(json!({"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": "ws_1"})),
+            ev(json!({"type": "response.web_search_call.searching", "output_index": 0, "item_id": "ws_1"})),
+            ev(json!({"type": "response.web_search_call.completed", "output_index": 0, "item_id": "ws_1"})),
+            ev(json!({"type": "response.output_item.done", "output_index": 0, "item": search_done})),
+        ]);
+    }
+    events.extend([
         ev(json!({"type": "response.output_item.added", "output_index": 1,
                    "item": {"type": "reasoning", "id": "rs_1", "status": "in_progress", "summary": []}})),
         ev(
@@ -496,21 +506,28 @@ fn responses_stream_with_search() {
             json!({"type": "response.output_text.done", "output_index": 2, "item_id": "msg_1", "content_index": 0, "text": "News: …"}),
         ),
         ev(json!({"type": "response.output_item.done", "output_index": 2, "item": message_done})),
-        ev(
-            json!({"type": "response.completed", "response": {"id": "resp_1", "model": "kimi-k3", "status": "completed",
-                   "output": [search_done, reasoning_done, message_done], "usage": usage}}),
-        ),
-    ];
-    let (p, acc, _) = run_responses(&events);
-    assert!(p.finished());
+    ]);
+    let output =
+        if search { json!([search_done, reasoning_done, message_done]) } else { json!([reasoning_done, message_done]) };
+    events.push(ev(
+        json!({"type": "response.completed", "response": {"id": "resp_1", "model": "kimi-k3", "status": "completed",
+                                "output": output, "usage": usage}}),
+    ));
+    events
+}
+
+#[test]
+fn responses_stream_with_search() {
+    let (p, acc, _) = run_responses(&search_stream(true, json!([])));
+    assert!(p.finished() && p.searched());
     let parts = acc.parts();
     assert_eq!(parts.len(), 3, "{parts:?}");
     match &parts[0] {
         Part::ToolCall(t) => {
             assert_eq!(t.name, "web_search");
             assert_eq!(t.status.as_deref(), Some("completed"));
-            assert_eq!(t.input, Some(json!({"query": "2026年9月3日 重大新闻"})));
-            assert_eq!(t.output.as_ref().unwrap()["sources"][0]["url"], "https://example.com/news/1");
+            assert_eq!(t.input, Some(json!({"type": "search", "query": "2026年9月3日 重大新闻"})));
+            assert_eq!(t.output.as_ref().unwrap()["sources"].as_array().unwrap().len(), 3, "verbatim");
         }
         other => panic!("{other:?}"),
     }
@@ -519,7 +536,11 @@ fn responses_stream_with_search() {
         "no separator added after the single reasoning part: {:?}",
         parts[1]
     );
-    assert!(matches!(&parts[2], Part::Text { text, citations } if text == "News: …" && citations.len() == 1));
+    // Kimi's annotations are empty: the search's sources are the answer's (each URL once).
+    let Part::Text { text, citations } = &parts[2] else { panic!("{parts:?}") };
+    assert_eq!(text, "News: …");
+    let got: Vec<_> = citations.iter().map(|c| (c.url.as_deref().unwrap(), c.title.as_deref().unwrap())).collect();
+    assert_eq!(got, [("https://example.com/news/1", "新闻标题"), ("https://example.com/news/2", "另一条")]);
     assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
     assert_eq!(acc.upstream_id.as_deref(), Some("resp_1"));
     let u = acc.usage.unwrap();
@@ -530,18 +551,90 @@ fn responses_stream_with_search() {
     let native = p.native_payload();
     assert_eq!(native["output"].as_array().unwrap().len(), 3);
     assert_eq!(native["output"][0]["type"], "web_search_call");
+    // Real `url_citation`s (should Moonshot send them) are the answer's sources instead.
+    let cite = json!([{"type": "url_citation", "url": "https://example.com/news/1", "title": "新闻标题", "start_index": 0, "end_index": 4}]);
+    let (_, acc, _) = run_responses(&search_stream(true, cite));
+    assert!(
+        matches!(acc.parts().last(), Some(Part::Text { citations, .. }) if citations.len() == 1 && citations[0].range == Some((0, 4)))
+    );
+}
+
+/// No `web_search_call`: Moonshot judged that no search was needed (none is billed).
+#[test]
+fn responses_without_a_search() {
+    let (p, acc, _) = run_responses(&search_stream(false, json!([])));
+    assert!(p.finished() && !p.searched());
+    assert!(acc.parts().iter().all(|p| !matches!(p, Part::ToolCall(_))));
+    // 1000 × ¥20/M + 200 × ¥100/M, no search fee.
+    assert!((acc.usage.unwrap().cost_usd.unwrap() - 0.04 / 7.0).abs() < 1e-12);
+}
+
+/// `+s` end to end: a notice when Moonshot ran no search, none when it did.
+#[tokio::test]
+async fn end_to_end_search_notice() {
+    let h = [Turn::user_text("今天有什么新闻？")];
+    for (search, want) in
+        [(false, vec!["no web search ran (Moonshot decides from the input whether to search)"]), (true, vec![])]
+    {
+        let (base, server) = serve(sse(&search_stream(search, json!([])))).await;
+        let m = Moonshot::new(DirectConfig { base_url: base, ..moonshot(None).cfg.clone() }).unwrap();
+        let (blobs, _) = Blobs::new(&[]);
+        let p = m.prepare(&input("kimi-k3", &[flag("s")], &h), &[], &blobs).await.unwrap();
+        let mut evs = Vec::new();
+        let (r, _) =
+            m.stream(&p, &mut |e: StreamEvent| evs.push(e), &crate::NullObserver, &CancellationToken::new()).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(server.await.unwrap()["tools"], json!([{"type": "web_search"}]));
+        assert_eq!(notices(&evs), want, "search: {search}");
+    }
+}
+
+/// Media other models generated in earlier turns: assistant messages carry text only (both APIs).
+#[tokio::test]
+async fn generated_media_of_other_models_are_not_sent() {
+    let (blobs, refs) = Blobs::new(&[b"\x89PNG", b"\x00\x00mp4"]);
+    let with = |mime: &str, r: &BlobRef| BlobRef { mime: mime.into(), ..r.clone() };
+    let earlier = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![
+            Part::text("Here you go."),
+            Part::File { blob: with("video/mp4", &refs[1]), filename: Some("v.mp4".into()), generated: true },
+            Part::Image {
+                blob: with("image/png", &refs[0]),
+                filename: None,
+                generated: true,
+                dims: None,
+                thought: false,
+            },
+        ],
+        native: None,
+    };
+    let h = vec![Turn::user_text("make a video"), earlier, Turn::user_text("describe it")];
+    for opts in [vec![], vec![flag("s")]] {
+        let p = moonshot(None).prepare(&input("kimi-k3", &opts, &h), &[], &blobs).await.unwrap();
+        assert_eq!(
+            p.warnings,
+            vec![
+                "1 image and 1 video generated in an earlier turn were not sent: assistant messages here carry text only"
+            ],
+            "{opts:?}"
+        );
+    }
 }
 
 #[test]
 fn responses_abnormal_ends() {
-    let (_, acc, _) = run_responses(&[json!({"type": "response.incomplete", "sequence_number": 0, "response": {
+    let (p, acc, _) = run_responses(&[json!({"type": "response.incomplete", "sequence_number": 0, "response": {
         "id": "resp_2", "status": "incomplete", "incomplete_details": {"reason": "content_filter"}, "output": [],
         "usage": {"input_tokens": 10, "output_tokens": 0}}})]);
     assert_eq!(acc.finish_reason.as_deref(), Some("content_filter"));
     assert_eq!(acc.finish_details, Some(json!({"reason": "content_filter"})));
-    let (_, acc, _) = run_responses(&[json!({"type": "response.incomplete", "sequence_number": 0, "response": {
+    assert!(!p.answered_without_search(), "a blocked answer: nothing to say about the search");
+    let (p, acc, _) = run_responses(&[json!({"type": "response.incomplete", "sequence_number": 0, "response": {
         "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}, "output": []}})]);
     assert_eq!(acc.finish_reason.as_deref(), Some("length"));
+    assert!(p.answered_without_search(), "cut at the output limit without a search");
     // A failed response is Moonshot's error, verbatim.
     let mut p = responses::Parser::new(model_spec("kimi-k3"), 7.0);
     let failed = json!({"type": "response.failed", "sequence_number": 3, "response": {"id": "resp_3", "status": "failed",
@@ -620,4 +713,47 @@ fn cost() {
     assert!((c - 22.86 / 7.0).abs() < 1e-9, "{c}");
     assert!(estimate_cost(model_spec("kimi-k3").unwrap(), &Usage::default(), 0, 7.0).is_none());
     assert!(estimate_cost(model_spec("kimi-k3").unwrap(), &u, 0, 0.0).is_none(), "no exchange rate");
+}
+
+/// One HTTP exchange on a local port: the base URL and a handle yielding the JSON body sent.
+async fn serve(body: String) -> (String, tokio::task::JoinHandle<Value>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (mut buf, mut tmp) = (Vec::new(), [0u8; 8192]);
+        let sent = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                    .unwrap_or(0);
+                while buf.len() < pos + 4 + len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                break serde_json::from_slice(&buf[pos + 4..pos + 4 + len]).unwrap_or(Value::Null);
+            }
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        let _ = sock.shutdown().await;
+        sent
+    });
+    (base, server)
+}
+
+fn sse(events: &[Value]) -> String {
+    events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap_or("message"))).collect()
+}
+
+fn notices(evs: &[StreamEvent]) -> Vec<&str> {
+    evs.iter().filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n.as_str()) } else { None }).collect()
 }

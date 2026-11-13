@@ -1,12 +1,18 @@
-//! OpenAI's own API: the Responses API (`POST {base}/responses`), used
-//! statelessly (docs/research/openai.md; model pages, pricing and guides
-//! fetched 2026-11-11/12).
+//! OpenAI's own API: the Responses API (`POST {base}/responses`)
+//! (docs/research/openai.md; model pages, pricing and guides fetched
+//! 2026-11-11/12, the create/retrieve references and the reasoning, prompt
+//! cache diagnostics, code interpreter and web search guides 2026-11-13).
 //!
 //! What the bot sends:
-//! - `store: false`, `stream: true`; earlier turns of the same model replay
-//!   all their output items verbatim (reasoning with the `encrypted_content`
-//!   stateless responses carry by default, messages with `phase`, hosted tool
-//!   calls); other assistant turns are plain text.
+//! - `store: true` (the owner's choice: a broken stream can then be recovered
+//!   from OpenAI's stored copy, [`recover`]; OpenAI keeps stored responses
+//!   "for at least 30 days"), `stream: true`, and always
+//!   `include: ["reasoning.encrypted_content"]`, which stored responses do not
+//!   carry by default: replay never depends on OpenAI's storage. Earlier turns
+//!   of the same model replay all their output items verbatim (reasoning with
+//!   its encrypted content, messages with `phase`, hosted tool calls); other
+//!   assistant turns are their text (OpenAI's assistant messages carry text
+//!   only: their images and files are not sent, which a warning says).
 //! - Defaults (D3): the model's highest `reasoning.effort` with
 //!   `reasoning.summary: "detailed"`; the full output budget
 //!   (`max_output_tokens`, which counts reasoning too); images at
@@ -15,20 +21,46 @@
 //!   the summary is requested, as the old bot did.
 //! - Left at OpenAI's defaults: `reasoning.context` and `reasoning.mode`,
 //!   `truncation` (`disabled`: an overflow is a 400, after which the bot
-//!   shrinks the budget), `prompt_cache_options`, web search
-//!   `search_context_size` / `user_location`, the container memory (1 GB).
-//! - `+s` → `web_search` (+ `include: web_search_call.action.sources`),
-//!   `+c` → `code_interpreter` with `container: {type: auto}`
-//!   (+ `include: code_interpreter_call.outputs`); OpenAI has no URL fetching.
+//!   shrinks the budget), the prompt cache TTL, web search
+//!   `search_context_size` / `user_location` / `search_content_types`, the
+//!   container memory (1 GB).
+//! - Prompt cache diagnostics (GPT-5.6 and later): a follow-up of a turn
+//!   replayed natively sends `prompt_cache_options.comparison_response_id` =
+//!   that turn's response id (free, changes nothing else); a miss because the
+//!   conversation or the tools changed is a notice, the rest is in `/info`.
+//! - `+s` → `web_search` (+ `include: web_search_call.action.sources` and
+//!   `web_search_call.results`, kept in the tool call), `+c` →
+//!   `code_interpreter` with `container: {type: auto}` (+ `include:
+//!   code_interpreter_call.outputs`; the files the code writes are fetched
+//!   from the container where the answer cites them, [`files`]); OpenAI has
+//!   no URL fetching.
+//!   `+i` → `image_generation` (see [`images::tool`]: GPT-Image-2.6 Sunburst
+//!   at its highest quality, `moderation: "low"`, three partial images, the
+//!   size from `1 2 4` / ratios, `q=`, `bg=`); its `image_generation_call`
+//!   items give the images (previews while streaming) and a tool call with
+//!   the revised prompt, and replay in later turns, so a reply edits in
+//!   context. Its tokens (`tool_usage.image_gen`) are priced at the image
+//!   model's rates.
 //!   `v=` → `text.verbosity`; `tier=` → `service_tier` (flex, priority/fast,
 //!   ultrafast, per model).
+//! - Bare image-model ids (`gpt-image-…`) go to the Images API instead
+//!   ([`images`]); `sora-*` and the DALL·E models are errors (shut down).
 //! - `safety_identifier` = the hashed user, `prompt_cache_key` = the
 //!   conversation, `stream_options.include_obfuscation: false`.
 //! - Files: `input_file` takes PDFs, documents, presentations, spreadsheets
 //!   and ~100 text/code types natively; other text files are inlined (D6);
 //!   audio and video are errors (the Responses API has no such input).
+//! - What responses report about their input: earlier reasoning OpenAI
+//!   withheld from the model (`input_transformations`) for any reason but
+//!   `turn_boundary` is a notice.
 //! - No cost in responses: estimated from the dated price table below.
 
+pub(crate) mod files;
+pub mod images;
+pub(crate) mod media;
+pub(crate) mod recover;
+#[cfg(test)]
+mod stream_tests;
 pub(crate) mod wire;
 
 use omni_core::Usage;
@@ -38,7 +70,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{ErrorKind, LlmError, Retry, retry_for_status};
 use crate::openrouter::options::{Applied, overlay};
 use crate::provider::{DirectConfig, Provider};
-use crate::request::{self, Requested, RouteCaps, Tool};
+use crate::request::{self, Generation, Requested, RouteCaps, Tool};
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared, budget};
 use wire::{Platform, Price, Scale};
 
@@ -76,6 +108,8 @@ pub struct ModelSpec {
     pub fast: Option<f64>,
     /// `service_tier: "ultrafast"` (6× the standard price).
     pub ultrafast: bool,
+    /// Prompt cache diagnostics ("GPT-5.6 and later supported models").
+    pub cache_diagnostics: bool,
 }
 
 const MAX_TO_LOW: &[&str] = &["max", "xhigh", "high", "medium", "low"];
@@ -102,6 +136,7 @@ const BASE: ModelSpec = ModelSpec {
     flex: true,
     fast: Some(2.0),
     ultrafast: false,
+    cache_diagnostics: true,
 };
 
 /// OpenAI's models, 2026-11-12. Limits and reasoning levels: the model pages
@@ -123,6 +158,7 @@ pub const MODELS: &[ModelSpec] = &[
         long_context: false,
         flex: false,
         fast: None,
+        cache_diagnostics: false,
         ..BASE
     },
     ModelSpec {
@@ -158,14 +194,23 @@ pub const MODELS: &[ModelSpec] = &[
         image_detail: "original",
         price: price(5.0, 0.5, None, 30.0),
         fast: Some(2.5),
+        cache_diagnostics: false,
         ..BASE
     },
-    ModelSpec { id: "gpt-5.5-pro", efforts: Some(PRO), price: price(30.0, 30.0, None, 180.0), fast: None, ..BASE },
+    ModelSpec {
+        id: "gpt-5.5-pro",
+        efforts: Some(PRO),
+        price: price(30.0, 30.0, None, 180.0),
+        fast: None,
+        cache_diagnostics: false,
+        ..BASE
+    },
     ModelSpec {
         id: "gpt-5.4",
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
         price: price(2.5, 0.25, None, 15.0),
+        cache_diagnostics: false,
         ..BASE
     },
     ModelSpec {
@@ -175,6 +220,7 @@ pub const MODELS: &[ModelSpec] = &[
         image_detail: "original",
         price: price(0.75, 0.075, None, 4.5),
         long_context: false,
+        cache_diagnostics: false,
         ..BASE
     },
     ModelSpec {
@@ -185,15 +231,24 @@ pub const MODELS: &[ModelSpec] = &[
         price: price(0.2, 0.02, None, 1.25),
         long_context: false,
         fast: None,
+        cache_diagnostics: false,
         ..BASE
     },
-    ModelSpec { id: "gpt-5.4-pro", efforts: Some(PRO), price: price(30.0, 30.0, None, 180.0), fast: None, ..BASE },
+    ModelSpec {
+        id: "gpt-5.4-pro",
+        efforts: Some(PRO),
+        price: price(30.0, 30.0, None, 180.0),
+        fast: None,
+        cache_diagnostics: false,
+        ..BASE
+    },
     ModelSpec {
         id: "gpt-5.2",
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         price: price(1.75, 0.175, None, 14.0),
         long_context: false,
+        cache_diagnostics: false,
         ..BASE
     },
     ModelSpec {
@@ -204,6 +259,7 @@ pub const MODELS: &[ModelSpec] = &[
         long_context: false,
         flex: false,
         fast: None,
+        cache_diagnostics: false,
         ..BASE
     },
     // Deprecated.
@@ -213,6 +269,7 @@ pub const MODELS: &[ModelSpec] = &[
         efforts: Some(&["high", "medium", "low", "none"]),
         price: price(1.25, 0.125, None, 10.0),
         long_context: false,
+        cache_diagnostics: false,
         ..BASE
     },
     ModelSpec {
@@ -221,6 +278,7 @@ pub const MODELS: &[ModelSpec] = &[
         efforts: Some(&["high", "medium", "low", "minimal"]),
         price: price(1.25, 0.125, None, 10.0),
         long_context: false,
+        cache_diagnostics: false,
         ..BASE
     },
 ];
@@ -248,18 +306,23 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
 const ANY_EFFORT: &[&str] = &["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 
 /// What OpenAI offers for a model (the vendor's own API: official = route).
-struct Caps(Option<&'static ModelSpec>);
+struct Caps {
+    spec: Option<&'static ModelSpec>,
+    /// The request has the image generation tool (`+i`): its options apply.
+    image_tool: bool,
+}
 
 impl RouteCaps for Caps {
     fn name(&self) -> &str {
         NAME
     }
     fn tool(&self, tool: Tool) -> bool {
-        // web_search and code_interpreter (every model in the table lists both).
-        matches!(tool, Tool::Search | Tool::Code)
+        // web_search, code_interpreter and image_generation: every model in the
+        // table lists all three on its model page.
+        matches!(tool, Tool::Search | Tool::Code | Tool::Image)
     }
     fn efforts(&self) -> Option<Vec<String>> {
-        let levels = match self.0 {
+        let levels = match self.spec {
             Some(s) => s.efforts?,
             None => ANY_EFFORT,
         };
@@ -272,13 +335,17 @@ impl RouteCaps for Caps {
         false
     }
     fn verbosity(&self) -> bool {
-        self.0.is_none_or(|s| s.verbosity)
+        self.spec.is_none_or(|s| s.verbosity)
     }
     fn image_options(&self) -> bool {
         false
     }
+    fn generation(&self) -> Generation {
+        // The image generation tool's quality and background; it has no `n`.
+        Generation { quality: self.image_tool, background: self.image_tool, ..Default::default() }
+    }
     fn tiers(&self) -> Vec<String> {
-        let (flex, fast, ultrafast) = match self.0 {
+        let (flex, fast, ultrafast) = match self.spec {
             Some(s) => (s.flex, s.fast.is_some(), s.ultrafast),
             None => (true, true, true),
         };
@@ -301,12 +368,14 @@ const VERBOSITY: &[&str] = &["low", "medium", "high"];
 pub struct OpenAi {
     cfg: DirectConfig,
     http: reqwest::Client,
+    /// How a broken stream's stored response is polled.
+    recovery: recover::Backoff,
 }
 
 impl OpenAi {
     pub fn new(cfg: DirectConfig) -> anyhow::Result<Self> {
         let http = cfg.http()?;
-        Ok(Self { cfg, http })
+        Ok(Self { cfg, http, recovery: recover::Backoff::DEFAULT })
     }
 
     async fn build(
@@ -316,6 +385,9 @@ impl OpenAi {
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
         let model = input.model;
+        if let Some(e) = images::gone(model) {
+            return Err(e);
+        }
         let spec = model_spec(model);
         let user = request::parse(input.options).map_err(LlmError::request)?;
         let mut req = Requested::default();
@@ -326,11 +398,24 @@ impl OpenAi {
         if req.providers.is_some() {
             return Err(LlmError::request(format!("`p=` (provider choice) does not apply to {NAME}")));
         }
-        let caps = Caps(spec);
-        // `request::official` knows OpenAI's verbosity only by OpenRouter ids (`openai/…`): checked here.
+        // A bare image model: the Images API, no chat model.
+        if images::is_image_model(model) {
+            return images::prepare(&self.cfg, input, &req, &user, blobs).await;
+        }
+        let image_tool = req.tools.contains(&Tool::Image);
+        let caps = Caps { spec, image_tool };
+        // `request::official` knows OpenAI's verbosity only by OpenRouter ids (`openai/…`), and image
+        // sizes only for Gemini: both checked here.
         let mut checked = req.clone();
         checked.verbosity = None;
+        checked.image_size = None;
+        checked.aspect_ratio = None;
         request::validate(model, &checked, &caps).map_err(LlmError::request)?;
+        if !image_tool && (req.image_size.is_some() || req.aspect_ratio.is_some()) {
+            return Err(LlmError::request(format!(
+                "`{model}` has no image size/aspect options (they are for its image generation tool: add +i)"
+            )));
+        }
         if let Some(v) = &req.verbosity {
             if !caps.verbosity() {
                 return Err(LlmError::request(format!("`{model}` has no verbosity setting")));
@@ -351,7 +436,7 @@ impl OpenAi {
             "input": conv.input,
             "stream": true,
             "stream_options": {"include_obfuscation": false},
-            "store": false,
+            "store": true,
         });
         let src = |by_user: bool| if by_user { "option" } else { "default" };
         let mut applied = Vec::new();
@@ -392,31 +477,53 @@ impl OpenAi {
         }
 
         let mut tools = Vec::new();
-        let mut include = Vec::new();
+        // Stored responses carry no encrypted reasoning unless asked: replay must not depend on the storage.
+        let mut include = vec!["reasoning.encrypted_content"];
+        let mut notes = Vec::new();
         for &t in &req.tools {
-            let (tool, inc) = match t {
-                Tool::Search => (json!({"type": "web_search"}), "web_search_call.action.sources"),
+            let (tool, inc): (Value, &[&str]) = match t {
+                // Every source consulted, and the image results (filled when the search looks for images).
+                Tool::Search => {
+                    (json!({"type": "web_search"}), &["web_search_call.action.sources", "web_search_call.results"])
+                }
                 Tool::Code => (
                     json!({"type": "code_interpreter", "container": {"type": "auto"}}),
-                    "code_interpreter_call.outputs",
+                    &["code_interpreter_call.outputs"],
                 ),
-                // TODO(image generation agent): the image_generation tool.
-                Tool::Fetch | Tool::Maps | Tool::Image => {
+                // The images come in the `image_generation_call` items (no `include` needed).
+                Tool::Image => {
+                    let plan = images::tool(model, &req, &user)?;
+                    // The tool (asked for), then its parameters with their own sources.
+                    applied.push(Applied {
+                        source: src(user.tools.contains(&t)).into(),
+                        patch: json!({"tools": [{"type": "image_generation"}]}),
+                    });
+                    applied.extend(plan.applied);
+                    settings.extend(plan.settings);
+                    notes.extend(plan.notes);
+                    tools.push(plan.tool);
+                    continue;
+                }
+                Tool::Fetch | Tool::Maps => {
                     return Err(LlmError::request(format!("`{model}` has no {} (`+{}`)", t.describe(), t.letter())));
                 }
             };
             applied.push(Applied {
                 source: src(user.tools.contains(&t)).into(),
-                patch: json!({"tools": [tool], "include": [inc]}),
+                patch: json!({"tools": [tool], "include": inc}),
             });
             settings.push(t.describe().to_string());
             tools.push(tool);
-            include.push(inc);
+            include.extend(inc);
         }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
-            body["include"] = json!(include);
         }
+        body["include"] = json!(include);
+        applied.push(Applied {
+            source: "default".into(),
+            patch: json!({"store": true, "include": ["reasoning.encrypted_content"]}),
+        });
         if let Some(v) = &req.verbosity {
             body["text"] = json!({"verbosity": v});
             applied
@@ -440,6 +547,12 @@ impl OpenAi {
         if let Some(s) = &input.session_id {
             body["prompt_cache_key"] = json!(s);
         }
+        // Why the prompt cache missed against the previous turn (free; changes nothing else).
+        if let (Some(id), true) = (&conv.last_response_id, spec.is_some_and(|s| s.cache_diagnostics)) {
+            let diagnostics = json!({"comparison_response_id": id});
+            body["prompt_cache_options"] = diagnostics.clone();
+            applied.push(Applied { source: "default".into(), patch: json!({"prompt_cache_options": diagnostics}) });
+        }
         let mut warnings = Vec::new();
         if spec.is_none() {
             warnings.push(format!(
@@ -448,6 +561,7 @@ impl OpenAi {
                 body.get("max_output_tokens").map(|v| v.to_string()).unwrap_or_else(|| "not set".into())
             ));
         }
+        warnings.extend(conv.warnings);
         Ok(Prepared {
             dialect: DIALECT,
             model: model.to_string(),
@@ -455,7 +569,7 @@ impl OpenAi {
             body,
             applied,
             warnings,
-            notes: conv.notes,
+            notes: conv.notes.into_iter().chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: false,
@@ -480,7 +594,7 @@ impl Provider for OpenAi {
         NAME
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some()
+        model_spec(model).is_some() || images::image_spec(model).is_some()
     }
     async fn prepare(
         &self,
@@ -497,7 +611,16 @@ impl Provider for OpenAi {
         observer: &dyn Observer,
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
-        wire::stream(&self.http, &self.cfg.api_key, self.cfg.idle_timeout, &WIRE, p, sink, observer, cancel).await
+        if p.dialect == images::DIALECT {
+            return images::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
+        }
+        let run = wire::Run {
+            http: &self.http,
+            api_key: &self.cfg.api_key,
+            idle_timeout: self.cfg.idle_timeout,
+            recovery: Some(&self.recovery),
+        };
+        wire::stream(&run, &WIRE, p, sink, observer, cancel).await
     }
 }
 
@@ -531,7 +654,29 @@ pub fn estimate_cost(model: &str, response: &Value, u: &Usage) -> Option<f64> {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let tokens = wire::token_cost(&s.price, u, written_12h, scale.times(tier))?;
-    Some(tokens + tool_fees(response))
+    Some(tokens + tool_fees(response) + image_tool_cost(response)?)
+}
+
+/// The image generation tool's tokens (`tool_usage.image_gen`, summed over
+/// its calls), at the rates of the image model the request's tool used
+/// (echoed in the response's `tools`). Cache hits are priced where the usage
+/// reports them; OpenAI notes they may be billed without being reported, so
+/// this is an upper bound. `None`: image tokens of a model not in the table.
+fn image_tool_cost(response: &Value) -> Option<f64> {
+    let Some(u) = response.pointer("/tool_usage/image_gen").filter(|u| u.is_object()) else { return Some(0.0) };
+    if u.get("total_tokens").and_then(Value::as_u64) == Some(0)
+        && u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) == 0
+    {
+        return Some(0.0);
+    }
+    let model = response
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|t| t.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("image_generation")))
+        .and_then(|t| t.get("model"))
+        .and_then(Value::as_str)
+        .unwrap_or(images::TOOL_MODEL);
+    images::image_spec(model).map(|s| images::usage_cost(&s.price, u))
 }
 
 /// Web searches (`tool_usage.web_search.num_requests` counts the billable
@@ -692,7 +837,9 @@ mod tests {
         assert_eq!(b["reasoning"], json!({"effort": "max", "summary": "detailed"}));
         assert_eq!(b["max_output_tokens"], 128_000);
         assert_eq!(p.auto_max_tokens, Some(128_000));
-        assert_eq!((b["store"].clone(), b["stream"].clone()), (json!(false), json!(true)));
+        // Stored (a broken stream is recovered from it), with the encrypted reasoning for replay.
+        assert_eq!((b["store"].clone(), b["stream"].clone()), (json!(true), json!(true)));
+        assert_eq!(b["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(b["stream_options"], json!({"include_obfuscation": false}));
         assert_eq!(b["safety_identifier"], "u-hash");
         assert_eq!(b["prompt_cache_key"], "tg-7");
@@ -700,7 +847,7 @@ mod tests {
             b["input"],
             json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
         );
-        // Nothing else: no sampling, no instructions, no include, no tools, no tier.
+        // Nothing else: no sampling, no instructions, no tools, no tier, no cache comparison (no earlier turn).
         let keys: Vec<&str> = b.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
@@ -712,10 +859,17 @@ mod tests {
                 "store",
                 "reasoning",
                 "max_output_tokens",
+                "include",
                 "safety_identifier",
                 "prompt_cache_key"
             ]
         );
+        assert!(
+            p.applied.iter().any(|a| a.source == "default"
+                && a.patch == json!({"store": true, "include": ["reasoning.encrypted_content"]}))
+        );
+        // Unknown models too (replay must not depend on OpenAI's storage).
+        assert_eq!(prep("gpt-7-nova", &[]).await.unwrap().body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(p.settings, vec!["effort max"]);
         assert_eq!(p.applied[0].source, "default");
         assert_eq!(p.applied[1].patch, json!({"max_output_tokens": 128_000}));
@@ -772,7 +926,16 @@ mod tests {
             b["tools"],
             json!([{"type": "web_search"}, {"type": "code_interpreter", "container": {"type": "auto"}}])
         );
-        assert_eq!(b["include"], json!(["web_search_call.action.sources", "code_interpreter_call.outputs"]));
+        // Everything the tools can return: search sources and results, code outputs.
+        assert_eq!(
+            b["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+                "web_search_call.results",
+                "code_interpreter_call.outputs"
+            ])
+        );
         assert_eq!(b["text"], json!({"verbosity": "high"}));
         assert_eq!(b["service_tier"], "flex");
         assert_eq!(p.settings, vec!["effort low", "web search", "code execution", "verbosity high", "tier flex"]);
@@ -998,8 +1161,17 @@ mod tests {
         events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect()
     }
 
+    /// Recovery polls in milliseconds (the real pauses are seconds, the window at least 30 s).
+    const QUICK: recover::Backoff = recover::Backoff {
+        first: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+        min_window: Duration::from_millis(400),
+        max_window: Duration::from_millis(400),
+    };
+
     async fn call(base: String, p: &Prepared) -> (Result<Value, LlmError>, CallOutcome, Vec<StreamEvent>) {
-        let o = OpenAi::new(cfg(&base)).unwrap();
+        let mut o = OpenAi::new(cfg(&base)).unwrap();
+        o.recovery = QUICK;
         let p = Prepared { url: o.cfg.url("/responses"), ..p.clone() };
         let mut events = Vec::new();
         let mut sink = |e: StreamEvent| events.push(e);
@@ -1081,5 +1253,176 @@ mod tests {
         let e = call(base, &p).await.0.unwrap_err();
         assert_eq!((e.kind, e.status, e.retry), (ErrorKind::Http, Some(429), Retry::Never));
         assert_eq!(e.details, Some(serde_json::from_str::<Value>(body).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_image_generation_tool_on_chat_models() {
+        let p = prep("gpt-6.1-sol", &[flag("i")]).await.unwrap();
+        assert_eq!(
+            p.body["tools"],
+            json!([{"type": "image_generation", "model": "gpt-image-2.6-sunburst", "quality": "max", "moderation": "low", "partial_images": 3}])
+        );
+        assert_eq!(p.body["include"], json!(["reasoning.encrypted_content"]), "the images come in the items");
+        assert_eq!(
+            p.settings,
+            ["effort max", "image generation (gpt-image-2.6-sunburst)", "image quality max", "moderation low"]
+        );
+        assert!(p.applied.iter().any(|a| a.source == "default" && a.patch["tools"][0]["moderation"] == "low"));
+        // Its options: size and ratio, quality, background (on any model in the table).
+        let p = prep("chat-latest", &[flag("iW"), kv("q", "high"), kv("bg", "opaque")]).await.unwrap();
+        let t = &p.body["tools"][0];
+        assert_eq!(
+            (t["size"].clone(), t["quality"].clone(), t["background"].clone()),
+            (json!("3840x2160"), json!("high"), json!("opaque"))
+        );
+        assert!(p.settings.contains(&"image size 3840x2160 (4K, 16:9)".to_string()), "{:?}", p.settings);
+        assert!(p.notes.iter().any(|n| n.contains("experimental")), "{:?}", p.notes);
+        assert_eq!(prep("gpt-5.4-nano", &[flag("i2")]).await.unwrap().body["tools"][0]["size"], "2048x2048");
+        // With other tools, in order; `include` only for those that need it.
+        let p = prep("gpt-6-sol", &[flag("si"), kv("e", "low")]).await.unwrap();
+        assert_eq!(p.body["tools"][0], json!({"type": "web_search"}));
+        assert_eq!(p.body["tools"][1]["type"], "image_generation");
+        assert_eq!(
+            p.body["include"],
+            json!(["reasoning.encrypted_content", "web_search_call.action.sources", "web_search_call.results"])
+        );
+        // OpenAI takes the effort as the image complexity: said.
+        assert!(p.notes.iter().any(|n| n.contains("image complexity")), "{:?}", p.notes);
+        // Image options need the tool; values are checked for its model.
+        assert!(
+            err("gpt-6.1-sol", &[kv("q", "high")]).await.contains("does not take an image quality (`q=`) via OpenAI")
+        );
+        assert!(
+            err("gpt-6.1-sol", &[flag("W")])
+                .await
+                .contains("no image size/aspect options (they are for its image generation tool: add +i)")
+        );
+        assert!(
+            err("gpt-6.1-sol", &[flag("i"), kv("q", "ultra")])
+                .await
+                .contains("levels: max, xhigh, high, medium, low, auto")
+        );
+        assert!(err("gpt-6.1-sol", &[flag("i"), kv("n", "2")]).await.contains("(`n=`) via OpenAI"));
+        assert!(err("gpt-6.1-sol", &[flag("i"), kv("ar", "5:1")]).await.contains("between 1:3 and 3:1"));
+        assert!(
+            err("gpt-6.1-sol", &[flag("i"), kv("bg", "red")]).await.contains("backgrounds: auto, opaque, transparent")
+        );
+    }
+
+    #[tokio::test]
+    async fn image_generation_streams_previews_then_the_image_and_replays() {
+        let p = prep("gpt-6.1-sol", &[flag("i")]).await.unwrap();
+        let png = |s: &str| crate::provider::b64(&[b"\x89PNG".as_slice(), s.as_bytes()].concat());
+        let done_item = json!({"type": "image_generation_call", "id": "ig_1", "status": "completed", "action": "generate",
+            "revised_prompt": "A gray tabby cat hugging an otter", "size": "1536x1024", "quality": "max", "background": "opaque",
+            "output_format": "png", "result": png("final")});
+        let message = json!({"type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Here it is.", "annotations": []}]});
+        let events = [
+            json!({"type": "response.created", "sequence_number": 0, "response": {"id": "resp_7", "status": "in_progress", "output": []}}),
+            json!({"type": "response.output_item.added", "sequence_number": 1, "output_index": 0, "item": {"type": "image_generation_call", "id": "ig_1", "status": "in_progress"}}),
+            json!({"type": "response.image_generation_call.in_progress", "sequence_number": 2, "output_index": 0, "item_id": "ig_1"}),
+            json!({"type": "response.image_generation_call.generating", "sequence_number": 3, "output_index": 0, "item_id": "ig_1"}),
+            json!({"type": "response.image_generation_call.partial_image", "sequence_number": 4, "output_index": 0, "item_id": "ig_1",
+                "partial_image_index": 0, "partial_image_b64": png("p0"), "size": "1536x1024", "output_format": "png"}),
+            json!({"type": "response.image_generation_call.partial_image", "sequence_number": 5, "output_index": 0, "item_id": "ig_1",
+                "partial_image_index": 1, "partial_image_b64": png("p1")}),
+            json!({"type": "response.image_generation_call.completed", "sequence_number": 6, "output_index": 0, "item_id": "ig_1"}),
+            json!({"type": "response.output_item.done", "sequence_number": 7, "output_index": 0, "item": done_item}),
+            json!({"type": "response.output_text.delta", "sequence_number": 8, "output_index": 1, "item_id": "msg_1", "content_index": 0, "delta": "Here it is.", "logprobs": []}),
+            json!({"type": "response.output_item.done", "sequence_number": 9, "output_index": 1, "item": message}),
+            json!({"type": "response.completed", "sequence_number": 10, "response": {"id": "resp_7", "status": "completed", "service_tier": "default",
+                "tools": [{"type": "image_generation", "model": "gpt-image-2.6-sunburst", "quality": "max", "moderation": "low", "partial_images": 3}],
+                "output": [done_item, message],
+                "usage": {"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 200, "output_tokens_details": {"reasoning_tokens": 100}, "total_tokens": 1200},
+                "tool_usage": {"web_search": {"num_requests": 0}, "image_gen": {"input_tokens": 100, "input_tokens_details": {"image_tokens": 0, "text_tokens": 100},
+                    "output_tokens": 6500, "output_tokens_details": {"image_tokens": 6500, "text_tokens": 0}, "total_tokens": 6600}}}}),
+        ];
+        let (base, _) = serve(200, "text/event-stream", "", sse(&events)).await;
+        let (r, _, evs) = call(base, &p).await;
+        let native = r.unwrap();
+        let shown: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Tool(t) => Some(format!("tool {}", t.status.clone().unwrap_or_default())),
+                StreamEvent::PartialImage { slot, .. } => Some(format!("preview {slot}")),
+                StreamEvent::Image { mime, .. } => Some(format!("image {mime}")),
+                StreamEvent::PreviewDone { slot } => Some(format!("done {slot}")),
+                StreamEvent::Text(t) => Some(format!("text {t}")),
+                StreamEvent::Finish { .. } => Some("finish".into()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "tool in_progress",
+                "tool in_progress",
+                "tool generating",
+                "preview ig_1",
+                "preview ig_1",
+                "tool completed",
+                "tool completed",
+                "image image/png",
+                "done ig_1",
+                "text Here it is.",
+                "finish"
+            ]
+        );
+        let mut acc = crate::Accumulator::new();
+        evs.iter().cloned().for_each(|e| acc.apply(e));
+        let Part::ToolCall(t) = &acc.parts()[0] else { panic!("{:?}", acc.parts()) };
+        assert_eq!(
+            (t.name.as_str(), t.input.clone()),
+            ("image_generation", Some(json!("A gray tabby cat hugging an otter")))
+        );
+        assert_eq!(
+            t.output,
+            Some(
+                json!({"action": "generate", "size": "1536x1024", "quality": "max", "background": "opaque", "output_format": "png"})
+            )
+        );
+        // Cost: the chat model's tokens plus the image model's (100 text in, 6500 image out).
+        let usage =
+            evs.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(u.clone()) } else { None }).unwrap();
+        let want = (1000.0 * 2.0 + 200.0 * 10.0) / 1e6 + (100.0 * 5.0 + 6500.0 * 30.0) / 1e6;
+        assert!(close(usage.cost_usd.unwrap(), want), "{:?}", usage.cost_usd);
+        // The next turn replays the call with its image, so a reply edits it in context.
+        let mut turn = acc.turn();
+        turn.native = Some(omni_core::content::NativeOutput {
+            dialect: DIALECT.into(),
+            model: "gpt-6.1-sol".into(),
+            payload: native,
+            context_tokens: None,
+        });
+        let history = vec![Turn::user_text("draw"), turn, Turn::user_text("make it night")];
+        let next = prep_with(&openai(), "gpt-6.1-sol", &[flag("i")], &history).await.unwrap();
+        assert_eq!(next.body["input"][1]["type"], "image_generation_call");
+        assert_eq!(next.body["input"][1]["result"], png("final"));
+        assert_eq!(next.body["input"][2]["type"], "message");
+    }
+
+    #[test]
+    fn image_tool_tokens_are_priced_at_the_image_model() {
+        let r = json!({"service_tier": "default", "tools": [{"type": "image_generation", "model": "gpt-image-1.5"}],
+            "tool_usage": {"image_gen": {"input_tokens": 10, "input_tokens_details": {"text_tokens": 10, "image_tokens": 0},
+                "output_tokens": 1000, "output_tokens_details": {"image_tokens": 900, "text_tokens": 100}, "total_tokens": 1010}}});
+        let c = estimate_cost("gpt-6-luna", &r, &usage(0, 0, 0, 0)).unwrap();
+        assert!(close(c, (10.0 * 5.0 + 900.0 * 32.0 + 100.0 * 10.0) / 1e6), "{c}");
+        // Zero counts (no image call): nothing; an unknown image model: the cost is unknown.
+        let none = json!({"tool_usage": {"image_gen": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}});
+        assert!(close(estimate_cost("gpt-6-luna", &none, &usage(0, 0, 0, 0)).unwrap(), 0.0));
+        let unknown = json!({"tools": [{"type": "image_generation", "model": "gpt-image-9"}],
+            "tool_usage": {"image_gen": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}});
+        assert!(estimate_cost("gpt-6-luna", &unknown, &usage(0, 0, 0, 0)).is_none());
+    }
+
+    #[tokio::test]
+    async fn bare_image_models_and_gone_models_route_away_from_responses() {
+        let p = prep("gpt-image-2.6-flare", &[]).await.unwrap();
+        assert_eq!((p.dialect, p.url.as_str()), (images::DIALECT, "https://api.openai.com/v1/images/generations"));
+        assert!(openai().knows("gpt-image-2.6-flare") && openai().knows("gpt-image-2-2026-04-21"));
+        assert!(!openai().knows("gpt-image-1"));
+        assert!(err("sora-2", &[]).await.contains("shut down the Videos API and the Sora 2 models on 2026-09-24"));
     }
 }

@@ -22,7 +22,13 @@
 //! - **Replay** only within the same dialect and model: Chat `content` +
 //!   `reasoning_content` (the official multi-turn sample sends it back; without
 //!   `tools` the API ignores it), Messages content blocks verbatim (thinking
-//!   with its signature, the search call and its results).
+//!   with its signature, the search call and its results). Assistant messages
+//!   carry text only on both endpoints: media other models generated in
+//!   earlier turns are not sent (a warning says what).
+//! - **Searches**: on the Messages endpoint, `usage.server_tool_use` counts
+//!   every search attempt (`web_search_requests`) and the successful
+//!   non-empty ones (`tool_search`, the billed ones); when some came back
+//!   empty or failed, a notice says how many.
 //! - **Finishes**: `content_filter` is a block (not retried);
 //!   `insufficient_system_resource` and `aborted` interrupt the answer, so
 //!   they are retryable failures.
@@ -227,8 +233,18 @@ impl Provider for DeepSeek {
         settings.push(if effort == "none" { "thinking off".to_string() } else { format!("effort {effort}") });
         applied.push(Applied { source: source(user.effort.is_some()).into(), patch: reasoning.clone() });
 
+        let mut warnings = Vec::new();
         let (mut body, url, dialect, notes) = if search {
             let (system, msgs, notes) = messages_request(input.history, model, blobs).await?;
+            // Answers that go back as text: what they generated is not sent.
+            let as_text = input.history.iter().filter(|t| {
+                t.role == Role::Assistant
+                    && !t.native.as_ref().is_some_and(|n| n.dialect == MESSAGES_DIALECT && n.model == model)
+            });
+            warnings.extend(crate::anthropic::history::media_not_sent(
+                as_text,
+                "the assistant messages of DeepSeek's Anthropic-compatible API carry text only",
+            ));
             let mut body = json!({"model": model, "messages": msgs, "stream": true});
             if let Some(s) = system {
                 body["system"] = s;
@@ -261,7 +277,11 @@ impl Provider for DeepSeek {
             });
         }
 
-        let mut warnings = Vec::new();
+        if dialect == DIALECT {
+            // This model's own Chat answers are replayed; other turns go as their text.
+            let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
+            warnings.extend(crate::provider::unsent_media(input.history, own));
+        }
         if spec.is_none() {
             warnings.push(format!(
                 "`{model}` is not in the bot's DeepSeek model table: limits and price unknown (max_tokens {}; cost not \
@@ -671,6 +691,13 @@ fn search_results(block: &Value) -> (Option<Value>, bool) {
     }
 }
 
+/// "N of M searches failed or returned nothing", when the usage says so.
+fn failed_searches(tools: &Value) -> Option<String> {
+    let tried = tools.get("web_search_requests").and_then(Value::as_u64)?;
+    let found = tools.get("tool_search").and_then(Value::as_u64)?;
+    (tried > found).then(|| format!("{} of {tried} searches failed or returned nothing", tried - found))
+}
+
 impl EventParser for MessagesParser {
     fn event(&mut self, name: Option<&str>, data: &Value) -> Result<Vec<StreamEvent>, LlmError> {
         let ty = data.get("type").and_then(Value::as_str).or(name);
@@ -684,6 +711,13 @@ impl EventParser for MessagesParser {
             return Err(e);
         }
         let mut evs = self.inner.event(name, data)?;
+        // `web_search_requests` counts every search attempt, `tool_search` the
+        // successful non-empty ones (what DeepSeek bills).
+        if ty == Some("message_delta")
+            && let Some(n) = data.pointer("/usage/server_tool_use").and_then(failed_searches)
+        {
+            evs.push(StreamEvent::Notice(n));
+        }
         if ty == Some("content_block_start") {
             let cb = data.get("content_block").unwrap_or(&Value::Null);
             match cb.get("type").and_then(Value::as_str) {
@@ -1084,6 +1118,40 @@ mod tests {
         assert!(e.message.contains("does not take a location via DeepSeek"), "{}", e.message);
     }
 
+    /// Media other models generated in earlier turns: Chat assistant messages carry text only.
+    #[tokio::test]
+    async fn generated_media_of_other_models_are_not_sent() {
+        let png = BlobRef::for_bytes(b"\x89PNG", "image/png");
+        let ogg = BlobRef::for_bytes(b"OggS", "audio/ogg");
+        let image =
+            |b: &BlobRef| Part::Image { blob: b.clone(), filename: None, generated: true, dims: None, thought: false };
+        let earlier = Turn {
+            role: Role::Assistant,
+            origin: Origin::Live,
+            parts: vec![
+                Part::text("Here:"),
+                image(&png),
+                image(&png),
+                Part::File { blob: ogg, filename: Some("a.ogg".into()), generated: true },
+            ],
+            native: Some(NativeOutput {
+                dialect: "openai.responses".into(),
+                model: "gpt-6.1-sol".into(),
+                payload: json!({}),
+                context_tokens: None,
+            }),
+        };
+        let h = vec![Turn::user_text("draw"), earlier, Turn::user_text("which is better?")];
+        let p = prepare("deepseek-flash", &[], &h).await.unwrap();
+        assert_eq!(
+            p.warnings,
+            vec![
+                "2 images and 1 audio file generated in an earlier turn were not sent: assistant messages here carry text only"
+            ]
+        );
+        assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here:"}));
+    }
+
     #[tokio::test]
     async fn budget_and_unknown_models() {
         // A long conversation leaves less room in the context.
@@ -1288,6 +1356,8 @@ mod tests {
         );
         assert_eq!(acc.turn().answer_text(), "https://www.python.org/");
         assert_eq!(acc.finish_reason.as_deref(), Some("stop"));
+        // Two attempts, one successful non-empty search.
+        assert_eq!(acc.notices, vec!["1 of 2 searches failed or returned nothing"]);
         let u = acc.usage.clone().unwrap();
         assert_eq!((u.input_tokens, u.cached_input_tokens, u.output_tokens), (Some(3168), Some(256), Some(52)));
         // 2912 misses × 9 + 256 hits × 0.3 + 52 × 27 (peak, CNY/1M) + 1 search × 0.005 CNY.
@@ -1297,6 +1367,45 @@ mod tests {
         assert_eq!(native["content"][0], json!({"type": "thinking", "thinking": "Search it.", "signature": "sig"}));
         assert_eq!(native["content"][1]["input"]["query"], "python official site");
         assert_eq!(native["content"][2]["content"][0]["encrypted_content"], "ENC");
+    }
+
+    #[test]
+    fn searches_that_all_found_something_say_nothing() {
+        let mut p = MessagesParser::default();
+        let end = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"input_tokens": 4973, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 2304, "output_tokens": 246,
+                      "service_tier": "standard", "server_tool_use": {"web_search_requests": 2, "tool_search": 2}}});
+        let evs = p.event(Some("message_delta"), &end).unwrap();
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))), "{evs:?}");
+        assert_eq!(
+            failed_searches(&json!({"web_search_requests": 3, "tool_search": 0})).unwrap(),
+            "3 of 3 searches failed or returned nothing"
+        );
+        assert!(failed_searches(&json!({"web_search_requests": 3})).is_none(), "no count of successes: nothing to say");
+    }
+
+    #[tokio::test]
+    async fn media_of_other_answers_is_a_warning_on_messages() {
+        let png = BlobRef::for_bytes(b"\x89PNG", "image/png");
+        let answer = Turn {
+            role: Role::Assistant,
+            origin: Origin::Live,
+            parts: vec![
+                Part::text("Here is the chart."),
+                Part::Image { blob: png, filename: None, generated: true, dims: None, thought: false },
+            ],
+            native: None,
+        };
+        let h = vec![Turn::user_text("chart"), answer, Turn::user_text("latest numbers?")];
+        let p = prepare("deepseek-v4-pro", &[flag("s")], &h).await.unwrap();
+        assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here is the chart."}));
+        assert_eq!(
+            p.warnings,
+            vec![
+                "1 image generated in an earlier turn was not sent: the assistant messages of DeepSeek's \
+                 Anthropic-compatible API carry text only"
+            ]
+        );
     }
 
     #[test]

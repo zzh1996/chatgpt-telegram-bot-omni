@@ -15,11 +15,16 @@
 //!   order: it is replayed byte for byte for the same model.
 //! - An explicit `max_tokens` (the platform default is 64K of the 128K).
 //! - Web search (`+s`): the chat `web_search` tool with Zhipu's own advanced
-//!   engine `search_pro`, the sources returned (`search_result: true`) ahead
-//!   of the answer (`result_sequence: "before"`: the search is shown where it
-//!   happened). Only the text models take it (the vision request schema has
-//!   function tools only). The top-level `web_search[]` becomes a
-//!   `web_search` tool call and the answer's sources.
+//!   engine `search_pro` at full depth (the documented maximum of 50 results,
+//!   `content_size: "high"`), the sources returned (`search_result: true`)
+//!   ahead of the answer (`result_sequence: "before"`: the search is shown
+//!   where it happened). Only the text models take it (the vision request
+//!   schema has function tools only). The top-level `web_search[]` becomes a
+//!   `web_search` tool call (every result verbatim; the API returns no query)
+//!   and the answer's sources. Zhipu's search-intent detection decides
+//!   whether to search: an answer without `web_search[]` says that none ran.
+//! - Assistant messages carry text only: media other models generated in
+//!   earlier turns are not sent (a warning says what).
 //! - Media per model: JPEG/PNG images and MP4/MKV/MOV videos (as data URLs)
 //!   on the vision models; files (PDF, Word, xlsx, pptx, txt, jsonl, as
 //!   `file_data`) on the GLM-5.3-Flash family; other text files are inlined.
@@ -28,6 +33,10 @@
 //!   failure, `model_context_window_exceeded` a truncation (like `length`).
 //! - Cost from the CNY price list (tiers by input length), plus 0.03 CNY per
 //!   search.
+//!
+//! The image models (GLM-Image, CogView) have their own API: [`images`].
+
+pub mod images;
 
 use omni_core::Usage;
 use omni_core::content::{Citation, Part, Role, ToolCall, Turn};
@@ -53,8 +62,17 @@ const ID_HEADER: &str = "x-log-id";
 /// collaboration" with higher recall and accuracy than `search_std`; Sogou and
 /// Quark are third-party engines.
 pub const SEARCH_ENGINE: &str = "search_pro";
-/// CNY per search with [`SEARCH_ENGINE`].
+/// CNY per search with [`SEARCH_ENGINE`] (docs.bigmodel.cn pricing, 2026-11-13).
 pub const SEARCH_CNY: f64 = 0.03;
+/// Results per search: the documented maximum ("可填范围：1-50，最大单次搜索返回50条，
+/// 默认为10"; docs.bigmodel.cn chat completion reference, 2026-11-13). The fee is per search.
+pub const SEARCH_COUNT: u64 = 50;
+/// The longest page extracts ("high：最大化上下文，信息量较大但内容详细"; the
+/// default `medium` returns summaries).
+pub const SEARCH_CONTENT_SIZE: &str = "high";
+/// A `+s` answer without `web_search[]`: Zhipu's search-intent detection (on
+/// by default) found no need to search.
+const NO_SEARCH: &str = "no web search ran (Zhipu's search-intent detection decides)";
 /// The id given to the search call (the API returns none).
 const SEARCH_CALL_ID: &str = "web_search";
 /// Effort levels accepted for models outside the table (the API's own set for
@@ -259,7 +277,7 @@ impl Provider for Zhipu {
         NAME
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some()
+        model_spec(model).is_some() || images::spec(model).is_some()
     }
 
     async fn prepare(
@@ -268,6 +286,9 @@ impl Provider for Zhipu {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if images::is_image_model(input.model) {
+            return images::prepare(&self.cfg, input, presets).await;
+        }
         let user = request::parse(input.options).map_err(LlmError::request)?;
         let mut req = Requested::default();
         for p in presets {
@@ -350,11 +371,16 @@ impl Provider for Zhipu {
             let tools = json!([{"type": "web_search", "web_search": {
                 "enable": true,
                 "search_engine": SEARCH_ENGINE,
+                "count": SEARCH_COUNT,
+                "content_size": SEARCH_CONTENT_SIZE,
                 "search_result": true,
                 "result_sequence": "before",
             }}]);
             body["tools"] = tools.clone();
-            settings.push(format!("{} ({SEARCH_ENGINE})", Tool::Search.describe()));
+            settings.push(format!(
+                "{} ({SEARCH_ENGINE}, count {SEARCH_COUNT}, content_size {SEARCH_CONTENT_SIZE})",
+                Tool::Search.describe()
+            ));
             applied.push(Applied {
                 source: source(user.tools.contains(&Tool::Search)).into(),
                 patch: json!({"tools": tools}),
@@ -366,6 +392,9 @@ impl Provider for Zhipu {
         }
 
         let mut warnings = Vec::new();
+        // This model's own answers are replayed (text and reasoning); other turns go as their text.
+        let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
+        warnings.extend(crate::provider::unsent_media(input.history, own));
         match spec {
             None => warnings.push(format!(
                 "`{model}` is not in the bot's Zhipu model table: limits, price and reasoning options unknown \
@@ -399,6 +428,9 @@ impl Provider for Zhipu {
         observer: &dyn Observer,
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
+        if p.dialect == images::DIALECT {
+            return images::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
+        }
         let mut priced = PricedSink { inner: sink, model: &p.model, cny_per_usd: self.cfg.cny_per_usd, searches: 0 };
         let rb = self.http.post(&p.url).bearer_auth(&self.cfg.api_key).json(&p.body);
         let s = chatstream::run_with(
@@ -415,9 +447,13 @@ impl Provider for Zhipu {
         )
         .await;
         let outcome = CallOutcome { upstream_id: s.header_id, ..Default::default() };
+        let no_search = p.body.get("tools").is_some() && s.parser.answered_without_search();
         match (s.result, s.parser.abnormal) {
             (Err(e), _) | (Ok(()), Some(e)) => (Err(e), outcome),
             (Ok(()), None) => {
+                if no_search {
+                    priced.event(StreamEvent::Notice(NO_SEARCH.into()));
+                }
                 let native = native_payload(&s.parser.inner, s.parser.web_search.as_ref());
                 (Ok(native), outcome)
             }
@@ -630,13 +666,27 @@ struct GlmParser {
     /// The inference failed (`network_error`): the call fails (retryably) once
     /// the stream has ended.
     abnormal: Option<LlmError>,
+    /// The normalized finish reason.
+    finish: Option<String>,
 }
 
 impl GlmParser {
     fn new() -> Self {
         let mut inner = ChunkParser::default();
         inner.map_error = Some(error_from_json);
-        Self { inner, web_search: None, citations: Vec::new(), content_filter: Vec::new(), abnormal: None }
+        Self {
+            inner,
+            web_search: None,
+            citations: Vec::new(),
+            content_filter: Vec::new(),
+            abnormal: None,
+            finish: None,
+        }
+    }
+
+    /// The answer ended normally (or at the output limit) without `web_search[]`.
+    fn answered_without_search(&self) -> bool {
+        matches!(self.finish.as_deref(), Some("stop" | "length")) && self.web_search.is_none()
     }
 }
 
@@ -651,20 +701,15 @@ fn pick(r: &Value, keys: &[&str]) -> Value {
     Value::Object(o)
 }
 
-/// The search as a tool call: the results' titles, links, sites and dates.
+/// The search as a tool call: every result verbatim (`refer`, `title`, `link`,
+/// `media`, `icon`, `publish_date`, `content`); Zhipu returns no query.
 fn search_call(results: &Value) -> ToolCall {
-    let summary = results
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|r| pick(r, &["refer", "title", "link", "media", "publish_date"]))
-        .collect();
     ToolCall {
         id: Some(SEARCH_CALL_ID.into()),
         name: "web_search".into(),
         status: Some("completed".into()),
         input: None,
-        output: Some(Value::Array(summary)),
+        output: Some(results.clone()),
     }
 }
 
@@ -765,6 +810,7 @@ impl EventParser for GlmParser {
                 "model_context_window_exceeded" => "length",
                 other => other,
             };
+            self.finish = Some(reason.to_string());
             out.push(StreamEvent::Finish { reason: Some(reason.to_string()), native: Some(r) });
         }
         Ok(out)
@@ -982,9 +1028,10 @@ mod tests {
         let p = prepare("glm-5.3", &[flag("s")], &h).await.unwrap();
         assert_eq!(
             p.body["tools"],
-            json!([{"type": "web_search", "web_search": {"enable": true, "search_engine": "search_pro", "search_result": true, "result_sequence": "before"}}])
+            json!([{"type": "web_search", "web_search": {"enable": true, "search_engine": "search_pro", "count": 50,
+                    "content_size": "high", "search_result": true, "result_sequence": "before"}}])
         );
-        assert_eq!(p.settings, vec!["effort max", "web search (search_pro)"]);
+        assert_eq!(p.settings, vec!["effort max", "web search (search_pro, count 50, content_size high)"]);
         assert_eq!(p.applied.last().unwrap().source, "option");
         let cases: &[(&str, &[OptionToken], &str)] = &[
             ("glm-5.3-flash", &[flag("s")], "documented for the text models only"),
@@ -1201,10 +1248,8 @@ mod tests {
         let parts = acc.parts();
         let Part::ToolCall(t) = &parts[0] else { panic!("{parts:?}") };
         assert_eq!((t.name.as_str(), t.status.as_deref()), ("web_search", Some("completed")));
-        assert_eq!(
-            t.output.as_ref().unwrap()[0],
-            json!({"refer": "ref_1", "title": "2025年5月23日财经早资讯", "link": "https://www.sohu.com/a/1", "media": "搜狐", "publish_date": "2025-05-23"})
-        );
+        assert_eq!(t.output.as_ref(), Some(&results), "every result field, verbatim");
+        assert_eq!(t.input, None, "Zhipu returns no query");
         assert!(matches!(&parts[1], Part::Reasoning(_)));
         let Part::Text { text, citations } = &parts[2] else { panic!("{parts:?}") };
         assert_eq!(text, "根据 [ref_1] …");
@@ -1449,7 +1494,10 @@ mod tests {
         assert!(head.starts_with("POST /api/paas/v4/chat/completions HTTP/1.1"), "{head}");
         assert!(head.to_ascii_lowercase().contains("authorization: bearer k"), "{head}");
         assert_eq!(sent["tools"][0]["web_search"]["search_engine"], "search_pro");
+        assert_eq!(sent["tools"][0]["web_search"]["count"], 50);
+        assert_eq!(sent["tools"][0]["web_search"]["content_size"], "high");
         assert_eq!(outcome.upstream_id.as_deref(), Some("log-1"));
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))), "a search ran");
         let native = r.unwrap();
         assert_eq!((native["content"].as_str(), native["reasoning_content"].as_str()), (Some("答"), Some("想")));
         assert_eq!(native["web_search"][0]["refer"], "ref_1");
@@ -1459,6 +1507,55 @@ mod tests {
         assert_eq!(costs.len(), 4);
         assert!((costs[3] - ((20.0 * 8.0 + 2.0 * 28.0) / 1e6 + 0.03) / 7.0).abs() < 1e-12, "{costs:?}");
         assert!(costs.iter().all(|c| *c >= 0.03 / 7.0));
+    }
+
+    /// `+s`, but Zhipu's intent detection ran no search: no `web_search[]`, a notice.
+    #[tokio::test]
+    async fn end_to_end_without_a_search() {
+        let body = sse(&[
+            chunk(json!({"role": "assistant", "content": "你好"}), None, Some(usage(20, 2, 0))),
+            chunk(json!({"content": ""}), Some("stop"), Some(usage(20, 2, 0))),
+        ]);
+        let (r, _, evs, _, _) =
+            exchange(200, "content-type: text/event-stream\r\n", body.clone(), "glm-5.3", &[flag("s")]).await;
+        assert!(r.is_ok());
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Tool(_))));
+        let notices: Vec<_> =
+            evs.iter().filter_map(|e| if let StreamEvent::Notice(n) = e { Some(n.as_str()) } else { None }).collect();
+        assert_eq!(notices, ["no web search ran (Zhipu's search-intent detection decides)"]);
+        // No search fee either: 20 × 8 + 2 × 28 CNY/1M.
+        let cost =
+            evs.iter().rev().find_map(|e| if let StreamEvent::Usage(u) = e { u.cost_usd } else { None }).unwrap();
+        assert!((cost - (20.0 * 8.0 + 2.0 * 28.0) / 1e6 / 7.0).abs() < 1e-12);
+        // Without `+s`, nothing to say.
+        let (_, _, evs, _, _) = exchange(200, "content-type: text/event-stream\r\n", body, "glm-5.3", &[]).await;
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))));
+    }
+
+    /// Media other models generated in earlier turns: assistant messages carry text only.
+    #[tokio::test]
+    async fn generated_media_of_other_models_are_not_sent() {
+        let png = BlobRef::for_bytes(b"\x89PNG", "image/png");
+        let pdf = BlobRef::for_bytes(b"%PDF", "application/pdf");
+        let earlier = Turn {
+            role: Role::Assistant,
+            origin: Origin::Live,
+            parts: vec![
+                Part::text("Done:"),
+                Part::Image { blob: png, filename: None, generated: true, dims: None, thought: false },
+                Part::File { blob: pdf, filename: Some("r.pdf".into()), generated: true },
+            ],
+            native: None,
+        };
+        let h = vec![Turn::user_text("make"), earlier, Turn::user_text("summarize")];
+        let p = prepare("glm-5.3", &[], &h).await.unwrap();
+        assert_eq!(
+            p.warnings,
+            vec![
+                "1 image and 1 file generated in an earlier turn were not sent: assistant messages here carry text only"
+            ]
+        );
+        assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Done:"}));
     }
 
     #[tokio::test]
