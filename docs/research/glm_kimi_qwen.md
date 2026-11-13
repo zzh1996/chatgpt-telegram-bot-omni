@@ -173,7 +173,7 @@ Vision models: `glm-5.3-flash*`, `glm-5v-turbo`, `glm-4.6v*`, `glm-4.5v`, `glm-4
 |---|---|---|---|
 | image | `{"type":"image_url","image_url":{"url":"https://…"\|base64}}` | ≤5 MB, ≤6000×6000, jpg/png/jpeg. CN ≤50 images (5.3-Flash/5V-Turbo/4.6V/4.5V); 1 for 4V-Flash (no base64). Intl: "GLM-5V limited to 150" | [glm-cnchat], [glm-zchat] |
 | video | `{"type":"video_url","video_url":{"url":"…"}}` | ≤200 MB, mp4/mkv/mov; URL (base64 **UNVERIFIED**) | [glm-cnchat] |
-| file | `{"type":"file","file":{"file_id"\|"file_url"\|"file_data":"data:<MIME>;base64,…","filename":"…"}}` | ≤50 MB each, ≤50 files; pdf/txt/word/jsonl/xlsx/pptx. Intl: can't be mixed with image/video | [glm-cnchat], [glm-zchat] |
+| file | `{"type":"file","file":{"file_id"\|"file_url"\|"file_data":"data:<MIME>;base64,…","filename":"…"}}` | ≤50 MB each, ≤50 files; pdf/txt/word/jsonl/xlsx/pptx. Intl: can't be mixed with image/video. Measured 2026-11-13 on glm-5.3-flash: a txt as `file_data` fails with 1210 "文件解析失败" (any data-URL MIME, even 45 bytes); a PDF parses. The bot inlines text files | [glm-cnchat], [glm-zchat] |
 | audio (CN `glm-4-voice`) | `{"type":"input_audio","input_audio":{"data":"<b64>","format":"wav"\|"mp3"}}` | ≤10 min | [glm-cnchat] |
 
 - **Files:** `file_id` comes from `POST /paas/v4/files` (CN purposes `batch|code-interpreter|agent|voice-clone-input|user_data`; intl `user_data|agent`). Zhipu parses files server-side [glm-cnfile], [glm-zoas].

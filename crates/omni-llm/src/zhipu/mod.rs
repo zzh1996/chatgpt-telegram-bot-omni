@@ -26,8 +26,9 @@
 //! - Assistant messages carry text only: media other models generated in
 //!   earlier turns are not sent (a warning says what).
 //! - Media per model: JPEG/PNG images and MP4/MKV/MOV videos (as data URLs)
-//!   on the vision models; files (PDF, Word, xlsx, pptx, txt, jsonl, as
-//!   `file_data`) on the GLM-5.3-Flash family; other text files are inlined.
+//!   on the vision models; files (PDF, Word, xlsx, pptx, as `file_data`) on
+//!   the GLM-5.3-Flash family; text files are inlined (the `file` part does
+//!   not parse them, measured 2026-11-13).
 //! - Usage on every chunk (`stream_options.chunk_include_usage`). Finishes:
 //!   `sensitive` is a content-filter stop, `network_error` a retryable
 //!   failure, `model_context_window_exceeded` a truncation (like `length`).
@@ -522,15 +523,6 @@ fn native_document(mime: &str, name: &str) -> bool {
         || ["wordprocessingml", "spreadsheetml", "presentationml"].iter().any(|k| mime.contains(k))
 }
 
-/// Text files the `file` part takes (txt, jsonl); others are inlined.
-fn native_text(mime: &str, name: &str) -> bool {
-    match extension(name).as_str() {
-        "txt" | "jsonl" => true,
-        "" => mime == "text/plain",
-        _ => false,
-    }
-}
-
 async fn data_url(blobs: &dyn BlobLoader, blob: &omni_core::BlobRef) -> Result<String, LlmError> {
     Ok(provider::data_url(&blob.mime, &provider::load(blobs, blob).await?))
 }
@@ -628,10 +620,10 @@ async fn chat_messages(
                             }
                             content.push(file_part(data_url(blobs, blob).await?, name));
                         }
-                        MediaClass::Text if file && native_text(mime, name) => {
-                            content.push(file_part(data_url(blobs, blob).await?, name));
-                        }
-                        // No text-file input on this model: inlined verbatim as a separate part.
+                        // Inlined verbatim as a separate part: the `file` part does not
+                        // parse text files although the docs list txt and jsonl (measured
+                        // 2026-11-13: "文件解析失败" for a 45-byte txt with every data-URL
+                        // MIME; PDFs parse).
                         MediaClass::Text => content.push(inline_text(blobs, blob, name).await?),
                         MediaClass::Audio => return Err(no_input(model, "audio", name, spec)),
                         MediaClass::Other => {
@@ -1124,7 +1116,7 @@ mod tests {
             let blobs = &blobs;
             async move { zp().prepare(&input(model, &[], &h), &[], blobs).await }
         };
-        // GLM-5.3-Flash: images, videos and files natively; code inlined.
+        // GLM-5.3-Flash: images, videos and documents natively; text files inlined.
         let h = user(vec![
             Part::text("look"),
             image(&img),
@@ -1142,7 +1134,7 @@ mod tests {
             c[3],
             json!({"type": "file", "file": {"file_data": provider::data_url("application/pdf", b"%PDF-1.7"), "filename": "a.pdf"}})
         );
-        assert_eq!(c[4]["file"]["filename"], "notes.txt");
+        assert_eq!(c[4], json!({"type": "text", "text": "notes"}), "a txt does not parse as a `file` part");
         assert_eq!(c[5], json!({"type": "text", "text": "print(1)"}));
         assert!(p.notes.is_empty(), "{:?}", p.notes);
         // GLM-5.3 is text only: text files are inlined, media rejected.

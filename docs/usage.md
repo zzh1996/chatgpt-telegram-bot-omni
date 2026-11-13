@@ -92,7 +92,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 **DeepSeek**：`deepseek-v4-pro`、`deepseek-flash`。默认开思考、`reasoning_effort=max`；`e=max|high|low`，`e=none` 关闭思考；`max_tokens` 显式发送（最多 393216）。`+s` 只有 `deepseek-v4-pro` 有（官方的服务端搜索只在它的 Anthropic 兼容接口和 Responses 接口上），bot 把这样的请求发到 Anthropic 兼容接口；有搜索失败或没有结果时注明次数。图片只有 flash 能读。不发 `user_id`：DeepSeek 用它按用户隔离 KV 缓存，群里几个人接着同一段对话聊就会互相用不上缓存（flash 缓存命中价是未命中的 1/50），旧版也没发。峰谷价：北京时间工作日 9–12 点、14–18 点为高峰（法定节假日按官方放假安排算平时），按请求发出的时刻计价。
 
-**智谱**：`glm-5.3`（纯文本）、`glm-5.3-flash`（图片、视频、文件）等。思考默认开、`reasoning_effort=max`；5.3 系列 `e=max|high|low`、不能关思考；5.2 `e=max|high`，可 `e=none`。保留思考（`clear_thinking: false`，否则智谱会丢掉回传的上一轮推理）。`+s` 是智谱自己的 `search_pro` 搜索（每次 0.03 元），取官方允许的最多 50 条结果、`content_size: high`（每条内容更全，输入 token 会多很多），结果（标题、网站、日期、摘录）先于回答显示，智谱判断不需要搜索时注明；视觉模型（如 `glm-5.3-flash`）没有搜索。
+**智谱**：`glm-5.3`（纯文本）、`glm-5.3-flash`（图片、视频、PDF 和 Office 文档）等；文本文件一律内联发送（智谱的文件接口解析不了 txt，实测报"文件解析失败"）。思考默认开、`reasoning_effort=max`；5.3 系列 `e=max|high|low`、不能关思考；5.2 `e=max|high`，可 `e=none`。保留思考（`clear_thinking: false`，否则智谱会丢掉回传的上一轮推理）。`+s` 是智谱自己的 `search_pro` 搜索（每次 0.03 元），取官方允许的最多 50 条结果、`content_size: high`（每条内容更全，输入 token 会多很多），结果（标题、网站、日期、摘录）先于回答显示，智谱判断不需要搜索时注明；视觉模型（如 `glm-5.3-flash`）没有搜索。
 
 **Moonshot**：`kimi-k3`、`kimi-k3.1-pro` 等（K2 系列年底停用，不在表里）。始终思考，`e=max|high|low`（默认 max）。输出上限用 `max_completion_tokens`。`+s` 走 Moonshot 的 Responses API 的 `web_search`，来源列在 📚 Sources，没有搜索时注明。PDF 和文档要先上传到 Moonshot（有状态），bot 不支持；图片、视频按 base64 发送。`-highspeed` 模型价格翻倍，只给 `priority_users`。账户余额见 `/credits`。
 
