@@ -152,6 +152,7 @@ const TOPICS: &[Topic] = &[
 - The prefix ends at the first `$` of the first line.
 - In a group I ignore prefixes I do not know (they may belong to another bot, or be plain text), so normal chatting never starts me.
 - In a private chat a first line with `$` always counts, and an unknown prefix is an error.
+- A reply starts a conversation only to bring the photo, file, album or location it replies to; replies to other messages are ignored, prefix or not (replies to my answers continue them).
 - With several prefixes, an empty one between two commas asks the empty prefix too: `c,,g$`.
 - In a group with several of these bots, each answers the prefixes it has.
 :::"#,
@@ -177,6 +178,7 @@ const TOPICS: &[Topic] = &[
 - 前缀到第一行的第一个 `$` 为止。
 - 群里我会忽略不认识的前缀（可能是别的 bot 的，也可能只是普通文字），所以正常聊天不会触发我。
 - 私聊里第一行只要有 `$` 就算前缀，不认识的前缀会报错。
+- 回复别的消息时，只有为了带上它的图片、文件、相册或位置才会开始对话；回复其他消息会被忽略，带前缀也一样（回复我的回答是接着聊）。
 - 写几个前缀时，两个逗号之间留空表示也问名字为空的前缀：`c,,g$`。
 - 群里有好几个这样的 bot 时，每个 bot 只回答它有的前缀。
 :::"#,
@@ -280,7 +282,7 @@ const TOPICS: &[Topic] = &[
         who: Who::Everyone,
         body: r#"**Send something with your message**:
 - Write the prefix in the caption of a photo, a file or an album: caption `c$What is in this picture?`
-- Or reply with `c$…` to a photo, file, album or location (only that message's media is sent, not its text).
+- Or reply with `c$…` to a photo, file, album or location (only that message's media is sent, not its text). A reply to any other message (someone's text, another bot's answer) is ignored, even with a prefix.
 - To add it to a conversation, reply to my answer with the photo, file or album.
 
 **What works**: photos and albums (one message, all images in order), files, voice messages, videos and round videos, GIFs, static and video stickers, rich messages (sent as Markdown), and polls, contacts, dice and checklists (sent as text).
@@ -291,7 +293,7 @@ const TOPICS: &[Topic] = &[
         title_zh: "📎 图片、文件和其他附件",
         body_zh: r#"**随消息发送附件**：
 - 把前缀写在图片、文件或相册的说明（caption）里：说明写 `c$这张图里有什么？`
-- 或者用 `c$…` 回复一条图片、文件、相册或位置消息（只发送那条消息里的媒体，不发送它的文字）。
+- 或者用 `c$…` 回复一条图片、文件、相册或位置消息（只发送那条消息里的媒体，不发送它的文字）。回复其他消息（别人的文字、其他 bot 的回答）会被忽略，带前缀也一样。
 - 想在对话中加入附件，就带着图片、文件或相册回复我的回答。
 
 **支持的内容**：图片和相册（算作一条消息，所有图片按顺序发送）、文件、语音、视频和圆形视频消息、GIF、静态和视频贴纸、富消息（按 Markdown 发送），以及投票、联系人、骰子和待办清单（按文字发送）。
@@ -434,7 +436,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 
 ::: The small text at the end, item by item
 - What was asked for: `effort max · web search` and the like.
-- `in 1,234 (cached 1,000)` — input tokens, and how many were read from the cache; `cache write` — written to it.
+- `in 1,234 (incl. 1,000 cached)` — input tokens, including those read from the cache (billed at the cache price) or written to it.
 - `out 567 (reasoning 400)` — output tokens, and how many were reasoning.
 - The cost in USD. `≈` means my estimate from the platform's prices (the platform reported none); `+ code execution` and the like name a charge the estimate leaves out.
 - How long it took.
@@ -468,7 +470,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 
 ::: 末尾小字的各项含义
 - 请求了什么：`effort max · web search` 之类。
-- `in 1,234 (cached 1,000)` — 输入 token，其中多少是从缓存读的；`cache write` — 写入缓存的。
+- `in 1,234 (incl. 1,000 cached)` — 输入 token，包括从缓存读的（按缓存价计费）和写入缓存的。
 - `out 567 (reasoning 400)` — 输出 token，其中多少是推理。
 - 费用（USD）。`≈` 表示是我按平台价格估算的（平台没有给出费用）；`+ code execution` 之类表示估算里没算进去的收费。
 - 用了多长时间。

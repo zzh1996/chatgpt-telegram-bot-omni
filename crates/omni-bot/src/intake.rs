@@ -176,10 +176,7 @@ async fn on_update(app: &Arc<App>, bot: &Arc<BotConn>, update: tl::enums::Update
     if let Some(tl::enums::MessageReplyHeader::Header(h)) = &m.reply_to {
         payload.has_quote = h.quote;
     }
-    let reply_to = match &m.reply_to {
-        Some(tl::enums::MessageReplyHeader::Header(h)) => h.reply_to_msg_id,
-        _ => None,
-    };
+    let reply_to = reply_target(&m);
     let (bot_name, text, date, msg_id, grouped) =
         (bot.name.clone(), crate::media::text_of(&m), m.date as i64, m.id, m.grouped_id);
     let payload_json = serde_json::to_string(&payload)?;
@@ -376,9 +373,16 @@ fn looks_like_spec(s: &omni_core::trigger::SpecToken) -> bool {
     !s.model.is_empty() && s.model.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
 }
 
+/// The message this one explicitly replies to, in the same chat. In a forum
+/// topic every message points at the topic's first message (`forum_topic`
+/// without `reply_to_top_id`): that is not a reply.
 pub fn reply_target(m: &tl::types::Message) -> Option<i32> {
     match &m.reply_to {
-        Some(tl::enums::MessageReplyHeader::Header(h)) if h.reply_to_peer_id.is_none() => h.reply_to_msg_id,
+        Some(tl::enums::MessageReplyHeader::Header(h))
+            if h.reply_to_peer_id.is_none() && !(h.forum_topic && h.reply_to_top_id.is_none()) =>
+        {
+            h.reply_to_msg_id
+        }
         _ => None,
     }
 }

@@ -300,7 +300,44 @@ pub fn youtube_refs(text: &str) -> Vec<String> {
     re.captures_iter(text).map(|c| c[1].to_string()).collect()
 }
 
+/// Whether a reply to a message that is not one of this bot's answers brings
+/// something to attach (media, an album, a location, a poll…); `None` when
+/// the message is no such reply. The old bot's rule: a reply starts a
+/// conversation only to bring what it replies to; a reply to anything else
+/// (someone's text, another bot's answer) is ignored, prefix or not.
+async fn reply_brings(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Option<bool>> {
+    let Some(rt) = ib.reply_to_msg_id else { return Ok(None) };
+    if conv::turn_for_message(&app.db, &bot.name, ib.chat_id, rt).await?.is_some() {
+        return Ok(None);
+    }
+    // When the message cannot be read, as before: the request goes ahead.
+    let Ok(msgs) = bot.get_messages(ib.chat_id, &[rt]).await else { return Ok(Some(true)) };
+    Ok(Some(msgs.iter().any(|m| match m {
+        grammers_tl_types::enums::Message::Message(m) => {
+            m.grouped_id.is_some()
+                || !media::media_of(m).is_empty()
+                || !media::locations_of(m).is_empty()
+                || !media::cards_of(m).is_empty()
+        }
+        _ => false,
+    })))
+}
+
 async fn new_conversation(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
+    if reply_brings(app, bot, ib).await? == Some(false) {
+        if ib.chat_id > 0 {
+            reply::notice(
+                app,
+                bot,
+                ib.chat_id,
+                ib.msg_id,
+                "⚠️ a reply only continues one of my answers, or brings me the photo, file or location it replies \
+                 to; to start a conversation, send the message without replying",
+            )
+            .await;
+        }
+        return Ok(());
+    }
     let Ok(Some(t)) = trigger::parse_trigger(&ib.text, app.marker()).map_err(|e| e.to_string()).inspect_err(|e| {
         let e = e.clone();
         let (app, bot, chat, msg) = (app.clone(), bot.clone(), ib.chat_id, ib.msg_id);
