@@ -347,16 +347,20 @@ async fn cogview_answers_directly_and_failures_are_verbatim() {
 /// A `FAIL` with a reason is classified by it.
 #[test]
 fn failed_tasks_with_a_reason() {
-    let e = task_failed(json!({"model": "glm-image", "task_status": "FAIL", "request_id": "r",
-        "error": {"code": "1301", "message": "系统检测到输入或生成内容可能包含不安全或敏感内容"}}));
+    let e = task_failed(
+        json!({"model": "glm-image", "task_status": "FAIL", "request_id": "r",
+        "error": {"code": "1301", "message": "系统检测到输入或生成内容可能包含不安全或敏感内容"}}),
+        "image",
+    );
     assert_eq!((e.kind, e.retry, e.error_type.as_deref()), (ErrorKind::InBand, Retry::Never, Some("1301")));
     assert_eq!(e.details.unwrap()["request_id"], "r", "the whole result, verbatim");
     let e = task_failed(
         json!({"model": "glm-image", "task_status": "FAIL", "error": {"code": "1234", "message": "网络错误"}}),
+        "image",
     );
     assert_eq!(e.retry, Retry::Backoff);
-    let e = task_failed(json!({"task_status": "FAIL", "content_filter": [{"role": "assistant", "level": 1}]}));
+    let e = task_failed(json!({"task_status": "FAIL", "content_filter": [{"role": "assistant", "level": 1}]}), "image");
     assert_eq!(e.retry, Retry::Never, "a content filter is never retried");
-    let e = task_failed(json!({"task_status": "FAIL"}));
+    let e = task_failed(json!({"task_status": "FAIL"}), "image");
     assert_eq!(e.retry, Retry::Backoff);
 }

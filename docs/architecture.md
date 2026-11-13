@@ -84,7 +84,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 - `omni_llm::provider`：`Provider` trait（`prepare` → `Prepared`，`stream` → 事件，`knows` 模型表，`balance` 余额）、`DirectConfig`、价目表工具（`TokenPrice`、`PricingSink` 给没有费用的用量估价）、`PROVIDERS`（id、名字、key 的环境变量、默认地址）。bot 启动时为每个有 key 的 `[providers.<id>]` 建一个，`App.direct` 按 id 查；`jobs` 按回合的 provider 分派。
 - 每个平台一个模块：自己的模型表（上下文、最大输出、推理档位、价格）、`RouteCaps`（官方能力即通道能力）、历史转换（同方言同模型原样回放 native，否则只发文本）、请求体、错误分类。流解析复用三种方言的解析器（OpenRouter 的 Responses / Messages `EventParser`、Chat Completions `ChunkParser`，各自包一层补上平台特有的事件）和 `chatstream`；Gemini 是自己的 generateContent 解析器（含 long decode 的续写和 checkpoint：`Prepared::with_continuation`、`merge_natives` 按方言分派）。
 - 一个平台有两种接口时（DeepSeek 的 Chat + Anthropic 兼容、Moonshot 的 Chat + Responses、百炼的 Chat + Responses），两种方言分开记 native，只在同方言同模型时回放。
-- 出图/视频接口也是方言（OpenAI Images、xAI Imagine 图片和视频、方舟 Seedream、智谱、百炼），由同一个 provider 按模型 ID 分派；异步任务（xAI 视频、GLM-Image）建好就发 `Checkpoint`，`with_continuation` 把它变成"查询同一个任务"的请求。
+- 出图/视频接口也是方言（OpenAI Images、xAI Imagine 图片和视频、方舟 Seedream、智谱图片和视频、百炼、Gemini Omni 的 Interactions API），由同一个 provider 按模型 ID 分派；异步任务（视频、GLM-Image）建好就发 `Checkpoint`，`with_continuation` 把它变成"查询同一个任务"的请求。
 - `omni_llm::meta`：每次调用经过一个 `Collector`（包住 raw 日志的 `Observer`），按接口家族（Responses、Messages、generateContent、Chat Completions）收集去掉内容的响应信封、一部分响应头和耗时，不需要各 provider 解析；`jobs` 把它存进 `attempts.meta`（`/info` 显示），并据此算出页脚里"和请求不同"的服务事实（模型、等级、地域、推理强度）和提示（D59）。重试提示（`retry-after-ms`、`x-should-retry`）在 `chatstream::run_with` 里统一处理。
 - 流事件 `Restart`：provider 要把这次调用的全部输出重新发一遍（OpenAI 断流后从保存的结果恢复，D61），bot 丢掉这次调用已收到的部分；`ContextSize`：API 报告的精确上下文大小（xAI），下一轮的上下文直接用它。
 

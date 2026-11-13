@@ -34,9 +34,11 @@
 //! - Cost from the CNY price list (tiers by input length), plus 0.03 CNY per
 //!   search.
 //!
-//! The image models (GLM-Image, CogView) have their own API: [`images`].
+//! The image models (GLM-Image, CogView) have their own API: [`images`]; so
+//! have the video models (CogVideoX, Vidu): [`videos`].
 
 pub mod images;
+pub mod videos;
 
 use omni_core::Usage;
 use omni_core::content::{Citation, Part, Role, ToolCall, Turn};
@@ -277,7 +279,7 @@ impl Provider for Zhipu {
         NAME
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some() || images::spec(model).is_some()
+        model_spec(model).is_some() || images::spec(model).is_some() || videos::spec(model).is_some()
     }
 
     async fn prepare(
@@ -288,6 +290,9 @@ impl Provider for Zhipu {
     ) -> Result<Prepared, LlmError> {
         if images::is_image_model(input.model) {
             return images::prepare(&self.cfg, input, presets).await;
+        }
+        if videos::is_video_model(input.model) {
+            return videos::prepare(&self.cfg, input, presets, blobs).await;
         }
         let user = request::parse(input.options).map_err(LlmError::request)?;
         let mut req = Requested::default();
@@ -430,6 +435,9 @@ impl Provider for Zhipu {
     ) -> (Result<Value, LlmError>, CallOutcome) {
         if p.dialect == images::DIALECT {
             return images::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
+        }
+        if p.dialect == videos::DIALECT {
+            return videos::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
         }
         let mut priced = PricedSink { inner: sink, model: &p.model, cny_per_usd: self.cfg.cny_per_usd, searches: 0 };
         let rb = self.http.post(&p.url).bearer_auth(&self.cfg.api_key).json(&p.body);

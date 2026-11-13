@@ -11,7 +11,8 @@
 //! - [`stream`]: the SSE chunk parser (thoughts, text, images, code
 //!   execution, grounding, URL context, long-decode checkpoints, usage, blocks);
 //! - [`pricing`]: dated price list and cost estimate;
-//! - [`errors`]: classification of Google's error objects.
+//! - [`errors`]: classification of Google's error objects;
+//! - [`omni`]: video generation (Gemini Omni Flash on the Interactions API).
 //!
 //! **Long decode** (Gemini 4): `maxOutputTokens` is the total of all hops; a
 //! hop that must continue ends with `finishReason: CONTINUATION` and a
@@ -22,14 +23,18 @@
 //! parts committed so far, which the resumed stream returns with its own (the
 //! bot keeps only the natives of completed hops).
 //!
-//! Not used: the Interactions API (Google's recommended interface for new
-//! projects, with server-side state, background runs and stream resumption by
-//! `last_event_id`), the Files API, explicit caching, function calling.
+//! **Video** is Gemini Omni Flash on the Interactions API ([`omni`]: bare
+//! `gemini-omni-…` ids; Veo is shut down). The chat models do not use the
+//! Interactions API (Google's recommended interface for new projects, with
+//! server-side state, background runs and stream resumption by
+//! `last_event_id`). Not used either: uploads to the Files API, explicit
+//! caching, function calling.
 
 mod build;
 pub mod convert;
 pub mod errors;
 pub mod models;
+pub mod omni;
 pub mod pricing;
 pub mod stream;
 #[cfg(test)]
@@ -67,7 +72,7 @@ impl Provider for Google {
         NAME
     }
     fn knows(&self, model: &str) -> bool {
-        models::known(model)
+        models::known(model) || omni::spec(model).is_some()
     }
     async fn prepare(
         &self,
@@ -75,6 +80,9 @@ impl Provider for Google {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if omni::is_video_model(input.model) {
+            return omni::prepare(&self.cfg, input, presets, blobs).await;
+        }
         build::prepare(&self.cfg, input, presets, blobs).await
     }
     async fn stream(
@@ -84,6 +92,9 @@ impl Provider for Google {
         observer: &dyn Observer,
         cancel: &CancellationToken,
     ) -> (Result<Value, LlmError>, CallOutcome) {
+        if p.dialect == omni::DIALECT {
+            return omni::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
+        }
         let carried = p.body.get("continuationToken").and_then(Value::as_str).and_then(carry::get).unwrap_or_default();
         let parser = stream::ChunkParser::new(&p.model, &p.body, build::now_unix(), carried);
         let rb = self.http.post(&p.url).header("x-goog-api-key", &self.cfg.api_key).json(&p.body);

@@ -21,6 +21,8 @@
 //! asks for"), no quality and no background option, and `imageConfig` has
 //! only `aspectRatio` and `imageSize` (no person-generation or safety
 //! setting; the adjustable safety filters are off by default since 2.5).
+//! **Video generation** is not in this table: Gemini Omni Flash runs on the
+//! Interactions API ([`super::omni`]), and Veo is shut down.
 //!
 //! **Tool traces**: on Gemini 3 and 4 the built-in tools' own calls and
 //! results can come back as parts (`toolConfig.includeServerSideToolInvocations`,

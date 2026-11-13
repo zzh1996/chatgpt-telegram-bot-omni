@@ -236,7 +236,15 @@ fn tools_title(calls: &[&ToolCall]) -> String {
     // How it ended (an exit code, an error code, a URL status), else a status other than completed.
     let status = |t: &ToolCall| match (crate::toolview::outcome(t), t.status.as_deref()) {
         (Some(o), _) => format!(" ({o})"),
-        (None, None | Some("completed" | "complete" | "success" | "succeeded" | "done")) => String::new(),
+        (None, None) => String::new(),
+        (None, Some(s))
+            if matches!(
+                s.to_ascii_lowercase().as_str(),
+                "completed" | "complete" | "success" | "succeeded" | "done"
+            ) =>
+        {
+            String::new()
+        }
         (None, Some(s)) => format!(" ({s})"),
     };
     let same = calls.len() > 1 && calls.windows(2).all(|w| w[0].name == w[1].name);

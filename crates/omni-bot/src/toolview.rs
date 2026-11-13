@@ -118,10 +118,10 @@ fn json_block(v: &Value) -> RBlock {
     RBlock::Pre { text: serde_json::to_string_pretty(v).unwrap_or_default(), language: "json".into() }
 }
 
-/// Fields no shape took: a few flat values as one line (`duration: 1 ·
-/// resolution: 720p`, nested ones dotted: `citations.enabled: true`), anything
-/// deeper, longer or more numerous as its JSON.
-fn rest_block(v: &Value) -> RBlock {
+/// Fields no shape took: the flat ones as one line (`duration: 1 ·
+/// resolution: 720p`, nested ones dotted: `citations.enabled: true`), the rest
+/// (lists, deep or long values) as JSON — so nothing is lost.
+fn rest_blocks(v: &Value) -> Vec<RBlock> {
     fn leaves(prefix: &str, v: &Value, depth: usize, out: &mut Vec<String>) -> bool {
         match v {
             Value::String(s) if s.chars().count() <= 120 && !s.contains('\n') => {
@@ -133,18 +133,36 @@ fn rest_block(v: &Value) -> RBlock {
                 true
             }
             Value::Object(o) if depth < 2 && !o.is_empty() => {
-                o.iter().all(|(k, x)| leaves(&format!("{prefix}.{k}"), x, depth + 1, out))
+                let mut mine = Vec::new();
+                let ok = o.iter().all(|(k, x)| leaves(&format!("{prefix}.{k}"), x, depth + 1, &mut mine));
+                if ok {
+                    out.extend(mine);
+                }
+                ok
             }
             _ => false,
         }
     }
-    if let Some(o) = v.as_object() {
-        let mut line = Vec::new();
-        if o.iter().all(|(k, x)| leaves(k, x, 0, &mut line)) && line.len() <= 8 {
-            return text(&line.join(" · "));
+    let Some(o) = v.as_object() else { return vec![json_block(v)] };
+    let mut line = Vec::new();
+    let mut complex = serde_json::Map::new();
+    for (k, x) in o {
+        if !leaves(k, x, 0, &mut line) {
+            complex.insert(k.clone(), x.clone());
         }
     }
-    json_block(v)
+    if line.len() > 12 {
+        // Too many for a line: all of it as JSON.
+        return vec![json_block(v)];
+    }
+    let mut out = Vec::new();
+    if !line.is_empty() {
+        out.push(text(&line.join(" · ")));
+    }
+    if !complex.is_empty() {
+        out.push(json_block(&Value::Object(complex)));
+    }
+    out
 }
 
 fn code(s: &str, language: &str) -> RBlock {
@@ -321,7 +339,7 @@ fn input_object(t: &ToolCall, o: &Map<String, Value>) -> Vec<RBlock> {
         out.insert(0, text(k));
     }
     if let Some(rest) = f.rest() {
-        out.push(rest_block(&rest));
+        out.extend(rest_blocks(&rest));
     }
     out
 }
@@ -383,7 +401,7 @@ fn sources(list: &[Value]) -> RBlock {
                 }
             }
             if let Some(rest) = f.rest() {
-                blocks.push(rest_block(&rest));
+                blocks.extend(rest_blocks(&rest));
             }
             RItem { checkbox: None, blocks }
         })
@@ -404,7 +422,7 @@ fn output_item(t: &ToolCall, v: &Value) -> Vec<RBlock> {
             f.skip("url");
             let mut out = vec![text("image (shown in the reply)")];
             if let Some(rest) = f.rest() {
-                out.push(rest_block(&rest));
+                out.extend(rest_blocks(&rest));
             }
             out
         }
@@ -478,7 +496,7 @@ fn code_result(o: &Map<String, Value>) -> Vec<RBlock> {
         }
     }
     if let Some(rest) = f.rest() {
-        out.push(rest_block(&rest));
+        out.extend(rest_blocks(&rest));
     }
     out
 }
@@ -505,7 +523,7 @@ fn output_object(t: &ToolCall, o: &Map<String, Value>) -> Vec<RBlock> {
         }
         let mut out = vec![text(&line)];
         if let Some(rest) = f.rest() {
-            out.push(rest_block(&rest));
+            out.extend(rest_blocks(&rest));
         }
         return out;
     }
@@ -643,7 +661,7 @@ fn output_object(t: &ToolCall, o: &Map<String, Value>) -> Vec<RBlock> {
             out.push(RBlock::Footer(RText::plain(n)));
         }
         if let Some(r) = doc_rest {
-            out.push(rest_block(&r));
+            out.extend(rest_blocks(&r));
         }
     }
     // Claude's text editor: what happened to the file, what it read or changed.
@@ -686,14 +704,14 @@ fn output_object(t: &ToolCall, o: &Map<String, Value>) -> Vec<RBlock> {
     }
     if out.is_empty() {
         // Nothing recognised: the fields as they are (flat ones on a line, else the JSON).
-        return vec![rest_block(&Value::Object(o.clone()))];
+        return rest_blocks(&Value::Object(o.clone()));
     }
     // The result envelope's type repeats the tool's name.
     if o.get("type").and_then(Value::as_str).is_some_and(|t| t.ends_with("_result")) {
         f.skip("type");
     }
     if let Some(rest) = f.rest() {
-        out.push(rest_block(&rest));
+        out.extend(rest_blocks(&rest));
     }
     out
 }
@@ -885,6 +903,19 @@ mod tests {
         // Known fields readable, the unknown one kept as JSON.
         let mixed = call("web_search", json!({"query": "q", "max_results": 5}), Value::Null);
         assert_eq!(shown(&blocks(&mixed)), "🔎 q\nmax_results: 5\n");
+    }
+
+    #[test]
+    fn flat_fields_readable_nested_ones_json() {
+        let t = call(
+            "video_generation",
+            json!("a candle"),
+            json!({"task_status": "SUCCESS", "model": "cogvideox-flash", "choices": [{"index": 0, "finish_reason": "stop"}]}),
+        );
+        assert_eq!(
+            shown(&blocks(&t)),
+            "> a candle\ntask_status: SUCCESS · model: cogvideox-flash\nJSON {\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"finish_reason\": \"stop\"\n    }\n  ]\n}\n"
+        );
     }
 
     #[test]

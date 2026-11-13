@@ -172,7 +172,7 @@ fn err(m: impl Into<String>) -> LlmError {
     LlmError::request(m)
 }
 
-fn ratio(r: &str) -> Option<(u64, u64)> {
+pub(super) fn ratio(r: &str) -> Option<(u64, u64)> {
     let (a, b) = r.split_once(':')?;
     let (a, b): (u64, u64) = (a.parse().ok()?, b.parse().ok()?);
     (a > 0 && b > 0).then_some((a, b))
@@ -225,7 +225,8 @@ fn prompt(history: &[Turn], model: &str) -> Result<(String, Vec<String>), LlmErr
     Ok((prompt, notes))
 }
 
-fn has_options(req: &Requested) -> bool {
+/// Whether `req` asks for anything (`tier=default`/`auto` ask for nothing).
+pub(super) fn has_options(req: &Requested) -> bool {
     let mut r = req.clone();
     if matches!(r.tier.as_deref(), Some("default" | "auto")) {
         r.tier = None;
@@ -363,17 +364,24 @@ fn image_mime(bytes: &[u8], header: Option<&str>) -> String {
     header.filter(|h| h.starts_with("image/")).unwrap_or("image/png").to_string()
 }
 
-struct Run<'a> {
-    http: &'a reqwest::Client,
-    cfg: &'a DirectConfig,
-    sink: &'a mut dyn EventSink,
-    observer: &'a dyn Observer,
-    cancel: &'a CancellationToken,
+/// One request's calls to BigModel (shared with [`super::videos`]): JSON
+/// calls with the log id as `Meta`, and downloads of generated files.
+pub(super) struct Run<'a> {
+    pub(super) http: &'a reqwest::Client,
+    pub(super) cfg: &'a DirectConfig,
+    pub(super) sink: &'a mut dyn EventSink,
+    pub(super) observer: &'a dyn Observer,
+    pub(super) cancel: &'a CancellationToken,
 }
 
 impl Run<'_> {
     /// Send a request and read its JSON answer (errors classified as Zhipu's).
-    async fn call(&mut self, rb: reqwest::RequestBuilder, url: &str, body: &Value) -> Result<Value, LlmError> {
+    pub(super) async fn call(
+        &mut self,
+        rb: reqwest::RequestBuilder,
+        url: &str,
+        body: &Value,
+    ) -> Result<Value, LlmError> {
         self.observer.request(url, body);
         let timeout = self.cfg.idle_timeout;
         let resp = tokio::select! {
@@ -420,15 +428,17 @@ impl Run<'_> {
         Ok(v)
     }
 
-    /// Download a generated image (Zhipu's temporary link).
-    async fn fetch(&mut self, url: &str) -> Result<(Vec<u8>, String), LlmError> {
+    /// Download a generated file from Zhipu's temporary link (no credentials
+    /// sent): its bytes and `content-type`. `what` names it in errors.
+    pub(super) async fn download(&mut self, url: &str, what: &str) -> Result<(Vec<u8>, Option<String>), LlmError> {
         self.observer.request(url, &Value::Null);
         let timeout = self.cfg.idle_timeout;
+        let timed_out = || LlmError::new(ErrorKind::Timeout, Retry::Backoff, format!("{what} download timed out"));
         let resp = tokio::select! {
             _ = self.cancel.cancelled() => return Err(LlmError::cancelled()),
             r = tokio::time::timeout(timeout, self.http.get(url).send()) => match r {
-                Err(_) => return Err(LlmError::new(ErrorKind::Timeout, Retry::Backoff, "image download timed out")),
-                Ok(Err(e)) => return Err(LlmError::network(format!("image download failed: {e}"))),
+                Err(_) => return Err(timed_out()),
+                Ok(Err(e)) => return Err(LlmError::network(format!("{what} download failed: {e}"))),
                 Ok(Ok(r)) => r,
             }
         };
@@ -438,7 +448,7 @@ impl Run<'_> {
             let mut e = LlmError::new(
                 ErrorKind::Http,
                 crate::error::retry_for_status(status, None),
-                format!("downloading the generated image failed: HTTP {status}"),
+                format!("downloading the generated {what} failed: HTTP {status}"),
             );
             e.status = Some(status);
             e.details = Some(json!({"url": url}));
@@ -448,11 +458,18 @@ impl Run<'_> {
         let bytes = tokio::select! {
             _ = self.cancel.cancelled() => return Err(LlmError::cancelled()),
             b = tokio::time::timeout(timeout, resp.bytes()) => match b {
-                Err(_) => return Err(LlmError::new(ErrorKind::Timeout, Retry::Backoff, "image download timed out")),
-                Ok(Err(e)) => return Err(LlmError::network(format!("image download failed: {e}"))),
+                Err(_) => return Err(timed_out()),
+                Ok(Err(e)) => return Err(LlmError::network(format!("{what} download failed: {e}"))),
                 Ok(Ok(b)) => b.to_vec(),
             }
         };
+        self.observer.body_text(&format!("({} bytes of {})", bytes.len(), header.as_deref().unwrap_or("unknown type")));
+        Ok((bytes, header))
+    }
+
+    /// Download a generated image (Zhipu's temporary link).
+    async fn fetch(&mut self, url: &str) -> Result<(Vec<u8>, String), LlmError> {
+        let (bytes, header) = self.download(url, "image").await?;
         let mime = image_mime(&bytes, header.as_deref());
         Ok((bytes, mime))
     }
@@ -503,7 +520,7 @@ impl Run<'_> {
                     self.deliver(model, urls).await?;
                     return Ok(v);
                 }
-                "FAIL" => return Err(task_failed(v)),
+                "FAIL" => return Err(task_failed(v, "image")),
                 _ => {}
             }
             tokio::select! {
@@ -522,7 +539,8 @@ impl Run<'_> {
 /// checkpointed id (polling the same task, which answers FAIL again at once);
 /// the next attempt creates a new task. An error object or a content-filter
 /// result in it is the reason: classified as such (a filter is never retried).
-fn task_failed(v: Value) -> LlmError {
+/// `what` names the task (`image`, `video`: [`super::videos`] shares this).
+pub(super) fn task_failed(v: Value, what: &str) -> LlmError {
     if let Some(err) = v.get("error").filter(|e| e.is_object()) {
         let mut e = super::error_from_json(err, None, None, ErrorKind::InBand);
         e.details = Some(v);
@@ -530,9 +548,12 @@ fn task_failed(v: Value) -> LlmError {
     }
     let filtered = v.get("content_filter").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
     let (retry, message) = if filtered {
-        (Retry::Never, "Zhipu's image task failed (task_status FAIL) with a content filter result")
+        (Retry::Never, format!("Zhipu's {what} task failed (task_status FAIL) with a content filter result"))
     } else {
-        (Retry::Backoff, "Zhipu's image task failed without a reason (task_status FAIL); a new task may succeed")
+        (
+            Retry::Backoff,
+            format!("Zhipu's {what} task failed without a reason (task_status FAIL); a new task may succeed"),
+        )
     };
     let mut e = LlmError::new(ErrorKind::InBand, retry, message);
     e.error_type = Some("FAIL".into());

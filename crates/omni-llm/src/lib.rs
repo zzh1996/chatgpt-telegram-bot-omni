@@ -127,11 +127,17 @@ impl Prepared {
         if self.dialect == google::DIALECT {
             return google::continuation_request(self, item);
         }
+        if self.dialect == google::omni::DIALECT {
+            return google::omni::continuation_request(self, item);
+        }
         if self.dialect == xai::VIDEO_DIALECT {
             return xai::video_continuation(self, item);
         }
         if self.dialect == zhipu::images::DIALECT {
             return zhipu::images::continuation_request(self, item);
+        }
+        if self.dialect == zhipu::videos::DIALECT {
+            return zhipu::videos::continuation_request(self, item);
         }
         let mut p = self.clone();
         if let Some(msgs) = p.body.get_mut("messages").and_then(Value::as_array_mut) {
