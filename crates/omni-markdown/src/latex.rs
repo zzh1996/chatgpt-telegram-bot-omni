@@ -6,7 +6,12 @@
 //!   commit f59d6ee) breaks every environment and the macros JLaTeXMath defines
 //!   as "new commands": `\dfrac`, `\tfrac`, `\dbinom`, `\operatorname`,
 //!   `\textbf`, `\textit`, `\textrm`, `\textsf`, `\texttt`, `\pmod`, `\mod`,
-//!   `\substack`. A block formula that fails is not shown at all.
+//!   `\substack`. A block formula that fails is not shown at all. It draws
+//!   `\Omega`, `\varOmega`, `\otimes`, `\rightleftharpoons` and `\nleqslant` at
+//!   font code 173, the soft hyphen, which Android's text drawing never shows:
+//!   they are invisible, whatever the spelling (`Ω` and `⊗` are mapped to them).
+//!   A Greek letter in `\text{}` makes the formula fail (its text-mode glyph
+//!   is in a font Telegram does not ship).
 //! - iOS and macOS: SwiftMath. No `\boxed`, `\fbox`, `\underbrace`, `\overset`,
 //!   `\xrightarrow`, `\middle`, `\mbox`, `array`, `align`, `gathered`, `\dots`,
 //!   `\bmod`, `\lvert`, `\tag`, `\:` …; a formula that fails is shown as its
@@ -118,13 +123,20 @@ const RESPELLED: &[(&str, &str)] = &[
     ("checkmark", "\\text{✓}"),
     ("complement", "\\text{∁}"),
     ("triangleq", "\\text{≜}"),
-    ("rightleftharpoons", "\\text{⇌}"),
+    ("rightleftharpoons", "\\text{\u{21CB}}"),
     ("leftrightharpoons", "\\text{⇋}"),
     ("lesssim", "\\text{≲}"),
     ("gtrsim", "\\text{≳}"),
     ("approxeq", "\\text{≊}"),
     ("S", "\\text{§}"),
     ("P", "\\text{¶}"),
+    // Invisible on Android (font code 173), each as the owner picked from a test
+    // on every app (2026-11-14): Ω as the Ohm sign in text (Android draws it with
+    // the system font), ⇌ as ⇋ (above), ⊗ as a small `\bigotimes` (in [`emit`]).
+    ("Omega", "\\text{\u{2126}}"),
+    ("varOmega", "\\text{\u{2126}}"),
+    ("otimes", "\\otimes"),
+    ("nleqslant", "\\nleq"),
 ];
 
 /// Commands that leave only their (last) argument, after skipping this many.
@@ -291,8 +303,10 @@ const SYMBOLS: &[(char, &str)] = &[
     ('Φ', "\\Phi"),
     ('Χ', "X"),
     ('Ψ', "\\Psi"),
-    ('Ω', "\\Omega"),
-    ('\u{2126}', "\\Omega"),
+    ('Ω', "\\text{\u{2126}}"),
+    ('\u{2126}', "\\text{\u{2126}}"),
+    ('⇌', "\\text{\u{21CB}}"),
+    ('≰', "\\nleq"),
 ];
 
 /// Superscript and subscript characters: `^` or `_`, and what they raise or lower.
@@ -668,7 +682,7 @@ fn rewrite(chars: &[char], out: &mut String) {
             continue;
         }
         if let Some((_, to)) = RESPELLED.iter().find(|(from, _)| *from == name) {
-            out.push_str(to);
+            emit(out, to);
             i = after;
             continue;
         }
@@ -759,16 +773,94 @@ fn rewrite(chars: &[char], out: &mut String) {
 }
 
 /// The text group of a `\text` at `at`, copied as written (text is not a
-/// formula). Returns where it ends (`at` when there is none).
+/// formula), except what Android cannot draw in text: a Greek letter (it makes
+/// the formula fail) goes out of the text as its command, `Ω` is the Ohm sign,
+/// `⇌` `⇋` and `⊗` a small `\bigotimes` (invisible otherwise). Returns where
+/// it ends (`at` when there is none).
 fn copy_text_group(chars: &[char], at: usize, out: &mut String) -> usize {
     let k = skip_spaces(chars, at);
-    match (chars.get(k), group_end(chars, k)) {
-        (Some('{'), Some(e)) => {
-            out.extend(&chars[k..e]);
-            e
+    let (Some('{'), Some(e)) = (chars.get(k), group_end(chars, k)) else { return at };
+    out.push('{');
+    let mut depth = 0usize;
+    let mut j = k + 1;
+    while j < e - 1 {
+        let c = chars[j];
+        match c {
+            '\\' => {
+                out.extend(&chars[j..(j + 2).min(e - 1)]);
+                j += 2;
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
         }
-        _ => at,
+        let greek = matches!(c, '\u{391}'..='\u{3A9}' | '\u{3B1}'..='\u{3C9}' | 'ϑ');
+        let math = SYMBOLS.iter().find(|(u, _)| *u == c).map(|(_, tex)| *tex);
+        match (c, math) {
+            ('Ω', _) => out.push('\u{2126}'),
+            ('⇌', _) => out.push('\u{21CB}'),
+            // A letter as Latin as it looks (`Α`).
+            (_, Some(tex)) if greek && tex.len() == 1 => out.push_str(tex),
+            (_, Some(tex)) if (greek || c == '⊗') && depth == 0 => {
+                out.push('}');
+                emit(out, tex);
+                out.push_str("\\text{");
+            }
+            _ => out.push(c),
+        }
+        j += 1;
     }
+    out.push('}');
+    e
+}
+
+/// Write `tex` where the formula goes on: braced after `^` or `_` unless it is
+/// one token; `\otimes` as Android draws it, a `\bigotimes` (small, unless in a
+/// superscript or subscript, which makes it small anyway).
+fn emit(out: &mut String, tex: &str) {
+    if tex.is_empty() {
+        return;
+    }
+    let tex = match tex {
+        "\\otimes" if in_script(out) => "\\bigotimes",
+        "\\otimes" => "{\\textstyle\\bigotimes}",
+        t => t,
+    };
+    let t = out.trim_end();
+    let one_token = tex.chars().count() == 1
+        || (tex.len() > 1 && tex.starts_with('\\') && tex[1..].chars().all(|c| c.is_ascii_alphabetic()));
+    if (t.ends_with('^') || t.ends_with('_')) && !t.ends_with("\\^") && !t.ends_with("\\_") && !one_token {
+        out.push('{');
+        out.push_str(tex);
+        out.push('}');
+    } else {
+        out.push_str(tex);
+    }
+}
+
+/// Whether what is written next to `out` is in a superscript or subscript.
+fn in_script(out: &str) -> bool {
+    let chars: Vec<char> = out.trim_end().chars().collect();
+    if matches!(chars.last(), Some('^' | '_')) {
+        return true;
+    }
+    let mut depth = 0usize;
+    for i in (0..chars.len()).rev() {
+        let escaped = i > 0 && chars[i - 1] == '\\';
+        match chars[i] {
+            '}' if !escaped => depth += 1,
+            '{' if !escaped && depth > 0 => depth -= 1,
+            '{' if !escaped => {
+                // A group still open: a script's when `^` or `_` opened it.
+                if matches!(chars[..i].iter().rev().find(|c| !c.is_whitespace()), Some('^' | '_')) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A prime or a character beyond ASCII at `i` (outside `\text{}`), written so
@@ -809,9 +901,9 @@ fn rewrite_char(chars: &[char], i: usize, out: &mut String) -> usize {
         return j;
     }
     if let Some((_, tex)) = SYMBOLS.iter().find(|(u, _)| *u == c) {
-        out.push_str(tex);
+        emit(out, tex);
         // `\times x`, not `\timesx`.
-        if tex.ends_with(|c: char| c.is_ascii_alphabetic()) && chars.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic())
+        if out.ends_with(|c: char| c.is_ascii_alphabetic()) && chars.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic())
         {
             out.push(' ');
         }
@@ -1106,7 +1198,7 @@ mod tests {
         assert_eq!(t(r"\lcm(a,b) \coloneqq c"), r"\mathrm{lcm}(a,b) := c");
         assert_eq!(t(r"\abs{x} + \norm{v} + \abs*{y}"), r"\left| x \right| + \left\| v \right\| + \left| y \right|");
         assert_eq!(t(r"\sum_{\substack{i<j \\ i,j \in S}} a_i"), r"\sum_{{i<j \atop i,j \in S}} a_i");
-        assert_eq!(t(r"\therefore x \rightleftharpoons y \S 2"), r"\text{∴} x \text{⇌} y \text{§} 2");
+        assert_eq!(t(r"\therefore x \rightleftharpoons y \S 2"), r"\text{∴} x \text{⇋} y \text{§} 2");
         assert_eq!(t(r"\phantom{0}1 \boxed 5"), "1 5");
         assert_eq!(t(r"\textbf{bold} \textit{it} \mbox{box}"), r"\text{bold} \text{it} \text{box}");
         assert_eq!(t(r"\lvert x \rvert + \lVert v \rVert"), r"| x | + \| v \|");
@@ -1126,6 +1218,29 @@ mod tests {
         // Unclosed or unknown: as written.
         assert_eq!(t(r"\boxed{x"), r"\boxed{x");
         assert_eq!(t(r"\boxedx"), r"\boxedx");
+    }
+
+    #[test]
+    fn what_android_cannot_draw() {
+        // Font code 173: Ω as the Ohm sign in text, ⇌ as ⇋, ⊗ as a small `\bigotimes`.
+        assert_eq!(t(r"R = 10\,\Omega + \varOmega"), "R = 10\\,\\text{\u{2126}} + \\text{\u{2126}}");
+        assert_eq!(t("R = 10 Ω = 10 Ω"), "R = 10 \\text{\u{2126}} = 10 \\text{\u{2126}}");
+        assert_eq!(t(r"x_\Omega + x_Ω"), "x_{\\text{\u{2126}}} + x_{\\text{\u{2126}}}");
+        assert_eq!(
+            t(r"\mathrm{N_2 + 3H_2 \rightleftharpoons 2NH_3} ⇌"),
+            "\\mathrm{N_2 + 3H_2 \\text{\u{21CB}} 2NH_3} \\text{\u{21CB}}"
+        );
+        assert_eq!(t(r"A \otimes B = A ⊗ B"), r"A {\textstyle\bigotimes} B = A {\textstyle\bigotimes} B");
+        assert_eq!(t(r"V^{\otimes n} \otimes W_⊗"), r"V^{\bigotimes n} {\textstyle\bigotimes} W_\bigotimes");
+        assert_eq!(t(r"a \nleqslant b ≰ c"), r"a \nleq b \nleq c");
+        // Greek letters out of text; Ω, ⇌ and ⊗ in text as above.
+        assert_eq!(t(r"\text{其中 α 为常数}"), r"\text{其中 }\alpha\text{ 为常数}");
+        assert_eq!(t(r"\text{θ=0 时} + \textbf{Α}"), r"\text{}\theta\text{=0 时} + \text{A}");
+        assert_eq!(
+            t(r"\text{电阻 10 Ω，A ⇌ B，A ⊗ B}"),
+            "\\text{电阻 10 \u{2126}，A \u{21CB} B，A }{\\textstyle\\bigotimes}\\text{ B}"
+        );
+        assert_eq!(t(r"\text{a {β} c}"), r"\text{a {β} c}");
     }
 
     #[test]
