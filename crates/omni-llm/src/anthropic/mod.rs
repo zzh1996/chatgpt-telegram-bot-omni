@@ -156,8 +156,9 @@ pub fn betas(model: &str, body: &Value) -> Vec<&'static str> {
 
 /// What the Messages API offers for a model (the platform's own API, so this
 /// is the official capability set). Unknown models: everything the API has,
-/// left to the API to check.
-struct Caps(Option<&'static ModelSpec>);
+/// left to the API to check. With the request's `max_tokens` (the largest
+/// thinking budget is one below it).
+struct Caps(Option<&'static ModelSpec>, u64);
 
 const ALL_EFFORTS: &[&str] = &["max", "xhigh", "high", "medium", "low"];
 
@@ -188,6 +189,13 @@ impl RouteCaps for Caps {
     }
     fn tiers(&self) -> Vec<String> {
         if self.0.is_none_or(|s| s.fast.is_some()) { vec!["fast".into()] } else { Vec::new() }
+    }
+    fn default_effort(&self) -> Option<String> {
+        self.0.map(|s| s.effort.to_string())
+    }
+    /// Budget thinking (Opus 4.5, Haiku 4.5): `+h` the largest budget, `+l` the smallest.
+    fn budget_range(&self) -> Option<(u64, u64)> {
+        self.0.filter(|s| s.thinking == Thinking::Budget).map(|_| (self.1.saturating_sub(1), MIN_BUDGET))
     }
 }
 
@@ -281,6 +289,10 @@ fn plan_thinking(
             p.effort = Some(e.to_string());
         }
         (None, Some(n)) => {
+            if req.level.is_some() && n < MIN_BUDGET {
+                // +h on a max_tokens too small for any budget.
+                largest_budget()?;
+            }
             check_budget(n)?;
             p.thinking = Some(summarized(json!({"type": "enabled", "budget_tokens": n})));
             // Opus 4.5: the effort (its highest by default) composes with the budget.
@@ -343,16 +355,18 @@ impl Provider for Anthropic {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request(format!("`p=` (provider choice) does not apply to {NAME}")));
         }
-        request::validate(model, &req, &Caps(spec)).map_err(LlmError::request)?;
+        let max_tokens = input.max_tokens_override.unwrap_or_else(|| self.auto_max_tokens(input, spec));
+        let caps = Caps(spec, max_tokens);
+        request::validate(model, &req, &caps).map_err(LlmError::request)?;
+        let level_note = request::resolve_reasoning(model, &mut req, &caps).map_err(LlmError::request)?;
         let src = |by_user: bool| if by_user { "option" } else { "default" }.to_string();
         let mut applied = vec![Applied { source: "default".into(), patch: json!({"anthropic-version": API_VERSION}) }];
         let mut settings = Vec::new();
 
-        let max_tokens = input.max_tokens_override.unwrap_or_else(|| self.auto_max_tokens(input, spec));
         let cite = history::citations_allowed(input.history, model);
         let tools = tool_defs(spec, &req.tools, cite);
         let interleaved = spec.is_some_and(|s| s.interleaved_beta) && !tools.is_empty();
@@ -377,7 +391,7 @@ impl Provider for Anthropic {
         }
         if !reasoning.is_empty() {
             applied.push(Applied {
-                source: src(user.effort.is_some() || user.budget.is_some()),
+                source: src(user.effort.is_some() || user.budget.is_some() || user.level.is_some()),
                 patch: Value::Object(reasoning),
             });
         }
@@ -424,7 +438,7 @@ impl Provider for Anthropic {
             applied.push(Applied { source: "default".into(), patch: json!({"anthropic-beta": betas.join(",")}) });
         }
 
-        let notes = conv.notes;
+        let notes: Vec<String> = level_note.into_iter().chain(conv.notes).collect();
         // Container time is billed apart and not in the estimate (free with web
         // search or fetch): a marker after the cost (`crate::Prepared::settings`).
         let free_code = spec.is_none_or(|s| s.dynamic_web)

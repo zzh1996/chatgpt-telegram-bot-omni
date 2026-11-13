@@ -84,6 +84,11 @@ async fn prep(model: &str, o: &[&str], history: &[Turn]) -> Result<Prepared, Llm
     provider().prepare(&input(model, &o, history), &[], &Blobs::default()).await
 }
 
+/// The note that the default reasoning level is not the highest (owner's rule, 2026-11-13).
+fn is_level_note(n: &str) -> bool {
+    n.starts_with("reasoning effort is ") || n.starts_with("reasoning is off by default")
+}
+
 async fn prep_ok(model: &str, o: &[&str]) -> Prepared {
     prep(model, o, &[Turn::user_text("hi")]).await.unwrap_or_else(|e| panic!("{model} {o:?}: {e}"))
 }
@@ -149,9 +154,10 @@ fn stop() -> Value {
 // ------------------------------------------------------------------ requests
 
 #[tokio::test]
-async fn defaults_are_the_highest_the_model_offers() {
-    // Claude 5.x and Opus 4.7/4.8: adaptive thinking, the top effort, summaries
-    // instead of the hidden (`omitted`) default.
+async fn defaults_are_the_official_ones() {
+    // Claude 5.x and Opus 4.7/4.8: adaptive thinking at the model's default effort
+    // (medium on Opus 5.5 and Haiku 5.5, high elsewhere), summaries instead of the
+    // hidden (`omitted`) default, and a note that +h is the highest.
     for model in [
         "claude-fable-5-2",
         "claude-mythos-5-2",
@@ -165,13 +171,14 @@ async fn defaults_are_the_highest_the_model_offers() {
         "claude-sonnet-5",
         "claude-haiku-5-5",
     ] {
+        let effort = if matches!(model, "claude-opus-5-5" | "claude-haiku-5-5") { "medium" } else { "high" };
         let p = prep_ok(model, &[]).await;
         assert_eq!(p.url, "https://api.anthropic.com/v1/messages");
         assert_eq!(p.dialect, DIALECT);
         assert_eq!(p.body["model"], model);
         assert_eq!(p.body["stream"], true);
         assert_eq!(p.body["thinking"], json!({"type": "adaptive", "display": "summarized"}), "{model}");
-        assert_eq!(p.body["output_config"], json!({"effort": "max"}), "{model}");
+        assert_eq!(p.body["output_config"], json!({"effort": effort}), "{model}");
         assert_eq!(p.body["max_tokens"], 128_000, "{model}");
         assert_eq!(p.auto_max_tokens, Some(128_000));
         assert_eq!(p.body["cache_control"], json!({"type": "ephemeral"}));
@@ -179,31 +186,53 @@ async fn defaults_are_the_highest_the_model_offers() {
         for absent in ["tools", "speed", "metadata", "system", "service_tier", "temperature", "container"] {
             assert!(p.body.get(absent).is_none(), "{model}: {absent}");
         }
-        assert_eq!(p.settings, vec!["effort max"], "{model}");
-        assert!(p.warnings.is_empty() && p.notes.is_empty(), "{model}");
+        assert_eq!(p.settings, vec![format!("effort {effort}")], "{model}");
+        assert!(p.warnings.is_empty(), "{model}");
+        assert_eq!(
+            p.notes,
+            [format!("reasoning effort is {effort} by default, not the highest (max); add +h for the highest")],
+            "{model}"
+        );
         assert!(betas(model, &p.body).is_empty(), "{model}");
         assert!(!p.long_decode);
         assert_eq!(p.applied[0].patch, json!({"anthropic-version": "2026-10-21"}));
         let reasoning = p.applied.iter().find(|a| a.patch.get("thinking").is_some()).unwrap();
         assert_eq!(reasoning.source, "default");
+        // +h: the top level, no note.
+        let p = prep_ok(model, &["h"]).await;
+        assert_eq!((p.body["output_config"].clone(), p.notes.len()), (json!({"effort": "max"}), 0), "{model}");
     }
+    // +l: thinking off where it can be (Sonnet 5.5: between_tools), else the lowest level (Opus 5.5).
+    assert_eq!(prep_ok("claude-sonnet-5-5", &["l"]).await.body["thinking"], json!({"type": "between_tools"}));
+    assert_eq!(prep_ok("claude-opus-4-8", &["l"]).await.body["thinking"], json!({"type": "disabled"}));
+    let p = prep_ok("claude-opus-5-5", &["l"]).await;
+    assert_eq!(p.body["output_config"], json!({"effort": "low"}));
     // 4.6: `summarized` is already the default; no `xhigh`, so `max` is the top.
     for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
         let p = prep_ok(model, &[]).await;
         assert_eq!(p.body["thinking"], json!({"type": "adaptive"}), "{model}");
-        assert_eq!(p.body["output_config"], json!({"effort": "max"}));
+        assert_eq!(p.body["output_config"], json!({"effort": "high"}));
+        assert_eq!(prep_ok(model, &["h"]).await.body["output_config"], json!({"effort": "max"}));
     }
-    // 4.5 generation: manual thinking with the largest valid budget.
+    // 4.5 generation: no thinking unless asked (the API's default); +h the largest valid budget.
     let p = prep_ok("claude-opus-4-5", &[]).await;
     assert_eq!(p.body["max_tokens"], 64_000);
+    assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
+    assert_eq!(p.notes, ["reasoning is off by default (the highest level is high); add +h for the highest"]);
+    let p = prep_ok("claude-opus-4-5", &["h"]).await;
     assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}));
     assert_eq!(p.body["output_config"], json!({"effort": "high"}));
     assert_eq!(p.settings, vec!["effort high", "thinking budget 63999"]);
     for model in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
         let p = prep_ok(model, &[]).await;
+        assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
+        assert_eq!(p.notes, ["reasoning is off by default; add +h to think with the largest budget"]);
+        let p = prep_ok(model, &["h"]).await;
         assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}), "{model}");
         assert!(p.body.get("output_config").is_none(), "{model}: no effort parameter");
         assert_eq!(p.settings, vec!["thinking budget 63999"]);
+        let p = prep_ok(model, &["l"]).await;
+        assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
     }
 }
 
@@ -281,7 +310,7 @@ async fn options_the_api_does_not_have_are_errors() {
     let e = prep_err("claude-opus-5-5", &["m"]).await;
     assert_eq!(e, "`claude-opus-5-5` has no Google Maps (`+m`)");
     assert!(prep_err("claude-opus-5-5", &["v=high"]).await.contains("has no verbosity setting"));
-    assert!(prep_err("claude-opus-5-5", &["4W"]).await.contains("has no image size/aspect options"));
+    assert!(prep_err("claude-opus-5-5", &["size=4K"]).await.contains("has no image size/aspect options"));
     assert_eq!(
         prep_err("claude-opus-5-5", &["p=anthropic"]).await,
         "`p=` (provider choice) does not apply to Anthropic"
@@ -297,7 +326,7 @@ async fn options_the_api_does_not_have_are_errors() {
 async fn fast_mode_and_tiers() {
     let p = prep_ok("claude-opus-5-5", &["tier=fast"]).await;
     assert_eq!(p.body["speed"], "fast");
-    assert_eq!(p.settings, vec!["effort max", "tier fast"]);
+    assert_eq!(p.settings, vec!["effort medium", "tier fast"]);
     assert!(betas("claude-opus-5-5", &p.body).is_empty(), "GA on Opus 5.5");
     let p = prep_ok("claude-fable-5-2", &["tier=fast"]).await;
     assert!(betas("claude-fable-5-2", &p.body).is_empty());
@@ -317,8 +346,8 @@ async fn fast_mode_and_tiers() {
 async fn server_tools_at_their_current_versions() {
     let p = prep_ok("claude-opus-5-5", &["s"]).await;
     assert_eq!(p.body["tools"], json!([{"type": "web_search_20260318", "name": "web_search"}]));
-    assert_eq!(p.settings, vec!["effort max", "web search"]);
-    assert!(p.notes.is_empty(), "code execution behind dynamic filtering is free");
+    assert_eq!(p.settings, vec!["effort medium", "web search"]);
+    assert!(p.notes.iter().all(|n| is_level_note(n)), "code execution behind dynamic filtering is free");
     // A fixed order whatever the option order (the tool list is part of the replay prefix).
     let p = prep_ok("claude-opus-5-5", &["cus"]).await;
     assert_eq!(
@@ -330,13 +359,13 @@ async fn server_tools_at_their_current_versions() {
         ]),
         "web fetch cites the fetched pages (off by default)"
     );
-    assert_eq!(p.settings, vec!["effort max", "web search", "URL fetching", "code execution"]);
+    assert_eq!(p.settings, vec!["effort medium", "web search", "URL fetching", "code execution"]);
     // Code execution alone is billed by container time, which the estimate leaves
     // out: a "+ code execution" marker after the cost, not a note.
     let p = prep_ok("claude-haiku-5-5", &["c"]).await;
     assert_eq!(p.body["tools"], json!([{"type": "code_execution_20260521", "name": "code_execution"}]));
-    assert_eq!(p.settings, vec!["effort max", "code execution", "+ code execution"]);
-    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    assert_eq!(p.settings, vec!["effort medium", "code execution", "+ code execution"]);
+    assert!(p.notes.iter().all(|n| is_level_note(n)), "{:?}", p.notes);
     // With dynamic-filtering web search or fetch it is free: no marker.
     let p = prep_ok("claude-haiku-5-5", &["cs"]).await;
     assert!(!p.settings.iter().any(|s| s == "+ code execution"), "{:?}", p.settings);
@@ -344,7 +373,7 @@ async fn server_tools_at_their_current_versions() {
     let p = prep_ok("claude-haiku-4-5", &["cs"]).await;
     assert_eq!(p.settings.last().map(String::as_str), Some("+ code execution"), "{:?}", p.settings);
     // Before Claude 4.6: the basic web tools, and interleaved thinking with a manual budget.
-    let p = prep_ok("claude-opus-4-5", &["su"]).await;
+    let p = prep_ok("claude-opus-4-5", &["suh"]).await;
     assert_eq!(
         p.body["tools"],
         json!([{"type": "web_search_20250305", "name": "web_search"},
@@ -390,20 +419,21 @@ async fn output_budget_follows_context_cap_and_overrides() {
         .unwrap();
     assert_eq!(p.body["max_tokens"], 50_000);
     // After a context overflow: the bot's smaller value, and the budget below it.
-    let mut i = input("claude-haiku-4-5", &o, &h);
+    let high = opts(&["h"]);
+    let mut i = input("claude-haiku-4-5", &high, &h);
     i.max_tokens_override = Some(5000);
     let p = provider().prepare(&i, &[], &Blobs::default()).await.unwrap();
     assert_eq!(p.body["max_tokens"], 5000);
-    assert_eq!(p.body["thinking"]["budget_tokens"], 4999);
+    assert_eq!(p.body["thinking"]["budget_tokens"], 4999, "+h: the largest budget below max_tokens");
     assert_eq!(p.auto_max_tokens, Some(5000));
     // A long conversation on a 200K model leaves less room for output.
     let long = [Turn::user_text("a".repeat(480_000))];
-    let p = prep("claude-haiku-4-5", &[], &long).await.unwrap();
+    let p = prep("claude-haiku-4-5", &["h"], &long).await.unwrap();
     let m = p.body["max_tokens"].as_u64().unwrap();
     assert!(m < 64_000 && m > 30_000, "{m}");
     assert_eq!(p.body["thinking"]["budget_tokens"], m - 1);
     // No room for the minimum budget: say so instead of sending a request that cannot work.
-    let mut i = input("claude-haiku-4-5", &o, &h);
+    let mut i = input("claude-haiku-4-5", &high, &h);
     i.max_tokens_override = Some(1024);
     let e = provider().prepare(&i, &[], &Blobs::default()).await.unwrap_err();
     assert!(e.message.contains("no room for a thinking budget"), "{e}");
@@ -448,7 +478,7 @@ async fn native_turns_replay_verbatim_with_the_same_model_and_tools() {
     assert_eq!(msgs[0]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
     assert!(msgs[2]["content"][0].get("cache_control").is_none());
     assert!(p.applied.iter().any(|a| a.patch.get("messages[0].content[0].cache_control").is_some()));
-    assert!(p.notes.is_empty());
+    assert!(p.notes.iter().all(|n| is_level_note(n)), "{:?}", p.notes);
 
     // Without web search now: the tool list changed, so the answer goes back as text.
     let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
@@ -456,14 +486,14 @@ async fn native_turns_replay_verbatim_with_the_same_model_and_tools() {
         p.body["messages"][1],
         json!({"role": "assistant", "content": [{"type": "text", "text": "Claude Shannon was born on April 30, 1916"}]})
     );
-    assert!(p.notes[0].contains("other tools"), "{:?}", p.notes);
+    assert!(p.notes.iter().any(|n| n.contains("other tools")), "{:?}", p.notes);
     // Another model: text only, no note (that is what switching models means).
     let p = prep("claude-sonnet-5-5", &["s"], &history).await.unwrap();
     assert_eq!(
         p.body["messages"][1]["content"],
         json!([{"type": "text", "text": "Claude Shannon was born on April 30, 1916"}])
     );
-    assert!(p.notes.is_empty());
+    assert!(p.notes.iter().all(|n| is_level_note(n)), "{:?}", p.notes);
     // Same model and tools from OpenRouter's Messages skin: another dialect, text only.
     let mut or = history.clone();
     or[2].native.as_mut().unwrap().dialect = "openrouter.messages".into();
@@ -563,7 +593,7 @@ async fn user_media_is_sent_natively() {
     assert_eq!(c[4]["source"]["data"], "fn main() {}");
     assert_eq!(c[4]["citations"], json!({"enabled": true}));
     assert_eq!(c[5], json!({"type": "text", "text": "Compare them."}));
-    assert!(p.notes.is_empty(), "text files are native documents, nothing is inlined");
+    assert!(p.notes.iter().all(|n| is_level_note(n)), "text files are native documents, nothing is inlined");
     assert!(c[0].get("citations").is_none() && c[1].get("citations").is_none(), "images are not documents");
     assert!(p.applied.iter().any(|a| a.patch.get("messages[].content[document].citations").is_some()));
     assert!(super::stream::citations_on(&p.body));
@@ -650,7 +680,7 @@ async fn generated_media_of_other_models_is_an_error() {
         .unwrap();
     assert_eq!(p.body["messages"][1]["content"], json!([{"type": "text", "text": "Here it is."}]));
     assert_eq!(p.body["messages"].as_array().unwrap().len(), 3);
-    assert!(p.warnings.is_empty() && p.notes.is_empty(), "{:?} {:?}", p.warnings, p.notes);
+    assert!(p.warnings.is_empty() && p.notes.iter().all(|n| is_level_note(n)), "{:?} {:?}", p.warnings, p.notes);
     // Two answers with media.
     let mut video = answer.clone();
     video.parts.push(Part::File { blob: mp4, filename: Some("clip.mp4".into()), generated: true });
@@ -1861,7 +1891,7 @@ async fn citations_stay_off_in_conversations_made_without_them() {
     let p = provider().prepare(&input("claude-opus-5-5", &o, &history), &[], &blobs).await.unwrap();
     assert_eq!(p.body["messages"][0]["content"][0]["citations"], json!({"enabled": true}));
     assert_eq!(p.body["messages"][1]["content"][0]["signature"], "sig");
-    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    assert!(p.notes.iter().all(|n| is_level_note(n)), "{:?}", p.notes);
     // An old answer before any document, or one of another model: no reason to keep them off.
     let history = vec![Turn::user_text("hi"), assistant("claude-opus-5-5", legacy, "Hi."), doc_turn];
     let p = provider().prepare(&input("claude-opus-5-5", &o, &history), &[], &blobs).await.unwrap();

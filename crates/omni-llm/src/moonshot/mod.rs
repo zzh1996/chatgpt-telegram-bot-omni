@@ -147,6 +147,13 @@ impl RouteCaps for Caps<'_> {
     fn can_disable_reasoning(&self) -> bool {
         self.0.thinking == Thinking::Switch
     }
+    /// K3: `reasoning_effort` "default max", the top level.
+    fn default_effort(&self) -> Option<String> {
+        (self.0.thinking == Thinking::Effort).then(|| EFFORTS[0].to_string())
+    }
+    fn fixed_reasoning(&self) -> bool {
+        self.0.thinking == Thinking::Always
+    }
     fn budget(&self) -> bool {
         false
     }
@@ -191,7 +198,7 @@ struct ReasoningSetting {
 }
 
 fn reasoning(spec: &ModelSpec, req: &Requested, user: &Requested) -> ReasoningSetting {
-    let by_user = user.effort.is_some();
+    let by_user = user.effort.is_some() || user.level.is_some();
     match spec.thinking {
         Thinking::Effort => {
             let e = req.effort.clone().unwrap_or_else(|| EFFORTS[0].to_string());
@@ -255,7 +262,7 @@ impl Moonshot {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request("`p=` (provider choice) does not apply to Moonshot"));
         }
@@ -264,6 +271,8 @@ impl Moonshot {
             Some(s) => {
                 check(s, &req)?;
                 crate::request::validate(input.model, &req, &Caps(s)).map_err(LlmError::request)?;
+                // K3's default is its top level: no note to add.
+                crate::request::resolve_reasoning(input.model, &mut req, &Caps(s)).map_err(LlmError::request)?;
             }
             None if has_options(&req) => {
                 return Err(LlmError::request(format!(

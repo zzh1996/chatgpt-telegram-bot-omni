@@ -143,7 +143,7 @@ fn table_covers_the_configured_aliases() {
 }
 
 #[tokio::test]
-async fn gemini_4_defaults_are_the_maximum() {
+async fn gemini_4_defaults_are_the_official_ones() {
     let p = prep("gemini-4-carbon", &[], &hi()).await.unwrap();
     assert_eq!(p.dialect, DIALECT);
     assert_eq!(
@@ -157,15 +157,25 @@ async fn gemini_4_defaults_are_the_maximum() {
             "generationConfig": {
                 // Long decode: the total budget of all hops (D13).
                 "maxOutputTokens": 393_216,
-                "thinkingConfig": {"thinkingLevel": "high", "includeThoughts": true}
+                // Gemini 4 Carbon's default level (the thinking guide), not its top.
+                "thinkingConfig": {"thinkingLevel": "medium", "includeThoughts": true}
             }
         })
     );
     assert!(p.long_decode);
     assert_eq!(p.auto_max_tokens, Some(393_216));
     assert_eq!(p.max_tokens(), Some(393_216));
-    assert_eq!(p.settings, vec!["effort high"]);
-    assert!(p.warnings.is_empty() && p.notes.is_empty());
+    assert_eq!(p.settings, vec!["effort medium"]);
+    assert!(p.warnings.is_empty());
+    assert_eq!(p.notes, ["reasoning effort is medium by default, not the highest (high); add +h for the highest"]);
+    let h = prep("gemini-4-carbon", &[flag("h")], &hi()).await.unwrap();
+    assert_eq!(h.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+    assert!(h.notes.is_empty());
+    let l = prep("gemini-4-carbon", &[flag("l")], &hi()).await.unwrap();
+    assert_eq!(
+        l.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low",
+        "Gemini 4 cannot turn thinking off"
+    );
     let sources: Vec<&str> = p.applied.iter().map(|a| a.source.as_str()).collect();
     assert_eq!(sources, vec!["budget", "default"]);
     // The shared helpers find the output budget in its Gemini place.
@@ -179,7 +189,15 @@ async fn gemini_4_defaults_are_the_maximum() {
 async fn per_model_thinking_and_output_defaults() {
     let p = prep("gemini-3.8-flash", &[], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["maxOutputTokens"], 65_536);
-    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium");
+    // Defaults per model: minimal on the Flash-Lite models, high on 3.1 Pro (its top: no note).
+    let lite = prep("gemini-3.5-flash-lite", &[], &hi()).await.unwrap();
+    assert_eq!(lite.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal");
+    let pro = prep("gemini-3.1-pro-preview", &[], &hi()).await.unwrap();
+    assert_eq!(
+        (pro.body["generationConfig"]["thinkingConfig"]["thinkingLevel"].as_str(), pro.notes.len()),
+        (Some("high"), 0)
+    );
     assert!(!p.long_decode);
     // A configured cap applies (not to Gemini 4's long-decode budget).
     let mut c = cfg("https://x/v1beta");
@@ -193,25 +211,32 @@ async fn per_model_thinking_and_output_defaults() {
     let p = prep("gemini-nano-banana-2.1", &[], &hi()).await.unwrap();
     let g = &p.body["generationConfig"];
     assert_eq!(g["maxOutputTokens"], 32_768);
-    assert_eq!(g["thinkingConfig"], json!({"thinkingLevel": "high", "includeThoughts": true}));
+    assert_eq!(g["thinkingConfig"], json!({"thinkingLevel": "medium", "includeThoughts": true}));
     assert_eq!(g["responseModalities"], json!(["TEXT", "IMAGE"]));
     assert!(g.get("imageConfig").is_none(), "no image size unless asked (presets set it)");
 
     let p = prep("gemini-3-pro-image", &[], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["thinkingConfig"], json!({"includeThoughts": true}));
     assert_eq!(p.settings, vec!["reasoning on"]);
+    let p = prep("gemini-3-pro-image", &[flag("h")], &hi()).await.unwrap();
+    assert_eq!((p.settings.clone(), p.notes.len()), (vec!["reasoning on".to_string()], 0), "fixed: +h changes nothing");
 
     let p = prep("gemini-3.6-flash", &[kv("e", "minimal")], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal");
     assert_eq!(p.settings, vec!["effort minimal"]);
     assert_eq!(p.applied[1].source, "option");
 
-    // Gemini 4 Hydrogen: the highest of its four levels; long decode like Carbon and Argon.
+    // Gemini 4 Hydrogen: high by default, xhigh the highest; long decode like Carbon and Argon.
     let p = prep("gemini-4-hydrogen", &[], &hi()).await.unwrap();
-    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "xhigh");
+    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
     assert_eq!(p.body["generationConfig"]["maxOutputTokens"], 393_216);
     assert!(p.long_decode);
-    assert_eq!(p.settings, vec!["effort xhigh"]);
+    assert_eq!(p.settings, vec!["effort high"]);
+    assert_eq!(p.notes, ["reasoning effort is high by default, not the highest (xhigh); add +h for the highest"]);
+    assert_eq!(
+        prep("gemini-4-hydrogen", &[flag("h")], &hi()).await.unwrap().body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "xhigh"
+    );
     assert!(prep("gemini-4-hydrogen", &[kv("e", "medium")], &hi()).await.is_ok());
     let e = prep_err("gemini-4-hydrogen", &[kv("e", "minimal")], &hi()).await;
     assert!(e.contains("levels: xhigh, high, medium, low"), "{e}");
@@ -254,7 +279,7 @@ async fn tools_tiers_and_their_validation() {
     assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}));
     assert!(p.applied.iter().any(|a| a.patch.pointer("/toolConfig/includeServerSideToolInvocations").is_some()));
     assert_eq!(p.body["service_tier"], "flex");
-    assert_eq!(p.settings, vec!["effort high", "web search", "code execution", "URL fetching", "tier flex"]);
+    assert_eq!(p.settings, vec!["effort medium", "web search", "code execution", "URL fetching", "tier flex"]);
     // Code execution reports its parts anyway; no tools, nothing to ask for.
     assert!(prep("gemini-4-carbon", &[flag("c")], &hi()).await.unwrap().body.get("toolConfig").is_none());
     assert!(prep("gemini-3.8-flash", &[], &hi()).await.unwrap().body.get("toolConfig").is_none());
@@ -268,7 +293,7 @@ async fn tools_tiers_and_their_validation() {
     for model in ["gemini-nano-banana-2.1", "gemini-3.1-flash-image"] {
         let p = prep(model, &[flag("s")], &hi()).await.unwrap();
         assert_eq!(p.body["tools"], json!([{"googleSearch": {"searchTypes": {"webSearch": {}, "imageSearch": {}}}}]));
-        assert_eq!(p.settings, vec!["effort high", "web and image search"], "{model}");
+        assert_eq!(p.settings[1], "web and image search", "{model}");
         assert!(p.body.get("toolConfig").is_none(), "{model}");
     }
     let p = prep("gemini-3-pro-image", &[flag("s")], &hi()).await.unwrap();
@@ -292,23 +317,23 @@ async fn tools_tiers_and_their_validation() {
 
 #[tokio::test]
 async fn image_options_per_model() {
-    let p = prep("gemini-nano-banana-2.1", &[flag("4W")], &hi()).await.unwrap();
+    let p = prep("gemini-nano-banana-2.1", &[kv("size", "4K"), kv("ar", "16:9")], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["imageConfig"], json!({"imageSize": "4K", "aspectRatio": "16:9"}));
-    assert_eq!(p.settings, vec!["effort high", "image size 4K", "aspect ratio 16:9"]);
+    assert_eq!(p.settings, vec!["effort medium", "image size 4K", "aspect ratio 16:9"]);
     assert!(prep("gemini-nano-banana-2.1", &[kv("ar", "1:8")], &hi()).await.is_ok());
     assert!(prep("gemini-3.1-flash-image", &[kv("ar", "8:1")], &hi()).await.is_ok());
     let e = prep_err("gemini-3-pro-image", &[kv("ar", "1:8")], &hi()).await;
     assert!(e.contains("aspect ratio 1:8 is not available") && e.contains("21:9"), "{e}");
-    let e = prep_err("gemini-3.1-flash-lite-image", &[flag("4")], &hi()).await;
+    let e = prep_err("gemini-3.1-flash-lite-image", &[kv("size", "4K")], &hi()).await;
     assert_eq!(e, "image size 4K is not available for `gemini-3.1-flash-lite-image`; sizes: 1K");
-    let e = prep_err("gemini-3.8-flash", &[flag("4")], &hi()).await;
+    let e = prep_err("gemini-3.8-flash", &[kv("size", "4K")], &hi()).await;
     assert_eq!(e, "`gemini-3.8-flash` has no image size/aspect options");
     // Presets first, the user's options over them.
     let preset = Requested { image_size: Some("4K".into()), ..Default::default() };
     let p = prep_full(
         &google(),
         "gemini-nano-banana-2.1",
-        &[flag("1")],
+        &[kv("size", "1K")],
         &hi(),
         std::slice::from_ref(&preset),
         &Blobs::none(),
@@ -337,7 +362,7 @@ async fn maps_takes_the_latest_location() {
         json!({"retrievalConfig": {"latLng": {"latitude": 31.2304, "longitude": 121.4737}},
                "includeServerSideToolInvocations": true})
     );
-    assert_eq!(p.settings, vec!["effort high", "Google Maps near 31.2304,121.4737"]);
+    assert_eq!(p.settings, vec!["effort medium", "Google Maps near 31.2304,121.4737"]);
     // A location has no content form: only the text is sent.
     assert_eq!(p.body["contents"][2], json!({"role": "user", "parts": [{"text": "cafes near me?"}]}));
 
@@ -348,7 +373,7 @@ async fn maps_takes_the_latest_location() {
 
     let p = prep("gemini-4-argon", &[flag("m")], &hi()).await.unwrap();
     assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}), "no position");
-    assert_eq!(p.settings, vec!["effort high", "Google Maps (no position sent)"]);
+    assert_eq!(p.settings, vec!["effort medium", "Google Maps (no position sent)"]);
 
     let only_location = vec![user_turn(vec![location(1.0, 2.0)])];
     let e = prep_err("gemini-3.8-flash", &[flag("m")], &only_location).await;
@@ -469,7 +494,7 @@ async fn media_goes_natively_at_the_highest_resolution() {
     assert_eq!(parts[8]["inlineData"]["mimeType"], "video/mp4");
     assert_eq!(parts[8]["mediaResolution"]["level"], "MEDIA_RESOLUTION_HIGH");
     assert_eq!(parts[9], json!({"text": "Compare all of these."}));
-    assert!(p.notes.is_empty());
+    assert!(p.notes.iter().all(|n| n.starts_with("reasoning effort")), "{:?}", p.notes);
     let a = p.applied.iter().find(|a| a.patch.get("mediaResolution (per part)").is_some()).unwrap();
     assert_eq!(a.source, "default");
 

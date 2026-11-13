@@ -162,7 +162,7 @@ impl OpenRouter {
         for p in presets {
             req = options::overlay(&req, p);
         }
-        let req = options::overlay(&req, &user);
+        let mut req = options::overlay(&req, &user);
         // Pin: the user's choice, else the vendor's own endpoint.
         let pinned: Vec<String> = match &req.providers {
             Some(p) => p.iter().map(|s| s.split('/').next().unwrap_or(s).to_string()).collect(),
@@ -186,6 +186,7 @@ impl OpenRouter {
             Some(v) => Some(v),
             None => self.auto_max_tokens(input, info.as_deref()),
         };
+        let level_note = crate::request::resolve_reasoning(model, &mut req, &caps).map_err(LlmError::request)?;
         let plan = options::plan(model, info.as_deref(), &caps, &req, &user, auto_max).map_err(LlmError::request)?;
         let mut warnings = Vec::new();
         if info.is_none() {
@@ -269,7 +270,7 @@ impl OpenRouter {
             body,
             applied: all_applied,
             warnings,
-            notes,
+            notes: level_note.into_iter().chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: dialect == options::Dialect::Chat && self.cfg.fidelity.is_long_decode(model),

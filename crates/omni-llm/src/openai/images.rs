@@ -891,7 +891,7 @@ mod tests {
     async fn options_map_to_the_request() {
         let p = prep(
             "gpt-image-2.6-flare",
-            &[flag("W"), kv("q", "low"), kv("bg", "transparent"), kv("n", "3"), kv("e", "low")],
+            &[kv("ar", "16:9"), kv("q", "low"), kv("bg", "transparent"), kv("n", "3"), kv("e", "low")],
         )
         .await
         .unwrap();
@@ -915,7 +915,10 @@ mod tests {
             ]
         );
         assert!(p.notes[0].contains("experimental"));
-        assert_eq!(prep("gpt-image-2.6-flare", &[flag("1h")]).await.unwrap().body["size"], "864x1152");
+        assert_eq!(
+            prep("gpt-image-2.6-flare", &[kv("size", "1K"), kv("ar", "3:4")]).await.unwrap().body["size"],
+            "864x1152"
+        );
         assert_eq!(prep("gpt-image-2.5-flare", &[kv("ar", "21:9")]).await.unwrap().body["size"], "3808x1632");
         let p = prep("gpt-image-2.5-sunburst", &[kv("bg", "transparent")]).await.unwrap();
         assert_eq!(p.body["background"], "transparent");

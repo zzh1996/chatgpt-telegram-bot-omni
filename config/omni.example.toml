@@ -517,40 +517,41 @@ spec = "openrouter:qwen/qwen3.8-max-prime"
 # ------------------------------------------------------------------ presets
 # Default options for matching models, in the same syntax as after a prefix
 # (validated like the user's; the user's options override them). Requests
-# otherwise default to the highest the model officially offers (reasoning
-# effort, output length, reasoning summaries, image output).
+# otherwise use the official default reasoning level (+h: the highest, +l: the
+# lowest) and the highest the model offers for output length, reasoning
+# summaries and image output.
 
 # Image models: the largest image size by default (4K; 3.1 Flash Lite Image
 # has only 1K), through OpenRouter and the Gemini API alike.
 [[presets]]
 match = "openrouter:google/gemini-nano-banana*"
 note = "largest image size"
-options = "4"
+options = "size=4K"
 
 [[presets]]
 match = "openrouter:google/gemini-3.1-flash-image*"
 note = "largest image size"
-options = "4"
+options = "size=4K"
 
 [[presets]]
 match = "openrouter:google/gemini-3-pro-image*"
 note = "largest image size"
-options = "4"
+options = "size=4K"
 
 [[presets]]
 match = "google:gemini-nano-banana*"
 note = "largest image size"
-options = "4"
+options = "size=4K"
 
 [[presets]]
 match = "google:gemini-3.1-flash-image*"
 note = "largest image size"
-options = "4"
+options = "size=4K"
 
 [[presets]]
 match = "google:gemini-3-pro-image*"
 note = "largest image size"
-options = "4"
+options = "size=4K"
 
 # ------------------------------------------------------------------ dev
 # [dev]

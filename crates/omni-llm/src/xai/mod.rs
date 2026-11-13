@@ -82,6 +82,8 @@ pub struct ModelSpec {
     pub context: u64,
     /// `reasoning.effort` levels, highest first; `None`: no effort parameter.
     pub efforts: Option<&'static [&'static str]>,
+    /// The default level (the model pages: `high` on 4.7/4.6/4.5, `low` on 4.3).
+    pub effort: Option<&'static str>,
     /// A reasoning model (returns encrypted reasoning for replay).
     pub reasoning: bool,
     /// Prompts under 200K tokens (USD per 1M tokens); from 200K on every
@@ -103,6 +105,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &[],
         context: 500_000,
         efforts: Some(&["xhigh", "high", "medium", "low"]),
+        effort: Some("high"),
         reasoning: true,
         price: price(2.0, 0.5, 6.0),
     },
@@ -111,6 +114,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &[],
         context: 500_000,
         efforts: Some(&["xhigh", "high", "medium", "low"]),
+        effort: Some("high"),
         reasoning: true,
         price: price(2.0, 0.5, 6.0),
     },
@@ -119,6 +123,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &["grok-4.5-latest", "grok-build-latest"],
         context: 500_000,
         efforts: Some(&["high", "medium", "low"]),
+        effort: Some("high"),
         reasoning: true,
         price: price(2.0, 0.3, 6.0),
     },
@@ -127,6 +132,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &["grok-4.3-latest"],
         context: 1_000_000,
         efforts: Some(&["xhigh", "high", "medium", "low", "none"]),
+        effort: Some("low"),
         reasoning: true,
         price: price(1.25, 0.2, 2.5),
     },
@@ -135,6 +141,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &["grok-4.20", "grok-4.20-reasoning", "grok-4.20-0309", "grok-4.20-reasoning-latest"],
         context: 1_000_000,
         efforts: None,
+        effort: None,
         reasoning: true,
         price: price(1.25, 0.2, 2.5),
     },
@@ -143,6 +150,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &["grok-4.20-non-reasoning", "grok-4.20-non-reasoning-latest"],
         context: 1_000_000,
         efforts: None,
+        effort: None,
         reasoning: false,
         price: price(1.25, 0.2, 2.5),
     },
@@ -151,6 +159,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &["grok-code-fast-1", "grok-code-fast", "grok-code-fast-1-0825"],
         context: 256_000,
         efforts: None,
+        effort: None,
         reasoning: true,
         price: price(1.0, 0.2, 2.0),
     },
@@ -183,6 +192,13 @@ impl RouteCaps for Caps {
     }
     fn can_disable_reasoning(&self) -> bool {
         self.efforts().is_some_and(|l| l.iter().any(|e| e == "none"))
+    }
+    fn default_effort(&self) -> Option<String> {
+        self.0.and_then(|s| s.effort).map(str::to_string)
+    }
+    /// grok-4.20 (reasoning) and grok-build reason without an effort parameter.
+    fn fixed_reasoning(&self) -> bool {
+        self.0.is_some_and(|s| s.reasoning && s.efforts.is_none())
     }
     fn budget(&self) -> bool {
         false
@@ -225,7 +241,7 @@ impl Xai {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request(format!("`p=` (provider choice) does not apply to {NAME}")));
         }
@@ -241,6 +257,7 @@ impl Xai {
         checked.image_size = None;
         checked.aspect_ratio = None;
         request::validate(model, &checked, &Caps(spec)).map_err(LlmError::request)?;
+        let level_note = request::resolve_reasoning(model, &mut req, &Caps(spec)).map_err(LlmError::request)?;
         if req.image_size.is_some() || req.aspect_ratio.is_some() {
             return Err(LlmError::request(if req.tools.contains(&Tool::Image) {
                 "xAI's image generation tool takes no image size or aspect ratio: Grok picks the ratio (ask for it \
@@ -259,20 +276,16 @@ impl Xai {
         let mut settings = Vec::new();
         let mut include = Vec::new();
 
-        let reasoning = match (spec, req.effort.as_deref()) {
-            (_, Some("none")) => Some(("none".to_string(), "reasoning off".to_string())),
-            (Some(s), e) => s
-                .efforts
-                .and_then(|l| l.first())
-                .map(|top| e.unwrap_or(top))
-                .map(|e| (e.to_string(), format!("effort {e}"))),
-            // Not in the table: only what the user asked for.
-            (None, e) => e.map(|e| (e.to_string(), format!("effort {e}"))),
+        // The level settled by `resolve_reasoning`: the model's default, `+h`, `+l` or `e=`.
+        let reasoning = match req.effort.as_deref() {
+            Some("none") => Some(("none".to_string(), "reasoning off".to_string())),
+            Some(e) => Some((e.to_string(), format!("effort {e}"))),
+            None => None,
         };
         if let Some((effort, desc)) = reasoning {
             body["reasoning"] = json!({"effort": effort});
             applied.push(Applied {
-                source: src(user.effort.is_some()).into(),
+                source: src(user.effort.is_some() || user.level.is_some()).into(),
                 patch: json!({"reasoning": body["reasoning"]}),
             });
             settings.push(desc);
@@ -351,7 +364,7 @@ impl Xai {
             body,
             applied,
             warnings,
-            notes: conv.notes,
+            notes: level_note.into_iter().chain(conv.notes).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: false,
@@ -574,7 +587,7 @@ mod tests {
         assert_eq!(p.url, "https://api.x.ai/v1/responses");
         assert_eq!(p.dialect, DIALECT);
         let b = &p.body;
-        assert_eq!(b["reasoning"], json!({"effort": "xhigh"}));
+        assert_eq!(b["reasoning"], json!({"effort": "high"}), "xAI's default level");
         assert_eq!(b["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!((b["store"].clone(), b["stream"].clone()), (json!(false), json!(true)));
         assert_eq!((b["safety_identifier"].clone(), b["prompt_cache_key"].clone()), (json!("u-hash"), json!("tg-3")));
@@ -597,12 +610,27 @@ mod tests {
                 "prompt_cache_key"
             ]
         );
-        assert_eq!(p.settings, vec!["effort xhigh"]);
-        assert!(p.warnings.is_empty() && p.notes.is_empty());
+        assert_eq!(p.settings, vec!["effort high"]);
+        assert!(p.warnings.is_empty());
+        assert_eq!(p.notes, ["reasoning effort is high by default, not the highest (xhigh); add +h for the highest"]);
+        // +h / +l; grok-4.5's default is its top; grok-4.3 defaults to low; grok-4.20 reasons at a fixed depth.
+        assert_eq!(prep("grok-4.7", &[flag("h")]).await.body["reasoning"], json!({"effort": "xhigh"}));
+        assert_eq!(
+            prep("grok-4.7", &[flag("l")]).await.body["reasoning"],
+            json!({"effort": "low"}),
+            "4.7 cannot turn it off"
+        );
+        assert_eq!(prep("grok-4.3", &[flag("l")]).await.body["reasoning"], json!({"effort": "none"}));
+        let p = prep("grok-4.5", &[]).await;
+        assert_eq!((p.body["reasoning"].clone(), p.notes.len()), (json!({"effort": "high"}), 0));
+        assert_eq!(prep("grok-4.3", &[]).await.body["reasoning"], json!({"effort": "low"}));
+        let p = prep("grok-4.20", &[flag("h")]).await;
+        assert!(p.body.get("reasoning").is_none() && p.notes.is_empty());
+        assert!(err("grok-4.20-non-reasoning", &[flag("h")]).await.contains("+h"));
 
-        assert_eq!(prep("grok-4.6", &[]).await.body["reasoning"]["effort"], "xhigh");
+        assert_eq!(prep("grok-4.6", &[]).await.body["reasoning"]["effort"], "high");
         assert_eq!(prep("grok-4.5", &[]).await.body["reasoning"]["effort"], "high");
-        assert_eq!(prep("grok-4.3", &[]).await.body["reasoning"]["effort"], "xhigh");
+        assert_eq!(prep("grok-4.3", &[flag("h")]).await.body["reasoning"]["effort"], "xhigh");
         // No effort parameter: nothing sent; non-reasoning: no encrypted reasoning either.
         let p = prep("grok-4.20", &[]).await;
         assert!(p.body.get("reasoning").is_none());
@@ -642,7 +670,7 @@ mod tests {
         assert_eq!(err("grok-4.7", &[kv("v", "low")]).await, "`grok-4.7` has no verbosity setting");
         assert!(err("grok-4.7", &[kv("tier", "flex")]).await.contains("tiers: priority, fast"));
         assert!(err("grok-4.7", &[kv("budget", "100")]).await.contains("no reasoning token budget"));
-        assert!(err("grok-4.7", &[flag("W")]).await.contains("no image size/aspect options"));
+        assert!(err("grok-4.7", &[kv("ar", "16:9")]).await.contains("no image size/aspect options"));
         assert_eq!(err("grok-4.7", &[kv("p", "xai")]).await, "`p=` (provider choice) does not apply to xAI");
     }
 
@@ -657,7 +685,7 @@ mod tests {
         assert_eq!(content[1]["detail"], "high");
         assert_eq!(content[2]["type"], "input_file");
         // Inline files did not trigger attachment_search (2026-11-13): said only when the usage reports it.
-        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        assert!(p.notes.iter().all(|n| n.starts_with("reasoning effort")), "{:?}", p.notes);
         assert!(p.applied.iter().any(|a| a.patch == json!({"input_image": {"detail": "high"}})));
     }
 
@@ -804,10 +832,10 @@ mod tests {
         let p = prep("grok-4.7", &[flag("si")]).await;
         assert_eq!(p.body["tools"], json!([{"type": "web_search"}, {"type": "image_generation"}]));
         assert_eq!(p.body["include"], json!(["reasoning.encrypted_content", "web_search_call.action.sources"]));
-        assert_eq!(p.settings, vec!["effort xhigh", "web search", "image generation"]);
+        assert_eq!(p.settings, vec!["effort high", "web search", "image generation"]);
         assert!(p.applied.iter().any(|a| a.patch == json!({"tools": [{"type": "image_generation"}]})));
         // The tool takes no size, ratio, quality or background.
-        assert!(err("grok-4.7", &[flag("iW")]).await.contains("takes no image size or aspect ratio"));
+        assert!(err("grok-4.7", &[flag("i"), kv("ar", "16:9")]).await.contains("takes no image size or aspect ratio"));
         assert!(
             err("grok-4.7", &[flag("i"), kv("q", "medium")])
                 .await

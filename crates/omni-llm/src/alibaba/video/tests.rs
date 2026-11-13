@@ -167,7 +167,7 @@ async fn defaults_are_the_largest_resolution_without_watermark() {
 
 #[tokio::test]
 async fn options_are_checked_per_model() {
-    let p = prep("happyhorse-1.1-t2v", &[flag("1W"), kv("sec", "10")]).await.unwrap();
+    let p = prep("happyhorse-1.1-t2v", &[kv("size", "1K"), kv("ar", "16:9"), kv("sec", "10")]).await.unwrap();
     assert_eq!(
         p.body["parameters"],
         json!({"resolution": "720P", "ratio": "16:9", "duration": 10, "watermark": false})
@@ -178,10 +178,13 @@ async fn options_are_checked_per_model() {
     );
     assert_eq!(prep("happyhorse-1.1-t2v", &[kv("ar", "4:5")]).await.unwrap().body["parameters"]["ratio"], "4:5");
     assert!(prep_err("wan2.7-t2v", &[kv("ar", "4:5")]).await.contains("ratios: 16:9, 9:16, 1:1, 4:3, 3:4"));
-    assert!(prep_err("happyhorse-1.1-t2v", &[flag("4")]).await.contains("sizes: 1K (720P), 2K (1080P)"));
-    assert!(prep_err("wanx2.1-t2v-turbo", &[flag("2")]).await.contains("sizes: 1K (720P)"));
+    assert!(prep_err("happyhorse-1.1-t2v", &[kv("size", "4K")]).await.contains("sizes: 1K (720P), 2K (1080P)"));
+    assert!(prep_err("wanx2.1-t2v-turbo", &[kv("size", "2K")]).await.contains("sizes: 1K (720P)"));
     // `size` from tier and ratio.
-    assert_eq!(prep("wan2.6-t2v", &[flag("1w")]).await.unwrap().body["parameters"]["size"], "1088*832");
+    assert_eq!(
+        prep("wan2.6-t2v", &[kv("size", "1K"), kv("ar", "4:3")]).await.unwrap().body["parameters"]["size"],
+        "1088*832"
+    );
     assert!(prep_err("wan2.6-t2v", &[kv("ar", "21:9")]).await.contains("at 1080P; ratios: 16:9, 9:16, 1:1, 4:3, 3:4"));
     // Lengths.
     assert_eq!(prep("wan2.5-t2v-preview", &[kv("sec", "10")]).await.unwrap().body["parameters"]["duration"], 10);
@@ -218,7 +221,7 @@ async fn images_by_model_family() {
     let e = prep_with("happyhorse-1.1-i2v", &[], &two(), &blobs).await.unwrap_err();
     assert!(e.message.contains("takes one image"), "{}", e.message);
     // Its ratio follows the image: not sent, noted.
-    let p = prep_with("happyhorse-1.1-i2v", &[flag("W")], &one(), &blobs).await.unwrap();
+    let p = prep_with("happyhorse-1.1-i2v", &[kv("ar", "16:9")], &one(), &blobs).await.unwrap();
     assert!(p.body["parameters"].get("ratio").is_none());
     assert_eq!(p.notes, ["ℹ️ aspect ratio 16:9 not sent: image-to-video takes the image's aspect ratio"]);
     // References need a prompt.
@@ -284,7 +287,7 @@ async fn a_reply_to_an_alibaba_video_passes_its_url() {
     let (img, bi) = photo(PNG, "image/png", false);
     let p = prep_with(
         "happyhorse-1.0-video-edit",
-        &[flag("W")],
+        &[kv("ar", "16:9")],
         &reply_to_video("换衣服", vec![img.clone()]),
         &Blobs(vec![bi.clone()]),
     )
@@ -323,7 +326,7 @@ async fn a_reply_to_an_alibaba_video_passes_its_url() {
     // Wan 3.0: everything a reference; its ratio and length are Wan's.
     let p = prep_with(
         "wan3.0-video",
-        &[flag("W"), kv("sec", "8")],
+        &[kv("ar", "16:9"), kv("sec", "8")],
         &reply_to_video("向后延长", vec![img]),
         &Blobs(vec![bi]),
     )
@@ -454,7 +457,7 @@ async fn run(p: &Prepared, origin: &str) -> (Result<Value, LlmError>, CallOutcom
 async fn a_task_is_created_asynchronously_polled_and_downloaded() {
     let (origin, seen) =
         task_server(created(), vec![pending("PENDING"), pending("RUNNING"), succeeded()], "/output/video_url").await;
-    let p = prepared(&origin, "happyhorse-1.1-t2v", &[flag("1")]).await;
+    let p = prepared(&origin, "happyhorse-1.1-t2v", &[kv("size", "1K")]).await;
     let (r, outcome, evs) = run(&p, &origin).await;
     let native = r.unwrap();
     assert_eq!(native["output"]["video_url"], format!("{origin}/files/video.mp4"), "kept for edits of replies");

@@ -240,6 +240,13 @@ impl RouteCaps for Caps {
     fn can_disable_reasoning(&self) -> bool {
         self.0.is_none_or(|s| s.thinking.can_disable())
     }
+    /// GLM-5.2 and later: "Default is `max`" (the chat API reference), the top level.
+    fn default_effort(&self) -> Option<String> {
+        self.0.and_then(|s| s.thinking.efforts().first()).map(|e| e.to_string())
+    }
+    fn fixed_reasoning(&self) -> bool {
+        self.0.is_some_and(|s| matches!(s.thinking, Thinking::Always(l) if l.is_empty()))
+    }
     fn budget(&self) -> bool {
         false
     }
@@ -298,7 +305,7 @@ impl Provider for Zhipu {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request("`p=` (provider choice) does not apply to Zhipu BigModel"));
         }
@@ -312,8 +319,10 @@ impl Provider for Zhipu {
             )));
         }
         request::validate(model, &req, &Caps(spec)).map_err(LlmError::request)?;
+        let level_note = request::resolve_reasoning(model, &mut req, &Caps(spec)).map_err(LlmError::request)?;
 
-        let (messages, notes) = chat_messages(input.history, model, spec, blobs).await?;
+        let (messages, mut notes) = chat_messages(input.history, model, spec, blobs).await?;
+        notes.splice(0..0, level_note);
         let mut body = json!({
             "model": model,
             "messages": messages,
@@ -358,7 +367,10 @@ impl Provider for Zhipu {
             for (k, v) in &reasoning {
                 body[k] = v.clone();
             }
-            applied.push(Applied { source: source(user.effort.is_some()).into(), patch: Value::Object(reasoning) });
+            applied.push(Applied {
+                source: source(user.effort.is_some() || user.level.is_some()).into(),
+                patch: Value::Object(reasoning),
+            });
         }
 
         // Output budget: explicit (the default, 64K, would cut 128K models short).
@@ -1032,7 +1044,7 @@ mod tests {
             ("glm-5.3", &[kv("p", "z-ai")], "does not apply to Zhipu BigModel"),
             ("glm-5.3", &[kv("tier", "flex")], "no service tiers"),
             ("glm-5.3", &[kv("budget", "100")], "no reasoning token budget"),
-            ("glm-5.3", &[flag("W")], "no image size"),
+            ("glm-5.3", &[kv("ar", "16:9")], "no image size"),
         ];
         for (model, opts, want) in cases {
             let e = prepare(model, opts, &h).await.unwrap_err();

@@ -5,7 +5,7 @@
 //! specs  := spec (',' spec)*              -- several specs = several models in parallel
 //! spec   := model ('+' option)*
 //! model  := alias | model id               -- e.g. `c`, `` (the empty alias), `anthropic/claude-opus-5.5`
-//! option := flag | key=value               -- e.g. `s`, `4W`, `e=low`
+//! option := flag | key=value               -- e.g. `s`, `h`, `e=low`, `size=4K`
 //! ```
 //!
 //! The marker is configurable per deployment (see [`check_marker`] for what is

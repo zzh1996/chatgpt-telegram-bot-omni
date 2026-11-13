@@ -273,7 +273,7 @@ async fn defaults_are_the_largest_resolution_with_audio_and_no_watermark() {
 
 #[tokio::test]
 async fn options_are_checked_per_model() {
-    let p = prep(S20, &[flag("1W"), kv("sec", "10")]).await.unwrap();
+    let p = prep(S20, &[kv("size", "1K"), kv("ar", "16:9"), kv("sec", "10")]).await.unwrap();
     assert_eq!(
         (p.body["resolution"].clone(), p.body["ratio"].clone(), p.body["duration"].clone()),
         (json!("720p"), json!("16:9"), json!(10))
@@ -284,9 +284,9 @@ async fn options_are_checked_per_model() {
     );
     assert_eq!(p.applied.iter().filter(|a| a.source == "option").count(), 3);
     assert_eq!(prep(S25, &[kv("ar", "21:9")]).await.unwrap().body["ratio"], "21:9");
-    assert_eq!(prep(S20, &[flag("4")]).await.unwrap().body["resolution"], "4k");
-    assert!(prep_err(S25, &[flag("4")]).await.contains("sizes: 1K (720p), 2K (1080p)"));
-    assert!(prep_err(FAST, &[flag("2")]).await.contains("sizes: 1K (720p)"));
+    assert_eq!(prep(S20, &[kv("size", "4K")]).await.unwrap().body["resolution"], "4k");
+    assert!(prep_err(S25, &[kv("size", "4K")]).await.contains("sizes: 1K (720p), 2K (1080p)"));
+    assert!(prep_err(FAST, &[kv("size", "2K")]).await.contains("sizes: 1K (720p)"));
     assert!(prep_err(S25, &[kv("ar", "5:4")]).await.contains("ratios: 16:9, 4:3, 1:1, 3:4, 9:16, 21:9"));
     assert!(prep_err(S25, &[kv("sec", "31")]).await.contains("videos of 4–30 s"));
     assert!(prep_err(S20, &[kv("sec", "16")]).await.contains("videos of 4–15 s"));
@@ -310,7 +310,7 @@ async fn drafts_are_480p_on_seedance_2_5() {
     let p = prep(S25, &[kv("q", "draft")]).await.unwrap();
     assert_eq!((p.body["draft"].clone(), p.body["resolution"].clone()), (json!(true), json!("480p")));
     assert!(p.settings.contains(&"draft (480p)".to_string()), "{:?}", p.settings);
-    assert!(prep_err(S25, &[kv("q", "draft"), flag("2")]).await.contains("a draft is 480p"));
+    assert!(prep_err(S25, &[kv("q", "draft"), kv("size", "2K")]).await.contains("a draft is 480p"));
     assert!(prep_err(S25, &[kv("q", "high")]).await.contains("modes: draft"));
     assert!(prep_err(S20, &[kv("q", "draft")]).await.contains("draft mode is on Seedance 2.5"));
     assert!(prep_err(S25, &[kv("q", "final")]).await.contains("`+q=final` to a draft video"));
@@ -368,11 +368,11 @@ async fn ratios_a_mode_cannot_use_are_noted_not_sent() {
     let (a, ba) = photo(PNG, "image/png", false);
     let blobs = Blobs(vec![ba]);
     // 2.5 keeps the first frame's ratio (Ark: "仅支持 adaptive").
-    let p = prep_with(S25, &[flag("W")], &[user(vec![a.clone()])], &blobs).await.unwrap();
+    let p = prep_with(S25, &[kv("ar", "16:9")], &[user(vec![a.clone()])], &blobs).await.unwrap();
     assert!(p.body.get("ratio").is_none());
     assert_eq!(p.notes, ["ℹ️ aspect ratio 16:9 not sent: Seedance 2.5 keeps the first frame's aspect ratio"]);
     // 2.0 crops the image to it.
-    let p = prep_with(S20, &[flag("W")], &[user(vec![a])], &blobs).await.unwrap();
+    let p = prep_with(S20, &[kv("ar", "16:9")], &[user(vec![a])], &blobs).await.unwrap();
     assert_eq!(p.body["ratio"], "16:9");
     assert!(p.notes.is_empty());
     // Web search is not offered (no published price).
@@ -413,7 +413,7 @@ async fn a_reply_to_a_seedance_video_passes_its_url() {
     let now = unix_now();
     let answer = video_answer(DIALECT, S25, task("cgt-prev", S25, now - 600, false));
     let history = vec![Turn::user_text("一只猫"), answer.clone(), Turn::user_text("把猫换成狗")];
-    let p = prep_with(S25, &[flag("W"), kv("sec", "8")], &history, &Blobs(vec![])).await.unwrap();
+    let p = prep_with(S25, &[kv("ar", "16:9"), kv("sec", "8")], &history, &Blobs(vec![])).await.unwrap();
     let c = p.body["content"].as_array().unwrap();
     assert_eq!(c[0], json!({"type": "text", "text": "把猫换成狗"}));
     assert_eq!(c[1]["role"], "reference_video");
@@ -423,7 +423,7 @@ async fn a_reply_to_a_seedance_video_passes_its_url() {
     assert!(p.body.get("ratio").is_none() && p.body.get("duration").is_none());
     assert!(p.notes[0].starts_with("ℹ️ aspect ratio 16:9, sec=8 not sent"), "{:?}", p.notes);
     // 2.0 takes them.
-    let p = prep_with(S20, &[flag("W"), kv("sec", "8")], &history, &Blobs(vec![])).await.unwrap();
+    let p = prep_with(S20, &[kv("ar", "16:9"), kv("sec", "8")], &history, &Blobs(vec![])).await.unwrap();
     assert_eq!((p.body["ratio"].clone(), p.body["duration"].clone()), (json!("16:9"), json!(8)));
     // After 24 hours the URL is gone.
     let old = video_answer(DIALECT, S25, task("cgt-old", S25, now - 25 * 3600, false));
@@ -455,11 +455,12 @@ async fn the_final_video_of_a_draft() {
     assert_eq!(p.settings, ["final video of the draft", "resolution 1080p", "no watermark"]);
     assert_eq!(p.notes, ["ℹ️ the message's text is not sent: the final video reuses the draft's prompt"]);
     // Length and ratio are the draft's.
-    let p = prep_with(S25, &[kv("q", "final"), flag("W"), kv("sec", "5")], &history, &Blobs(vec![])).await.unwrap();
+    let p =
+        prep_with(S25, &[kv("q", "final"), kv("ar", "16:9"), kv("sec", "5")], &history, &Blobs(vec![])).await.unwrap();
     assert!(p.body.get("ratio").is_none() && p.body.get("duration").is_none());
     assert!(p.notes.iter().any(|n| n.contains("reuses the draft's aspect ratio and length")), "{:?}", p.notes);
     // Only 1080p, the same model, a draft, within 14 days.
-    let e = prep_with(S25, &[kv("q", "final"), flag("1")], &history, &Blobs(vec![])).await.unwrap_err();
+    let e = prep_with(S25, &[kv("q", "final"), kv("size", "1K")], &history, &Blobs(vec![])).await.unwrap_err();
     assert!(e.message.contains("is 1080p"), "{}", e.message);
     let other = vec![
         Turn::user_text("一只猫"),
@@ -505,7 +506,7 @@ async fn ids_outside_the_table() {
         "doubao-seedance-3-0-270101",
     ] {
         assert!(!ark().knows(id), "{id}");
-        for options in [&[][..], &[flag("2")]] {
+        for options in [&[][..], &[kv("size", "2K")]] {
             assert_eq!(
                 prep_err(id, options).await,
                 format!(
@@ -564,7 +565,7 @@ async fn a_task_is_created_polled_and_downloaded() {
         "/content/video_url",
     )
     .await;
-    let p = prepared(&origin, S20, &[flag("1")]).await;
+    let p = prepared(&origin, S20, &[kv("size", "1K")]).await;
     let (r, outcome, evs) = run(&p, &origin).await;
     let native = r.unwrap();
     assert_eq!(native["content"]["video_url"], format!("{origin}/files/video.mp4"), "kept for edits of replies");

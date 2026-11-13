@@ -161,7 +161,7 @@ async fn invalid_options_are_rejected() {
     assert!(e.contains("does not apply to Moonshot"), "{e}");
     let e = prepare_err("kimi-k3", &[kv("v", "high")]).await;
     assert!(e.contains("no verbosity"), "{e}");
-    let e = prepare_err("kimi-k3", &[flag("4")]).await;
+    let e = prepare_err("kimi-k3", &[kv("size", "4K")]).await;
     assert!(e.contains("no image size"), "{e}");
     assert!(prepare("kimi-k3", &[flag("q")], &[Turn::user_text("hi")]).await.is_err());
     // tier=default changes nothing.

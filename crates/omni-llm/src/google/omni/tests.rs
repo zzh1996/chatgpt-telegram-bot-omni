@@ -99,7 +99,7 @@ async fn defaults_are_4k_in_the_background() {
 
 #[tokio::test]
 async fn options_map_to_the_response_format() {
-    let p = prep(OMNI, &[flag("1H"), kv("sec", "15")]).await.unwrap();
+    let p = prep(OMNI, &[kv("size", "1K"), kv("ar", "9:16"), kv("sec", "15")]).await.unwrap();
     assert_eq!(
         p.body["response_format"],
         json!({"type": "video", "resolution": "720p", "aspect_ratio": "9:16", "duration": "15s"}),
@@ -108,12 +108,12 @@ async fn options_map_to_the_response_format() {
     assert_eq!(p.settings, ["text-to-video", "resolution 720p", "aspect ratio 9:16", "15 s"]);
     let sources: Vec<&str> = p.applied.iter().map(|a| a.source.as_str()).collect();
     assert_eq!(sources[..3], ["option", "option", "option"]);
-    let p = prep(OMNI, &[flag("2"), kv("ar", "16:9")]).await.unwrap();
+    let p = prep(OMNI, &[kv("size", "2K"), kv("ar", "16:9")]).await.unwrap();
     assert_eq!(
         p.body["response_format"],
         json!({"type": "video", "resolution": "1080p", "delivery": "uri", "aspect_ratio": "16:9"})
     );
-    assert!(err(OMNI, &[flag("w")]).await.contains("ratios: 16:9, 9:16"));
+    assert!(err(OMNI, &[kv("ar", "4:3")]).await.contains("ratios: 16:9, 9:16"));
     assert!(err(OMNI, &[kv("sec", "16")]).await.contains("videos of 3–15 s (sec=16)"));
     assert!(err(OMNI, &[kv("sec", "2")]).await.contains("3–15 s"));
     for (opt, what) in [

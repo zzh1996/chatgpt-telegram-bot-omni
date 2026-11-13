@@ -215,7 +215,7 @@ const TOPICS: &[Topic] = &[
         title: "⚙️ Options: search, reasoning, sizes…",
         commands: &[],
         who: Who::Everyone,
-        body: r#"Options go between the model and `$`, each after a `+`: `c+s$What is new in Rust?`. Letters can be written together, `g+4W$` is 4K and 16:9; options with `=` each need their own `+`: `c+s+e=low$`.
+        body: r#"Options go between the model and `$`, each after a `+`: `c+s$What is new in Rust?`. Letters can be written together, `c+sh$` is web search at the highest reasoning level; options with `=` each need their own `+`: `g+size=4K+ar=16:9$`.
 
 | Option | What it does |
 |---|---|
@@ -224,12 +224,13 @@ const TOPICS: &[Topic] = &[
 | `u` | read the web pages your message links to |
 | `m` | maps; your latest Telegram location is your position |
 | `i` | draw images in a chat |
+| `h` | the model's highest reasoning level |
+| `l` | its lowest: reasoning off where it can be turned off |
 | `e=high` | reasoning effort, one of the model's levels; `e=none` turns reasoning off |
 | `budget=8000` | reasoning token budget (models that use one) |
 | `v=low` | answer length: `low`, `medium` or `high` |
-| `1` `2` `4` | image size 1K, 2K, 4K (videos: 720p, 1080p, 4K) |
-| `S` `W` `H` `w` `h` | aspect ratio 1:1, 16:9, 9:16, 4:3, 3:4 |
-| `ar=21:9` | any aspect ratio the model supports |
+| `size=4K` | image size `1K`, `2K` or `4K` (videos: 720p, 1080p, 4K) |
+| `ar=16:9` | aspect ratio, any the model supports |
 | `q=high` | image or video quality, one of the model's levels |
 | `n=4` | how many images |
 | `bg=transparent` | image background: `auto`, `opaque` or `transparent` |
@@ -238,14 +239,14 @@ const TOPICS: &[Topic] = &[
 | `tier=flex` | service tier: `flex` is cheaper; faster tiers only for priority users |
 
 - Which options a model has depends on it and its platform. Every option is checked before anything is sent: one the model does not have, or a value it does not have, is an error that says what it has. Anything not in this table is an error.
-- Without options every request uses the most the model allows: the highest reasoning effort, the longest output, the best image quality. I never add a system prompt.
+- Without options a request reasons at the level the platform recommends for the model (its default); when that is not the highest, the answer says so, and `h` gives the highest. Everything else is the most the model allows: the longest output, the best image quality. I never add a system prompt.
 
 ::: More about p= and tier=
 - `p=` names another official provider of the model on OpenRouter, by OpenRouter's name for it; several, separated by a vertical bar, mean any of them. It is an error on a platform's own API.
 - `tier=flex` is cheaper and slower where the platform has it. `tier=priority` and fast modes cost more and are only for priority users. `tier=default` changes nothing.
 :::"#,
         title_zh: "⚙️ 选项：搜索、推理、尺寸……",
-        body_zh: r#"选项写在模型和 `$` 之间，每个前面加 `+`：`c+s$Rust 最近有什么新消息？`。字母可以连写，`g+4W$` 就是 4K、16:9；带 `=` 的选项各自需要一个 `+`：`c+s+e=low$`。
+        body_zh: r#"选项写在模型和 `$` 之间，每个前面加 `+`：`c+s$Rust 最近有什么新消息？`。字母可以连写，`c+sh$` 就是网页搜索加最高推理强度；带 `=` 的选项各自需要一个 `+`：`g+size=4K+ar=16:9$`。
 
 | 选项 | 作用 |
 |---|---|
@@ -254,12 +255,13 @@ const TOPICS: &[Topic] = &[
 | `u` | 读取你的消息里链接的网页 |
 | `m` | 地图；你最近发的 Telegram 位置就是你所在的位置 |
 | `i` | 在对话里画图 |
+| `h` | 该模型最高的推理强度 |
+| `l` | 最低的推理强度：能关闭推理的就关闭 |
 | `e=high` | 推理强度，取该模型的档位之一；`e=none` 关闭推理 |
 | `budget=8000` | 推理 token 预算（使用预算的模型） |
 | `v=low` | 回答的详细程度：`low`、`medium` 或 `high` |
-| `1` `2` `4` | 图片尺寸 1K、2K、4K（视频：720p、1080p、4K） |
-| `S` `W` `H` `w` `h` | 宽高比 1:1、16:9、9:16、4:3、3:4 |
-| `ar=21:9` | 模型支持的任意宽高比 |
+| `size=4K` | 图片尺寸 `1K`、`2K` 或 `4K`（视频：720p、1080p、4K） |
+| `ar=16:9` | 宽高比，模型支持的任意一种 |
 | `q=high` | 图片或视频的质量，取该模型的档位之一 |
 | `n=4` | 生成几张图 |
 | `bg=transparent` | 图片背景：`auto`、`opaque` 或 `transparent` |
@@ -268,7 +270,7 @@ const TOPICS: &[Topic] = &[
 | `tier=flex` | 服务等级：`flex` 更便宜；更快的等级只给优先用户 |
 
 - 一个模型有哪些选项，取决于模型本身和它的平台。所有选项在发出前都会检查：模型没有的选项或取值会报错，并告诉你它有哪些。表里没有的选项都会报错。
-- 不加选项时，每个请求都用模型允许的最大值：最高的推理强度、最长的输出、最好的图片质量。我从不额外加 system prompt。
+- 不加选项时，推理强度用平台给这个模型推荐的默认档位；不是最高档时回答里会注明，加 `h` 就是最高档。其他都用模型允许的最大值：最长的输出、最好的图片质量。我从不额外加 system prompt。
 
 ::: 关于 p= 和 tier=
 - `p=` 指定该模型在 OpenRouter 上的另一个官方提供方，用 OpenRouter 对它的叫法；用竖线隔开几个，表示其中任意一个都可以。在平台自己的 API 上会报错。
@@ -313,7 +315,7 @@ const TOPICS: &[Topic] = &[
 - To edit, attach images, or reply to an image or video they made, saying what to change.
 - They take one prompt, not a conversation: replying to an answer they cannot edit is an error.
 
-**Options**: size `1` `2` `4`, aspect ratio `S` `W` `H` `w` `h` or `ar=`, quality `q=`, how many `n=`, background `bg=`, video length `sec=`. By default: the highest quality, the largest size and no watermark. Values a model does not have are errors that list the valid ones.
+**Options**: size `size=`, aspect ratio `ar=`, quality `q=`, how many `n=`, background `bg=`, video length `sec=`. By default: the highest quality, the largest size and no watermark. Values a model does not have are errors that list the valid ones.
 
 - A preview shows while an image is drawn. Videos are made in the background and keep going if the bot restarts.
 - Reply /raw to an answer for the original files."#,
@@ -324,7 +326,7 @@ const TOPICS: &[Topic] = &[
 - 想编辑，就附上图片，或者回复它生成的图片或视频，写明要改什么。
 - 它们只接收一条提示词，不接收对话：回复一条它们没法编辑的回答会报错。
 
-**选项**：尺寸 `1` `2` `4`，宽高比 `S` `W` `H` `w` `h` 或 `ar=`，质量 `q=`，张数 `n=`，背景 `bg=`，视频长度 `sec=`。默认是最高质量、最大尺寸、不加水印。模型没有的取值会报错，并列出可选值。
+**选项**：尺寸 `size=`，宽高比 `ar=`，质量 `q=`，张数 `n=`，背景 `bg=`，视频长度 `sec=`。默认是最高质量、最大尺寸、不加水印。模型没有的取值会报错，并列出可选值。
 
 - 画图过程中会先显示预览。视频在后台生成，bot 重启后也会接着生成。
 - 对回答回复 /raw，可以拿到原始文件。"#,

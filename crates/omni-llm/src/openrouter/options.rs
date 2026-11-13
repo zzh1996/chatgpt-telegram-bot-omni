@@ -161,6 +161,23 @@ impl RouteCaps for OrCaps<'_> {
         self.info.and_then(|i| i.reasoning.as_ref()).is_some_and(|r| r.supports_max_tokens == Some(true))
     }
 
+    /// The catalog's `default_effort` when it is one of the model's levels: OpenRouter's
+    /// documented default for the model (2026-11-13 it matches the vendors' for most of the
+    /// configured models; Claude Opus 5.5, Gemini 3.1 Pro / 4 Hydrogen / Nano Banana 2.1 and
+    /// GPT-5.4 differ).
+    fn default_effort(&self) -> Option<String> {
+        let r = self.info?.reasoning.as_ref()?;
+        let d = r.default_effort.clone()?;
+        r.supported_efforts.as_ref()?.contains(&d).then_some(d)
+    }
+
+    /// Mandatory reasoning without levels or a budget: nothing to set.
+    fn fixed_reasoning(&self) -> bool {
+        self.info.and_then(|i| i.reasoning.as_ref()).is_some_and(|r| {
+            r.mandatory == Some(true) && r.supported_efforts.is_none() && r.supports_max_tokens != Some(true)
+        })
+    }
+
     fn verbosity(&self) -> bool {
         self.info.is_some_and(|i| i.supports("verbosity"))
     }
@@ -240,6 +257,7 @@ pub fn overlay(base: &Requested, over: &Requested) -> Requested {
     }
     take!(effort);
     take!(budget);
+    take!(level);
     take!(verbosity);
     take!(image_size);
     take!(aspect_ratio);
@@ -249,17 +267,25 @@ pub fn overlay(base: &Requested, over: &Requested) -> Requested {
     take!(count);
     take!(background);
     take!(seconds);
+    // One reasoning setting wins: the later one (a preset's e= gives way to a typed +h).
     if over.effort.is_some() {
         r.budget = None;
+        r.level = None;
     }
     if over.budget.is_some() {
         r.effort = None;
+        r.level = None;
+    }
+    if over.level.is_some() {
+        r.effort = None;
+        r.budget = None;
     }
     r
 }
 
-/// Build the plan: defaults (the highest the model officially offers) plus the
-/// validated options `req` (`user` = what the user typed, for attribution).
+/// Build the plan: defaults (the reasoning level settled by
+/// `request::resolve_reasoning`, the highest image detail and output budget)
+/// plus the validated options `req` (`user` = what the user typed, for attribution).
 pub fn plan(
     model: &str,
     info: Option<&ModelInfo>,
@@ -273,22 +299,16 @@ pub fn plan(
     let mut applied = Vec::new();
     let src = |by_user: bool| if by_user { "option" } else { "default" };
 
-    // Reasoning: the highest level by default.
-    let ri = info.and_then(|i| i.reasoning.as_ref());
+    // Reasoning: the level settled by `request::resolve_reasoning` (the catalog's default,
+    // +h, +l, e=); none settled: OpenRouter's (and the vendor's) own default.
     let none_listed = caps.efforts().is_some_and(|l| l.iter().any(|x| x == "none"));
     let reasoning = match (&req.effort, req.budget) {
         (Some(e), _) if e == "none" && !none_listed => Reasoning::Off,
         (Some(e), _) => Reasoning::Effort(e.clone()),
         (None, Some(n)) => Reasoning::Budget(n),
-        (None, None) => match ri {
-            None => Reasoning::Unset,
-            Some(r) => match r.supported_efforts.as_ref().and_then(|l| l.first()) {
-                Some(top) => Reasoning::Effort(top.clone()),
-                None => Reasoning::On,
-            },
-        },
+        (None, None) => Reasoning::Unset,
     };
-    let user_reasoning = user.effort.is_some() || user.budget.is_some();
+    let user_reasoning = user.effort.is_some() || user.budget.is_some() || user.level.is_some();
     let rdesc = match &reasoning {
         Reasoning::Unset => None,
         Reasoning::On => Some("reasoning on".to_string()),
@@ -397,7 +417,7 @@ mod tests {
             "id": "openai/gpt-6.1-sol",
             "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
             "supported_parameters": ["reasoning", "max_tokens", "verbosity"],
-            "reasoning": {"supported_efforts": efforts, "mandatory": false},
+            "reasoning": {"supported_efforts": efforts, "default_effort": "medium", "mandatory": false},
             "top_provider": {"max_completion_tokens": 128000}
         }))
         .unwrap()
@@ -407,9 +427,15 @@ mod tests {
         serde_json::from_value(json!({"tag": tag, "native_tools": tools})).unwrap()
     }
 
+    /// The reasoning level `resolve_reasoning` settles, then the plan (as `prepare` does).
+    fn resolved(caps: &OrCaps<'_>, mut req: Requested) -> (Requested, Option<String>) {
+        let note = request::resolve_reasoning(caps.model, &mut req, caps).unwrap();
+        (req, note)
+    }
+
     #[test]
-    fn defaults_are_the_highest_level() {
-        let i = info(&["max", "high", "low", "none"]);
+    fn defaults_are_the_catalog_ones() {
+        let i = info(&["max", "high", "medium", "low", "none"]);
         let eps =
             vec![ep("openai", json!({"openrouter:web_search": {"type": "web_search"}})), ep("openai/flex", json!({}))];
         let caps = OrCaps {
@@ -420,20 +446,47 @@ mod tests {
             dialect: Dialect::Responses,
         };
         let none = Requested::default();
-        let p = plan("openai/gpt-6.1-sol", Some(&i), &caps, &none, &none, Some(1000)).unwrap();
-        assert_eq!(p.reasoning, Reasoning::Effort("max".into()));
+        let (req, note) = resolved(&caps, none.clone());
+        let p = plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &none, Some(1000)).unwrap();
+        assert_eq!(p.reasoning, Reasoning::Effort("medium".into()), "the catalog's default_effort");
+        assert_eq!(
+            note.as_deref(),
+            Some("reasoning effort is medium by default, not the highest (max); add +h for the highest")
+        );
         assert_eq!(p.summary, Some("detailed"));
         assert_eq!(p.image_detail, Some("high"));
-        assert_eq!(p.described, vec!["effort max"]);
+        assert_eq!(p.described, vec!["effort medium"]);
+        // +h: the top level; +l: off (none is listed).
+        let h = request::parse(&[OptionToken::Flag("h".into())]).unwrap();
+        let (req, note) = resolved(&caps, h.clone());
+        assert_eq!(
+            plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &h, None).unwrap().reasoning,
+            Reasoning::Effort("max".into())
+        );
+        assert!(note.is_none());
+        let l = request::parse(&[OptionToken::Flag("l".into())]).unwrap();
+        let (req, _) = resolved(&caps, l.clone());
+        assert_eq!(
+            plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &l, None).unwrap().reasoning,
+            Reasoning::Effort("none".into())
+        );
         let req =
             request::parse(&[OptionToken::Flag("sc".into()), OptionToken::KeyValue("tier".into(), "flex".into())])
                 .unwrap();
-        let p = plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &req, None).unwrap();
+        let (r, _) = resolved(&caps, req.clone());
+        let p = plan("openai/gpt-6.1-sol", Some(&i), &caps, &r, &req, None).unwrap();
         assert_eq!(p.providers, vec!["openai", "openai/flex"]);
-        assert_eq!(p.described, vec!["effort max", "web search", "code execution", "tier flex"]);
+        assert_eq!(p.described, vec!["effort medium", "web search", "code execution", "tier flex"]);
         // URL fetching: OpenAI has none officially.
         let req = request::parse(&[OptionToken::Flag("u".into())]).unwrap();
         assert!(plan("openai/gpt-6.1-sol", Some(&i), &caps, &req, &req, None).is_err());
+        // No catalog default: nothing is sent (the vendor's own default).
+        let bare: ModelInfo =
+            serde_json::from_value(json!({"id": "x/y", "reasoning": {"supported_efforts": ["high", "low"]}})).unwrap();
+        let caps = OrCaps { model: "x/y", info: Some(&bare), endpoints: &[], pinned: vec![], dialect: Dialect::Chat };
+        let (req, note) = resolved(&caps, Requested::default());
+        assert!(req.effort.is_none() && note.is_none());
+        assert_eq!(plan("x/y", Some(&bare), &caps, &req, &req, None).unwrap().reasoning, Reasoning::Unset);
     }
 
     #[test]

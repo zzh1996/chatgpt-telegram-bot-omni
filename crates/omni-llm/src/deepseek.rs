@@ -77,6 +77,8 @@ const MAX_TOKENS_LIMIT: u64 = 393_216;
 /// first. The aliases the API also accepts (`minimal` → low, `medium`/`xhigh`
 /// → high) are not offered: they would be remapped silently.
 const EFFORTS: &[&str] = &["max", "high", "low"];
+/// The default level of both models (`/models` `effort.default_level`, 2026-11-13).
+const DEFAULT_EFFORT: &str = "high";
 /// The server-side search tool of the Messages endpoint (both documented
 /// versions select the same tool). `max_uses` is left at its default, which is
 /// also the cap (5).
@@ -169,6 +171,9 @@ impl RouteCaps for Caps {
     fn efforts(&self) -> Option<Vec<String>> {
         Some(EFFORTS.iter().map(|e| e.to_string()).collect())
     }
+    fn default_effort(&self) -> Option<String> {
+        Some(DEFAULT_EFFORT.into())
+    }
     fn can_disable_reasoning(&self) -> bool {
         true
     }
@@ -234,7 +239,7 @@ impl Provider for DeepSeek {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request("`p=` (provider choice) does not apply to DeepSeek"));
         }
@@ -244,12 +249,13 @@ impl Provider for DeepSeek {
         let wants_search = req.tools.contains(&Tool::Search);
         let wants_fetch = req.tools.contains(&Tool::Fetch);
         request::validate(model, &req, &Caps(spec)).map_err(LlmError::request)?;
+        let level_note = request::resolve_reasoning(model, &mut req, &Caps(spec)).map_err(LlmError::request)?;
         // The Messages endpoint for v4-pro's search; Flash's web tools stay on Chat Completions.
         let search = wants_search && web == WebTools::MessagesSearch;
 
         let mut applied = Vec::new();
         let mut settings = Vec::new();
-        let effort = req.effort.as_deref().unwrap_or(EFFORTS[0]);
+        let effort = req.effort.as_deref().unwrap_or(DEFAULT_EFFORT);
         let source = |by_user: bool| if by_user { "option" } else { "default" };
         // Thinking: an explicit `thinking.type` decides the mode on both endpoints.
         let reasoning = match (effort, search) {
@@ -258,7 +264,10 @@ impl Provider for DeepSeek {
             (e, true) => json!({"thinking": {"type": "enabled"}, "output_config": {"effort": e}}),
         };
         settings.push(if effort == "none" { "thinking off".to_string() } else { format!("effort {effort}") });
-        applied.push(Applied { source: source(user.effort.is_some()).into(), patch: reasoning.clone() });
+        applied.push(Applied {
+            source: source(user.effort.is_some() || user.level.is_some()).into(),
+            patch: reasoning.clone(),
+        });
 
         let mut warnings = Vec::new();
         let (mut body, url, dialect, notes) = if search {
@@ -343,7 +352,7 @@ impl Provider for DeepSeek {
             body,
             applied,
             warnings,
-            notes,
+            notes: level_note.into_iter().chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: max_tokens,
             long_decode: false,
@@ -1057,13 +1066,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_defaults_are_the_maximum() {
+    async fn chat_defaults_are_the_official_ones() {
         let h = vec![Turn::user_text("hi")];
         let p = prepare("deepseek-v4-pro", &[], &h).await.unwrap();
         assert_eq!(p.dialect, DIALECT);
         assert_eq!(p.url, "https://api.deepseek.com/chat/completions");
         assert_eq!(p.body["thinking"], json!({"type": "enabled"}));
-        assert_eq!(p.body["reasoning_effort"], "max");
+        assert_eq!(p.body["reasoning_effort"], "high", "DeepSeek's default level");
+        assert_eq!(p.notes, ["reasoning effort is high by default, not the highest (max); add +h for the highest"]);
         assert_eq!(p.body["max_tokens"], 393_216);
         assert_eq!(p.auto_max_tokens, Some(393_216));
         assert_eq!(p.body["stream"], true);
@@ -1073,11 +1083,17 @@ mod tests {
         for k in ["temperature", "top_p", "tools", "service_tier", "metadata"] {
             assert!(p.body.get(k).is_none(), "{k} must not be sent");
         }
-        assert_eq!(p.settings, vec!["effort max"]);
+        assert_eq!(p.settings, vec!["effort high"]);
         assert_eq!(p.applied[0].source, "default");
-        assert_eq!(p.applied[0].patch, json!({"thinking": {"type": "enabled"}, "reasoning_effort": "max"}));
+        assert_eq!(p.applied[0].patch, json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high"}));
         assert_eq!(p.applied[1].patch, json!({"max_tokens": 393_216}));
         assert!(p.warnings.iter().all(|w| !w.contains("model table")));
+        // +h: the highest level, no note; +l: thinking off.
+        let p = prepare("deepseek-v4-pro", &[flag("h")], &h).await.unwrap();
+        assert_eq!((p.body["reasoning_effort"].as_str(), p.applied[0].source.as_str()), (Some("max"), "option"));
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        let p = prepare("deepseek-flash", &[flag("l")], &h).await.unwrap();
+        assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
     }
 
     #[tokio::test]
@@ -1127,7 +1143,7 @@ mod tests {
             ("deepseek-v4-pro", &[kv("tier", "flex")], "no service tiers"),
             ("deepseek-v4-pro", &[kv("budget", "1000")], "no reasoning token budget"),
             ("deepseek-v4-pro", &[kv("v", "low")], "no verbosity"),
-            ("deepseek-v4-pro", &[flag("4")], "no image size"),
+            ("deepseek-v4-pro", &[kv("size", "4K")], "no image size"),
             ("deepseek-v4-pro", &[flag("frob")], "unknown option"),
         ];
         for (model, opts, want) in cases {
@@ -1147,7 +1163,7 @@ mod tests {
         assert_eq!((p.dialect, p.url.as_str()), (DIALECT, "https://api.deepseek.com/chat/completions"));
         assert_eq!(p.body["tools"], json!([{"type": "deepseek_web_search"}]));
         assert_eq!(p.body["thinking"], json!({"type": "enabled"}));
-        assert_eq!(p.body["reasoning_effort"], "max");
+        assert_eq!(p.body["reasoning_effort"], "high");
         assert!(p.settings.contains(&"web search".to_string()), "{:?}", p.settings);
         let p = prepare("deepseek-flash", &[flag("su")], &h).await.unwrap();
         assert_eq!(p.body["tools"], json!([{"type": "deepseek_web_search"}, {"type": "deepseek_read_url"}]));
@@ -1272,7 +1288,7 @@ mod tests {
         assert_eq!(p.dialect, MESSAGES_DIALECT);
         assert_eq!(p.url, "https://api.deepseek.com/anthropic/v1/messages");
         assert_eq!(p.body["thinking"], json!({"type": "enabled"}));
-        assert_eq!(p.body["output_config"], json!({"effort": "max"}));
+        assert_eq!(p.body["output_config"], json!({"effort": "high"}));
         assert!(p.body.get("reasoning_effort").is_none());
         assert_eq!(p.body["tools"], json!([{"type": "web_search_20260209", "name": "web_search"}]));
         assert_eq!(p.body["max_tokens"], 393_216);
@@ -1280,7 +1296,7 @@ mod tests {
         assert!(p.body.get("user_id").is_none());
         assert_eq!(p.body["system"], json!([{"type": "text", "text": "be brief"}]));
         assert_eq!(p.body["messages"], json!([{"role": "user", "content": "news?"}]));
-        assert_eq!(p.settings, vec!["effort max", "web search"]);
+        assert_eq!(p.settings, vec!["effort high", "web search"]);
         let p = prepare("deepseek-v4-pro", &[flag("s"), kv("e", "none")], &h).await.unwrap();
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
         assert!(p.body.get("output_config").is_none());
@@ -1362,7 +1378,7 @@ mod tests {
         ]);
         let p = ds().prepare(&input("deepseek-v4-pro", &[], &h), &[], &blobs).await.unwrap();
         assert_eq!(p.body["messages"][0]["content"][1], json!({"type": "text", "text": "fn main() {}"}));
-        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        assert!(p.notes.iter().all(|n| n.starts_with("reasoning effort")), "{:?}", p.notes);
         let h = turn(vec![Part::File { blob: pdf, filename: Some("a.pdf".into()), generated: false }]);
         let e = ds().prepare(&input("deepseek-flash", &[], &h), &[], &blobs).await.unwrap_err();
         assert!(e.message.contains("does not take PDF input via DeepSeek (a.pdf)"), "{}", e.message);

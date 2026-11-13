@@ -96,11 +96,15 @@ fn thinking(spec: &ModelSpec, req: &Requested) -> Option<(Value, String)> {
     let level = |l: &str| (json!({"thinkingLevel": l, "includeThoughts": true}), format!("effort {l}"));
     let budget = |n: u64| (json!({"thinkingBudget": n, "includeThoughts": true}), format!("thinking budget {n}"));
     let off = || (json!({"thinkingBudget": 0}), "thinking off".to_string());
+    // The level or budget settled by `resolve_reasoning` (the model's default, +h, +l, e=,
+    // budget=); nothing settled: only the thoughts, and Gemini's own default.
+    let gemini_default = || (json!({"includeThoughts": true}), "effort: Gemini's default".to_string());
     match spec.thinking {
-        Thinking::Levels(levels) => Some(level(req.effort.as_deref().unwrap_or(levels[0]))),
-        Thinking::Budget { max, .. } => Some(match req.effort.as_deref() {
-            Some("none") => off(),
-            _ => budget(req.budget.unwrap_or(max)),
+        Thinking::Levels(_) => Some(req.effort.as_deref().map_or_else(gemini_default, level)),
+        Thinking::Budget { .. } => Some(match (req.effort.as_deref(), req.budget) {
+            (Some("none"), _) => off(),
+            (_, Some(n)) => budget(n),
+            _ => (json!({"includeThoughts": true}), "thinking budget: dynamic (Gemini's default)".to_string()),
         }),
         Thinking::AlwaysOn => Some((json!({"includeThoughts": true}), "reasoning on".to_string())),
         Thinking::Unsupported => None,
@@ -132,7 +136,7 @@ pub async fn prepare(
     for p in presets {
         req = overlay(&req, p);
     }
-    let req = overlay(&req, &user);
+    let mut req = overlay(&req, &user);
     if req.providers.is_some() {
         return Err(err(format!("`p=` (provider choice) does not apply to {NAME}")));
     }
@@ -143,6 +147,7 @@ pub async fn prepare(
     basic.image_size = None;
     basic.aspect_ratio = None;
     request::validate(model, &basic, &Caps(&spec)).map_err(LlmError::request)?;
+    let level_note = request::resolve_reasoning(model, &mut req, &Caps(&spec)).map_err(LlmError::request)?;
     check_more(model, &spec, &req)?;
 
     let conv = convert::convert(input.history, model, &spec, blobs).await?;
@@ -186,7 +191,7 @@ pub async fn prepare(
 
     if let Some((config, desc)) = thinking(&spec, &req) {
         applied.push(Applied {
-            source: src(user.effort.is_some() || user.budget.is_some()),
+            source: src(user.effort.is_some() || user.budget.is_some() || user.level.is_some()),
             patch: json!({"generationConfig": {"thinkingConfig": config}}),
         });
         generation.insert("thinkingConfig".into(), config);
@@ -340,7 +345,7 @@ pub async fn prepare(
         body,
         applied,
         warnings,
-        notes: Vec::new(),
+        notes: level_note.into_iter().collect(),
         show_debug: false,
         auto_max_tokens: max_tokens,
         long_decode: spec.long_decode,

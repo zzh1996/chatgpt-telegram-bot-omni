@@ -94,6 +94,9 @@ pub struct ModelSpec {
     pub unified: bool,
     pub long_decode: bool,
     pub thinking: Thinking,
+    /// The default `thinkingLevel` (the thinking guide's per-model table, `*`);
+    /// `None`: nothing is sent and Gemini decides.
+    pub default_level: Option<&'static str>,
     pub tools: &'static [Tool],
     /// Google Search and Google Maps grounding in one request ("Gemini 3.5
     /// Flash and later").
@@ -155,6 +158,7 @@ const fn text_model(
         unified: false,
         long_decode: false,
         thinking: Thinking::Levels(levels),
+        default_level: None,
         tools: ALL_TOOLS,
         search_with_maps,
         tool_invocations: matches!(family, Family::Gemini3 | Family::Gemini4),
@@ -188,6 +192,7 @@ const fn image_model(
         unified: false,
         long_decode: false,
         thinking,
+        default_level: None,
         tools,
         search_with_maps: false,
         tool_invocations: false,
@@ -200,26 +205,41 @@ const fn image_model(
     }
 }
 
-const GEMINI_38_FLASH: ModelSpec = text_model("gemini-3.8-flash", Family::Gemini3, LEVELS_HML, true);
-const GEMINI_36_FLASH: ModelSpec = text_model("gemini-3.6-flash", Family::Gemini3, LEVELS_ALL, true);
+const GEMINI_38_FLASH: ModelSpec =
+    ModelSpec { default_level: Some("medium"), ..text_model("gemini-3.8-flash", Family::Gemini3, LEVELS_HML, true) };
+const GEMINI_36_FLASH: ModelSpec =
+    ModelSpec { default_level: Some("medium"), ..text_model("gemini-3.6-flash", Family::Gemini3, LEVELS_ALL, true) };
 
 /// The table (2026-11-12). Levels from the thinking guide's per-model table;
 /// tools from the model pages' capability lists and the tools' "supported
 /// models" tables; Search together with Maps on "Gemini 3.5 Flash and later".
 pub const MODELS: &[ModelSpec] = &[
-    ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), ..gemini4("gemini-4-hydrogen") },
-    gemini4("gemini-4-carbon"),
-    gemini4("gemini-4-argon"),
+    ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), default_level: Some("high"), ..gemini4("gemini-4-hydrogen") },
+    ModelSpec { default_level: Some("medium"), ..gemini4("gemini-4-carbon") },
+    ModelSpec { default_level: Some("medium"), ..gemini4("gemini-4-argon") },
     GEMINI_38_FLASH,
     GEMINI_36_FLASH,
     // "Gemini 3.5 Flash and later" for Search + Maps: taken to include 3.5 Flash-Lite
     // (UNVERIFIED; Google answers with an error if not).
-    text_model("gemini-3.5-flash-lite", Family::Gemini3, LEVELS_ALL, true),
-    text_model("gemini-3.1-pro-preview", Family::Gemini3, LEVELS_HML, false),
-    text_model("gemini-3.1-flash-lite", Family::Gemini3, LEVELS_ALL, false),
-    text_model("gemini-3-flash-preview", Family::Gemini3, LEVELS_ALL, false),
+    ModelSpec {
+        default_level: Some("minimal"),
+        ..text_model("gemini-3.5-flash-lite", Family::Gemini3, LEVELS_ALL, true)
+    },
+    ModelSpec {
+        default_level: Some("high"),
+        ..text_model("gemini-3.1-pro-preview", Family::Gemini3, LEVELS_HML, false)
+    },
+    ModelSpec {
+        default_level: Some("minimal"),
+        ..text_model("gemini-3.1-flash-lite", Family::Gemini3, LEVELS_ALL, false)
+    },
+    ModelSpec {
+        default_level: Some("high"),
+        ..text_model("gemini-3-flash-preview", Family::Gemini3, LEVELS_ALL, false)
+    },
     ModelSpec {
         image_search: true,
+        default_level: Some("medium"),
         ..image_model(
             "gemini-nano-banana-2.1",
             131_072,
@@ -232,6 +252,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         image_search: true,
+        default_level: Some("minimal"),
         ..image_model(
             "gemini-3.1-flash-image",
             131_072,
@@ -244,15 +265,18 @@ pub const MODELS: &[ModelSpec] = &[
     },
     // "Supported image_size values: 1024px (1K). (Note: 2K and 4K are unsupported)";
     // the model page lists the ten base ratios (while also saying "14").
-    image_model(
-        "gemini-3.1-flash-lite-image",
-        65_536,
-        4_096,
-        Thinking::Levels(&["high", "minimal"]),
-        NO_TOOLS,
-        IMAGE_MODEL,
-        ImageOut { sizes: &["1K"], ratios: RATIOS_BASE },
-    ),
+    ModelSpec {
+        default_level: Some("minimal"),
+        ..image_model(
+            "gemini-3.1-flash-lite-image",
+            65_536,
+            4_096,
+            Thinking::Levels(&["high", "minimal"]),
+            NO_TOOLS,
+            IMAGE_MODEL,
+            ImageOut { sizes: &["1K"], ratios: RATIOS_BASE },
+        )
+    },
     image_model(
         "gemini-3-pro-image",
         65_536,
@@ -302,6 +326,7 @@ fn guess(model: &str) -> ModelSpec {
         unified: gemini4,
         long_decode: gemini4,
         thinking,
+        default_level: None,
         tools: ALL_TOOLS,
         search_with_maps: true,
         tool_invocations: matches!(family, Family::Gemini4 | Family::Gemini3) && !image,
@@ -349,5 +374,19 @@ impl RouteCaps for Caps<'_> {
     }
     fn tiers(&self) -> Vec<String> {
         self.0.tiers.iter().map(|s| s.to_string()).collect()
+    }
+    fn default_effort(&self) -> Option<String> {
+        self.0.default_level.map(str::to_string)
+    }
+    /// Gemini 3 Pro Image always thinks; nothing to set.
+    fn fixed_reasoning(&self) -> bool {
+        self.0.thinking == Thinking::AlwaysOn
+    }
+    /// Gemini 2.5: `+h` the largest `thinkingBudget`, `+l` the smallest (or off where 0 is allowed).
+    fn budget_range(&self) -> Option<(u64, u64)> {
+        match self.0.thinking {
+            Thinking::Budget { min, max, .. } => Some((max, min)),
+            _ => None,
+        }
     }
 }

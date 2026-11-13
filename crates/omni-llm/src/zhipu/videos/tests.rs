@@ -104,20 +104,21 @@ async fn cogvideox_defaults_are_the_best_the_api_has() {
 #[tokio::test]
 async fn sizes_ratios_lengths_and_quality() {
     let size = |p: Prepared| p.body["size"].as_str().unwrap().to_string();
-    assert_eq!(size(prep("cogvideox-3", &[flag("1")]).await.unwrap()), "1280x720");
-    assert_eq!(size(prep("cogvideox-3", &[flag("2")]).await.unwrap()), "1920x1080");
-    assert_eq!(size(prep("cogvideox-3", &[flag("H")]).await.unwrap()), "1080x1920");
-    assert_eq!(size(prep("cogvideox-3", &[flag("1H")]).await.unwrap()), "720x1280");
-    assert_eq!(size(prep("cogvideox-3", &[flag("S")]).await.unwrap()), "1024x1024");
+    assert_eq!(size(prep("cogvideox-3", &[kv("size", "1K")]).await.unwrap()), "1280x720");
+    assert_eq!(size(prep("cogvideox-3", &[kv("size", "2K")]).await.unwrap()), "1920x1080");
+    assert_eq!(size(prep("cogvideox-3", &[kv("ar", "9:16")]).await.unwrap()), "1080x1920");
+    assert_eq!(size(prep("cogvideox-3", &[kv("size", "1K"), kv("ar", "9:16")]).await.unwrap()), "720x1280");
+    assert_eq!(size(prep("cogvideox-3", &[kv("ar", "1:1")]).await.unwrap()), "1024x1024");
     assert_eq!(size(prep("cogvideox-3", &[kv("ar", "256:135")]).await.unwrap()), "2048x1080");
     assert_eq!(size(prep("cogvideox-3", &[kv("ar", "2048:1080")]).await.unwrap()), "2048x1080");
-    assert_eq!(size(prep("cogvideox-2", &[flag("w")]).await.unwrap()), "1280x960");
+    assert_eq!(size(prep("cogvideox-2", &[kv("ar", "4:3")]).await.unwrap()), "1280x960");
     assert_eq!(size(prep("cogvideox-2", &[kv("ar", "3:2")]).await.unwrap()), "720x480");
-    let e = err("cogvideox-3", &[flag("4H")]).await;
+    let e = err("cogvideox-3", &[kv("size", "4K"), kv("ar", "9:16")]).await;
     assert!(e.contains("video size 4K 9:16 is not available") && e.contains("sizes: 1280x720, 720x1280"), "{e}");
-    assert!(err("cogvideox-3", &[flag("w")]).await.contains("video size 4:3 is not available"));
-    assert!(err("cogvideox-3", &[flag("1S")]).await.contains("1K 1:1"));
-    let p = prep("cogvideox-3", &[kv("sec", "10"), kv("q", "speed"), flag("2W")]).await.unwrap();
+    assert!(err("cogvideox-3", &[kv("ar", "4:3")]).await.contains("video size 4:3 is not available"));
+    assert!(err("cogvideox-3", &[kv("size", "1K"), kv("ar", "1:1")]).await.contains("1K 1:1"));
+    let p =
+        prep("cogvideox-3", &[kv("sec", "10"), kv("q", "speed"), kv("size", "2K"), kv("ar", "16:9")]).await.unwrap();
     assert_eq!(
         (p.body["duration"].clone(), p.body["quality"].clone(), p.body["size"].clone()),
         (json!(10), json!("speed"), json!("1920x1080"))
@@ -153,7 +154,7 @@ async fn sizes_ratios_lengths_and_quality() {
 
 #[tokio::test]
 async fn vidu_models_have_fixed_lengths_and_resolutions() {
-    let p = prep("viduq1-text", &[flag("H")]).await.unwrap();
+    let p = prep("viduq1-text", &[kv("ar", "9:16")]).await.unwrap();
     assert_eq!(
         p.body,
         json!({"model": "viduq1-text", "prompt": "一只猫在玩毛线球", "size": "1920x1080", "aspect_ratio": "9:16",
@@ -162,8 +163,8 @@ async fn vidu_models_have_fixed_lengths_and_resolutions() {
     assert_eq!(p.settings, ["text-to-video", "size 1920x1080", "aspect ratio 9:16"]);
     assert_eq!(prep("viduq1-text", &[kv("sec", "5")]).await.unwrap().body["duration"], 5);
     assert!(err("viduq1-text", &[kv("sec", "4")]).await.contains("videos of 5 s (sec=4)"));
-    assert!(err("viduq1-text", &[flag("1")]).await.contains("sizes: 2 (1920x1080)"));
-    assert!(err("viduq1-text", &[flag("w")]).await.contains("ratios: 16:9, 9:16, 1:1"));
+    assert!(err("viduq1-text", &[kv("size", "1K")]).await.contains("sizes: 2 (1920x1080)"));
+    assert!(err("viduq1-text", &[kv("ar", "4:3")]).await.contains("ratios: 16:9, 9:16, 1:1"));
     // Image models: the image's own ratio, background music only where Vidu makes it.
     let (img, b) = photo("image/webp", b"RIFF\0\0\0\0WEBPVP8 ");
     let blobs = MemBlobs(vec![b]);
@@ -174,7 +175,7 @@ async fn vidu_models_have_fixed_lengths_and_resolutions() {
     assert_eq!(p.settings, ["image-to-video", "size 1280x720", "background music"]);
     let p = prep_with("viduq1-image", &[], &h, &blobs).await.unwrap();
     assert!(p.body.get("with_audio").is_none(), "only for 4 s videos: {}", p.body);
-    let e = prep_with("viduq1-image", &[flag("W")], &h, &blobs).await.unwrap_err().message;
+    let e = prep_with("viduq1-image", &[kv("ar", "16:9")], &h, &blobs).await.unwrap_err().message;
     assert!(e.contains("has no aspect ratio option"), "{e}");
     let e = prep("viduq1-image", &[]).await.unwrap_err().message;
     assert!(e.contains("takes one image (the first frame); this message has none") && e.contains("separate models"));
@@ -182,12 +183,12 @@ async fn vidu_models_have_fixed_lengths_and_resolutions() {
     assert!(e.contains("takes a prompt alone; this message has 1 image"), "{e}");
     // vidu2-start-end has a smaller size without a letter.
     let two = vec![user(vec![Part::text("变身"), img.clone(), img.clone()])];
-    let p = prep_with("vidu2-start-end", &[flag("1")], &two, &blobs).await.unwrap();
+    let p = prep_with("vidu2-start-end", &[kv("size", "1K")], &two, &blobs).await.unwrap();
     assert_eq!((p.body["size"].clone(), p.body["image_url"].as_array().unwrap().len()), (json!("1280x720"), 2));
     assert_eq!(p.settings[0], "first and last frame");
     // References: 1–3 images, always an array.
     let one = vec![user(vec![Part::text("这只猫在跳舞"), img.clone()])];
-    let p = prep_with("vidu2-reference", &[flag("S")], &one, &blobs).await.unwrap();
+    let p = prep_with("vidu2-reference", &[kv("ar", "1:1")], &one, &blobs).await.unwrap();
     assert_eq!((p.body["image_url"].as_array().unwrap().len(), p.body["aspect_ratio"].clone()), (1, json!("1:1")));
     assert_eq!(p.settings[0], "reference-to-video (1 image)");
     let four = vec![user(vec![Part::text("x"), img.clone(), img.clone(), img.clone(), img])];
@@ -206,7 +207,7 @@ async fn images_choose_the_cogvideox_mode() {
     assert!(p.body.get("size").is_none());
     assert_eq!(p.settings[0], "image-to-video");
     assert!(p.settings.contains(&"size: Zhipu's default (the image's aspect ratio, short side 1080)".to_string()));
-    let p = prep_with("cogvideox-3", &[flag("4")], &[user(vec![a.clone()])], &blobs).await.unwrap();
+    let p = prep_with("cogvideox-3", &[kv("size", "4K")], &[user(vec![a.clone()])], &blobs).await.unwrap();
     assert_eq!(p.body["size"], "3840x2160");
     assert!(p.body.get("prompt").is_none(), "an image without text is enough");
     // Two images: the first and the last frame, in order.
@@ -275,7 +276,7 @@ async fn replies_and_what_zhipu_cannot_take() {
 async fn unknown_models_are_not_supported() {
     // Their price is unknown to the bot, whatever the options.
     for id in ["cogvideox-9", "vidu3-text"] {
-        for opts in [&[][..], &[flag("W")]] {
+        for opts in [&[][..], &[kv("ar", "16:9")]] {
             assert_eq!(
                 err(id, opts).await,
                 format!(

@@ -989,9 +989,12 @@ mod tests {
         assert!(p.body.get("quality").is_none());
         assert_eq!(p.body["resolution"], "2k");
         // Options.
-        let p = prep("grok-imagine-image-2.0", &[flag("1W"), kv("q", "low"), kv("n", "4"), kv("bg", "transparent")])
-            .await
-            .unwrap();
+        let p = prep(
+            "grok-imagine-image-2.0",
+            &[kv("size", "1K"), kv("ar", "16:9"), kv("q", "low"), kv("n", "4"), kv("bg", "transparent")],
+        )
+        .await
+        .unwrap();
         let b = &p.body;
         assert_eq!(
             (b["resolution"].clone(), b["aspect_ratio"].clone(), b["quality"].clone()),
@@ -1014,7 +1017,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_the_image_api_does_not_take_is_an_error() {
-        assert!(err("grok-imagine-image-2.0", &[flag("4")]).await.contains("sizes: 1K, 2K"));
+        assert!(err("grok-imagine-image-2.0", &[kv("size", "4K")]).await.contains("sizes: 1K, 2K"));
         assert!(err("grok-imagine-image-2.0", &[kv("ar", "5:4")]).await.contains("ratios: 1:1, 3:4"));
         assert!(err("grok-imagine-image-2.0", &[kv("q", "max")]).await.contains("levels: low, medium, auto"));
         // `high` is in the API's enum, but the model rejects it (live): refused before sending.
@@ -1112,7 +1115,8 @@ mod tests {
         );
         assert_eq!(p.settings, ["text-to-video", "resolution 1080p"]);
         assert_eq!(prep("grok-imagine-video", &[]).await.unwrap().body["resolution"], "720p");
-        let p = prep("grok-imagine-video-1.5-lite", &[kv("sec", "12"), flag("1H")]).await.unwrap();
+        let p =
+            prep("grok-imagine-video-1.5-lite", &[kv("sec", "12"), kv("size", "1K"), kv("ar", "9:16")]).await.unwrap();
         assert_eq!(
             (p.body["duration"].clone(), p.body["resolution"].clone(), p.body["aspect_ratio"].clone()),
             (json!(12), json!("720p"), json!("9:16"))
@@ -1123,7 +1127,7 @@ mod tests {
         let blobs = MemBlobs(vec![b1.clone()]);
         let p = prep_with(
             "grok-imagine-video-1.5",
-            &[flag("W")],
+            &[kv("ar", "16:9")],
             &[user(vec![Part::text("animate"), img.clone()])],
             &blobs,
         )
@@ -1152,7 +1156,7 @@ mod tests {
         assert_eq!(p.settings[0], "reference-to-video (2 images)");
         let e = prep_with("grok-imagine-video", &[kv("sec", "15")], &refs, &blobs3).await.unwrap_err();
         assert!(e.message.contains("reference-to-video of 1–10 s"), "{}", e.message);
-        let e = prep_with("grok-imagine-video-1.5", &[flag("2")], &refs, &blobs3).await.unwrap_err();
+        let e = prep_with("grok-imagine-video-1.5", &[kv("size", "2K")], &refs, &blobs3).await.unwrap_err();
         assert!(e.message.contains("sizes: 1K (720p)"), "{}", e.message);
         let e = prep_with("grok-imagine-video-1.5-lite", &[], &refs, &blobs3).await.unwrap_err();
         assert!(e.message.contains("takes one image (the first frame), not 2"), "{}", e.message);
@@ -1165,7 +1169,7 @@ mod tests {
         let video = Part::File { blob: clip, filename: Some("v.mp4".into()), generated: true };
         let history =
             vec![Turn::user_text("a dancer"), answer(vec![video]), Turn::user_text("give her a silver necklace")];
-        let p = prep_with("grok-imagine-video", &[kv("sec", "6"), flag("W")], &history, &blobs).await.unwrap();
+        let p = prep_with("grok-imagine-video", &[kv("sec", "6"), kv("ar", "16:9")], &history, &blobs).await.unwrap();
         assert_eq!(p.url, "https://api.x.ai/v1/videos/edits");
         assert!(p.body["video"]["url"].as_str().unwrap().starts_with("data:video/mp4;base64,"));
         assert!(
@@ -1190,8 +1194,8 @@ mod tests {
         assert!(err("grok-imagine-video-1.5", &[kv("q", "high")]).await.contains("does not take an image quality"));
         assert!(err("grok-imagine-video-1.5", &[kv("n", "2")]).await.contains("(`n=`) via xAI"));
         assert!(err("grok-imagine-video-1.5", &[kv("sec", "16")]).await.contains("videos of 1–15 s"));
-        assert!(err("grok-imagine-video-1.5", &[flag("4")]).await.contains("sizes: 1K (720p), 2K (1080p)"));
-        assert!(err("grok-imagine-video", &[flag("2")]).await.contains("sizes: 1K (720p)"));
+        assert!(err("grok-imagine-video-1.5", &[kv("size", "4K")]).await.contains("sizes: 1K (720p), 2K (1080p)"));
+        assert!(err("grok-imagine-video", &[kv("size", "2K")]).await.contains("sizes: 1K (720p)"));
         assert!(err("grok-imagine-video-1.5", &[kv("ar", "2:1")]).await.contains("ratios: 1:1, 16:9"));
         // An attached non-MP4 video cannot be edited.
         let (mov, bm) = file("a.mov", "video/quicktime", b"moov");

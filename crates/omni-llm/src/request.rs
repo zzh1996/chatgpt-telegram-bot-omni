@@ -56,12 +56,24 @@ impl Tool {
     }
 }
 
+/// `+h` / `+l`: the model's highest or lowest reasoning level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// The highest level (or the largest budget) the official API offers.
+    Highest,
+    /// Reasoning off where it can be turned off, else the lowest level.
+    Lowest,
+}
+
 /// Parsed options (what was asked for, not yet validated).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Requested {
     pub tools: Vec<Tool>,
-    /// Reasoning effort level; `none` disables reasoning.
+    /// Reasoning effort level; `none` disables reasoning. Unset: the official
+    /// default ([`resolve_reasoning`]).
     pub effort: Option<String>,
+    /// `+h` / `+l` (settled into `effort` or `budget` by [`resolve_reasoning`]).
+    pub level: Option<Level>,
     /// Reasoning token budget.
     pub budget: Option<u64>,
     pub verbosity: Option<String>,
@@ -112,14 +124,8 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
                                 r.tools.push(tool);
                             }
                         }
-                        '1' => set(&mut r.image_size, "1K".to_string(), "image size")?,
-                        '2' => set(&mut r.image_size, "2K".to_string(), "image size")?,
-                        '4' => set(&mut r.image_size, "4K".to_string(), "image size")?,
-                        'S' => set(&mut r.aspect_ratio, "1:1".to_string(), "aspect ratio")?,
-                        'W' => set(&mut r.aspect_ratio, "16:9".to_string(), "aspect ratio")?,
-                        'H' => set(&mut r.aspect_ratio, "9:16".to_string(), "aspect ratio")?,
-                        'w' => set(&mut r.aspect_ratio, "4:3".to_string(), "aspect ratio")?,
-                        'h' => set(&mut r.aspect_ratio, "3:4".to_string(), "aspect ratio")?,
+                        'h' => set(&mut r.level, Level::Highest, "reasoning level")?,
+                        'l' => set(&mut r.level, Level::Lowest, "reasoning level")?,
                         _ => return Err(format!("unknown option `{c}` in `+{f}`; see /help options")),
                     }
                 }
@@ -132,6 +138,13 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
                     set(&mut r.budget, n, "budget")?;
                 }
                 "v" => set(&mut r.verbosity, v.to_ascii_lowercase(), "verbosity")?,
+                "size" => {
+                    let size = v.to_ascii_uppercase();
+                    if !matches!(size.as_str(), "1K" | "2K" | "4K") {
+                        return Err(format!("`size=` takes 1K, 2K or 4K, got `{v}`"));
+                    }
+                    set(&mut r.image_size, size, "image size")?;
+                }
                 "ar" => {
                     let ok = v.split_once(':').is_some_and(|(a, b)| {
                         !a.is_empty()
@@ -177,6 +190,12 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
     }
     if r.effort.is_some() && r.budget.is_some() {
         return Err("use either e= or budget=, not both".into());
+    }
+    if let Some(l) = r.level
+        && (r.effort.is_some() || r.budget.is_some())
+    {
+        let flag = if l == Level::Highest { "+h" } else { "+l" };
+        return Err(format!("{flag} sets the reasoning level already; leave out e= and budget="));
     }
     Ok(r)
 }
@@ -276,6 +295,82 @@ pub trait RouteCaps {
     fn generation(&self) -> Generation {
         Generation::default()
     }
+    /// The reasoning level the bot uses when none is asked for: the official
+    /// default (the level the API applies when none is sent, or the one the
+    /// vendor recommends turning on), sent explicitly. `None`: no named default
+    /// (nothing is sent and the API decides) or no reasoning levels.
+    fn default_effort(&self) -> Option<String> {
+        None
+    }
+    /// The model reasons at a depth the route cannot change: `+h` and `+l`
+    /// are accepted and change nothing.
+    fn fixed_reasoning(&self) -> bool {
+        false
+    }
+    /// The largest and smallest reasoning token budget, for `+h` and `+l` on
+    /// models without effort levels.
+    fn budget_range(&self) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+/// Settle the reasoning level (owner's rule, 2026-11-13): `+h` is the highest
+/// level the route offers (or the largest budget), `+l` turns reasoning off
+/// where the route can, else the lowest level (or the smallest budget); with
+/// neither and no `e=`/`budget=`, the official default
+/// ([`RouteCaps::default_effort`]). Returns the note for a default that is not
+/// the highest level. Call after [`validate`].
+pub fn resolve_reasoning(model: &str, r: &mut Requested, route: &dyn RouteCaps) -> Result<Option<String>, String> {
+    let levels = route.efforts().unwrap_or_default();
+    let named: Vec<&String> = levels.iter().filter(|l| *l != "none").collect();
+    let can_off = route.can_disable_reasoning() || levels.iter().any(|l| l == "none");
+    let via = route.name();
+    match r.level {
+        Some(Level::Highest) => {
+            if let Some(top) = named.first() {
+                r.effort = Some((*top).clone());
+            } else if let Some((max, _)) = route.budget_range() {
+                r.budget = Some(max);
+            } else if !route.fixed_reasoning() {
+                return Err(format!("`{model}` has no reasoning level to raise (`+h`) via {via}"));
+            }
+            Ok(None)
+        }
+        Some(Level::Lowest) => {
+            if can_off {
+                r.effort = Some("none".into());
+            } else if let Some(low) = named.last() {
+                r.effort = Some((*low).clone());
+            } else if let Some((_, min)) = route.budget_range() {
+                r.budget = Some(min);
+            } else if !route.fixed_reasoning() {
+                return Err(format!("`{model}` has no reasoning level to lower (`+l`) via {via}"));
+            }
+            Ok(None)
+        }
+        None if r.effort.is_none() && r.budget.is_none() => {
+            let Some(d) = route.default_effort() else { return Ok(None) };
+            let note = match named.first() {
+                Some(top) if **top != d => Some(not_highest(&d, top)),
+                None if d == "none" && route.budget_range().is_some() => {
+                    Some("reasoning is off by default; add +h to think with the largest budget".to_string())
+                }
+                _ => None,
+            };
+            r.effort = Some(d);
+            Ok(note)
+        }
+        None => Ok(None),
+    }
+}
+
+/// The note for a default reasoning level below the highest one.
+pub fn not_highest(current: &str, top: &str) -> String {
+    if current == "none" {
+        format!("reasoning is off by default (the highest level is {top}); add +h for the highest")
+    } else {
+        format!("reasoning effort is {current} by default, not the highest ({top}); add +h for the highest")
+    }
 }
 
 /// Image/video generation options a route takes (see [`RouteCaps::generation`]).
@@ -322,6 +417,13 @@ pub fn validate(model: &str, r: &Requested, route: &dyn RouteCaps) -> Result<(),
                 }
                 None => return Err(format!("`{model}` has no reasoning effort levels via {via}")),
             }
+        }
+    }
+    if let Some(l) = r.level {
+        let control = route.efforts().is_some() || route.budget() || route.can_disable_reasoning();
+        if !control && !route.fixed_reasoning() {
+            let flag = if l == Level::Highest { "+h" } else { "+l" };
+            return Err(format!("`{model}` has no reasoning level to set ({flag}) via {via}"));
         }
     }
     if let Some(n) = r.budget {
@@ -432,7 +534,14 @@ mod tests {
 
     #[test]
     fn parses_the_small_vocabulary() {
-        let r = parse(&[OptionToken::Flag("s4W".into()), kv("e", "LOW"), kv("tier", "flex")]).unwrap();
+        let r = parse(&[
+            OptionToken::Flag("s".into()),
+            kv("size", "4k"),
+            kv("ar", "16:9"),
+            kv("e", "LOW"),
+            kv("tier", "flex"),
+        ])
+        .unwrap();
         assert_eq!(r.tools, vec![Tool::Search]);
         assert_eq!(r.image_size.as_deref(), Some("4K"));
         assert_eq!(r.aspect_ratio.as_deref(), Some("16:9"));
@@ -440,8 +549,122 @@ mod tests {
         assert!(parse(&[OptionToken::Flag("x".into())]).is_err());
         assert!(parse(&[kv("temperature", "1")]).is_err());
         assert!(parse(&[OptionToken::Json(serde_json::json!({"a": 1}))]).is_err());
-        assert!(parse(&[OptionToken::Flag("WH".into())]).is_err(), "conflicting ratios");
+        assert!(parse(&[kv("ar", "16:9"), kv("ar", "9:16")]).is_err(), "conflicting ratios");
         assert!(parse(&[kv("e", "low"), kv("budget", "100")]).is_err());
+        // The one-letter size and ratio shortcuts are gone (owner, 2026-11-13).
+        for f in ["4", "1", "2", "W", "H", "S", "w"] {
+            assert!(parse(&[OptionToken::Flag(f.into())]).is_err(), "{f}");
+        }
+        assert!(parse(&[kv("size", "3K")]).unwrap_err().contains("1K, 2K or 4K"));
+        // h / l: the highest / lowest reasoning level, not with e= or budget=.
+        assert_eq!(parse(&[OptionToken::Flag("sh".into())]).unwrap().level, Some(Level::Highest));
+        assert_eq!(parse(&[OptionToken::Flag("l".into())]).unwrap().level, Some(Level::Lowest));
+        assert!(parse(&[OptionToken::Flag("hl".into())]).is_err());
+        assert!(parse(&[OptionToken::Flag("h".into()), kv("e", "low")]).unwrap_err().contains("+h"));
+        assert!(parse(&[OptionToken::Flag("l".into()), kv("budget", "10")]).is_err());
+    }
+
+    /// Defaults are the official ones; +h / +l pick the ends of the range.
+    #[test]
+    fn reasoning_levels_resolve() {
+        struct R {
+            efforts: Option<Vec<&'static str>>,
+            default: Option<&'static str>,
+            off: bool,
+            budget: Option<(u64, u64)>,
+            fixed: bool,
+        }
+        impl RouteCaps for R {
+            fn name(&self) -> &str {
+                "X"
+            }
+            fn tool(&self, _: Tool) -> bool {
+                false
+            }
+            fn efforts(&self) -> Option<Vec<String>> {
+                self.efforts.as_ref().map(|l| l.iter().map(|s| s.to_string()).collect())
+            }
+            fn can_disable_reasoning(&self) -> bool {
+                self.off
+            }
+            fn budget(&self) -> bool {
+                self.budget.is_some()
+            }
+            fn verbosity(&self) -> bool {
+                false
+            }
+            fn image_options(&self) -> bool {
+                false
+            }
+            fn tiers(&self) -> Vec<String> {
+                vec![]
+            }
+            fn default_effort(&self) -> Option<String> {
+                self.default.map(str::to_string)
+            }
+            fn fixed_reasoning(&self) -> bool {
+                self.fixed
+            }
+            fn budget_range(&self) -> Option<(u64, u64)> {
+                self.budget
+            }
+        }
+        let levels = R {
+            efforts: Some(vec!["max", "high", "medium", "low"]),
+            default: Some("medium"),
+            off: true,
+            budget: None,
+            fixed: false,
+        };
+        let go = |caps: &R, level: Option<Level>| {
+            let mut r = Requested { level, ..Default::default() };
+            let note = resolve_reasoning("m", &mut r, caps);
+            (r, note)
+        };
+        let (r, note) = go(&levels, None);
+        assert_eq!(r.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            note.unwrap().unwrap(),
+            "reasoning effort is medium by default, not the highest (max); add +h for the highest"
+        );
+        assert_eq!(go(&levels, Some(Level::Highest)).0.effort.as_deref(), Some("max"));
+        assert_eq!(go(&levels, Some(Level::Lowest)).0.effort.as_deref(), Some("none"), "off where it can be");
+        let no_off = R { off: false, ..levels };
+        assert_eq!(go(&no_off, Some(Level::Lowest)).0.effort.as_deref(), Some("low"));
+        // A default that is the highest: no note; e= given: nothing changes.
+        let top = R { default: Some("max"), ..no_off };
+        assert_eq!(go(&top, None).1.unwrap(), None);
+        let mut asked = Requested { effort: Some("low".into()), ..Default::default() };
+        assert_eq!(resolve_reasoning("m", &mut asked, &top).unwrap(), None);
+        assert_eq!(asked.effort.as_deref(), Some("low"));
+        // Off by default ("none" listed as a level).
+        let off_default = R {
+            efforts: Some(vec!["xhigh", "high", "medium", "low", "none"]),
+            default: Some("none"),
+            off: false,
+            budget: None,
+            fixed: false,
+        };
+        assert!(
+            go(&off_default, None)
+                .1
+                .unwrap()
+                .unwrap()
+                .starts_with("reasoning is off by default (the highest level is xhigh)")
+        );
+        // Budget-only models: +h / +l are the largest / smallest budget; off by default.
+        let budget =
+            R { efforts: None, default: Some("none"), off: false, budget: Some((64_000, 1_024)), fixed: false };
+        assert_eq!(go(&budget, Some(Level::Highest)).0.budget, Some(64_000));
+        assert_eq!(go(&budget, Some(Level::Lowest)).0.budget, Some(1_024));
+        assert!(go(&budget, None).1.unwrap().unwrap().contains("largest budget"));
+        // Fixed reasoning: accepted, nothing changes; no reasoning at all: an error.
+        let fixed = R { efforts: None, default: None, off: false, budget: None, fixed: true };
+        let (r, note) = go(&fixed, Some(Level::Highest));
+        assert!(r.effort.is_none() && r.budget.is_none() && note.unwrap().is_none());
+        let none = R { fixed: false, ..fixed };
+        assert!(go(&none, Some(Level::Highest)).1.unwrap_err().contains("+h"));
+        assert!(go(&none, Some(Level::Lowest)).1.unwrap_err().contains("+l"));
     }
 
     #[test]

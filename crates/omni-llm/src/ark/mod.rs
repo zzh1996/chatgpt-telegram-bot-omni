@@ -111,6 +111,9 @@ pub struct ModelSpec {
     pub fast: Tiers,
     /// 在线推理（低优）: `flex` (empty: not offered).
     pub flex: Tiers,
+    /// The default `reasoning_effort` (Ark's thinking guide: 2.1 and Evolving
+    /// `high`, the top level; 2.0 and character `medium`).
+    pub effort: &'static str,
 }
 
 const PRO_21: Tiers = &[(1024, r(6.0, 1.2, 30.0))];
@@ -122,6 +125,7 @@ const SEED_20_PRO: Tiers = &[(32, r(3.2, 0.64, 16.0)), (128, r(4.8, 0.96, 24.0))
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
         prefix: "doubao-seed-evolving",
+        effort: "high",
         context: 1_048_576,
         max_answer: 262_144,
         standard: PRO_21,
@@ -130,6 +134,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-1-pro",
+        effort: "high",
         context: 1_048_576,
         max_answer: 262_144,
         standard: PRO_21,
@@ -138,6 +143,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-1-lite",
+        effort: "high",
         context: 1_048_576,
         max_answer: 262_144,
         standard: &[(1024, ra(0.8, 0.16, 2.7, 12.0, 2.4))],
@@ -146,6 +152,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-1-turbo",
+        effort: "high",
         context: 262_144,
         max_answer: 262_144,
         standard: &[(256, r(3.0, 0.6, 15.0))],
@@ -154,6 +161,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-0-lite",
+        effort: "medium",
         context: 262_144,
         max_answer: 131_072,
         standard: &[
@@ -174,6 +182,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-0-mini",
+        effort: "medium",
         context: 262_144,
         max_answer: 131_072,
         standard: &[
@@ -194,6 +203,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-0-pro",
+        effort: "medium",
         context: 262_144,
         max_answer: 131_072,
         standard: SEED_20_PRO,
@@ -202,6 +212,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-0-code",
+        effort: "medium",
         context: 262_144,
         max_answer: 131_072,
         standard: SEED_20_PRO,
@@ -210,6 +221,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-character-260628",
+        effort: "medium",
         context: 131_072,
         max_answer: 32_768,
         standard: &[(32, r(0.8, 0.16, 2.0)), (128, r(1.2, 0.16, 6.0))],
@@ -236,7 +248,7 @@ fn replay(p: &Value) -> Value {
 pub const FLAVOR: Flavor = Flavor { dialect: DIALECT, image_detail: Some("xhigh"), replay };
 
 /// What Ark's Chat API offers (the vendor's own API, so official = route).
-struct ArkCaps;
+struct ArkCaps(Option<&'static ModelSpec>);
 
 impl crate::request::RouteCaps for ArkCaps {
     fn name(&self) -> &str {
@@ -262,6 +274,10 @@ impl crate::request::RouteCaps for ArkCaps {
     }
     fn tiers(&self) -> Vec<String> {
         vec!["flex".into(), "fast".into()]
+    }
+    /// A model outside the table: nothing is sent, Ark applies its default.
+    fn default_effort(&self) -> Option<String> {
+        self.0.map(|s| s.effort.to_string())
     }
 }
 
@@ -307,12 +323,16 @@ impl Ark {
         for p in presets {
             req = crate::openrouter::options::overlay(&req, p);
         }
-        let req = crate::openrouter::options::overlay(&req, &user);
+        let mut req = crate::openrouter::options::overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request("`p=` (provider choice) does not apply to Volcengine Ark"));
         }
-        crate::request::validate(input.model, &req, &ArkCaps).map_err(LlmError::request)?;
-        let (messages, notes) = chat::convert_history_with(input.history, input.model, None, blobs, &FLAVOR).await?;
+        let caps = ArkCaps(model_spec(input.model));
+        crate::request::validate(input.model, &req, &caps).map_err(LlmError::request)?;
+        let level_note = crate::request::resolve_reasoning(input.model, &mut req, &caps).map_err(LlmError::request)?;
+        let (messages, mut notes) =
+            chat::convert_history_with(input.history, input.model, None, blobs, &FLAVOR).await?;
+        notes.notes.splice(0..0, level_note);
         let mut body = json!({
             "model": input.model,
             "messages": messages,
@@ -322,24 +342,27 @@ impl Ark {
         });
         let mut applied = Vec::new();
         let mut settings = Vec::new();
-        // Reasoning: the highest level by default; e=none turns thinking off.
+        // Reasoning: the model's default level (sent explicitly); e=none turns thinking off.
         match req.effort.as_deref() {
             Some("none") | Some("minimal") => {
                 body["thinking"] = json!({"type": "disabled"});
                 body["reasoning_effort"] = json!("minimal");
                 settings.push("thinking off".to_string());
             }
-            e => {
-                let e = e.unwrap_or("high");
+            Some(e) => {
                 body["thinking"] = json!({"type": "enabled"});
                 body["reasoning_effort"] = json!(e);
                 settings.push(format!("effort {e}"));
             }
+            // A model outside the table: Ark's own default.
+            None => settings.push("effort: Ark's default".to_string()),
         }
-        applied.push(Applied {
-            source: if user.effort.is_some() { "option" } else { "default" }.into(),
-            patch: json!({"thinking": body["thinking"], "reasoning_effort": body["reasoning_effort"]}),
-        });
+        if req.effort.is_some() {
+            applied.push(Applied {
+                source: if user.effort.is_some() || user.level.is_some() { "option" } else { "default" }.into(),
+                patch: json!({"thinking": body["thinking"], "reasoning_effort": body["reasoning_effort"]}),
+            });
+        }
         let auto_max = input.max_tokens_override.or_else(|| self.auto_max_tokens(input));
         if let Some(m) = auto_max {
             body["max_tokens"] = json!(m);
@@ -854,6 +877,33 @@ mod tests {
         assert_eq!(p.body["stream_options"]["chunk_include_usage"], true);
         assert!(p.body.get("user").is_none(), "Ark Chat has no `user` field");
         assert!(p.body.get("prompt_cache_key").is_none(), "no conversation, no cache key");
+        // The official default: high on 2.1 (the top, no note), medium on 2.0 (a note); +h / +l.
+        let run = |model: &'static str, flag: &'static str| {
+            let opts: Vec<omni_core::trigger::OptionToken> =
+                if flag.is_empty() { vec![] } else { vec![omni_core::trigger::OptionToken::Flag(flag.into())] };
+            let history = history.clone();
+            async move {
+                let input = CallInput {
+                    model,
+                    options: &opts,
+                    history: &history,
+                    session_id: None,
+                    user: None,
+                    known_context: None,
+                    max_tokens_override: None,
+                };
+                ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap()
+            }
+        };
+        let p = run("doubao-seed-2-1-lite-260915", "").await;
+        assert_eq!((p.body["reasoning_effort"].as_str(), p.notes.len()), (Some("high"), 0));
+        let p = run("doubao-seed-2-0-lite-260428", "").await;
+        assert_eq!(p.body["reasoning_effort"], "medium");
+        assert_eq!(p.notes, ["reasoning effort is medium by default, not the highest (high); add +h for the highest"]);
+        let p = run("doubao-seed-2-0-lite-260428", "h").await;
+        assert_eq!((p.body["reasoning_effort"].as_str(), p.notes.len()), (Some("high"), 0));
+        let p = run("doubao-seed-2-0-lite-260428", "l").await;
+        assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
         let keyed = CallInput { session_id: Some("tg-9".into()), user: None, ..input };
         let p = ark().prepare_chat(&keyed, &[], &NoBlobs).await.unwrap();
         assert_eq!(p.body["prompt_cache_key"], "tg-9", "the conversation routes to one implicit cache");

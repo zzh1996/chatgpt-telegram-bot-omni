@@ -71,6 +71,12 @@ pub struct ModelSpec {
     pub thinking: Thinking,
     /// `output_config.effort` levels, highest first (empty: no effort parameter).
     pub efforts: &'static [&'static str],
+    /// The default level: `high` on most models, `medium` on Opus 5.5 and
+    /// Haiku 5.5 (effort docs); `none` where thinking needs a budget (Opus 4.5,
+    /// Haiku 4.5: no thinking unless asked). Opus/Sonnet 4.6–4.8 run without
+    /// thinking when it is omitted, but Anthropic recommends adaptive thinking:
+    /// the bot turns it on at the default level.
+    pub effort: &'static str,
     pub off: Off,
     /// `thinking.display` defaults to `"omitted"` (empty thinking text): the
     /// bot sends `"summarized"`, the most detailed display the API has. On
@@ -112,6 +118,7 @@ const MODERN: ModelSpec = ModelSpec {
     max_output: 128_000,
     thinking: Thinking::Adaptive { budget: false },
     efforts: ALL,
+    effort: "high",
     off: Off::Never,
     display_omitted: true,
     dynamic_web: true,
@@ -131,6 +138,7 @@ const GEN_45: ModelSpec = ModelSpec {
     max_output: 64_000,
     thinking: Thinking::Budget,
     efforts: &[],
+    effort: "none",
     off: Off::Disabled,
     display_omitted: false,
     dynamic_web: false,
@@ -168,6 +176,7 @@ pub const MODELS: &[ModelSpec] = &[
     // Opus 5.5: thinking always on, default effort medium, fast mode $8/$40 (no beta).
     ModelSpec {
         id: "claude-opus-5-5",
+        effort: "medium",
         fast: Some(Fast { input: 8.0, output: 40.0, beta: false }),
         input: 4.0,
         output: 20.0,
@@ -225,6 +234,7 @@ pub const MODELS: &[ModelSpec] = &[
     // Haiku 5.5: `disabled` at effort high or below; prompts over 100K tokens cost 5×.
     ModelSpec {
         id: "claude-haiku-5-5",
+        effort: "medium",
         off: Off::Disabled,
         input: 0.10,
         output: 0.50,

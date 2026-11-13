@@ -189,6 +189,9 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
 
 /// Qwen3.8 effort levels, highest first.
 const EFFORTS: [&str; 3] = ["xhigh", "medium", "low"];
+/// Qwen3.8 with no `reasoning_effort` (the official default): a thinking budget of
+/// 131,072 tokens, below `xhigh`'s 262,144 (deep-thinking guide, 2026-11-12).
+const QWEN38_DEFAULT_NOTE: &str = "reasoning effort is Qwen's default (a thinking budget of 131,072 tokens), not the highest (xhigh, 262,144); add +h for the highest";
 
 /// What Alibaba's API offers for a model (the vendor's own API: official = route).
 struct Caps<'a> {
@@ -224,6 +227,15 @@ impl RouteCaps for Caps<'_> {
     }
     fn tiers(&self) -> Vec<String> {
         Vec::new()
+    }
+    /// Thinking-only models without a budget (Qwen3.7 Max previews): nothing to set.
+    fn fixed_reasoning(&self) -> bool {
+        self.spec.thinking == Thinking::Always && !self.spec.effort
+    }
+    /// Budget models (Qwen3.7) on Chat Completions: `+h` the largest budget, `+l` the
+    /// smallest the API takes ("a positive integer").
+    fn budget_range(&self) -> Option<(u64, u64)> {
+        (!self.responses && !self.spec.effort).then_some(self.spec.max_cot?).map(|max| (max, 1))
     }
 }
 
@@ -340,16 +352,23 @@ impl Alibaba {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request("`p=` (provider choice) does not apply to Alibaba Model Studio"));
         }
         let spec = model_spec(input.model);
         let responses = responses_reason(&req).is_some();
+        let mut notes = Vec::new();
         match spec {
             Some(s) => {
                 check(s, &req)?;
-                crate::request::validate(input.model, &req, &Caps { spec: s, responses }).map_err(LlmError::request)?;
+                let caps = Caps { spec: s, responses };
+                crate::request::validate(input.model, &req, &caps).map_err(LlmError::request)?;
+                let asked = req.effort.is_some() || req.budget.is_some() || req.level.is_some();
+                crate::request::resolve_reasoning(input.model, &mut req, &caps).map_err(LlmError::request)?;
+                if s.effort && !asked {
+                    notes.push(QWEN38_DEFAULT_NOTE.to_string());
+                }
             }
             None if has_options(&req) => {
                 return Err(LlmError::request(format!(
@@ -360,7 +379,6 @@ impl Alibaba {
             }
             None => {}
         }
-        let mut notes = Vec::new();
         let auto_max = self.output_budget(input, spec);
         let mut p = match spec {
             Some(s) if responses => self.responses_request(input, s, &req, &user, blobs, &mut notes).await?,
@@ -432,9 +450,14 @@ impl Alibaba {
                         set("enable_thinking", json!(true));
                     }
                     if s.effort {
-                        let e = e.unwrap_or(EFFORTS[0]);
-                        set("reasoning_effort", json!(e));
-                        format!("effort {e}")
+                        // Nothing asked: Qwen's own default (no `reasoning_effort`).
+                        match e {
+                            Some(e) => {
+                                set("reasoning_effort", json!(e));
+                                format!("effort {e}")
+                            }
+                            None => "effort: Qwen's default".to_string(),
+                        }
                     } else if s.thinking == Thinking::Hybrid {
                         "thinking on".to_string()
                     } else {
@@ -443,7 +466,7 @@ impl Alibaba {
                 }
             };
             if !patch.is_empty() {
-                let by_user = user.effort.is_some() || user.budget.is_some();
+                let by_user = user.effort.is_some() || user.budget.is_some() || user.level.is_some();
                 applied.push(Applied {
                     source: if by_user { "option" } else { "default" }.into(),
                     patch: Value::Object(patch),
@@ -497,16 +520,21 @@ impl Alibaba {
         let mut body = json!({"model": input.model, "input": items, "stream": true, "store": false});
         let mut applied = vec![Applied { source: "default".into(), patch: json!({"store": false}) }];
         let mut settings = Vec::new();
-        let by_user = user.effort.is_some();
+        let by_user = user.effort.is_some() || user.level.is_some();
         let off = req.effort.as_deref() == Some("none");
         let described = if spec.effort {
-            let e = if off { "none" } else { req.effort.as_deref().unwrap_or(EFFORTS[0]) };
-            body["reasoning"] = json!({"effort": e});
-            applied.push(Applied {
-                source: if by_user { "option" } else { "default" }.into(),
-                patch: json!({"reasoning": {"effort": e}}),
-            });
-            if off { "thinking off".to_string() } else { format!("effort {e}") }
+            match req.effort.as_deref() {
+                Some(e) => {
+                    body["reasoning"] = json!({"effort": e});
+                    applied.push(Applied {
+                        source: if by_user { "option" } else { "default" }.into(),
+                        patch: json!({"reasoning": {"effort": e}}),
+                    });
+                    if off { "thinking off".to_string() } else { format!("effort {e}") }
+                }
+                // Nothing asked: Qwen's own default.
+                None => "effort: Qwen's default".to_string(),
+            }
         } else if spec.thinking == Thinking::Hybrid {
             // No `reasoning.effort` for Qwen3.7 on this API: the (deprecated) switch.
             body["enable_thinking"] = json!(!off);

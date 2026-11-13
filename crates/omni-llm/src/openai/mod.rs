@@ -90,6 +90,10 @@ pub struct ModelSpec {
     pub max_output: u64,
     /// `reasoning.effort` levels, highest first; `None`: the model documents none.
     pub efforts: Option<&'static [&'static str]>,
+    /// The default level (the model pages): `medium` on the GPT-6, GPT-5.6 and
+    /// GPT-5.5 families, `none` on GPT-5.4/5.2/5.1, `high` on gpt-5.5-pro;
+    /// `None`: undocumented (nothing is sent, the API decides).
+    pub effort: Option<&'static str>,
     /// Takes `reasoning.summary`.
     pub summary: bool,
     /// Takes `text.verbosity`.
@@ -133,6 +137,7 @@ const BASE: ModelSpec = ModelSpec {
     summary: true,
     verbosity: true,
     image_detail: "high",
+    effort: Some("medium"),
     price: price(0.0, 0.0, None, 0.0),
     price_from: None,
     long_context: true,
@@ -159,6 +164,7 @@ pub const MODELS: &[ModelSpec] = &[
     // "Latest Instant model used in ChatGPT": no effort levels, no tiers, no Batch.
     ModelSpec {
         id: "chat-latest",
+        effort: None,
         context: 400_000,
         efforts: None,
         verbosity: false,
@@ -208,6 +214,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.5-pro",
+        effort: Some("high"),
         efforts: Some(PRO),
         price: price(30.0, 30.0, None, 180.0),
         fast: None,
@@ -216,6 +223,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4",
+        effort: Some("none"),
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
         price: price(2.5, 0.25, None, 15.0),
@@ -224,6 +232,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4-mini",
+        effort: Some("none"),
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
@@ -234,6 +243,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4-nano",
+        effort: Some("none"),
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
@@ -245,6 +255,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4-pro",
+        effort: Some("medium"),
         efforts: Some(PRO),
         price: price(30.0, 30.0, None, 180.0),
         fast: None,
@@ -253,6 +264,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.2",
+        effort: Some("none"),
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         price: price(1.75, 0.175, None, 14.0),
@@ -262,6 +274,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.2-pro",
+        effort: None,
         context: 400_000,
         efforts: Some(PRO),
         price: price(21.0, 21.0, None, 168.0),
@@ -274,6 +287,7 @@ pub const MODELS: &[ModelSpec] = &[
     // Deprecated.
     ModelSpec {
         id: "gpt-5.1",
+        effort: Some("none"),
         context: 400_000,
         efforts: Some(&["high", "medium", "low", "none"]),
         price: price(1.25, 0.125, None, 10.0),
@@ -283,6 +297,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5",
+        effort: Some("medium"),
         context: 400_000,
         efforts: Some(&["high", "medium", "low", "minimal"]),
         price: price(1.25, 0.125, None, 10.0),
@@ -346,6 +361,13 @@ impl RouteCaps for Caps {
     fn verbosity(&self) -> bool {
         self.spec.is_none_or(|s| s.verbosity)
     }
+    fn default_effort(&self) -> Option<String> {
+        self.spec.and_then(|s| s.effort).map(str::to_string)
+    }
+    /// `chat-latest` reasons (it returns summaries) without effort levels.
+    fn fixed_reasoning(&self) -> bool {
+        self.spec.is_some_and(|s| s.efforts.is_none() && s.summary)
+    }
     fn image_options(&self) -> bool {
         false
     }
@@ -400,7 +422,7 @@ impl OpenAi {
         for p in presets {
             req = overlay(&req, p);
         }
-        let req = overlay(&req, &user);
+        let mut req = overlay(&req, &user);
         if req.providers.is_some() {
             return Err(LlmError::request(format!("`p=` (provider choice) does not apply to {NAME}")));
         }
@@ -417,6 +439,7 @@ impl OpenAi {
         checked.image_size = None;
         checked.aspect_ratio = None;
         request::validate(model, &checked, &caps).map_err(LlmError::request)?;
+        let level_note = request::resolve_reasoning(model, &mut req, &caps).map_err(LlmError::request)?;
         if !image_tool && (req.image_size.is_some() || req.aspect_ratio.is_some()) {
             return Err(LlmError::request(format!(
                 "`{model}` has no image size/aspect options (they are for its image generation tool: add +i)"
@@ -448,23 +471,22 @@ impl OpenAi {
         let mut applied = Vec::new();
         let mut settings = Vec::new();
 
-        // Reasoning: the highest effort and the most detailed summary by default.
+        // Reasoning: the settled level (the model's default, +h, +l or e=) and the most
+        // detailed summary; no level where the default is undocumented (the API decides).
         let reasoning = match (spec, req.effort.as_deref()) {
             (_, Some("none")) => Some((json!({"effort": "none"}), "reasoning off".to_string())),
-            (Some(s), e) => match (s.efforts.and_then(|l| l.first()), e) {
-                (Some(top), e) => {
-                    let e = e.unwrap_or(top);
-                    Some((json!({"effort": e, "summary": "detailed"}), format!("effort {e}")))
-                }
-                (None, _) if s.summary => Some((json!({"summary": "detailed"}), String::new())),
-                (None, _) => None,
-            },
+            (Some(s), Some(e)) if s.efforts.is_some() => {
+                Some((json!({"effort": e, "summary": "detailed"}), format!("effort {e}")))
+            }
+            (Some(s), _) if s.summary => Some((json!({"summary": "detailed"}), String::new())),
+            (Some(_), _) => None,
             // Not in the table: only what the user asked for.
             (None, Some(e)) => Some((json!({"effort": e}), format!("effort {e}"))),
             (None, None) => None,
         };
         if let Some((r, desc)) = reasoning {
-            applied.push(Applied { source: src(user.effort.is_some()).into(), patch: json!({"reasoning": r}) });
+            let by_user = user.effort.is_some() || user.level.is_some();
+            applied.push(Applied { source: src(by_user).into(), patch: json!({"reasoning": r}) });
             if !desc.is_empty() {
                 settings.push(desc);
             }
@@ -575,7 +597,7 @@ impl OpenAi {
             body,
             applied,
             warnings,
-            notes: conv.notes.into_iter().chain(notes).collect(),
+            notes: level_note.into_iter().chain(conv.notes).chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: false,
@@ -850,7 +872,7 @@ mod tests {
         assert_eq!(p.url, "https://api.openai.com/v1/responses");
         assert_eq!(p.dialect, DIALECT);
         let b = &p.body;
-        assert_eq!(b["reasoning"], json!({"effort": "max", "summary": "detailed"}));
+        assert_eq!(b["reasoning"], json!({"effort": "medium", "summary": "detailed"}), "OpenAI's default level");
         assert_eq!(b["max_output_tokens"], 128_000);
         assert_eq!(p.auto_max_tokens, Some(128_000));
         // Stored (a broken stream is recovered from it), with the encrypted reasoning for replay.
@@ -884,18 +906,36 @@ mod tests {
             p.applied.iter().any(|a| a.source == "default"
                 && a.patch == json!({"store": true, "include": ["reasoning.encrypted_content"]}))
         );
-        assert_eq!(p.settings, vec!["effort max"]);
+        assert_eq!(p.settings, vec!["effort medium"]);
         assert_eq!(p.applied[0].source, "default");
         assert_eq!(p.applied[1].patch, json!({"max_output_tokens": 128_000}));
         assert!(p.warnings.is_empty());
+        assert_eq!(p.notes, ["reasoning effort is medium by default, not the highest (max); add +h for the highest"]);
 
-        assert_eq!(prep("gpt-5.4", &[]).await.unwrap().body["reasoning"]["effort"], "xhigh");
-        assert_eq!(prep("gpt-5.5-pro", &[]).await.unwrap().body["reasoning"]["effort"], "xhigh");
-        assert_eq!(prep("gpt-5", &[]).await.unwrap().body["reasoning"]["effort"], "high");
+        // The official defaults per family; +h the top, +l off where it can be.
+        assert_eq!(prep("gpt-5.4", &[]).await.unwrap().body["reasoning"]["effort"], "none");
+        assert!(
+            prep("gpt-5.4", &[]).await.unwrap().notes[0]
+                .starts_with("reasoning is off by default (the highest level is xhigh)")
+        );
+        assert_eq!(prep("gpt-5.5-pro", &[]).await.unwrap().body["reasoning"]["effort"], "high");
+        assert_eq!(prep("gpt-5", &[]).await.unwrap().body["reasoning"]["effort"], "medium");
+        assert_eq!(prep("gpt-6.1-sol", &[flag("h")]).await.unwrap().body["reasoning"]["effort"], "max");
+        assert!(prep("gpt-6.1-sol", &[flag("h")]).await.unwrap().notes.is_empty());
+        assert_eq!(
+            prep("gpt-6.1-sol", &[flag("l")]).await.unwrap().body["reasoning"]["effort"],
+            "low",
+            "6.1 Sol has no none"
+        );
+        assert_eq!(prep("gpt-6-luna", &[flag("l")]).await.unwrap().body["reasoning"]["effort"], "none");
+        // gpt-5.2-pro documents no default: only the summary is sent.
+        let p = prep("gpt-5.2-pro", &[]).await.unwrap();
+        assert_eq!((p.body["reasoning"].clone(), p.notes.len()), (json!({"summary": "detailed"}), 0));
         // chat-latest: no effort levels documented, only the summary (as the old bot sent).
         let p = prep("chat-latest", &[]).await.unwrap();
         assert_eq!(p.body["reasoning"], json!({"summary": "detailed"}));
         assert!(p.settings.is_empty());
+        assert_eq!(prep("chat-latest", &[flag("h")]).await.unwrap().body["reasoning"], json!({"summary": "detailed"}));
         // The cap and the context window bound the budget.
         let capped =
             OpenAi::new(DirectConfig { max_tokens_cap: Some(32_000), ..cfg("https://api.openai.com/v1") }).unwrap();
@@ -1000,7 +1040,7 @@ mod tests {
         assert!(err("gpt-5.4-nano", &[kv("tier", "fast")]).await.contains("tiers: flex"));
         assert!(err("gpt-6-sol", &[kv("tier", "scale")]).await.contains("not available"));
         assert!(err("gpt-6-sol", &[kv("budget", "1000")]).await.contains("no reasoning token budget"));
-        assert!(err("gpt-6-sol", &[flag("4")]).await.contains("no image size/aspect options"));
+        assert!(err("gpt-6-sol", &[kv("size", "4K")]).await.contains("no image size/aspect options"));
         assert_eq!(err("gpt-6-sol", &[kv("p", "azure")]).await, "`p=` (provider choice) does not apply to OpenAI");
         assert!(err("gpt-6-sol", &[flag("x")]).await.contains("unknown option"));
     }
@@ -1285,11 +1325,11 @@ mod tests {
         assert_eq!(p.body["include"], json!(["reasoning.encrypted_content"]), "the images come in the items");
         assert_eq!(
             p.settings,
-            ["effort max", "image generation (gpt-image-2.6-sunburst)", "image quality max", "moderation low"]
+            ["effort medium", "image generation (gpt-image-2.6-sunburst)", "image quality max", "moderation low"]
         );
         assert!(p.applied.iter().any(|a| a.source == "default" && a.patch["tools"][0]["moderation"] == "low"));
         // Its options: size and ratio, quality, background (on any model in the table).
-        let p = prep("chat-latest", &[flag("iW"), kv("q", "high"), kv("bg", "opaque")]).await.unwrap();
+        let p = prep("chat-latest", &[flag("i"), kv("ar", "16:9"), kv("q", "high"), kv("bg", "opaque")]).await.unwrap();
         let t = &p.body["tools"][0];
         assert_eq!(
             (t["size"].clone(), t["quality"].clone(), t["background"].clone()),
@@ -1297,7 +1337,10 @@ mod tests {
         );
         assert!(p.settings.contains(&"image size 3840x2160 (4K, 16:9)".to_string()), "{:?}", p.settings);
         assert!(p.notes.iter().any(|n| n.contains("experimental")), "{:?}", p.notes);
-        assert_eq!(prep("gpt-5.4-nano", &[flag("i2")]).await.unwrap().body["tools"][0]["size"], "2048x2048");
+        assert_eq!(
+            prep("gpt-5.4-nano", &[flag("i"), kv("size", "2K")]).await.unwrap().body["tools"][0]["size"],
+            "2048x2048"
+        );
         // With other tools, in order; `include` only for those that need it.
         let p = prep("gpt-6-sol", &[flag("si"), kv("e", "low")]).await.unwrap();
         assert_eq!(p.body["tools"][0], json!({"type": "web_search"}));
@@ -1313,7 +1356,7 @@ mod tests {
             err("gpt-6.1-sol", &[kv("q", "high")]).await.contains("does not take an image quality (`q=`) via OpenAI")
         );
         assert!(
-            err("gpt-6.1-sol", &[flag("W")])
+            err("gpt-6.1-sol", &[kv("ar", "16:9")])
                 .await
                 .contains("no image size/aspect options (they are for its image generation tool: add +i)")
         );

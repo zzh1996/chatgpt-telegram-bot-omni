@@ -114,8 +114,17 @@ async fn qwen38_defaults() {
     assert_eq!(p.dialect, DIALECT);
     assert_eq!(p.url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions");
     assert_eq!(p.body["enable_thinking"], true);
-    // Explicit: unset, Qwen3.8 thinks with a 131072 budget; xhigh means 262144.
-    assert_eq!(p.body["reasoning_effort"], "xhigh");
+    // Qwen's own default (no `reasoning_effort`: a 131072 budget), with a note; +h is xhigh (262144).
+    assert!(p.body.get("reasoning_effort").is_none());
+    assert_eq!(
+        p.notes,
+        [
+            "reasoning effort is Qwen's default (a thinking budget of 131,072 tokens), not the highest (xhigh, 262,144); add +h for the highest"
+        ]
+    );
+    let h = prepare("qwen3.8-max", &[flag("h")]).await.unwrap();
+    assert_eq!((h.body["reasoning_effort"].as_str(), h.notes.len()), (Some("xhigh"), 0));
+    assert_eq!(prepare("qwen3.8-max", &[flag("l")]).await.unwrap().body["enable_thinking"], false);
     assert_eq!(p.body["stream"], true);
     assert_eq!(p.body["stream_options"], json!({"include_usage": true}));
     assert!(p.body.get("max_completion_tokens").is_none() && p.body.get("max_tokens").is_none());
@@ -126,10 +135,10 @@ async fn qwen38_defaults() {
     for k in ["temperature", "top_p", "top_k", "presence_penalty", "seed", "n"] {
         assert!(p.body.get(k).is_none(), "{k}");
     }
-    assert_eq!(p.settings, vec!["effort xhigh"]);
+    assert_eq!(p.settings, vec!["effort: Qwen's default"]);
     assert_eq!(p.applied[0].source, "default");
-    assert_eq!(p.applied[0].patch, json!({"enable_thinking": true, "reasoning_effort": "xhigh"}));
-    assert!(p.warnings.is_empty() && p.notes.is_empty());
+    assert_eq!(p.applied[0].patch, json!({"enable_thinking": true}));
+    assert!(p.warnings.is_empty() && p.notes.iter().all(|n| n.starts_with("reasoning effort")));
 }
 
 #[tokio::test]
@@ -229,13 +238,18 @@ async fn web_search_uses_the_responses_api() {
     assert_eq!(p.dialect, RESPONSES_DIALECT);
     assert_eq!(p.url, "https://dashscope.aliyuncs.com/compatible-mode/v1/responses");
     assert_eq!(p.body["tools"], json!([{"type": "web_search"}]));
-    assert_eq!(p.body["reasoning"], json!({"effort": "xhigh"}));
+    assert!(p.body.get("reasoning").is_none(), "Qwen's default");
     assert_eq!(p.body["store"], false);
     for k in ["enable_search", "search_options", "include_tool_usage", "messages", "enable_thinking"] {
         assert!(p.body.get(k).is_none(), "{k}");
     }
-    assert_eq!(p.settings, vec!["effort xhigh", "web search"]);
-    assert!(p.notes.is_empty() && p.warnings.is_empty(), "{:?} {:?}", p.notes, p.warnings);
+    assert_eq!(p.settings, vec!["effort: Qwen's default", "web search"]);
+    assert!(
+        p.notes.iter().all(|n| n.starts_with("reasoning effort")) && p.warnings.is_empty(),
+        "{:?} {:?}",
+        p.notes,
+        p.warnings
+    );
     assert!(p.applied.iter().any(|a| a.source == "option" && a.patch == json!({"tools": [{"type": "web_search"}]})));
     // Qwen3.7: the thinking switch on this API; with the web extractor.
     let p = prepare("qwen3.7-max", &[flag("su")]).await.unwrap();
@@ -265,20 +279,20 @@ async fn code_interpreter_uses_the_responses_api() {
     assert_eq!(p.body["store"], false);
     assert_eq!(p.body["stream"], true);
     assert_eq!(p.body["tools"], json!([{"type": "code_interpreter"}]));
-    assert_eq!(p.body["reasoning"], json!({"effort": "xhigh"}));
+    assert!(p.body.get("reasoning").is_none(), "Qwen's default");
     assert!(p.body.get("enable_thinking").is_none() && p.body.get("messages").is_none());
     assert_eq!(
         p.body["input"],
         json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
     );
-    assert_eq!(p.settings, vec!["effort xhigh", "code interpreter"]);
+    assert_eq!(p.settings, vec!["effort: Qwen's default", "code interpreter"]);
     let p = prepare("qwen3.8-max", &[flag("scu")]).await.unwrap();
     assert_eq!(
         p.body["tools"],
         json!([{"type": "code_interpreter"}, {"type": "web_search"}, {"type": "web_extractor"}])
     );
     assert!(p.body.get("enable_search").is_none());
-    assert_eq!(p.settings, vec!["effort xhigh", "code interpreter", "web search", "web extractor"]);
+    assert_eq!(p.settings, vec!["effort: Qwen's default", "code interpreter", "web search", "web extractor"]);
     // Qwen3.7: no `reasoning.effort` on this API, the switch instead.
     let p = prepare("qwen3.7-max", &[flag("c")]).await.unwrap();
     assert_eq!(p.body["enable_thinking"], true);
@@ -319,7 +333,7 @@ async fn media() {
     assert_eq!(c[1], json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/"}}));
     assert_eq!(c[2]["type"], "video_url");
     assert_eq!(p.body["vl_high_resolution_images"], true, "the highest image detail");
-    assert_eq!(p.settings, vec!["effort xhigh", "high-resolution images"]);
+    assert_eq!(p.settings, vec!["effort: Qwen's default", "high-resolution images"]);
     // Text-only model.
     let e = alibaba(None).prepare(&input("qwen3.7-max", &[], &h), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("takes text only"), "{}", e.message);
@@ -355,7 +369,7 @@ async fn media() {
     let p = alibaba(None).prepare(&input("qwen3.8-max", &[flag("s")], &h2), &[], &blobs).await.unwrap();
     assert!(p.body.get("vl_high_resolution_images").is_none());
     assert_eq!(
-        p.notes,
+        p.notes[1..],
         vec![
             "images at Alibaba's default resolution: web search (`+s`) needs the Responses API, which has no \
              high-resolution switch"

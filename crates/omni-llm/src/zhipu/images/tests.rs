@@ -90,14 +90,14 @@ async fn defaults_are_the_largest_size_hd_without_watermark() {
 #[tokio::test]
 async fn sizes_ratios_and_quality() {
     let size = |p: &Prepared| p.body["size"].as_str().unwrap().to_string();
-    assert_eq!(size(&prep("glm-image", &[flag("W")]).await.unwrap()), "2048x1152");
-    assert_eq!(size(&prep("glm-image", &[flag("H")]).await.unwrap()), "1152x2048");
-    assert_eq!(size(&prep("glm-image", &[flag("w")]).await.unwrap()), "2048x1536");
-    assert_eq!(size(&prep("glm-image", &[flag("1")]).await.unwrap()), "1024x1024");
-    assert_eq!(size(&prep("glm-image", &[flag("2")]).await.unwrap()), "2048x2048");
-    assert_eq!(size(&prep("cogview-4", &[flag("W")]).await.unwrap()), "1920x1072");
-    assert_eq!(size(&prep("cogview-4", &[flag("h")]).await.unwrap()), "1248x1664");
-    assert_eq!(size(&prep("cogview-3-flash", &[flag("1")]).await.unwrap()), "1024x1024");
+    assert_eq!(size(&prep("glm-image", &[kv("ar", "16:9")]).await.unwrap()), "2048x1152");
+    assert_eq!(size(&prep("glm-image", &[kv("ar", "9:16")]).await.unwrap()), "1152x2048");
+    assert_eq!(size(&prep("glm-image", &[kv("ar", "4:3")]).await.unwrap()), "2048x1536");
+    assert_eq!(size(&prep("glm-image", &[kv("size", "1K")]).await.unwrap()), "1024x1024");
+    assert_eq!(size(&prep("glm-image", &[kv("size", "2K")]).await.unwrap()), "2048x2048");
+    assert_eq!(size(&prep("cogview-4", &[kv("ar", "16:9")]).await.unwrap()), "1920x1072");
+    assert_eq!(size(&prep("cogview-4", &[kv("ar", "3:4")]).await.unwrap()), "1248x1664");
+    assert_eq!(size(&prep("cogview-3-flash", &[kv("size", "1K")]).await.unwrap()), "1024x1024");
     // Every size is within the documented rules.
     for (model, r) in [("glm-image", (21, 9)), ("cogview-4", (1, 4)), ("glm-image", (4, 1))] {
         let s = spec(model).unwrap().sizes;
@@ -105,9 +105,9 @@ async fn sizes_ratios_and_quality() {
         assert!(w % s.multiple == 0 && h % s.multiple == 0 && (w as u64) * (h as u64) <= s.max_pixels);
         assert!(w >= s.min_side && h >= s.min_side && w <= s.max_side && h <= s.max_side);
     }
-    let e = prep("cogview-4", &[flag("2")]).await.unwrap_err().message;
+    let e = prep("cogview-4", &[kv("size", "2K")]).await.unwrap_err().message;
     assert!(e.contains("sizes: 1K"), "{e}");
-    assert!(prep("glm-image", &[flag("4")]).await.unwrap_err().message.contains("sizes: 1K, 2K"));
+    assert!(prep("glm-image", &[kv("size", "4K")]).await.unwrap_err().message.contains("sizes: 1K, 2K"));
     assert!(prep("glm-image", &[kv("ar", "8:1")]).await.unwrap_err().message.contains("has no size"));
     let p = prep("cogview-4", &[kv("q", "standard")]).await.unwrap();
     assert_eq!(p.body["quality"], "standard");
@@ -121,7 +121,7 @@ async fn sizes_ratios_and_quality() {
     assert!(prep("glm-image", &[flag("i")]).await.unwrap_err().message.contains("without `+i`"));
     assert!(prep("glm-image", &[kv("e", "high")]).await.is_err());
     // Not in the table: its price is unknown to the bot, so it is not supported, with or without options.
-    for opts in [&[][..], &[flag("W")]] {
+    for opts in [&[][..], &[kv("ar", "16:9")]] {
         assert_eq!(
             prep("cogview-5", opts).await.unwrap_err().message,
             "`cogview-5` is not in the bot's Zhipu BigModel model table (its price is unknown), so it is not supported"

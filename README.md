@@ -36,7 +36,7 @@ docker compose logs -f
 | `anthropic/claude-opus-5.5$你好` | 直接写 bot 有的任意 OpenRouter 模型 ID（需 `allow_unlisted_models = true`），新模型无需改配置 |
 | `openai:gpt-6.1-sol$你好` | 直连该平台的官方 API（需配置它的 key；直接写 ID 同样需 `allow_unlisted_models = true`，而且只接受 bot 模型表里的模型） |
 | `c,g,61s$比较一下` | 多个模型并行 |
-| `c+s$` / `c+e=low$` / `gi+4W$` | 选项：官方搜索、推理强度、图片尺寸/比例…（本地校验，`/help options`） |
+| `c+s$` / `c+h$` / `gi+size=4K+ar=16:9$` | 选项：官方搜索、最高推理强度（`h`；`l` 最低）、图片尺寸/比例…（本地校验，`/help options`） |
 | `i$一只猫`、`dbv$海浪` | 直接调出图/视频模型：示例配置里平台字母加 `i`/`v` 是出图/视频模型（`i` = OpenAI GPT Image，`dbv` = Seedance，全部见 /models）；直接写 ID（`openai:gpt-image-2.6-sunburst$`）需该平台 `allow_unlisted_models = true`，示例配置里没开。回复生成的图 = 编辑它；`+n=` `+q=` `+bg=` `+sec=` |
 | `c$::system` + 换行 + 角色段落 | 自定义 system prompt 和前文历史 |
 | 图片/文件/相册的说明里写前缀，或带前缀回复图片/文件/相册/位置 | 附件交给模型；相册当一条消息；位置给 Gemini 的 Google Maps（`+m`）；富消息按 Markdown |

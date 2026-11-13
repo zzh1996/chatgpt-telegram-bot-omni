@@ -106,15 +106,18 @@ async fn defaults_are_the_largest_size_one_image_thinking_no_watermark() {
 #[tokio::test]
 async fn options_per_model() {
     let size = |p: &Prepared| p.body["parameters"]["size"].as_str().map(str::to_string);
-    assert_eq!(size(&prep("qwen-image-3.0", &[flag("W")]).await.unwrap()).as_deref(), Some("2720*1536"));
-    assert_eq!(size(&prep("qwen-image-2.1-pro", &[flag("1")]).await.unwrap()).as_deref(), Some("1024*1024"));
-    assert_eq!(size(&prep("wan2.6-t2i", &[flag("W")]).await.unwrap()).as_deref(), Some("1920*1072"));
-    assert_eq!(size(&prep("wan2.7-image", &[flag("1")]).await.unwrap()).as_deref(), Some("1K"));
-    assert_eq!(size(&prep("wan2.7-image-pro", &[flag("4H")]).await.unwrap()).as_deref(), Some("3072*5456"));
-    let e = prep("wan2.7-image", &[flag("4")]).await.unwrap_err().message;
+    assert_eq!(size(&prep("qwen-image-3.0", &[kv("ar", "16:9")]).await.unwrap()).as_deref(), Some("2720*1536"));
+    assert_eq!(size(&prep("qwen-image-2.1-pro", &[kv("size", "1K")]).await.unwrap()).as_deref(), Some("1024*1024"));
+    assert_eq!(size(&prep("wan2.6-t2i", &[kv("ar", "16:9")]).await.unwrap()).as_deref(), Some("1920*1072"));
+    assert_eq!(size(&prep("wan2.7-image", &[kv("size", "1K")]).await.unwrap()).as_deref(), Some("1K"));
+    assert_eq!(
+        size(&prep("wan2.7-image-pro", &[kv("size", "4K"), kv("ar", "9:16")]).await.unwrap()).as_deref(),
+        Some("3072*5456")
+    );
+    let e = prep("wan2.7-image", &[kv("size", "4K")]).await.unwrap_err().message;
     assert!(e.contains("sizes: 1K, 2K"), "{e}");
     assert!(prep("qwen-image-3.0", &[kv("ar", "9:1")]).await.unwrap_err().message.contains("1:8 to 8:1"));
-    assert!(prep("wan2.6-t2i", &[flag("4")]).await.unwrap_err().message.contains("not available"));
+    assert!(prep("wan2.6-t2i", &[kv("size", "4K")]).await.unwrap_err().message.contains("not available"));
 
     assert_eq!(prep("qwen-image-3.0-pro", &[kv("n", "6")]).await.unwrap().body["parameters"]["n"], 6);
     assert!(prep("qwen-image-3.0-pro", &[kv("n", "7")]).await.unwrap_err().message.contains("1–6"));
@@ -173,7 +176,7 @@ async fn edits_and_inputs() {
     assert_eq!(p.body["parameters"]["size"], "2K");
     assert!(p.body["parameters"].get("thinking_mode").is_none());
     assert!(
-        prep_with("wan2.7-image-pro", &[flag("4")], &history, &blobs)
+        prep_with("wan2.7-image-pro", &[kv("size", "4K")], &history, &blobs)
             .await
             .unwrap_err()
             .message

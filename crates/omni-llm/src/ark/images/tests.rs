@@ -121,13 +121,13 @@ async fn defaults_are_the_largest_size_without_watermark() {
 #[tokio::test]
 async fn sizes_and_ratios() {
     // Ark's tier × ratio table.
-    assert_eq!(prep(S55, &[flag("W")]).await.body["size"], "2816x1584");
-    assert_eq!(prep(S55, &[flag("1h")]).await.body["size"], "864x1152");
-    assert_eq!(prep(FLASH, &[flag("1W")]).await.body["size"], "1424x800");
+    assert_eq!(prep(S55, &[kv("ar", "16:9")]).await.body["size"], "2816x1584");
+    assert_eq!(prep(S55, &[kv("size", "1K"), kv("ar", "3:4")]).await.body["size"], "864x1152");
+    assert_eq!(prep(FLASH, &[kv("size", "1K"), kv("ar", "16:9")]).await.body["size"], "1424x800");
     assert_eq!(prep(PRO, &[kv("ar", "21:9")]).await.body["size"], "3136x1344");
-    let p = prep(PRO, &[flag("1")]).await;
+    let p = prep(PRO, &[kv("size", "1K")]).await;
     assert_eq!((p.body["size"].as_str(), p.settings[0].as_str()), (Some("1K"), "size 1K"));
-    let p = prep(S55, &[flag("H")]).await;
+    let p = prep(S55, &[kv("ar", "9:16")]).await;
     assert_eq!(p.settings[0], "size 1584x2816 (2K 9:16)");
     assert_eq!(p.applied[0].source, "option");
     // Other ratios: the exact ratio at the tier's pixel count.
@@ -136,7 +136,7 @@ async fn sizes_and_ratios() {
     assert_eq!(prep(S55, &[kv("ar", "1:4")]).await.body["size"], "1024x4096");
     // Outside what Ark takes.
     assert!(prep_err(S55, &[kv("ar", "1:20")]).await.contains("1:16 to 16:1"));
-    let e = prep_err(S55, &[flag("4")]).await;
+    let e = prep_err(S55, &[kv("size", "4K")]).await;
     assert!(e.contains("sizes: 1K, 2K"), "{e}");
     assert_eq!(dimensions(spec(S55).unwrap(), "1.5K", "16:9"), Ok((2048, 1152)));
 }
@@ -319,7 +319,7 @@ async fn ids_outside_the_table() {
         "doubao-seedream-4-0-250828",
     ] {
         assert!(!ark().knows(id), "{id}");
-        for options in [&[][..], &[flag("W")]] {
+        for options in [&[][..], &[kv("ar", "16:9")]] {
             assert_eq!(
                 prep_err(id, options).await,
                 format!(
@@ -476,7 +476,8 @@ async fn end_to_end() {
         "usage": {"generated_images": 1, "output_tokens": 4450, "total_tokens": 4450}
     })
     .to_string();
-    let (r, outcome, evs, head, _) = exchange(200, "application/json", body, S55, &[flag("1W")]).await;
+    let (r, outcome, evs, head, _) =
+        exchange(200, "application/json", body, S55, &[kv("size", "1K"), kv("ar", "16:9")]).await;
     assert!(head.starts_with("POST /api/v3/images/generations HTTP/1.1"), "{head}");
     assert!(head.to_ascii_lowercase().contains("authorization: bearer k"), "{head}");
     assert_eq!(outcome.upstream_id.as_deref(), Some("req-1"));
