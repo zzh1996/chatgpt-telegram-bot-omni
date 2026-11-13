@@ -778,6 +778,9 @@ pub fn split_blocks(blocks: Vec<RBlock>, limits: RichLimits) -> Vec<Vec<RBlock>>
     msgs
 }
 
+/// Appended to the title of a fold that goes on in the next message.
+const CONT: &str = " (cont.)";
+
 /// Split one block into a first piece (fitting `chars`/`blocks` if possible) and the rest.
 fn split_block(b: RBlock, chars: usize, blocks: usize) -> Option<(RBlock, RBlock)> {
     let chars = chars.max(64);
@@ -837,7 +840,12 @@ fn split_block(b: RBlock, chars: usize, blocks: usize) -> Option<(RBlock, RBlock
         }
         RBlock::Details { open, title, blocks: children } => {
             let (a, r) = split_children(children, chars.saturating_sub(title.chars() + 16), blocks.saturating_sub(1))?;
-            let cont = RText::concat(vec![title.clone(), RText::plain(" (cont.)")]);
+            // One marker however many messages the fold runs on: never "(cont.) (cont.)".
+            let cont = if title.to_plain().ends_with(CONT) {
+                title.clone()
+            } else {
+                RText::concat(vec![title.clone(), RText::plain(CONT)])
+            };
             Some((RBlock::Details { open, title, blocks: a }, RBlock::Details { open, title: cont, blocks: r }))
         }
         RBlock::Quote { blocks: children } => {
@@ -1049,6 +1057,28 @@ mod tests {
         }
         // Only titles of continuation details are added.
         assert!(total_after >= total_before - 50);
+    }
+
+    /// A fold over many messages: each continuation says "(cont.)" once.
+    #[test]
+    fn a_long_fold_is_marked_once_per_message() {
+        let lim = RichLimits { max_chars: 1000, max_blocks: 20, max_depth: 16, max_table_cols: 20, max_media: 50 };
+        let fold = RBlock::Details {
+            open: false,
+            title: RText::plain("💭 41 · 🔧 98"),
+            blocks: (0..120).map(|i| RBlock::Paragraph(RText::plain(format!("step {i} {}", "z".repeat(60))))).collect(),
+        };
+        let msgs = split_blocks(vec![fold], lim);
+        assert!(msgs.len() >= 5, "{}", msgs.len());
+        let titles: Vec<String> = msgs
+            .iter()
+            .map(|m| match &m[0] {
+                RBlock::Details { title, .. } => title.to_plain(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(titles[0], "💭 41 · 🔧 98");
+        assert!(titles[1..].iter().all(|t| t == "💭 41 · 🔧 98 (cont.)"), "{titles:?}");
     }
 
     #[test]
