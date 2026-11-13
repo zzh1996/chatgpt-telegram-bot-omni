@@ -24,7 +24,7 @@ view：RenderState → compose（富消息块）→ paginate → outbox（幂等
 | crate | 职责 | 依赖 |
 |---|---|---|
 | `omni-core` | 对话内容模型（`Turn`/`Part`/`Reasoning`/`Citation`/`NativeOutput`）、blob 引用、触发语法与 `::role` 解析、用量、JSON 工具（merge patch、blob 脱敏） | 纯逻辑 |
-| `omni-markdown` | Markdown → 自有 AST（带源码范围）→ 富消息块 `RBlock`/`RText`（镜像 TL PageBlock）或经典 entities；限额统计与切分 | pulldown-cmark（`vendor/` 里打了 CJK 友好强调补丁的副本） |
+| `omni-markdown` | Markdown → 自有 AST（带源码范围）→ 富消息块 `RBlock`/`RText`（镜像 TL PageBlock）或经典 entities；限额统计与切分；`latex` 把公式改写成各 Telegram app 都画得出的写法（D82） | pulldown-cmark（`vendor/` 里打了 CJK 友好强调补丁的副本） |
 | `omni-llm` | Provider 抽象（`CallInput`→`Prepared`→流事件）、SSE 解析、错误分类、OpenRouter（目录、Chat Completions / Responses / Messages 三种接口、选项/预设解析）、各平台官方 API 直连（`provider` 及各平台模块，见 §7） | reqwest |
 | `omni-bot` | 二进制 `omni`：配置、日志、SQLite、grammers Session、Telegram 收发、多 bot（各自独立）、任务、渲染、命令、权限、限额 | grammers、rusqlite |
 
@@ -58,7 +58,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 - 成员关系 `bot_chats` 从入群事件和收到的消息学习（只记录，不参与路由）。
 - 触发：每个 bot 独立解析前缀，只回答它能解析的 spec；群里不认识的 spec 静默跳过（可能属于别的 bot），私聊和 `/m` 里报错。几个 bot 都认识同一个前缀时各自回答。直接写的模型 ID 只在该 provider 的 `allow_unlisted_models = true` 时可用。直连平台的模型（直接写或经前缀）还必须在 bot 的模型表里（`Provider::knows`）：否则私聊和前缀报错，群里直接写的不理，`/models` 不列出。
 - 回复：由发出被回复消息的 bot 处理（按 bot 维度查 `tg_messages`）。
-- 命令：每个 bot 都回答发给它（`@`）或未加 @ 的命令；回复类命令（`/m` `/raw` `/dump` `/info` `/retry` `/continue`，以及作为回复的 `/prefix`）未加 @ 时只由发出被回复消息的 bot 处理。
+- 命令：每个 bot 都回答发给它（`@`）或未加 @ 的命令；回复类命令（`/m` `/raw` `/full` `/dump` `/info` `/retry` `/continue`，以及作为回复的 `/prefix`）未加 @ 时只由发出被回复消息的 bot 处理。
 - 启动时为每个 bot 注册命令菜单：先重置旧版本可能留下的按语言/聊天类型的列表（它们会盖住默认列表），再设所有聊天、所有语言共用的一份；管理员的私聊（和 bot 说过话之后）另设含管理命令的列表。
 
 ## 5. 渲染与限速
@@ -67,7 +67,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 - `prefixes`：本聊天的前缀（自定义 chatbot，表 `chat_prefixes`，按 bot + 聊天）：创建时把模型和选项解析定死，内存里缓存；`App::resolve_spec` 先查 bot 的前缀，再查本聊天的；新对话里每个这样的前缀单独一条链（它的 system prompt 和历史以 synthetic 回合写在用户消息前面），所以删除前缀不影响已有对话。
 - `compose`：把回合状态组装为富消息块（头部、折叠的推理/工具/来源、正文、提示、错误、页脚），每条消息第一行是 bot 的头部（小字），bot 生成的其它部分只用模型 Markdown 永远不会产生的块（details、footer），保证模型输出无法冒充。工具调用的内容由 `toolview` 按常见格式（搜索、来源、网页、代码输出、文件、错误）显示成可读的块，认不出的、没展示的字段显示为 JSON（D60）。
 - `help`：`/help` 的全部文字（D68），英文和中文（`/help_zh`）各一份：一条富消息，快速上手、命令表，每个主题一个折叠块；`/help <主题或命令>`、`/help_<主题>` 只看一个主题；管理员另有所在聊天类型的管理主题。文字是 Markdown（主题里 `::: 标题` … `:::` 是折叠块），`$` 换成配置的前缀标记，文件大小上限、`bold_cost_usd`、能否直接写模型 ID 按部署填入；不写具体的厂商和模型。测试保证每个命令都有主题、整个 `/help` 是一条消息。
-- `paginate`：按 32640 字 / 499 块切成多条消息（富消息上限 32768 / 500，留出续页头部的位置），超大块按结构拆分（代码按行、列表按项、表格按行并重复表头、折叠块按子块，后续消息里的折叠标题加一次 ` (cont.)`，不论跨几条消息都只加一次）。
+- `paginate`：按 32640 字 / 499 块切成多条消息（富消息上限 32768 / 500，留出续页头部的位置），超大块按结构拆分（代码按行、列表按项、表格按行并重复表头、折叠块按子块，后续消息里的折叠标题加一次 ` (cont.)`，不论跨几条消息都只加一次）。多条时每条的头部都标 `part i/n`（生成中 `part i`）。生成中先用 `rich::trim_folds` 把推理和工具调用的折叠缩到最新部分，整条不超过 `render.show_more_chars`（Telegram 的 "Show More"，D81）；写完的回答只因这些折叠超过一条消息时缩到一条，提示 `/full`（`compose::full_process` 把完整的折叠分页发出）。
 - `view`：每次尝试一个同步任务，只渲染最新状态（watch 通道合并中间状态）；与已发出内容哈希比较，只编辑变化的分段，新增分段回复前一段发送；最终状态多余的分段删除。
 - 降级链：富消息被拒（400 类内容错误）→ 模型部分改为原始 Markdown 块 → 仍被拒则纯文本 entities。
 - 限速（`tg::flood` + `tg::gate`，D38）：每个 (bot, chat) 一个门，一次只做一个操作。每个请求带类别（完毕内容 > 新回答第一条 > 生成中更新）和预估轻重；门只在 Telegram 预算（按实测模型、带余量的滑动窗口）放得下时才放行，同时满足条件的按类别、再按到期时间排。拿到许可后按最新版本渲染，若比申请时更重且此刻放不下就退回重排。生成中的更新按回答年龄定节奏（`view::pace`）。被接受的操作写进 `flood_log`，重启后据此恢复；每页消息当前显示的大小/结构存在 `outbox.shape_*`。

@@ -335,6 +335,11 @@ impl Ark {
         let (messages, mut notes) =
             chat::convert_history_with(input.history, input.model, None, blobs, &FLAVOR).await?;
         notes.notes.splice(0..0, level_note);
+        // Ark drops earlier turns' reasoning at every new user message (deep-thinking
+        // guide: "之前输出的思维链内容不会被拼接到上下文中"); there is no switch.
+        if req.effort.as_deref() != Some("none") && crate::provider::has_earlier_reasoning(input.history, input.model) {
+            notes.notes.push(crate::provider::reasoning_dropped("Ark"));
+        }
         let mut body = json!({
             "model": input.model,
             "messages": messages,

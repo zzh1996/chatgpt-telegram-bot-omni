@@ -117,11 +117,69 @@ pub fn label(s: &str) -> RText {
     RText::bold(RText::plain(s))
 }
 
+/// The icon of a reply's first line while it is being generated (`render.progress`):
+/// it moves on to the next frame with every update Telegram gets, so a reply still
+/// being written is told apart from a finished one (🤖) at its first line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Progress {
+    /// ⏳ and ⌛ in turn: an hourglass turned over.
+    Hourglass,
+    /// 🕛 🕐 🕑 …: a clock hand going round (the owner's choice, 2026-11-14).
+    #[default]
+    Clock,
+    /// 🌑 🌒 🌓 …: the phases of the moon.
+    Moon,
+    /// Always 🤖.
+    Off,
+}
+
+/// The icon of a finished reply (and of every reply with `progress = "off"`).
+pub const DONE_ICON: &str = "🤖";
+/// The icon of the earlier messages of a multi-message reply still being generated.
+pub const BUSY_ICON: &str = "⏳";
+
+impl Progress {
+    pub fn frame(self, n: u32) -> &'static str {
+        const HOURGLASS: &[&str] = &["⏳", "⌛"];
+        const CLOCK: &[&str] = &["🕛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚"];
+        const MOON: &[&str] = &["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+        let frames = match self {
+            Progress::Hourglass => HOURGLASS,
+            Progress::Clock => CLOCK,
+            Progress::Moon => MOON,
+            Progress::Off => return DONE_ICON,
+        };
+        frames[n as usize % frames.len()]
+    }
+}
+
+/// Which part of a reply in several messages a message is: `part 2/4` once
+/// their number is known (owner, 2026-11-14), `part 2` while it may still grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartOf {
+    pub n: usize,
+    pub of: Option<usize>,
+}
+
+impl PartOf {
+    pub fn label(self) -> String {
+        match self.of {
+            Some(total) => format!("part {}/{total}", self.n),
+            None => format!("part {}", self.n),
+        }
+    }
+}
+
 /// The first line of every reply message, in small text.
-fn header(model: &str, part: Option<usize>) -> RBlock {
-    let mut t = vec![RText::plain("🤖 "), label(model)];
+fn header(model: &str) -> RBlock {
+    header_with(DONE_ICON, model, None)
+}
+
+pub fn header_with(icon: &str, model: &str, part: Option<PartOf>) -> RBlock {
+    let mut t = vec![RText::plain(format!("{icon} ")), label(model)];
     if let Some(p) = part {
-        t.push(RText::plain(format!(" · part {p}")));
+        t.push(RText::plain(format!(" · {}", p.label())));
     }
     RBlock::Footer(RText::concat(t))
 }
@@ -800,7 +858,7 @@ fn usage_parts(u: &Usage) -> Vec<String> {
 pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     let raw = inp.raw_ai || inp.mode == Mode::Raw;
     let finished = inp.status != Status::Generating;
-    let mut out = vec![header(inp.model, None)];
+    let mut out = vec![header(inp.model)];
 
     // 2. earlier attempts of this reply (failed or interrupted), oldest first, folded.
     for a in inp.prior {
@@ -912,7 +970,30 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     if !f.is_empty() {
         out.push(RBlock::Footer(footer_text(&f, bold)));
     }
+    // Reasoning and tool calls below the footer when the answer is one stretch
+    // (or there is none yet): a long fold then never hides the footer behind
+    // Telegram's "Show More" (owner, 2026-11-14). An answer in several stretches
+    // keeps the order it was produced in.
+    if inp.answer_first && answer_stretches(inp.parts) <= 1 {
+        let (thinking, rest): (Vec<RBlock>, Vec<RBlock>) = out.into_iter().partition(is_thinking_fold);
+        out = rest;
+        out.extend(thinking);
+    }
     out
+}
+
+/// How many separate stretches of answer the parts have.
+fn answer_stretches(parts: &[Part]) -> usize {
+    let (mut n, mut in_answer) = (0, false);
+    for p in parts {
+        if is_answer(p) {
+            n += usize::from(!in_answer);
+            in_answer = true;
+        } else if is_process(p) {
+            in_answer = false;
+        }
+    }
+    n
 }
 
 /// A file size: `623.9 KB`, `12.4 MB`.
@@ -990,16 +1071,146 @@ fn pretty(v: &Value) -> String {
 /// continuation pages get.
 pub const PAGE_LIMITS: RichLimits = RichLimits { max_chars: 32_768 - 128, max_blocks: 500 - 1, ..RichLimits::TELEGRAM };
 
+/// The marker at the start of a fold shortened while the reply is generated.
+fn trimmed_marker(n: usize) -> RBlock {
+    RBlock::Footer(RText::plain(format!(
+        "… {} characters before this, shown when the reply is done",
+        fmt_tokens(n as u64)
+    )))
+}
+
+/// The marker at the start of a fold shortened in a finished reply.
+fn final_marker(n: usize) -> RBlock {
+    RBlock::Footer(RText::plain(format!(
+        "… {} characters before this; reply /full for all of it",
+        fmt_tokens(n as u64)
+    )))
+}
+
+/// `/full`: a finished answer's reasoning and tool calls, complete, folded as
+/// in the answer, in as many messages as they need (each with the header
+/// line). `None`: the answer has none.
+pub fn full_process(model: &str, parts: &[Part]) -> Option<Vec<Vec<RBlock>>> {
+    let inp = ComposeInput {
+        model,
+        options: "",
+        parts,
+        status: Status::Done,
+        attempt: 1,
+        max_attempts: 1,
+        error: None,
+        usage: None,
+        provider: None,
+        finish_reason: None,
+        native_finish_reason: None,
+        notes: &[],
+        elapsed: Duration::ZERO,
+        show_usage: false,
+        bold_cost: 0.0,
+        reasoning_open: false,
+        answer_first: true,
+        mode: Mode::Clean,
+        raw_ai: false,
+        hops: 0,
+        continuation: false,
+        attachments: &[],
+        settings: &[],
+        prior: &[],
+        previews: &[],
+        served: &[],
+    };
+    let folds: Vec<RBlock> = compose(&inp).into_iter().filter(is_thinking_fold).collect();
+    if folds.is_empty() {
+        return None;
+    }
+    // Short, so that `part 2/5` stays on the first line (owner, 2026-11-14).
+    let label = format!("{model} · reasoning");
+    let mut blocks = vec![header(&label)];
+    blocks.extend(folds);
+    Some(with_headers(&label, rich::split_blocks(rich::sanitize(blocks), PAGE_LIMITS), None))
+}
+
+/// Characters a shortened fold keeps at least (its latest ones).
+const TRIM_KEEP: usize = 600;
+
+/// A reasoning or tool-call fold (or the fold that groups them): what is
+/// shortened when a reply is too long, and what goes below the footer.
+fn is_thinking_title(t: &RText) -> bool {
+    let p = t.to_plain();
+    p.starts_with("💭") || p.starts_with("🔧")
+}
+
+fn is_thinking_fold(b: &RBlock) -> bool {
+    matches!(b, RBlock::Details { title, .. } if is_thinking_title(title))
+}
+
+/// A finished reply that needs more than one message only because of its
+/// reasoning and tool calls is shortened to one (owner, 2026-11-14): its
+/// reasoning and tool folds keep their latest part, with a marker naming /full.
+/// A reply whose other content needs several messages anyway keeps all of it;
+/// so does one that still needs two after the folds are shortened.
+fn fit_one_message(blocks: &mut Vec<RBlock>) {
+    let pages = |b: &[RBlock]| rich::split_blocks(b.to_vec(), PAGE_LIMITS).len();
+    if pages(blocks) <= 1 {
+        return;
+    }
+    let rest: Vec<RBlock> = blocks.iter().filter(|b| !is_thinking_fold(b)).cloned().collect();
+    if pages(&rest) > 1 {
+        return;
+    }
+    let mut budget = PAGE_LIMITS.max_chars;
+    for _ in 0..8 {
+        let mut b = blocks.clone();
+        rich::trim_folds(&mut b, budget, TRIM_KEEP, &is_thinking_title, &final_marker);
+        if pages(&b) <= 1 {
+            *blocks = b;
+            return;
+        }
+        budget = budget * 3 / 4;
+    }
+}
+
 /// Split a composed document into as few Telegram messages as the limits
-/// allow; continuation messages get the header line too.
-pub fn paginate(model: &str, blocks: Vec<RBlock>) -> Vec<Vec<RBlock>> {
-    let pages = rich::split_blocks(rich::sanitize(blocks), PAGE_LIMITS);
+/// allow; continuation messages get the header line too. `live`: the reply is
+/// still being generated, with this icon on its last message (the one being
+/// written) and [`BUSY_ICON`] on the others; `None`: 🤖 everywhere. While it is
+/// generated, collapsed folds keep only their latest part so that the reply
+/// stays within `stream_chars` characters (`render.show_more_chars`; 0: no
+/// limit): Telegram shows a longer rich message only up to the block that
+/// crosses about 8,000 characters (collapsed text included) and hides the rest,
+/// a fold's title and the footer too, behind "Show More".
+pub fn paginate(model: &str, blocks: Vec<RBlock>, live: Option<&str>, stream_chars: usize) -> Vec<Vec<RBlock>> {
+    let mut blocks = rich::sanitize(blocks);
+    if live.is_some() {
+        if stream_chars > 0 {
+            rich::trim_folds(&mut blocks, stream_chars, TRIM_KEEP, &is_thinking_title, &trimmed_marker);
+        }
+    } else {
+        fit_one_message(&mut blocks);
+    }
+    with_headers(model, rich::split_blocks(blocks, PAGE_LIMITS), live)
+}
+
+/// The header line on every page (`live`: see [`paginate`]).
+fn with_headers(model: &str, pages: Vec<Vec<RBlock>>, live: Option<&str>) -> Vec<Vec<RBlock>> {
+    let last = pages.len().saturating_sub(1);
     pages
         .into_iter()
         .enumerate()
         .map(|(i, mut p)| {
+            let icon = match live {
+                Some(frame) if i == last => frame,
+                Some(_) => BUSY_ICON,
+                None => DONE_ICON,
+            };
+            // Several messages: every one says which part it is, the first too, and of
+            // how many once the reply is done (owner, 2026-11-14), so that nobody takes
+            // one for the whole answer.
+            let part = (last > 0).then_some(PartOf { n: i + 1, of: live.is_none().then_some(last + 1) });
             if i > 0 {
-                p.insert(0, header(model, Some(i + 1)));
+                p.insert(0, header_with(icon, model, part));
+            } else if (icon != DONE_ICON || part.is_some()) && matches!(p.first(), Some(RBlock::Footer(_))) {
+                p[0] = header_with(icon, model, part);
             }
             p
         })
@@ -1347,6 +1558,77 @@ mod tests {
         }
     }
 
+    /// Reasoning of paragraphs, lists and a table, as models write it.
+    fn long_reasoning(chars: usize) -> String {
+        let mut s = String::new();
+        let mut i = 0;
+        while s.chars().count() < chars {
+            i += 1;
+            s.push_str(&match i % 4 {
+                0 => "- check 41\n- check 43\n- check 47, which divides it\n\n".to_string(),
+                1 => "| n | value |\n|---|---|\n| 40 | 1681 |\n| 41 | 1763 |\n\n".to_string(),
+                _ => {
+                    format!("Step {i}: the product of the roots equals the constant term, so test small primes. ")
+                        .repeat(3)
+                        + "\n\n"
+                }
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn a_reply_being_generated_stays_under_the_show_more_length() {
+        let text = long_reasoning(60_000);
+        let chars: Vec<char> = text.chars().collect();
+        for with_answer in [false, true] {
+            for n in (1_000..chars.len()).step_by(1_500) {
+                let mut parts = vec![Part::Reasoning(Reasoning {
+                    kind: ReasoningKind::Text,
+                    text: Some(chars[..n].iter().collect()),
+                    ..Default::default()
+                })];
+                if with_answer {
+                    parts.push(Part::text("x = 2 or x = 3"));
+                }
+                let mut inp = input(&parts, Status::Generating);
+                inp.reasoning_open = false;
+                let pages = paginate(inp.model, compose(&inp), Some("⏳"), 7_000);
+                assert_eq!(pages.len(), 1);
+                let shown = crate::tg::rich::expected_text(&pages[0]).chars().count();
+                assert!(shown <= 7_100, "answer={with_answer} reasoning={n}: {shown} characters");
+                // The header, the footer and the fold title stay; the fold says what it left out.
+                assert!(matches!(&pages[0][0], RBlock::Footer(t) if t.to_plain().starts_with("⏳ ")));
+                if n > 8_000 {
+                    let Some(RBlock::Details { blocks, .. }) = pages[0].last() else { panic!("{:?}", pages[0].last()) };
+                    assert!(matches!(&blocks[0], RBlock::Footer(t) if t.to_plain().contains("characters before this")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_finished_reply_too_long_only_for_its_reasoning_is_one_message() {
+        let reasoning = Part::Reasoning(Reasoning {
+            kind: ReasoningKind::Text,
+            text: Some(long_reasoning(60_000)),
+            ..Default::default()
+        });
+        let parts = vec![reasoning.clone(), Part::text("x = 2 or x = 3")];
+        let pages = paginate("m", compose(&input(&parts, Status::Done)), None, 7_000);
+        assert_eq!(pages.len(), 1);
+        let Some(RBlock::Details { blocks, .. }) = pages[0].last() else { panic!() };
+        let s = format!("{:?}", blocks);
+        assert!(s.contains("reply /full for all of it"), "{s}");
+        assert!(matches!(&pages[0][0], RBlock::Footer(t) if t.to_plain().starts_with("🤖 ")));
+        // A long answer needs several messages anyway: everything is kept.
+        let long_answer = "Paragraph of the answer that goes on for a while. ".repeat(1_500);
+        let parts = vec![reasoning, Part::text(long_answer.as_str())];
+        let pages = paginate("m", compose(&input(&parts, Status::Done)), None, 7_000);
+        assert!(pages.len() > 1);
+        assert!(!format!("{pages:?}").contains("reply /full for all of it"));
+    }
+
     #[test]
     fn layout_and_reserved_structure() {
         let parts = vec![
@@ -1485,26 +1767,27 @@ mod tests {
             Part::Text { text: "answer".into(), citations: vec![cite] },
             image,
         ];
-        assert_eq!(kinds(&parts, Status::Done), ["header", "p:answer", "📚", "photo", "💭", "footer"]);
+        // Reasoning and tool calls below the footer (owner, 2026-11-14).
+        assert_eq!(kinds(&parts, Status::Done), ["header", "p:answer", "📚", "photo", "footer", "💭"]);
         let blocks = compose(&input(&parts, Status::Done));
-        let RBlock::Details { title, blocks: inner, .. } = &blocks[4] else { panic!("{:?}", blocks[4]) };
+        let RBlock::Details { title, blocks: inner, .. } = &blocks[5] else { panic!("{:?}", blocks[5]) };
         assert_eq!(title.to_plain(), "💭 2 · 🔧 1");
         assert_eq!(inner.iter().map(kind).collect::<Vec<_>>(), ["💭", "🔧", "💭"]);
         // While the answer streams the reasoning is below it, closed and plain: thinking is over.
         let parts = vec![reasoning("**Planning**\n\nSo"), Part::text("Ans")];
-        assert_eq!(kinds(&parts, Status::Generating), ["header", "p:Ans", "💭", "footer"]);
+        assert_eq!(kinds(&parts, Status::Generating), ["header", "p:Ans", "footer", "💭"]);
         // Thinking again after the one answer: still one answer, so it stays first; the
         // reasoning in progress keeps its title.
         let parts = vec![reasoning("a"), Part::text("Ans"), reasoning("**Checking**\n\nb")];
         let blocks = compose(&input(&parts, Status::Generating));
-        assert_eq!(blocks.iter().map(kind).collect::<Vec<_>>(), ["header", "p:Ans", "💭+", "footer"]);
-        assert!(matches!(&blocks[2], RBlock::Details { title, .. } if title.to_plain() == "💭 Reasoning · Checking"));
+        assert_eq!(blocks.iter().map(kind).collect::<Vec<_>>(), ["header", "p:Ans", "footer", "💭+"]);
+        assert!(matches!(&blocks[3], RBlock::Details { title, .. } if title.to_plain() == "💭 Reasoning · Checking"));
         // Answers alternating with reasoning or tool calls: the order as produced.
         let parts = vec![reasoning("a"), Part::text("first"), tool_call(), Part::text("second")];
         assert_eq!(kinds(&parts, Status::Done), ["header", "💭", "p:first", "🔧", "p:second", "footer"]);
-        // Nothing to move: reasoning only, or the answer first anyway.
-        assert_eq!(kinds(&[reasoning("a")], Status::Done), ["header", "💭", "footer"]);
-        assert_eq!(kinds(&[Part::text("Ans"), tool_call()], Status::Done), ["header", "p:Ans", "🔧", "footer"]);
+        // Reasoning only, or the answer first anyway: the folds below the footer too.
+        assert_eq!(kinds(&[reasoning("a")], Status::Done), ["header", "footer", "💭"]);
+        assert_eq!(kinds(&[Part::text("Ans"), tool_call()], Status::Done), ["header", "p:Ans", "footer", "🔧"]);
         // `render.answer_first = false`: the order as produced.
         let mut i = input(&parts[..2], Status::Done);
         i.answer_first = false;
@@ -1626,11 +1909,11 @@ mod tests {
             ..Default::default()
         })];
         let blocks = compose(&input(&parts, Status::Generating));
-        assert!(matches!(&blocks[1], RBlock::Details { open: true, .. }));
+        assert!(matches!(blocks.last(), Some(RBlock::Details { open: true, .. })));
         // Off (the default): always folded, even while thinking.
         let mut i = input(&parts, Status::Generating);
         i.reasoning_open = false;
-        assert!(matches!(&compose(&i)[1], RBlock::Details { open: false, .. }));
+        assert!(matches!(compose(&i).last(), Some(RBlock::Details { open: false, .. })));
     }
 
     #[test]
@@ -1650,8 +1933,50 @@ mod tests {
         let long: String = (0..2000).map(|i| format!("line {i} {}\n\n", "x".repeat(30))).collect();
         let parts = vec![Part::text(long)];
         let blocks = compose(&input(&parts, Status::Done));
-        let pages = paginate("anthropic/claude-opus-5.5", blocks);
-        assert!(pages.len() >= 2);
-        assert!(matches!(&pages[1][0], RBlock::Footer(t) if t.to_plain() == "🤖 anthropic/claude-opus-5.5 · part 2"));
+        let pages = paginate("anthropic/claude-opus-5.5", blocks.clone(), None, 0);
+        let n = pages.len();
+        assert!(n >= 2);
+        // Done: every message says which part of how many, the first too (owner, 2026-11-14).
+        let header = |p: &Vec<RBlock>| match &p[0] {
+            RBlock::Footer(t) => t.to_plain(),
+            b => panic!("{b:?}"),
+        };
+        assert_eq!(header(&pages[0]), format!("🤖 anthropic/claude-opus-5.5 · part 1/{n}"));
+        assert_eq!(header(&pages[1]), format!("🤖 anthropic/claude-opus-5.5 · part 2/{n}"));
+        // While it is written the number of parts may still grow: no total.
+        let pages = paginate("anthropic/claude-opus-5.5", blocks, Some("🕐"), 0);
+        assert_eq!(header(&pages[0]), "⏳ anthropic/claude-opus-5.5 · part 1");
+        assert_eq!(header(pages.last().unwrap()), format!("🕐 anthropic/claude-opus-5.5 · part {}", pages.len()));
+    }
+
+    #[test]
+    fn command_output_in_several_messages_says_which_part() {
+        use omni_markdown::rich::RText;
+        let page = |s: &str| vec![RBlock::Paragraph(RText::plain(s))];
+        let titled = vec![
+            vec![
+                RBlock::Paragraph(RText::concat(vec![RText::plain("🤖 "), label("Request details")])),
+                page("a")[0].clone(),
+            ],
+            page("b"),
+            page("c"),
+        ];
+        let out = crate::reply::label_parts(titled);
+        let first: Vec<String> = out
+            .iter()
+            .map(|p| match &p[0] {
+                RBlock::Paragraph(t) | RBlock::Footer(t) => t.to_plain(),
+                b => panic!("{b:?}"),
+            })
+            .collect();
+        assert_eq!(
+            first,
+            ["🤖 Request details · part 1/3", "🤖 Request details · part 2/3", "🤖 Request details · part 3/3"]
+        );
+        // Untitled output: a small line first.
+        let out = crate::reply::label_parts(vec![page("a"), page("b")]);
+        assert!(matches!(&out[0][0], RBlock::Footer(t) if t.to_plain() == "part 1/2"));
+        // One message: unchanged.
+        assert_eq!(crate::reply::label_parts(vec![page("a")]), vec![page("a")]);
     }
 }

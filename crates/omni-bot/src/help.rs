@@ -82,6 +82,7 @@ const INTRO: &str = r#"I answer with AI models. Each model has a prefix: /models
 | `/model c` | the model of a prefix, and its details |
 | reply `/m g$text` | continue with another model |
 | reply /raw | the answer's original Markdown and files |
+| reply /full | the answer's complete reasoning and tool calls |
 | reply /dump | the conversation as a JSON file |
 | reply /info | the request's details |
 | reply /retry | try a failed answer again |
@@ -111,6 +112,7 @@ const INTRO_ZH: &str = r#"我用各家的 AI 模型回答问题。每个模型�
 | `/model c` | 前缀对应的模型及其详情 |
 | 回复 `/m g$文字` | 换一个模型接着聊 |
 | 回复 /raw | 回答的原始 Markdown 和文件 |
+| 回复 /full | 回答完整的推理和工具调用 |
 | 回复 /dump | 整段对话的 JSON 文件 |
 | 回复 /info | 请求详情 |
 | 回复 /retry | 重新生成失败的回答 |
@@ -420,9 +422,9 @@ Arr!
     Topic {
         key: "answers",
         title: "📖 Reading an answer, and commands for answers",
-        commands: &["raw", "dump", "info", "retry", "continue"],
+        commands: &["raw", "full", "dump", "info", "retry", "continue"],
         who: Who::Everyone,
-        body: r#"- **First line**: the platform and the model.
+        body: r#"- **First line**: the platform and the model. While the answer is being written its icon moves on with every update; 🤖 when it is done. An answer in several messages says which part each one is: `part 1/3` once it is done (`part 1` while it is written).
 - **💭 Reasoning**: the model's reasoning. While it thinks, the title also says what it is thinking about.
 - **🔧** tool calls (searches, code, pages read) with readable results. Several in a row are grouped: `💭 2 · 🔧 1`.
 - **📚 Sources**: the links the answer cites.
@@ -432,8 +434,11 @@ Arr!
 
 Everything I add is a fold or small text, so you can always tell which part is the model's answer.{ORDER} There is no stop button: once started, an answer is written to the end.
 
+Long reasoning and tool calls are shortened to their latest part, with a note at the start of the fold: while the answer is being written (so that Telegram's "Show More" hides nothing), and in a finished answer that only they would make longer than one message. /full shows all of them.
+
 **Commands for an answer** (reply with them to it):
 - /raw — its original Markdown, and the original files
+- /full — its complete reasoning and tool calls, folded as in the answer, in as many messages as they need
 - /dump — the whole conversation up to it, as a JSON file
 - /info — request details: attempts, timings, rate limits, and the full requests as JSON
 - /retry — answer a failed message again (like the 🔁 Retry button)
@@ -456,7 +461,7 @@ Everything I add is a fold or small text, so you can always tell which part is t
 - `finish: …` — why it stopped, when that was not the normal end.
 :::"#,
         title_zh: "📖 怎么看回答，以及针对回答的命令",
-        body_zh: r#"- **第一行**：平台和模型。
+        body_zh: r#"- **第一行**：平台和模型。回答还在写时，这里的图标随每次更新变化；写完是 🤖。分成几条消息的回答，每条都写它是第几部分：写完后是 `part 1/3`（还在写时是 `part 1`）。
 - **💭 Reasoning**：模型的推理。模型思考时，标题后面还会写它此刻在想什么。
 - **🔧** 工具调用（搜索、代码、读取的网页），结果是可读的形式。连续的几段会合成一组：`💭 2 · 🔧 1`。
 - **📚 Sources**：回答引用的链接。
@@ -466,8 +471,11 @@ Everything I add is a fold or small text, so you can always tell which part is t
 
 我加的内容都在折叠块或小字里，所以总能分清哪部分是模型的回答。{ORDER}没有停止按钮：回答一旦开始，就会写完。
 
+很长的推理和工具调用会只显示最新的一部分，折叠块开头有说明：回答还在写的时候（这样 Telegram 的"Show More"不会遮住任何东西），以及写完的回答仅仅因为它们而超过一条消息的时候。/full 显示全部。
+
 **针对回答的命令**（回复这条回答时使用）：
 - /raw — 它的原始 Markdown 和原始文件
+- /full — 它完整的推理和工具调用，像回答里一样折叠，需要几条消息就发几条
 - /dump — 到它为止的整段对话，JSON 文件
 - /info — 请求详情：每次尝试、耗时、限流余量，以及完整请求的 JSON
 - /retry — 重新生成失败的回答（和 🔁 Retry 按钮一样）
@@ -658,8 +666,8 @@ fn fill(text: &str, ctx: &Ctx) -> String {
         " `≈` means the cost is my estimate.".to_string()
     };
     let order = if ctx.answer_first {
-        " When the answer is one piece, it comes first and its reasoning and tool calls follow it; when answer and \
-         reasoning alternate, everything is in the order it happened."
+        " When the answer is one piece, it comes first, then the small text, then its reasoning and tool calls; when \
+         answer and reasoning alternate, everything is in the order it happened."
     } else {
         " Everything is in the order it happened."
     };
@@ -695,7 +703,7 @@ fn fill_zh(text: &str, ctx: &Ctx) -> String {
         "`≈` 表示费用是我估算的。".to_string()
     };
     let order = if ctx.answer_first {
-        "回答只有一段正文时，正文在最上面，推理和工具调用在它下面；正文和推理穿插时，一切按发生的顺序显示。"
+        "回答只有一段正文时，正文在最上面，然后是小字，推理和工具调用在最下面；正文和推理穿插时，一切按发生的顺序显示。"
     } else {
         "一切按发生的顺序显示。"
     };

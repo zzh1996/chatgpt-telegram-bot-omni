@@ -609,12 +609,17 @@ async fn container_files_of_a_recovered_stream_are_fetched_once() {
 
 #[test]
 fn withheld_reasoning_and_cache_misses_are_noted() {
-    let mut p = Parser::new(Platform::OpenAi, "gpt-6.1-sol", price, error_from_json);
     let progress =
         |t: Value| json!({"type": "response.in_progress", "response": {"id": "resp_1", "input_transformations": t}});
-    // Expected with `reasoning.context: current_turn`: nothing to say.
+    // Expected on a model with only `reasoning.context: current_turn` (the request says so): nothing more.
     let turn = json!([{"id": "rs_0", "type": "reasoning", "action": "removed", "reason": "turn_boundary"}]);
-    assert!(p.event(&progress(turn)).unwrap().iter().all(|e| !matches!(e, StreamEvent::Notice(_))));
+    let mut old = Parser::new(Platform::OpenAi, "gpt-5.2", price, error_from_json);
+    assert!(old.event(&progress(turn.clone())).unwrap().iter().all(|e| !matches!(e, StreamEvent::Notice(_))));
+    // Not expected where the bot asks for `all_turns`: said.
+    let mut sol = Parser::new(Platform::OpenAi, "gpt-6.1-sol", price, error_from_json);
+    assert!(sol.event(&progress(turn)).unwrap().iter().any(|e| matches!(e, StreamEvent::Notice(n)
+        if n == "ℹ️ OpenAI withheld 1 earlier reasoning item from the model: turn_boundary")));
+    let mut p = Parser::new(Platform::OpenAi, "gpt-5.2", price, error_from_json);
     let mixed = json!([
         {"id": "rs_1", "type": "reasoning", "action": "removed", "reason": "prefix_mismatch"},
         {"id": "rs_2", "type": "reasoning", "action": "removed", "reason": "turn_boundary"},

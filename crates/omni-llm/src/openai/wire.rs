@@ -966,15 +966,16 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// OpenAI's `input_transformations` (earlier inputs withheld from the model:
-/// `{id, type: "reasoning", action: "removed", reason}`), when any was for a
-/// reason other than `turn_boundary` (expected with `reasoning.context:
-/// "current_turn"`): `organization_mismatch`, `end_user_mismatch`,
-/// `model_mismatch`, `prefix_mismatch` (the conversation changed before it).
-fn withheld(r: &Value) -> Option<String> {
+/// `{id, type: "reasoning", action: "removed", reason}`): `organization_mismatch`,
+/// `end_user_mismatch`, `model_mismatch`, `prefix_mismatch` (the conversation
+/// changed before it), and `turn_boundary` where it is not expected: on a model
+/// the bot asks for `reasoning.context: "all_turns"` (on the others the request
+/// says so in advance).
+fn withheld(r: &Value, turn_boundary_expected: bool) -> Option<String> {
     let mut reasons: Vec<(String, usize)> = Vec::new();
     for t in r.get("input_transformations").and_then(Value::as_array).into_iter().flatten() {
         let reason = t.get("reason").and_then(Value::as_str).unwrap_or("no reason given");
-        if reason == "turn_boundary" {
+        if reason == "turn_boundary" && turn_boundary_expected {
             continue;
         }
         let what = match t.get("type").and_then(Value::as_str) {
@@ -1142,7 +1143,9 @@ impl Parser {
         if self.withheld_noted {
             return None;
         }
-        let n = withheld(r)?;
+        let all_turns =
+            self.platform == Platform::OpenAi && crate::openai::model_spec(&self.model).is_some_and(|s| s.all_turns);
+        let n = withheld(r, !all_turns)?;
         self.withheld_noted = true;
         Some(StreamEvent::Notice(n))
     }

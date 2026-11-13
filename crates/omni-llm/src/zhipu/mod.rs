@@ -148,6 +148,8 @@ const fn short_reply(input: f64, output: f64, hit: f64) -> Tier {
 const FREE: Tier = flat(0.0, 0.0, 0.0);
 
 const E53: &[&str] = &["max", "high", "low"];
+/// Models that cannot keep earlier turns' reasoning (see `prepare_chat`).
+const KEEPS_ONLY_CURRENT_TURN: &[&str] = &["glm-4.5-air", "glm-4.6v", "glm-4.6v-flashx", "glm-4.6v-flash"];
 /// GLM-5.2 also accepts xhigh/medium/low/minimal, which it remaps silently
 /// (to max/high/high/none): only the distinct levels are offered.
 const E52: &[&str] = &["max", "high"];
@@ -323,6 +325,15 @@ impl Provider for Zhipu {
 
         let (messages, mut notes) = chat_messages(input.history, model, spec, blobs).await?;
         notes.splice(0..0, level_note);
+        // `clear_thinking: false` keeps earlier reasoning on the GLM-4.7 and GLM-5 families;
+        // GLM-4.5-Air and GLM-4.6V have no way to keep it (their official chat templates
+        // drop it; the hosted API's behavior is UNVERIFIED).
+        if KEEPS_ONLY_CURRENT_TURN.contains(&model)
+            && req.effort.as_deref() != Some("none")
+            && crate::provider::has_earlier_reasoning(input.history, model)
+        {
+            notes.push(crate::provider::reasoning_dropped(model));
+        }
         let mut body = json!({
             "model": model,
             "messages": messages,

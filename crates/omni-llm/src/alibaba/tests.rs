@@ -132,7 +132,7 @@ async fn qwen38_defaults() {
     for k in ["temperature", "top_p", "top_k", "presence_penalty", "seed", "n"] {
         assert!(p.body.get(k).is_none(), "{k}");
     }
-    assert_eq!(p.settings, vec!["effort xhigh", "earlier reasoning kept"]);
+    assert_eq!(p.settings, vec!["effort xhigh"]);
     assert_eq!(p.applied[0].source, "default");
     assert_eq!(p.applied[0].patch, json!({"enable_thinking": true, "reasoning_effort": "xhigh"}));
     assert!(p.warnings.is_empty());
@@ -152,7 +152,7 @@ async fn thinking_options() {
     assert_eq!(p.body["thinking_budget"], 5000);
     assert_eq!(p.body["enable_thinking"], true);
     assert!(p.body.get("reasoning_effort").is_none(), "effort and budget together are an error");
-    assert_eq!(p.settings, vec!["thinking budget 5000", "earlier reasoning kept"]);
+    assert_eq!(p.settings, vec!["thinking budget 5000"]);
     let e = prepare_err("qwen3.8-max", &[kv("budget", "300000")]).await;
     assert!(e.contains("262144"), "{e}");
     // Only the native levels: the API would silently map max/high to xhigh.
@@ -165,7 +165,7 @@ async fn thinking_options() {
     assert!(p.body.get("reasoning_effort").is_none());
     // Qwen3.7 does not read replayed reasoning unless asked (its default is false).
     assert_eq!(p.body["preserve_thinking"], true);
-    assert_eq!(p.settings, vec!["thinking on", "earlier reasoning kept"]);
+    assert_eq!(p.settings, vec!["thinking on"]);
     let e = prepare_err("qwen3.7-max", &[kv("e", "low")]).await;
     assert!(e.contains("no reasoning effort levels"), "{e}");
     let p = prepare("qwen3.7-max", &[kv("budget", "8192")]).await.unwrap();
@@ -173,7 +173,7 @@ async fn thinking_options() {
     // Thinking-only snapshots take no switch.
     let p = prepare("qwen3.7-max-preview", &[]).await.unwrap();
     assert!(p.body.get("enable_thinking").is_none());
-    assert_eq!(p.settings, vec!["thinking (always on)", "earlier reasoning kept"]);
+    assert_eq!(p.settings, vec!["thinking (always on)"]);
     let e = prepare_err("qwen3.7-max-preview", &[kv("e", "none")]).await;
     assert!(e.contains("cannot turn reasoning off"), "{e}");
 }
@@ -329,7 +329,7 @@ async fn media() {
     assert_eq!(c[1], json!({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/"}}));
     assert_eq!(c[2]["type"], "video_url");
     assert_eq!(p.body["vl_high_resolution_images"], true, "the highest image detail");
-    assert_eq!(p.settings, vec!["effort xhigh", "earlier reasoning kept", "high-resolution images"]);
+    assert_eq!(p.settings, vec!["effort xhigh", "high-resolution images"]);
     // Text-only model.
     let e = alibaba(None).prepare(&input("qwen3.7-max", &[], &h), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("takes text only"), "{}", e.message);

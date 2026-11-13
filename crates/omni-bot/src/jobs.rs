@@ -405,6 +405,8 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         bold_cost: app.cfg.render.bold_cost_usd,
         reasoning_open: app.cfg.render.reasoning_open,
         answer_first: app.cfg.render.answer_first,
+        progress: app.cfg.render.progress,
+        stream_chars: app.cfg.render.show_more_chars,
         mode: app.cfg.render.markdown,
         prior: Vec::new(),
         previews: Vec::new(),

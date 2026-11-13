@@ -243,7 +243,7 @@ async fn defaults_are_the_official_ones() {
             "{model}"
         );
         assert_eq!(betas(model, &p.body), ["context-management-2025-06-27"]);
-        assert_eq!(p.settings, vec!["thinking budget 63999", "earlier thinking kept"]);
+        assert_eq!(p.settings, vec!["thinking budget 63999"]);
         let p = prep_ok(model, &["l"]).await;
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
     }
@@ -303,7 +303,7 @@ async fn effort_and_thinking_options() {
 async fn thinking_budget_option() {
     let p = prep_ok("claude-haiku-4-5", &["budget=20000"]).await;
     assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 20_000}));
-    assert_eq!(p.settings, vec!["thinking budget 20000", "earlier thinking kept"]);
+    assert_eq!(p.settings, vec!["thinking budget 20000"]);
     // Models that keep earlier thinking by themselves get no strategy.
     assert!(prep_ok("claude-opus-4-5", &["h"]).await.body.get("context_management").is_none());
     // Opus 4.5 keeps its (highest) effort alongside the budget.

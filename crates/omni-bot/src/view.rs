@@ -64,6 +64,10 @@ pub struct RenderState {
     pub reasoning_open: bool,
     /// `render.answer_first`.
     pub answer_first: bool,
+    /// `render.progress`: the first line's icon while generating.
+    pub progress: compose::Progress,
+    /// `render.show_more_chars`: the most a reply shows while it is generated.
+    pub stream_chars: usize,
     pub mode: Mode,
     /// Earlier attempts of this reply (shown above, in the same messages).
     pub prior: Vec<PriorAttempt>,
@@ -282,6 +286,8 @@ async fn sync_loop(
     let mut final_seen = false;
     let mut verified = false;
     let mut failures = 0u32;
+    // The progress icon's frame (see [`live_icon`]).
+    let mut frame = 0u32;
     let heartbeat = Duration::from_secs(30);
 
     if sent.is_empty() {
@@ -323,7 +329,7 @@ async fn sync_loop(
         let current = rx.borrow().clone();
         let ask = match current.as_ref() {
             Some(state) => {
-                let pages = pages_for(state, fallback);
+                let pages = pages_for(state, fallback, frame);
                 let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
                 let markup_of = |i: usize| if i + 1 == pages.len() { markup.as_ref() } else { None };
                 let weight =
@@ -354,8 +360,16 @@ async fn sync_loop(
             // give the final content the full rendering again.
             fallback = Fallback::None;
         }
-        let pages = pages_for(&state, fallback);
+        let mut pages = pages_for(&state, fallback, frame);
         let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
+        // The progress icon moves on with every update, and only with one: when
+        // something else changed (no edit of its own).
+        if live_icon(&state, frame).is_some()
+            && next_page(&pages, &sent, |i| if i + 1 == pages.len() { markup.as_ref() } else { None }).is_some()
+        {
+            frame = frame.wrapping_add(1);
+            pages = pages_for(&state, fallback, frame);
+        }
         let markup_of = |i: usize| if i + 1 == pages.len() { markup.as_ref() } else { None };
         let sources = media_sources(&state, &pages);
         if sources.iter().any(|s| !media.items.contains_key(&s.key)) {
@@ -515,7 +529,8 @@ async fn verify(
     state: &RenderState,
     fallback: Fallback,
 ) -> Option<String> {
-    let pages = pages_for(state, fallback);
+    // Only final states are verified: no progress icon.
+    let pages = pages_for(state, fallback, 0);
     let ids: Vec<i32> = sent.iter().map(|(id, _, _)| *id).collect();
     let msgs = match bot.get_messages(chat_id, &ids).await {
         Ok(m) => m,
@@ -558,18 +573,55 @@ async fn attach_original(app: &App, turn_id: i64, st: &mut RenderState) -> anyho
     Ok(())
 }
 
-fn pages_for(state: &RenderState, fallback: Fallback) -> Vec<Content> {
+/// The first line's icon of a reply still being generated, at progress `frame`.
+fn live_icon(state: &RenderState, frame: u32) -> Option<&'static str> {
+    let generating = matches!(state.status, Status::Generating | Status::Retrying { .. }) && !state.done;
+    (generating && state.progress != compose::Progress::Off).then(|| state.progress.frame(frame))
+}
+
+fn pages_for(state: &RenderState, fallback: Fallback, frame: u32) -> Vec<Content> {
     match fallback {
         Fallback::None | Fallback::RawAi => {
             let blocks = state.compose(fallback == Fallback::RawAi);
-            compose::paginate(&state.model, blocks).into_iter().map(Content::Rich).collect()
+            compose::paginate(&state.model, blocks, live_icon(state, frame), state.stream_chars)
+                .into_iter()
+                .map(Content::Rich)
+                .collect()
         }
         Fallback::PlainText => {
-            let f = compose::blocks_to_plain(&state.compose(true));
-            omni_markdown::split(&f, omni_markdown::Limits { max_utf16: 4000, max_entities: 90 })
-                .into_iter()
-                .map(Content::Text)
-                .collect()
+            let split = |blocks: &[omni_markdown::rich::RBlock]| {
+                let f = compose::blocks_to_plain(blocks);
+                omni_markdown::split(&f, omni_markdown::Limits { max_utf16: 3900, max_entities: 90 })
+            };
+            let mut blocks = state.compose(true);
+            let mut pages = split(&blocks);
+            if pages.len() > 1 {
+                // Every message says which part it is, the first too (owner, 2026-11-14).
+                let live = live_icon(state, frame);
+                let icon = live.unwrap_or(compose::DONE_ICON);
+                // The number of parts, once the reply is done (the header lines change the
+                // split a little: counted with them).
+                let mut total = None;
+                for _ in 0..2 {
+                    if let Some(first) = blocks.first_mut() {
+                        *first = compose::header_with(icon, &state.model, Some(compose::PartOf { n: 1, of: total }));
+                    }
+                    pages = split(&blocks);
+                    let n = pages.len();
+                    if live.is_some() || total == Some(n) {
+                        break;
+                    }
+                    total = Some(n);
+                }
+                let of = live.is_none().then_some(pages.len());
+                for (i, p) in pages.iter_mut().enumerate().skip(1) {
+                    let part = compose::PartOf { n: i + 1, of }.label();
+                    let mut f = omni_markdown::Formatted::plain(format!("{icon} {} · {part}\n\n", state.model));
+                    f.append(p);
+                    *p = f;
+                }
+            }
+            pages.into_iter().map(Content::Text).collect()
         }
     }
 }

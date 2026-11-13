@@ -384,6 +384,17 @@ pub struct RenderConfig {
     /// first, its reasoning and tool calls after it, so that Telegram's "show
     /// more" never hides it; `false`: everything in the order it was produced.
     pub answer_first: bool,
+    /// The icon of a reply's first line while it is generated: `clock` (🕛 🕐
+    /// 🕑 …, the default), `hourglass` (⏳ ⌛ in turn) or `moon` (it moves on
+    /// with every update), or `off` (🤖 throughout, as when done).
+    pub progress: crate::compose::Progress,
+    /// Telegram shows a rich message of more than about 8,000 characters (text
+    /// in collapsed folds included) only up to the block that crosses that
+    /// length, and hides the rest — a long fold's title and the footer too —
+    /// behind "Show More". While a reply is generated, its collapsed folds keep
+    /// only their latest part so that it stays within this many characters
+    /// (all of it shows when the reply is done); 0: no limit.
+    pub show_more_chars: usize,
 }
 
 impl Default for RenderConfig {
@@ -395,6 +406,8 @@ impl Default for RenderConfig {
             show_usage: "always".into(),
             bold_cost_usd: 0.2,
             answer_first: true,
+            progress: crate::compose::Progress::Clock,
+            show_more_chars: 7000,
         }
     }
 }

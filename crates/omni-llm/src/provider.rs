@@ -275,6 +275,23 @@ pub async fn load(blobs: &dyn BlobLoader, r: &omni_core::BlobRef) -> Result<Vec<
     blobs.load(r).await.map_err(|e| LlmError::request(format!("cannot load {r}: {e:#}")))
 }
 
+/// Whether earlier answers of `model` in `history` carry reasoning (shown or
+/// encrypted): what a platform that keeps only the current turn's reasoning
+/// drops.
+pub fn has_earlier_reasoning(history: &[omni_core::Turn], model: &str) -> bool {
+    history.iter().any(|t| {
+        t.role == omni_core::content::Role::Assistant
+            && t.native.as_ref().is_some_and(|n| n.model == model)
+            && t.parts.iter().any(|p| matches!(p, omni_core::Part::Reasoning(_)))
+    })
+}
+
+/// The note for earlier reasoning a platform drops although the bot sends it
+/// back (owner, 2026-11-14: keeping it is the norm, a drop is worth a note).
+pub fn reasoning_dropped(who: &str) -> String {
+    format!("earlier reasoning is dropped: {who} keeps only the current turn's")
+}
+
 pub fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)

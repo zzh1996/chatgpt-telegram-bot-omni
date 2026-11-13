@@ -334,10 +334,13 @@ impl Provider for DeepSeek {
         // "ignored" with the web tools; live 2026-11-14: the prompt grows by the replayed
         // reasoning). Owner, 2026-11-14: keep it. Not with the web tools, which ignore it.
         let web_tools_on = web == WebTools::DeepSeek && (wants_search || wants_fetch);
+        // With the web tools, "the thinking of earlier rounds is not added to the context".
+        let dropped =
+            (web_tools_on && effort != "none" && crate::provider::has_earlier_reasoning(input.history, model))
+                .then(|| crate::provider::reasoning_dropped("DeepSeek with web search or URL reading"));
         if dialect == DIALECT && effort != "none" && !web_tools_on {
             body["preserve_thinking"] = json!(true);
             applied.push(Applied { source: "default".into(), patch: json!({"preserve_thinking": true}) });
-            settings.push("earlier reasoning kept".into());
         }
         if dialect == DIALECT {
             // This model's own Chat answers are replayed; other turns go as their text.
@@ -364,7 +367,7 @@ impl Provider for DeepSeek {
             body,
             applied,
             warnings,
-            notes: level_note.into_iter().chain(notes).collect(),
+            notes: level_note.into_iter().chain(dropped).chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: max_tokens,
             long_decode: false,
@@ -1097,7 +1100,7 @@ mod tests {
         }
         // Earlier turns' reasoning is read back (undocumented switch; owner, 2026-11-14).
         assert_eq!(p.body["preserve_thinking"], true);
-        assert_eq!(p.settings, vec!["effort high", "earlier reasoning kept"]);
+        assert_eq!(p.settings, vec!["effort high"]);
         assert_eq!(p.applied[0].source, "default");
         assert_eq!(p.applied[0].patch, json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high"}));
         assert_eq!(p.applied[1].patch, json!({"max_tokens": 393_216}));
@@ -1119,7 +1122,7 @@ mod tests {
         let h = vec![Turn::user_text("hi")];
         let p = prepare("deepseek-flash", &[kv("e", "low")], &h).await.unwrap();
         assert_eq!(p.body["reasoning_effort"], "low");
-        assert_eq!(p.settings, vec!["effort low", "earlier reasoning kept"]);
+        assert_eq!(p.settings, vec!["effort low"]);
         assert_eq!(p.applied[0].source, "option");
         let p = prepare("deepseek-flash", &[kv("e", "none")], &h).await.unwrap();
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}));

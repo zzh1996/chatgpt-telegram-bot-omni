@@ -231,13 +231,25 @@ pub fn direct_default(model: &str) -> Option<String> {
     }
 }
 
+/// The direct API's table entry for an OpenAI model on OpenRouter.
+fn openai_spec(model: &str) -> Option<&'static crate::openai::ModelSpec> {
+    let id = model.strip_prefix("openai/")?;
+    let id = if id == "gpt-chat-latest" { "chat-latest" } else { id };
+    crate::openai::model_spec(id).or_else(|| id.strip_suffix("-pro").and_then(crate::openai::model_spec))
+}
+
 /// Whether the direct API takes `reasoning.context: "all_turns"` for this OpenAI model.
 fn direct_all_turns(model: &str) -> bool {
-    let id = model.strip_prefix("openai/").unwrap_or(model);
-    let id = if id == "gpt-chat-latest" { "chat-latest" } else { id };
-    crate::openai::model_spec(id)
-        .or_else(|| id.strip_suffix("-pro").and_then(crate::openai::model_spec))
-        .is_some_and(|s| s.all_turns)
+    openai_spec(model).is_some_and(|s| s.all_turns)
+}
+
+/// Whether OpenAI drops the earlier answers' reasoning in this request: GPT-5.2,
+/// 5.1 and 5 keep only the current turn's (they take no `all_turns`), on
+/// OpenRouter as on the direct API.
+pub fn keeps_current_turn_only(model: &str, plan: &Plan) -> bool {
+    plan.context.is_none()
+        && matches!(&plan.reasoning, Reasoning::Effort(e) if e != "none")
+        && openai_spec(model).is_some_and(|s| s.efforts.is_some() && !s.all_turns)
 }
 
 /// The note for a direct-API default level OpenRouter cannot request (Nano
@@ -516,6 +528,29 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_2_keeps_only_the_current_turns_reasoning() {
+        let i = info(&["xhigh", "high", "medium", "low", "none"]);
+        let eps = vec![ep("openai", json!({}))];
+        let caps = OrCaps {
+            model: "openai/gpt-5.2",
+            info: Some(&i),
+            endpoints: &eps,
+            pinned: vec!["openai".into()],
+            dialect: Dialect::Responses,
+        };
+        let none = Requested::default();
+        let (req, _) = resolved(&caps, none.clone());
+        let p = plan("openai/gpt-5.2", Some(&i), &caps, &req, &none, None).unwrap();
+        assert_eq!(p.context, None, "5.2 takes no all_turns");
+        assert!(keeps_current_turn_only("openai/gpt-5.2", &p));
+        // Reasoning off: nothing to drop.
+        let l = request::parse(&[OptionToken::Flag("l".into())]).unwrap();
+        let (req, _) = resolved(&caps, l.clone());
+        let p = plan("openai/gpt-5.2", Some(&i), &caps, &req, &l, None).unwrap();
+        assert!(!keeps_current_turn_only("openai/gpt-5.2", &p));
+    }
+
+    #[test]
     fn defaults_are_the_direct_apis_ones() {
         let i = info(&["max", "high", "medium", "low", "none"]);
         let eps =
@@ -533,6 +568,7 @@ mod tests {
         assert_eq!(p.reasoning, Reasoning::Effort("medium".into()), "the direct API's default");
         // Earlier turns' reasoning kept, as on the direct API.
         assert_eq!(p.context, Some("all_turns"));
+        assert!(!keeps_current_turn_only("openai/gpt-6.1-sol", &p));
         assert_eq!(
             note.as_deref(),
             Some("reasoning effort is medium by default, not the highest (max); add +h for the highest")

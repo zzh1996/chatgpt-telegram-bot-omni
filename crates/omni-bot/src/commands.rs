@@ -193,6 +193,7 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
         "models" => cmd_models(app, bot, ib, args.trim()).await?,
         "model" => cmd_model(app, bot, ib, args.trim()).await?,
         "raw" => cmd_raw(app, bot, ib).await?,
+        "full" => cmd_full(app, bot, ib).await?,
         "info" => cmd_info(app, bot, ib).await?,
         "dump" => cmd_dump(app, bot, ib).await?,
         "prefix" => cmd_prefix(app, bot, ib, args, access, admin).await?,
@@ -754,6 +755,46 @@ const RAW_INLINE_MAX: usize = 2000;
 
 /// `/raw`: one message with the original Markdown (inline when short, else
 /// an attached `.md`) and every original image/file of the answer attached.
+/// `/full`: the answer's reasoning and tool calls, complete, folded as in the
+/// answer (which shortens them when they alone would make it longer than one
+/// message), in one or more messages.
+async fn cmd_full(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
+    let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
+    if generating(&t) {
+        say(app, bot, ib, STILL_GENERATING).await;
+        return Ok(());
+    }
+    let model = t.spec.as_ref().map(|s| s.canonical()).unwrap_or_default();
+    let parts = &t.turn.parts;
+    let Some(pages) = crate::compose::full_process(&model, parts) else {
+        say(app, bot, ib, "this answer has no reasoning or tool calls").await;
+        return Ok(());
+    };
+    // Images and files inside the folds (code tools, thought images).
+    let keys: Vec<String> = pages.iter().flat_map(|p| omni_markdown::rich::media_keys(p)).collect();
+    let mut sources: Vec<Source> = Vec::new();
+    for p in parts {
+        let (blob, name, want) = match p {
+            Part::Image { blob, .. } => (blob, None, Want::Photo),
+            Part::File { blob, filename, .. } => (blob, filename.clone(), Want::Document),
+            _ => continue,
+        };
+        if keys.contains(&blob.sha256) && !sources.iter().any(|s| s.key == blob.sha256) {
+            let ext = blob.mime.rsplit('/').next().unwrap_or("bin");
+            sources.push(Source {
+                key: blob.sha256.clone(),
+                blob: blob.clone(),
+                filename: name.unwrap_or_else(|| format!("file.{ext}")),
+                want,
+            });
+        }
+    }
+    if let Err(e) = reply::send_pages_with_media(app, bot, ib.chat_id, ib.msg_id, pages, &sources).await {
+        say(app, bot, ib, &format!("⚠️ {e:#}")).await;
+    }
+    Ok(())
+}
+
 async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
     if generating(&t) {

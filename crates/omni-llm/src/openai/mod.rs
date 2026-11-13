@@ -616,6 +616,12 @@ impl OpenAi {
             ));
         }
         warnings.extend(conv.warnings);
+        // GPT-5.2, 5.1 and 5 take only `reasoning.context: current_turn`: OpenAI drops the
+        // earlier answers' reasoning the bot sends back.
+        let dropped = spec
+            .filter(|s| s.efforts.is_some() && !s.all_turns && req.effort.as_deref() != Some("none"))
+            .filter(|_| crate::provider::has_earlier_reasoning(input.history, model))
+            .map(|_| crate::provider::reasoning_dropped(&format!("OpenAI's {model}")));
         Ok(Prepared {
             dialect: DIALECT,
             model: model.to_string(),
@@ -623,7 +629,7 @@ impl OpenAi {
             body,
             applied,
             warnings,
-            notes: level_note.into_iter().chain(conv.notes).chain(notes).collect(),
+            notes: level_note.into_iter().chain(dropped).chain(conv.notes).chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: false,

@@ -42,7 +42,7 @@ docker compose logs -f
 | 图片/文件/相册的说明里写前缀，或带前缀回复图片/文件/相册/位置 | 附件交给模型；相册当一条消息；位置给 Gemini 的 Google Maps（`+m`）；富消息按 Markdown |
 | 回复 bot 消息 | 原样作为下一轮用户消息（开头的 `\` 会被去掉，用于转义） |
 | 回复 + `/m g$文字` | 换模型继续这段对话 |
-| 回复 + `/raw` `/dump` `/info` `/retry` `/continue` | 原始 Markdown/文件、整段对话的 JSON、请求详情、重试失败的回答、继续写撞到预算的回答 |
+| 回复 + `/raw` `/full` `/dump` `/info` `/retry` `/continue` | 原始 Markdown/文件、完整的推理和工具调用、整段对话的 JSON、请求详情、重试失败的回答、继续写撞到预算的回答 |
 
 完整说明见 [docs/usage.md](docs/usage.md)。
 

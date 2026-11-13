@@ -347,6 +347,128 @@ pub fn metrics_of(blocks: &[RBlock]) -> Metrics {
     m
 }
 
+/// Paths (indices through nested folds) of the closed folds that hold no
+/// other fold and whose title is `eligible`, with their content's size in characters.
+fn leaf_folds(
+    blocks: &[RBlock],
+    eligible: &dyn Fn(&RText) -> bool,
+    path: &mut Vec<usize>,
+    out: &mut Vec<(Vec<usize>, usize)>,
+) {
+    for (i, b) in blocks.iter().enumerate() {
+        if let RBlock::Details { open: false, title, blocks: inner } = b {
+            path.push(i);
+            if inner.iter().any(|b| matches!(b, RBlock::Details { .. })) {
+                leaf_folds(inner, eligible, path, out);
+            } else if eligible(title) {
+                out.push((path.clone(), metrics_of(inner).chars));
+            }
+            path.pop();
+        }
+    }
+}
+
+/// The content of the fold at `path`.
+fn fold_at<'a>(blocks: &'a mut [RBlock], path: &[usize]) -> Option<&'a mut Vec<RBlock>> {
+    let (first, rest) = path.split_first()?;
+    let RBlock::Details { blocks: inner, .. } = blocks.get_mut(*first)? else { return None };
+    if rest.is_empty() { Some(inner) } else { fold_at(inner, rest) }
+}
+
+/// The text of a block, plainly (lines for list items, table rows and nested blocks).
+fn block_plain(block: &RBlock) -> String {
+    let all = |blocks: &[RBlock]| blocks.iter().map(block_plain).collect::<Vec<_>>().join("\n");
+    match block {
+        RBlock::Paragraph(t)
+        | RBlock::Footer(t)
+        | RBlock::Heading { text: t, .. }
+        | RBlock::CollapsedQuote { text: t }
+        | RBlock::Photo { caption: t, .. }
+        | RBlock::Document { caption: t, .. }
+        | RBlock::Video { caption: t, .. }
+        | RBlock::Audio { caption: t, .. } => t.to_plain(),
+        RBlock::Pre { text, .. } | RBlock::Math(text) => text.clone(),
+        RBlock::Divider => String::new(),
+        RBlock::List { items } | RBlock::OrderedList { items, .. } => {
+            items.iter().map(|i| all(&i.blocks)).collect::<Vec<_>>().join("\n")
+        }
+        RBlock::Quote { blocks } => all(blocks),
+        RBlock::Details { title, blocks, .. } => format!("{}\n{}", title.to_plain(), all(blocks)),
+        RBlock::Table { rows, .. } => rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.text.to_plain()).collect::<Vec<_>>().join(" | "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// The last `keep` characters of a block: a code block stays one, anything
+/// else becomes a paragraph of its text.
+fn tail_of(block: &RBlock, keep: usize) -> RBlock {
+    let tail = |s: &str| {
+        let n = s.chars().count();
+        s.chars().skip(n.saturating_sub(keep)).collect::<String>()
+    };
+    match block {
+        RBlock::Pre { text, language } => RBlock::Pre { text: tail(text), language: language.clone() },
+        b => RBlock::Paragraph(RText::plain(tail(&block_plain(b)))),
+    }
+}
+
+/// Shorten collapsed folds whose title is `eligible` from their start until
+/// the blocks hold at most `budget` characters, largest first, each keeping at
+/// least `min_keep` characters of its latest content. `marker(n)`, put first in
+/// a shortened fold, says that `n` characters before it are not shown. Text
+/// that is shown (outside collapsed folds) is never touched.
+///
+/// For replies being generated: Telegram shows a rich message of more than
+/// about 8,000 characters only up to the block that crosses that length, the
+/// text in collapsed folds included, and hides the rest behind "Show More".
+pub fn trim_folds(
+    blocks: &mut [RBlock],
+    budget: usize,
+    min_keep: usize,
+    eligible: &dyn Fn(&RText) -> bool,
+    marker: &dyn Fn(usize) -> RBlock,
+) {
+    let mut done: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let total = metrics_of(blocks).chars;
+        if total <= budget {
+            return;
+        }
+        let mut folds = Vec::new();
+        leaf_folds(blocks, eligible, &mut Vec::new(), &mut folds);
+        folds.retain(|(p, size)| !done.contains(p) && *size > min_keep);
+        let Some((path, size)) = folds.into_iter().max_by_key(|(_, size)| *size) else { return };
+        done.push(path.clone());
+        let Some(inner) = fold_at(blocks, &path) else { return };
+        // Room for the marker too.
+        let marker_chars = marker(size).metrics().chars;
+        let keep = size.saturating_sub(total - budget + marker_chars).max(min_keep);
+        // Drop whole blocks from the start while the rest still holds `keep` characters.
+        let mut dropped = 0;
+        while inner.len() > 1 && metrics_of(&inner[1..]).chars >= keep {
+            dropped += inner[0].metrics().chars;
+            inner.remove(0);
+        }
+        // Then the start of what remains (its first block as text, if need be).
+        let rest = metrics_of(inner).chars;
+        if rest > keep
+            && let Some(first) = inner.first()
+        {
+            let first_chars = first.metrics().chars;
+            let cut = (rest - keep).min(first_chars);
+            let t = tail_of(first, first_chars - cut);
+            dropped += first_chars - t.metrics().chars;
+            inner[0] = t;
+        }
+        if dropped > 0 {
+            inner.insert(0, marker(dropped));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RichLimits {
     pub max_chars: usize,
@@ -533,7 +655,7 @@ fn block(b: &Block) -> Vec<RBlock> {
             let code = code.strip_suffix('\n').unwrap_or(code);
             vec![RBlock::Pre { text: code.to_string(), language: lang.clone().unwrap_or_default() }]
         }
-        Block::MathBlock { tex, .. } => vec![RBlock::Math(tex.trim().to_string())],
+        Block::MathBlock { tex, .. } => math_lines(tex),
         Block::Quote { blocks, .. } => vec![RBlock::Quote { blocks: blocks.iter().flat_map(block).collect() }],
         Block::List { start, items, .. } => {
             let items = items
@@ -581,6 +703,11 @@ fn block(b: &Block) -> Vec<RBlock> {
     }
 }
 
+/// A block formula as Telegram formulas: one per line (see [`crate::latex`]).
+fn math_lines(tex: &str) -> Vec<RBlock> {
+    crate::latex::display_lines(tex.trim()).into_iter().map(RBlock::Math).collect()
+}
+
 fn split_display_math(inlines: &[Inline]) -> Vec<RBlock> {
     let mut out = Vec::new();
     let mut cur: Vec<Inline> = Vec::new();
@@ -591,7 +718,7 @@ fn split_display_math(inlines: &[Inline]) -> Vec<RBlock> {
                 out.push(RBlock::Paragraph(t));
             }
             cur.clear();
-            out.push(RBlock::Math(tex.trim().to_string()));
+            out.extend(math_lines(tex));
         } else {
             cur.push(i.clone());
         }
@@ -618,7 +745,7 @@ fn inline(i: &Inline) -> RText {
     match i {
         Inline::Text { text, .. } => linkify(text),
         Inline::Code { code, .. } => RText::fixed(RText::plain(code.clone())),
-        Inline::Math { tex, .. } => RText::Math(tex.clone()),
+        Inline::Math { tex, .. } => RText::Math(crate::latex::for_telegram(tex)),
         Inline::Emph { children, .. } => RText::italic(inlines_to_rtext(children)),
         Inline::Strong { children, .. } => RText::bold(inlines_to_rtext(children)),
         Inline::Strike { children, .. } => RText::Strike(Box::new(inlines_to_rtext(children))),
@@ -1000,7 +1127,49 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(&b[1], RBlock::Math(m) if m == "\\boxed{x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}}"), "{b:?}");
+        // `\\boxed` is shown as source on the Apple apps: its content only (see `latex`).
+        assert!(matches!(&b[1], RBlock::Math(m) if m == "x = \\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}"), "{b:?}");
+    }
+
+    #[test]
+    fn long_collapsed_folds_keep_their_latest_part() {
+        let para = |c: char, n: usize| RBlock::Paragraph(RText::plain(c.to_string().repeat(n)));
+        let fold = |blocks: Vec<RBlock>| RBlock::Details { open: false, title: RText::plain("T"), blocks };
+        let marker = |n: usize| RBlock::Footer(RText::plain(format!("… {n} before")));
+        // Shown text, then a fold of 10 paragraphs of 1,000 characters.
+        let mut b = vec![para('s', 500), fold((0..10).map(|i| para((b'a' + i) as char, 1000)).collect())];
+        trim_folds(&mut b, 4000, 600, &|_| true, &marker);
+        assert!(metrics_of(&b).chars <= 4000, "{}", metrics_of(&b).chars);
+        assert_eq!(b[0], para('s', 500), "shown text is not touched");
+        let RBlock::Details { blocks: inner, .. } = &b[1] else { panic!() };
+        assert!(matches!(&inner[0], RBlock::Footer(t) if t.to_plain().starts_with("… ")), "{inner:?}");
+        assert_eq!(inner.last(), Some(&para('j', 1000)), "the latest content stays");
+        // One big paragraph: its tail.
+        let mut b = vec![fold(vec![para('x', 9000)])];
+        trim_folds(&mut b, 3000, 600, &|_| true, &marker);
+        assert!(metrics_of(&b).chars <= 3000);
+        let RBlock::Details { blocks: inner, .. } = &b[0] else { panic!() };
+        assert!(matches!(&inner[1], RBlock::Paragraph(t) if t.to_plain().chars().all(|c| c == 'x')));
+        // Within the budget, and open folds: unchanged.
+        let small = vec![fold(vec![para('x', 100)])];
+        let mut b = small.clone();
+        trim_folds(&mut b, 3000, 600, &|_| true, &marker);
+        assert_eq!(b, small);
+        let open = vec![RBlock::Details { open: true, title: RText::plain("T"), blocks: vec![para('x', 9000)] }];
+        let mut b = open.clone();
+        trim_folds(&mut b, 3000, 600, &|_| true, &marker);
+        assert_eq!(b, open);
+        // Nested folds: the inner ones are shortened, largest first.
+        let mut b = vec![fold(vec![fold(vec![para('a', 6000)]), fold(vec![para('b', 1000)])])];
+        trim_folds(&mut b, 4000, 600, &|_| true, &marker);
+        assert!(metrics_of(&b).chars <= 4000);
+        let RBlock::Details { blocks: outer, .. } = &b[0] else { panic!() };
+        assert!(matches!(&outer[1], RBlock::Details { blocks, .. } if blocks == &vec![para('b', 1000)]));
+        // Only eligible folds.
+        let keep = vec![fold(vec![para('x', 9000)])];
+        let mut b = keep.clone();
+        trim_folds(&mut b, 3000, 600, &|t| t.to_plain() != "T", &marker);
+        assert_eq!(b, keep);
     }
 
     #[test]

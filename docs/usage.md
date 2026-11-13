@@ -56,7 +56,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 不带选项时：
 
 - 推理强度 = 厂商文档给该模型推荐的档位（显式发送；多数就是不加参数时 API 用的那一档，按通用推荐，不按"聊天场景"的建议）。不是最高档时，回答下面有一行提示，写明当前档位和最高档，`+h` 就是最高档（和其它请求提示一样，回复已经显示过它的回答时不再重复）。各家：OpenAI 都是 medium（gpt-5.5-pro 为 high；GPT-5.4 / 5.2 / 5.1 的 API 默认 none 是官方说的低延迟选项，按推理指南"多数工作负载的默认配置"用 medium）；Claude 多数为 high，Opus 5.5、Haiku 5.5、Sonnet 4.6（官方标 "Medium effort (recommended)"）为 medium，Opus/Sonnet 4.6–4.8 照 Anthropic 的推荐开 adaptive thinking，Opus 4.5、Haiku 4.5 默认不思考（官方没有建议默认开）；Gemini 4 Carbon/Argon、3.8/3.6 Flash、Nano Banana 2.1 为 medium，Gemini 4 Hydrogen、3.1 Pro 为 high，Flash-Lite 和 Flash Image 为 minimal；Grok 4.7/4.6/4.5 为 high，4.3 为 low；DeepSeek 为 high；智谱 GLM-5.2 起和 Kimi K3 为 max（已是最高）；千问 3.8 为 xhigh（官方示例都显式发 xhigh；不发时思考预算只有 131,072）；豆包 2.1、Evolving 和 2.0-code（火山的 Agent/Coding 规范要求 high 以上）为 high，其它 2.0 和 character 为 medium；经 OpenRouter 和直连同一个模型的默认一样（OpenRouter 目录里的 `default_effort` 只是给客户端界面的预选值，不是厂商默认；OpenRouter 选不了直连的那一档时不发，由厂商默认，照样提示）。OpenAI 推理摘要 = detailed；Claude 思考显示 = summarized（官方默认 omitted 会看不到思考）；Gemini 带上思考摘要；
-- 之前回答的推理留在对话里（同一模型的回答原样回放）：平台默认就用的照旧（xAI、Claude、Gemini 3.5 Flash 起和 Gemini 4、GPT-6.x 和 5.6、Kimi、千问 3.8）；默认丢弃的打开：OpenAI GPT-5.4 起（含 pro 和 chat-latest）发 `reasoning.context: all_turns`（GPT-5.2、5.1、5 不支持），千问发 `preserve_thinking: true`，DeepSeek 在 Chat Completions 上发 `preserve_thinking: true`（文档没写、实测生效；联网工具忽略它所以不发），Claude Haiku 4.5 思考时用 `clear_thinking` 的 `keep: "all"`，智谱发 `clear_thinking: false`。豆包的服务端在下一轮丢弃之前的推理，没有开关。回放的推理按输入计费（多数是缓存价）；
+- 之前回答的推理留在对话里（同一模型的回答原样回放）：平台默认就用的照旧（xAI、Claude、Gemini 3.5 Flash 起和 Gemini 4、GPT-6.x 和 5.6、Kimi、千问 3.8）；默认丢弃的打开：OpenAI GPT-5.4 起（含 pro 和 chat-latest）发 `reasoning.context: all_turns`（GPT-5.2、5.1、5 不支持），千问发 `preserve_thinking: true`，DeepSeek 在 Chat Completions 上发 `preserve_thinking: true`（文档没写、实测生效；联网工具忽略它所以不发），Claude Haiku 4.5 思考时用 `clear_thinking` 的 `keep: "all"`，智谱发 `clear_thinking: false`。豆包的服务端在下一轮丢弃之前的推理，没有开关。保留是常态，不另外提示；之前的回答有推理、平台却会丢掉时（豆包，GPT-5.2、5.1、5（直连和经 OpenRouter），智谱 GLM-4.5-Air 和 GLM-4.6V 系列，开着联网工具的 DeepSeek），回答下面有一条提示 `earlier reasoning is dropped: … keeps only the current turn's`。回放的推理按输入计费（多数是缓存价）；
 - 输出上限 = 该模型的最大输出，但不超过上下文窗口剩余空间（经 OpenRouter 另有上限 393216，因为它按 `max_tokens` 冻结额度）；Gemini 4 long decode 为跨多次续写的总预算（回复 `/continue` 继续）；
 - 图片、视频、文档输入用官方最高精度（OpenAI `detail` = original 或 high，xAI = high，方舟 = xhigh，直连 Gemini = 最高的 media resolution，千问开高分辨率；视频帧率保持各平台默认；经 OpenRouter 走 Chat Completions 的其它厂商不发 `detail`）；
 - 生成的图片和视频：更高质量要多花钱时用平台默认的质量、尺寸和分辨率，回答下面写出默认值、最高值和拉到最高的选项（如 `image size is 1K by default, not the largest (4K); add +size=4K`）；价格一样时用最高的（智谱的图片和视频、Wan 2.7 图、千问图像 3.0 / 2.x、Gemini 3 Pro Image 的 2K）；
@@ -203,23 +203,26 @@ Arr!
 ## 3. 回答的样子
 
 ```
-🤖 anthropic:claude-opus-5-5                       ← 第一行：平台和模型（小字，加粗；经 OpenRouter 的是 openrouter:anthropic/claude-opus-5.5）
+🤖 anthropic:claude-opus-5-5                       ← 第一行：平台和模型（小字，加粗；经 OpenRouter 的是 openrouter:anthropic/claude-opus-5.5）；生成中图标是走动的时钟，写完是 🤖
 ▸ ⚠️ Attempt 1 failed: …                           ← 之前失败的尝试（如有），按顺序折叠：当时的输出、完整错误、用量
-▸ 💭 2 · 🔧 1                                       ← 连续的推理和工具调用合成一个折叠（小字写数量；回答只有一段正文时在正文下面），里面依次是：
-    ▸ 💭 Reasoning                                  ←   推理（小字标题）
-    ▸ 🔧 web_search: rust latest version            ←   工具调用：标题写它做了什么（查询、网址、代码）和不寻常的结局，展开看内容
-    ▸ 💭 Reasoning                                  ←   工具调用之后的又一段推理
 ……模型的回答（富文本 Markdown，图片在它出现的位置）……
 ▸ 📚 Sources · 5                                    ← 紧跟它所属的那段回答
 ▸ ⚠️ Error: …                                      ← 没有正常完成时：完整的原始错误对象
 ℹ️ …                                               ← 小字：bot 的提示（参数映射、截断原因…）
 effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) · ≈$0.012 · 12.3s    ← 小字
+▸ 💭 2 · 🔧 1                                       ← 连续的推理和工具调用合成一个折叠（小字写数量；回答只有一段正文时在页脚下面），里面依次是：
+    ▸ 💭 Reasoning                                  ←   推理（小字标题）
+    ▸ 🔧 web_search: rust latest version            ←   工具调用：标题写它做了什么（查询、网址、代码）和不寻常的结局，展开看内容
+    ▸ 💭 Reasoning                                  ←   工具调用之后的又一段推理
 ```
 
-- **正文在上**（`[render] answer_first = true`，默认）：回答只有一段连续正文（文字、图片、视频等）时，正文放在最上面，推理和工具调用放在它下面（它们之间仍按时间顺序），这样 Telegram 折叠长消息（"Show more"）时不会把正文藏在后面。正文和推理、工具调用互相穿插（不止一段正文）时按下面的时间顺序显示。生成中也一样：开始写正文后，之前的推理移到正文下面。`answer_first = false` 时一律按时间顺序。
+- **正文在上**（`[render] answer_first = true`，默认）：回答只有一段连续正文（文字、图片、视频等）时，正文放在最上面，然后是来源、提示和页脚，推理和工具调用放在最下面（页脚下面；它们之间仍按时间顺序），这样 Telegram 折叠长消息（"Show More"，见下）时藏起来的只会是推理和工具调用，不会是正文和页脚。正文和推理、工具调用互相穿插（不止一段正文）时按下面的时间顺序显示。生成中也一样：还没有正文时推理在页脚下面，开始写正文后正文在上。`answer_first = false` 时一律按时间顺序。
+- **生成中的标记**：回答还在生成时，第一行的图标随每次刷新走一格（`[render] progress`：`clock` 时钟 🕛 🕐 🕑 …，默认；`hourglass` 沙漏 ⏳ ⌛；`moon` 月相 🌑 🌒 …；`off` 一直是 🤖），写完变成 🤖，一眼就能分清回答写完了没有。
+- **"Show More"**：Telegram 只完整显示约 8000 字以内的富消息（收起的折叠里的字也算）；更长的消息从跨过这个长度的那一块起，后面的全藏在"Show More"按钮后面，连折叠块的标题和页脚都看不见（实测；在后面加空行没有用）。所以生成中的回答，推理和工具调用的折叠只保留最新的一部分，让整条消息不超过 `[render] show_more_chars` 字（默认 7000，0 = 不限），折叠开头一行小字写 `… N characters before this, shown when the reply is done`；写完后显示完整内容。写完的回答如果**只是因为**推理和工具调用而超过一条消息，它们也只保留最新的部分（开头写 `… N characters before this; reply /full for all of it`），回答仍是一条消息；回复 `/full` 看完整的推理和工具调用。其它内容本身就要多条消息、或缩短后仍超过一条时，全部照常发出。
 - **严格按时间顺序**（正文在上的情况除外）：推理、工具调用、回答、图片、拒答都显示在它实际产生的位置，只合并相邻的同类片段，不会挪动顺序（Gemini 的搜索、地图、URL context 在流的最后才报告，显示在它所支撑的回答之前，也就是它实际发生的位置；出图模型思考时画的草图放在推理折叠里）。相邻的几次工具调用合成一个折叠，标题是每次调用的摘要（同一个工具多次时写成 `web_search ×2: 查询1; 查询2`）。中间没有被正文打断的一串推理和工具调用（不止一个折叠时）放进一个外层折叠，标题是"💭 推理段数 · 🔧 工具调用次数"；正文穿插时每串一个，只有一项时不加外层。推理默认一直折叠（`[render] reasoning_open = true` 时，模型还在思考、后面还没有别的内容的那段推理是展开的；但每次刷新都会把读者手动收起的它重新展开）。
 - Markdown 按 CommonMark 解析，另加"CJK 友好"的强调规则：中文、日文、韩文里 `**注意：**内容`、`这是**“引用”**的` 这种标点贴着星号、两边没有空格的写法也会加粗。
 - 公式显示成 Telegram 的公式：`$…$`、`$$…$$`，以及 LaTeX 自己的 `\(…\)`、`\[…\]`（OpenAI、DeepSeek、千问、Grok、豆包的模型常这样写；按 CommonMark 它们只是转义的括号，公式里的 `_`、`*` 还会被当成强调）。代码里的不算；`\[…\]` 里不像公式的（如 `\[1\]`）仍是方括号；原文模式（`/raw`）照原样显示。
+- **公式改写成每个 app 都画得出的 LaTeX**：Telegram 各 app 用不同的公式引擎（2026-11-14 读源码、逐个 app 实测）：Android 是 JLaTeXMath，因为它的一个回归，所有环境（`aligned`、`cases`、矩阵…）和 `\dfrac`、`\tfrac`、`\operatorname`、`\textbf`、`\pmod` 等都画不出，整个块公式直接消失；iOS 和 macOS 是 SwiftMath，不支持 `\boxed`、`array`、`align`、`\dots`、`\lvert`、`\tag` 等，画不出时显示源码，`\text{}` 外的 `'` 和非 ASCII 字符（中文、`×`、`≤`…）被悄悄丢掉，macOS 上环境外的 `\\` 不换行；Desktop 是 MicroTeX，几乎都支持。所以 bot 改写模型常用的写法，意思不变：`\dfrac`、`\tfrac` → `\frac`，`\dbinom` → `\binom`，`\operatorname{f}` → `\mathrm{f}`，`\pmod{p}` → `\quad(\mathrm{mod}\,p)`，`\bmod` → `\mathrm{mod}`，`\boxed`、`\fbox`、颜色只留内容，`\textbf`、`\textit`、`\mbox` 等 → `\text`，`f'` → `f^{\prime}`，`×`、`≤`、`π`、`ℝ` 这类字符 → 对应的命令，`x²`、`a₁` → `x^{2}`、`a_{1}`，其它非 ASCII 文字（中文等）放进 `\text{}`，`\dots` → `\ldots`，`\lvert` → `|`，`\:` → `\;`，去掉 `\tag`、`\label`、`\nonumber`。多行的块公式（对齐环境、`\\`、`\left\{ … \right.` 里的方程组、`cases` 的每一种情况）拆成每行一个公式，去掉对齐用的 `&`（`cases` 的条件写在 `,\quad` 后面）；其它的 `array` 改成 `matrix`。仍然画不出的：矩阵在 Android 上不显示，`\underbrace`、`\overset`、`\xrightarrow` 在 iOS/macOS 上显示源码。原文模式和 `/raw` 是模型写的原样。
 - **工具调用**的标题写它做了什么，以及不寻常的结局：退出码（`exit 1`）、超时、错误码（`error: max_uses_exceeded`）、网址抓取失败的原因（`paywall`）。展开后是可读的内容，不是裸 JSON：搜索词，找到的来源（标题链接、网站、日期、摘录），打开或在里面查找的网页，抓取的网页和时间，代码和它的输出（stdout、stderr、退出码），生成的文件，出图用的尺寸、质量等。认不出的格式原样显示 JSON；认得的格式里没展示的字段也以 JSON 列在后面，所以不丢信息。只有加密内容之类人读不了的数据不显示，在 `/dump` 里。
 - **📚 Sources** 列出回答引用的链接；提供方给了被引用的原文时，链接下面是这段原文（截短）。引用的是文档（如用户发的 PDF）时写文档名和页码。Gemini 的 Search Suggestions（Google 要求和搜索支撑的回答一起展示）是来源下面的一行小字链接，不折叠。
 - 模型正在思考时，推理折叠的标题写它此刻在想什么：思考摘要里最新的一个小标题（如 `💭 Reasoning · Checking the dates`），没有小标题时是最新一段的开头；推理块外面还有一层折叠时，外层标题后面也带上这句。这一段思考一结束（后面出现了工具调用或回答，或回答生成完），标题就回到 `💭 Reasoning`。
@@ -232,7 +235,7 @@ effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) �
 - **重试不发新消息**：自动重试（默认最多 4 次尝试（含首次），失败后依次等 2、10、30 秒，见 `[retry]`；限流至少等 20 秒，上游要求更久时以上游为准（`retry-after-ms`，或秒数、日期形式的 `retry-after`）；只重试网络、超时、限流、上游故障这类可能成功的错误，上游用 `x-should-retry` 明确说了能不能重试时听它的）和手动重试都在同一组消息里进行，失败的尝试折叠在上面。
 - 模型生成的图片直接嵌在回答里它出现的位置，图下小字标注尺寸、文件大小和格式；生成的视频、音频可以直接播放，其它文件（例如代码工具写出的文件）作为附件；支持流式出图的模型在生成过程中先显示预览（"⏳ preview"），一张张替换成最终的图；一条回复尽量就是一条消息，只有超过 Telegram 的上限（32768 字、500 块、50 个图片/文件）才拆成多条。
 - **结构无歧义（防伪）**：每条回复消息的第一行是模型名（小字，让正文占主要篇幅）；除此之外 bot 加的所有东西都在折叠块或小字页脚里，而模型输出的 Markdown 永远渲染不出这两种块（`<details>` 等 HTML 一律按字面显示）。所以任何人都能准确指出哪部分是模型的回答。
-- 超过一条富消息的上限会自动拆成多条，后续消息第一行是 `🤖 模型 · part N`。
+- 超过一条富消息的上限会自动拆成多条，每一条（第一条也是）的第一行都写它是第几部分，免得把一条当成整个回答：写完后是 `🤖 模型 · part 1/3`，生成中总数还不确定，写 `part 1`（正在写的最后一条是时钟图标，前面已经写满的是 ⏳）。命令的输出（`/full`、`/help` 等）分多条时也一样。
 - Telegram 会把每段超过 70000 字节的文字静默截断（切在字符中间时整段变空），bot 会把长文字拆成多个文本节点发送来避免；回复发完后还会读回比对，若仍被改动，就在消息里附上原始 Markdown。
 - 某个块（如超过 20 列的表格、嵌套过深的列表）无法用富消息表达时，该块显示为原始 Markdown；整条富消息被 Telegram 拒绝时，模型部分改为原始 Markdown 再发；仍被拒绝才退回纯文本。Telegram 不接受的空结构（例如结尾多出的一个 ```` ``` ````、流式中刚打开的代码块）会被自动处理。
 - `render.markdown = "raw"` 时模型输出始终以原始 Markdown 展示。
@@ -248,6 +251,7 @@ effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) �
 | `/models [关键词]` | 当前 bot 的全部前缀（只含它有的模型，直连平台的还要在 bot 的模型表里）；带关键词时在前缀名和 spec 里搜索，OpenRouter 允许直接写模型 ID 时（`allow_unlisted_models`）还搜索它的模型目录 |
 | `/model <前缀>` | 第一行是 `前缀$ → 平台:模型 ID`（和回复第一行一样，经 OpenRouter 的是 `openrouter:author/model`）。经 OpenRouter 的模型：模型能力（模态、推理档位、最大输出、价格）及各 endpoint（是否第一方、量化）；直连官方 API 的模型只显示由哪个平台直连（不在 bot 模型表里的报错）。该 provider 允许直接写模型 ID 时也接受 ID |
 | 回复 + `/raw` | 一条消息：该回答的原始 Markdown（短的直接放代码块，推理在折叠块里；长的、或含 Telegram 会改写的字符如制表符时附 `.md` 文件），以及原图/原文件（附件） |
+| 回复 + `/full` | 该回答完整的推理和工具调用：像回答里一样折叠（收起），需要几条消息就发几条，第一行是 `🤖 模型 · reasoning`（多条时带 `part 1/3`）；其中的图片和文件一并附上。回答还在生成时、没有推理和工具调用时，回一句说明 |
 | 回复 + `/dump` | 一条消息：这段对话从开头到被回复的那条为止的 JSON 文件：每一轮的全部内容（文字、带签名的推理、工具调用、图片、文件、provider 的原样输出）、模型与选项、状态、每次尝试的结果/用量/错误；图片和文件以 base64 内嵌（同一个只嵌一次）。请求体见 `/info` |
 | 回复 + `/info` | 一条消息：请求摘要（每次尝试的状态、到第一段输出的时间、上游 ID；每次上游调用的请求 ID、实际服务的模型和等级、响应头和首个事件的耗时、限流余量），附完整的请求详情 JSON：每次尝试的请求体、上游 ID、用量、错误、上游回显，以及每次调用的响应元数据（去掉内容的响应对象，和一部分响应头：请求 ID、限流、耗时、服务等级、弃用提示；不含组织、项目、用户 ID 和 cookie，因为聊天里的人都能看 `/info`） |
 | 回复 + `/retry` | 重新生成一个失败的回答（同消息下的 🔁 Retry 按钮） |

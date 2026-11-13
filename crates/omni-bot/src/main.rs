@@ -312,6 +312,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("model", "Show which model a prefix calls"),
         ("m", continue_with.as_str()),
         ("raw", "Reply: get the original Markdown and files"),
+        ("full", "Reply: the answer's complete reasoning and tool calls"),
         ("dump", "Reply: the whole conversation as a JSON file"),
         ("prefix", "This chat's own prefixes: list, show, create"),
         ("unprefix", "Delete a prefix of this chat (its creator or an admin)"),

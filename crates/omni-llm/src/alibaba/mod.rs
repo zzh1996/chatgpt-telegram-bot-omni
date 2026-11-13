@@ -478,7 +478,6 @@ impl Alibaba {
                 // Later turns read the replayed reasoning (Qwen3.7's default is false).
                 body["preserve_thinking"] = json!(true);
                 applied.push(Applied { source: "default".into(), patch: json!({"preserve_thinking": true}) });
-                settings.push("earlier reasoning kept".into());
             }
             if images && s.vision {
                 // The highest image detail: 16,384 tokens (16,777,216 px) per image instead of 2,560.

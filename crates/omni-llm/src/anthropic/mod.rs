@@ -410,7 +410,6 @@ impl Provider for Anthropic {
             let cm = json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]});
             body["context_management"] = cm.clone();
             applied.push(Applied { source: "default".into(), patch: json!({"context_management": cm}) });
-            settings.push("earlier thinking kept".into());
         }
         let manual = think.thinking.as_ref().and_then(|t| t["type"].as_str()) == Some("enabled");
         if interleaved && manual {

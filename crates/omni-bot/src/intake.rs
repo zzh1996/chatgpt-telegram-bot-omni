@@ -32,8 +32,8 @@ use crate::tg::bot::BotConn;
 use crate::tg::convert::marked_peer_id;
 
 pub const COMMANDS: &[&str] = &[
-    "start", "help", "ping", "models", "model", "raw", "dump", "prefix", "unprefix", "retry", "continue", "m", "info",
-    "stats", "usage", "allow", "deny", "ban", "unban", "acl", "quota", "alias", "unalias", "credits",
+    "start", "help", "ping", "models", "model", "raw", "full", "dump", "prefix", "unprefix", "retry", "continue", "m",
+    "info", "stats", "usage", "allow", "deny", "ban", "unban", "acl", "quota", "alias", "unalias", "credits",
 ];
 
 fn update_state(s: &State) -> Option<UpdateState> {
@@ -309,11 +309,11 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
     let text = text.as_str();
     if let Some((name, _, addressed)) = parse_command(text, &bot.username) {
         // Every bot answers commands addressed to it or to everyone, like an
-        // independent instance; `/m`, `/raw`, `/dump`, `/retry`, `/continue`,
+        // independent instance; `/m`, `/raw`, `/full`, `/dump`, `/retry`, `/continue`,
         // `/info`, `/prefix` in replies only the bot that owns the replied message.
         // (any message of it, so that it can tell when that is not an answer; in a
         // private chat the bot is the only one to answer).
-        if matches!(name.as_str(), "m" | "raw" | "dump" | "retry" | "continue" | "info" | "prefix")
+        if matches!(name.as_str(), "m" | "raw" | "full" | "dump" | "retry" | "continue" | "info" | "prefix")
             && !addressed
             && chat_id < 0
             && let Some(rt) = reply_target(m)

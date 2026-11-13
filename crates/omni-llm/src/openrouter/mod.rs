@@ -258,6 +258,9 @@ impl OpenRouter {
         if let Some(u) = &input.user {
             body["user"] = json!(u);
         }
+        let dropped = (options::keeps_current_turn_only(model, &plan)
+            && crate::provider::has_earlier_reasoning(input.history, model))
+        .then(|| crate::provider::reasoning_dropped(&format!("OpenAI's {}", model.trim_start_matches("openai/"))));
         let mut all_applied = plan.applied.clone();
         all_applied.append(&mut applied);
         all_applied.push(options::Applied { source: "fidelity".into(), patch: routing });
@@ -272,7 +275,7 @@ impl OpenRouter {
             body,
             applied: all_applied,
             warnings,
-            notes: level_note.into_iter().chain(plan.notes.iter().cloned()).chain(notes).collect(),
+            notes: level_note.into_iter().chain(plan.notes.iter().cloned()).chain(notes).chain(dropped).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: dialect == options::Dialect::Chat && self.cfg.fidelity.is_long_decode(model),

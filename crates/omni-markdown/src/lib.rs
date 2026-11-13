@@ -12,6 +12,7 @@
 
 pub mod ast;
 pub mod formatted;
+pub mod latex;
 pub mod render;
 pub mod rich;
 pub mod split;
