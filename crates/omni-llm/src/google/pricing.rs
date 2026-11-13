@@ -9,9 +9,12 @@
 //! billed as) 3.8 Flash / 3.5 Flash-Lite from 2026-12-01.
 //!
 //! Formula (docs/research/gemini.md §9, derived, not an official formula):
-//! uncached prompt tokens at the input rate (audio at its own rate where the
-//! model has one), cached tokens at the cache rate, `toolUsePromptTokenCount`
-//! at the input rate, `candidatesTokenCount + thoughtsTokenCount` at the
+//! the input is `promptTokenCount + toolUsePromptTokenCount`; of it the
+//! `cachedContentTokenCount` at the cache rate and the rest at the input rate
+//! (audio at its own rates where the model has them). The cached tokens can
+//! exceed `promptTokenCount`: with code execution or search the model re-reads
+//! the tool results, and those come from the cache too (2026-11-13: prompt
+//! 5,003, tool use 321,767, cached 224,091); `candidatesTokenCount + thoughtsTokenCount` at the
 //! output rate (image tokens of `candidatesTokensDetails` at the image output
 //! rate, see [`estimate`]), the >200K-token rates when `promptTokenCount` exceeds 200,000,
 //! the tier actually served (`usageMetadata.serviceTier`), plus grounding:
@@ -265,14 +268,16 @@ pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g
         Some(over) if prompt > 200_000 => over,
         _ => p.base,
     };
-    let cached = count(usage, "cachedContentTokenCount").min(prompt);
-    let tool = count(usage, "toolUsePromptTokenCount");
+    // The cached tokens are a part of the whole input, the tool-use prompt included.
+    let all_input = prompt + count(usage, "toolUsePromptTokenCount");
+    let cached = count(usage, "cachedContentTokenCount").min(all_input);
     let candidates = count(usage, "candidatesTokenCount");
     let thoughts = count(usage, "thoughtsTokenCount");
     let audio_cached = modality(usage, "cacheTokensDetails", "AUDIO").min(cached);
-    let audio_uncached = modality(usage, "promptTokensDetails", "AUDIO").saturating_sub(audio_cached);
-    let uncached = prompt - cached;
-    let audio_uncached = audio_uncached.min(uncached);
+    let audio_all =
+        modality(usage, "promptTokensDetails", "AUDIO") + modality(usage, "toolUsePromptTokensDetails", "AUDIO");
+    let uncached = all_input - cached;
+    let audio_uncached = audio_all.saturating_sub(audio_cached).min(uncached);
     let image_out = modality(usage, "candidatesTokensDetails", "IMAGE");
     let text_out = if image_out == 0 {
         candidates
@@ -285,8 +290,7 @@ pub fn estimate(model: &str, usage: &Value, requested: Option<Tier>, now: i64, g
     let input = f(uncached - audio_uncached) * rates.input
         + f(audio_uncached) * rates.input_audio.unwrap_or(rates.input)
         + f(cached - audio_cached) * rates.cached
-        + f(audio_cached) * rates.cached_audio.unwrap_or(rates.cached)
-        + f(tool) * rates.input;
+        + f(audio_cached) * rates.cached_audio.unwrap_or(rates.cached);
     let output = f(text_out + thoughts) * rates.output + f(image_out) * rates.image_output.unwrap_or(rates.output);
     let fees = match p.grounding {
         Grounding::PerQuery(q) => g.queries as f64 * q,

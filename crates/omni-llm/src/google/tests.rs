@@ -1520,6 +1520,30 @@ fn errors_are_classified() {
 
 // ------------------------------------------------------------------ pricing
 
+/// A real Gemini 3.8 Flash answer with search and code execution (2026-11-13):
+/// most cached tokens come from the tool-use prompt (re-read tool results),
+/// not from `promptTokenCount`; all of them are billed at the cache rate.
+#[test]
+fn cached_tool_use_tokens_are_billed_at_the_cache_rate() {
+    let usage = json!({
+        "promptTokenCount": 5003, "candidatesTokenCount": 7380, "totalTokenCount": 339130,
+        "cachedContentTokenCount": 224091,
+        "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 5003}],
+        "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 171565}, {"modality": "IMAGE", "tokenCount": 52526}],
+        "toolUsePromptTokenCount": 321767,
+        "toolUsePromptTokensDetails": [{"modality": "IMAGE", "tokenCount": 76594}, {"modality": "TEXT", "tokenCount": 245173}],
+        "thoughtsTokenCount": 4980, "serviceTier": "standard"
+    });
+    let cost = |g: GroundingUse| pricing::estimate("gemini-3.8-flash", &usage, None, NOW, &g).unwrap();
+    // (5,003 + 321,767 − 224,091) × $0.75 + 224,091 × $0.075 + (7,380 + 4,980) × $3.75, per million.
+    let tokens = (102_679.0 * 0.75 + 224_091.0 * 0.075 + 12_360.0 * 3.75) / 1e6;
+    assert!((cost(GroundingUse::default()) - tokens).abs() < 1e-12, "{} vs {tokens}", cost(GroundingUse::default()));
+    assert!((cost(GroundingUse { queries: 3, ..Default::default() }) - (tokens + 0.042)).abs() < 1e-12);
+    // The footer's counts agree: input 326,770 including the 224,091 cached.
+    let u = crate::google::stream::usage_from_gemini(&usage);
+    assert_eq!((u.input_tokens, u.cached_input_tokens), (Some(326_770), Some(224_091)));
+}
+
 #[test]
 fn prices_by_tier_date_and_modality() {
     let m = |u: Value, tier: Option<Tier>, now: i64| {
