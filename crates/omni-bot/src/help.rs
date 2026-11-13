@@ -874,6 +874,48 @@ mod tests {
         assert!(chars < 25_000, "{chars}");
     }
 
+    /// Every `$` (the marker) is in code, so any marker the configuration
+    /// allows reads literally and cannot change the Markdown around it.
+    #[test]
+    fn the_marker_is_always_in_code() {
+        let mut texts = vec![INTRO, OUTRO, INTRO_ZH, OUTRO_ZH];
+        for t in TOPICS {
+            texts.push(t.body);
+            texts.push(t.body_zh);
+        }
+        for text in texts {
+            let mut fenced = false;
+            for line in text.lines() {
+                if line.trim_start().starts_with("```") {
+                    fenced = !fenced;
+                    continue;
+                }
+                if fenced {
+                    continue;
+                }
+                let mut in_code = false;
+                for c in line.chars() {
+                    match c {
+                        '`' => in_code = !in_code,
+                        '$' => assert!(in_code, "`$` outside code in: {line}"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Other markers, one and two characters, in both languages and both chat types.
+        for marker in ["¥", ">>", "%"] {
+            for lang in [Lang::En, Lang::Zh] {
+                for (admin, group) in [(true, true), (true, false), (false, true)] {
+                    let c = Ctx { marker: marker.into(), lang, ..ctx(admin, group) };
+                    let all = text(&overview(&c));
+                    assert!(!all.contains('$'), "{marker} {lang:?}");
+                    assert!(all.contains(&format!("c{marker}")), "{marker} {lang:?}");
+                }
+            }
+        }
+    }
+
     /// Folds inside a topic; `:::` in a code block is code.
     #[test]
     fn folds_inside_topics() {
