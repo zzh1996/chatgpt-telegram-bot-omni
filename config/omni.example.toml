@@ -78,7 +78,10 @@ max_tokens_cap = 393216        # cap for the automatic max_tokens (0 = model max
 # replying /continue to an answer that hit it extends it by the same amount.
 long_decode = ["google/gemini-4*"]
 long_decode_budget = 393216
-# Stable per-user hash sent as `user` (abuse attribution); leave empty to not send it.
+# Salt of the stable per-user hash (sha256 of salt + Telegram user id, abuse attribution) that
+# every platform gets: OpenRouter `user`; OpenAI, xAI, Moonshot, Ark images/video `safety_identifier`;
+# Anthropic `metadata.user_id`; Gemini `labels.safety_identifier`; Zhipu `user_id`; xAI Imagine `user`.
+# Empty: no user id is sent anywhere.
 user_id_salt = "${OPENROUTER_USER_SALT:-}"
 # Official providers users may switch to with `+p=<slug>` (per model author;
 # base slugs, regions included). Built-in defaults: openai = openai, azure,
