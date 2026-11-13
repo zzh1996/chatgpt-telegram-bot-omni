@@ -209,18 +209,19 @@ fn prompt(history: &[Turn], model: &str) -> Result<(String, Vec<String>), LlmErr
     if prompt.trim().is_empty() {
         return Err(err(format!("`{model}` needs a prompt: the message has no text")));
     }
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     let replied_images = last
         .checked_sub(1)
         .map(|i| &history[i])
         .filter(|t| t.role == Role::Assistant)
         .is_some_and(|t| t.parts.iter().any(|p| matches!(p, Part::Image { thought: false, .. })));
+    // It takes no input image and no conversation: a reply would ignore both (owner's rule: an error).
     if replied_images {
-        notes.push(format!(
-            "`{model}` takes no input image: the replied-to image is not sent, this text makes a new image"
-        ));
+        return Err(err(format!(
+            "`{model}` takes no input image, so it cannot edit the image replied to: start a new message"
+        )));
     } else if history[..last].iter().any(|t| t.role != Role::System && !t.answer_text().trim().is_empty()) {
-        notes.push(format!("`{model}` has no conversation: earlier messages are not sent"));
+        return Err(err(format!("`{model}` takes one prompt, not a conversation: start a new message")));
     }
     Ok((prompt, notes))
 }

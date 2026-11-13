@@ -224,10 +224,6 @@ pub async fn convert_history_with(
                                             filename.as_deref().unwrap_or("file")
                                         ))
                                     })?;
-                                    notes.notes.push(format!(
-                                        "📎 {} inlined as a separate text part by the bot (no native text-file input on this API)",
-                                        filename.as_deref().unwrap_or("file")
-                                    ));
                                     content.push(json!({"type": "text", "text": text}));
                                 }
                                 MediaClass::Other => {

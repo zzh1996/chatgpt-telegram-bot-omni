@@ -178,7 +178,6 @@ pub fn price(model: &str, tier: Tier, now: i64) -> Option<Price> {
         "gemini-3-pro-image" if tier == Standard => single(ri(2.00, 12.00, 120.00)),
         // "$0.039 per image": $30 per 1M image tokens, 1,290 tokens per image; "Text
         // input and output is priced the same as 2.5 Flash".
-        "gemini-2.5-flash-image" if tier == Standard => single(ri(0.30, 2.50, 30.00)),
         "gemini-2.5-pro" if !intro_g4 => flash_38(tier),
         "gemini-2.5-pro" => {
             let (base, over) = match tier {

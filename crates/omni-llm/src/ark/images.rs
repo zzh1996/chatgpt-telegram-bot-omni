@@ -8,12 +8,10 @@
 //! **The models** ([`MODELS`]): Seedream 5.5 (`doubao-seedream-5-5-261028`,
 //! first of Ark's "推荐模型"), 5.0 pro and 5.0 flash: one image per request,
 //! no streaming, 1K / 1.5K / 2K, up to 10 reference images, `background`
-//! (transparent / opaque; 5.5 also auto), `safety_identifier`. Seedream 5.0
-//! lite (`doubao-seedream-5-0-260128`, also `…-5-0-lite-260128`), 4.5 and 4.0:
-//! image groups (`sequential_image_generation`), streaming, up to 14 reference
-//! images, 2K–4K (4.0 also 1K), `web_search` on 5.0 lite only. Those three end
-//! service on 2026-11-24 14:00 (UTC+8) ("关停"; replacement 5.0 pro, for 4.0
-//! "doubao-seedream-4-0-20260415").
+//! (transparent / opaque; 5.5 also auto), `safety_identifier`. The models
+//! that made image groups, streamed and searched (5.0 lite, 4.5, 4.0) end
+//! service on 2026-11-24 and are not in the table (owner's rule); the code for
+//! groups, streams and searches stays for models that bring them back.
 //!
 //! **Conversation** (the owner's rule): a request sends only the new message's
 //! text (its text parts, an album's captions included, joined by line breaks)
@@ -41,14 +39,14 @@
 //! no option letter); `S W H w h ar=` aspect ratios (as pixels; Ark takes any
 //! ratio in [1/16, 16] within the model's pixel range); `n=` image groups;
 //! `bg=` background; `q=` the prompt optimization mode (`standard`, Ark's
-//! "质量更高", or `fast` on 5.0 pro and 4.0); `+s` web search (5.0 lite).
+//! "质量更高", or `fast` on 5.0 pro).
 //! Layer decomposition, its OCR and interactive editing by coordinates have
 //! no option.
 //!
 //! **Cost** (no cost in responses): CNY list prices per image, input images
 //! included (5.5 ¥0.05 each, 5.0 pro the first free then ¥0.02), output by
 //! the image's pixels (5.5 ¥0.13 up to 2.61M px, ¥0.23 up to 4.63M; 5.0 pro
-//! ¥0.30 / ¥0.60 above 2.61M; flash ¥0.12, lite ¥0.22, 4.5 ¥0.25, 4.0 ¥0.20),
+//! ¥0.30 / ¥0.60 above 2.61M; flash ¥0.12),
 //! for the `generated_images` Ark reports ("因审核等原因未成功输出的图片不计费").
 //! The image API's web search has no listed price (not estimated; noted).
 //!
@@ -114,8 +112,6 @@ pub struct Spec {
     pub input_cny: (f64, f64),
     /// CNY per output image by its pixels: (up to, price), ascending.
     pub output_cny: &'static [(u64, f64)],
-    /// End of service, and Ark's suggested replacement.
-    pub retires: Option<(&'static str, &'static str)>,
 }
 
 /// 5.5 / 5.0 pro / 5.0 flash: 1K, 1.5K, 2K.
@@ -146,70 +142,10 @@ const TABLE_5: &[(&str, &str, u32, u32)] = &[
     ("2K", "21:9", 3136, 1344),
 ];
 
-/// 5.0 lite / 4.5: 2K, 3K (lite), 4K.
-const TABLE_4: &[(&str, &str, u32, u32)] = &[
-    ("2K", "1:1", 2048, 2048),
-    ("2K", "4:3", 2304, 1728),
-    ("2K", "3:4", 1728, 2304),
-    ("2K", "16:9", 2848, 1600),
-    ("2K", "9:16", 1600, 2848),
-    ("2K", "3:2", 2496, 1664),
-    ("2K", "2:3", 1664, 2496),
-    ("2K", "21:9", 3136, 1344),
-    ("3K", "1:1", 3072, 3072),
-    ("3K", "4:3", 3456, 2592),
-    ("3K", "3:4", 2592, 3456),
-    ("3K", "16:9", 4096, 2304),
-    ("3K", "9:16", 2304, 4096),
-    ("3K", "3:2", 3744, 2496),
-    ("3K", "2:3", 2496, 3744),
-    ("3K", "21:9", 4704, 2016),
-    ("4K", "1:1", 4096, 4096),
-    ("4K", "4:3", 4704, 3520),
-    ("4K", "3:4", 3520, 4704),
-    ("4K", "16:9", 5504, 3040),
-    ("4K", "9:16", 3040, 5504),
-    ("4K", "3:2", 4992, 3328),
-    ("4K", "2:3", 3328, 4992),
-    ("4K", "21:9", 6240, 2656),
-];
-
-/// 4.0: 1K, 2K, 4K (its 2K and 4K as 4.5's).
-const TABLE_40: &[(&str, &str, u32, u32)] = &[
-    ("1K", "1:1", 1024, 1024),
-    ("1K", "4:3", 1152, 864),
-    ("1K", "3:4", 864, 1152),
-    ("1K", "16:9", 1280, 720),
-    ("1K", "9:16", 720, 1280),
-    ("1K", "3:2", 1248, 832),
-    ("1K", "2:3", 832, 1248),
-    ("1K", "21:9", 1512, 648),
-    ("2K", "1:1", 2048, 2048),
-    ("2K", "4:3", 2304, 1728),
-    ("2K", "3:4", 1728, 2304),
-    ("2K", "16:9", 2848, 1600),
-    ("2K", "9:16", 1600, 2848),
-    ("2K", "3:2", 2496, 1664),
-    ("2K", "2:3", 1664, 2496),
-    ("2K", "21:9", 3136, 1344),
-    ("4K", "1:1", 4096, 4096),
-    ("4K", "4:3", 4704, 3520),
-    ("4K", "3:4", 3520, 4704),
-    ("4K", "16:9", 5504, 3040),
-    ("4K", "9:16", 3040, 5504),
-    ("4K", "3:2", 4992, 3328),
-    ("4K", "2:3", 3328, 4992),
-    ("4K", "21:9", 6240, 2656),
-];
-
 /// [1280x720, 2048x2048x1.1025].
 const PIXELS_5: (u64, u64) = (921_600, 4_624_220);
-/// [2560x1440, 4096x4096].
-const PIXELS_4: (u64, u64) = (3_686_400, 16_777_216);
 /// "P ≤ 2.61M" (M = 10⁶: Ark writes 2048x2048x1.1025 = 4,624,220 as "4.63M").
 const P_2_61M: u64 = 2_610_000;
-
-const EOS_2026_11_24: &str = "2026-11-24 14:00 (UTC+8)";
 
 const SEEDREAM_5: Spec = Spec {
     id: "",
@@ -226,30 +162,6 @@ const SEEDREAM_5: Spec = Spec {
     safety_identifier: true,
     input_cny: (0.0, 0.0),
     output_cny: &[(u64::MAX, 0.0)],
-    retires: None,
-};
-
-const SEEDREAM_4: Spec = Spec {
-    max_refs: 14,
-    tiers: &["2K", "4K"],
-    table: TABLE_4,
-    pixels: PIXELS_4,
-    groups: true,
-    formats: false,
-    backgrounds: &[],
-    safety_identifier: false,
-    retires: Some((EOS_2026_11_24, "doubao-seedream-5-0-pro-260628")),
-    ..SEEDREAM_5
-};
-
-const LITE: Spec = Spec {
-    id: "doubao-seedream-5-0-260128",
-    name: "Seedream 5.0 lite",
-    tiers: &["2K", "3K", "4K"],
-    web_search: true,
-    formats: true,
-    output_cny: &[(u64::MAX, 0.22)],
-    ..SEEDREAM_4
 };
 
 /// Ark's image models (2026-11-13).
@@ -275,20 +187,6 @@ pub const MODELS: &[Spec] = &[
         name: "Seedream 5.0 flash",
         output_cny: &[(u64::MAX, 0.12)],
         ..SEEDREAM_5
-    },
-    LITE,
-    Spec { id: "doubao-seedream-5-0-lite-260128", ..LITE },
-    Spec { id: "doubao-seedream-4-5-251128", name: "Seedream 4.5", output_cny: &[(u64::MAX, 0.25)], ..SEEDREAM_4 },
-    Spec {
-        id: "doubao-seedream-4-0-250828",
-        name: "Seedream 4.0",
-        tiers: &["1K", "2K", "4K"],
-        table: TABLE_40,
-        pixels: (921_600, 16_777_216),
-        prompt_modes: &["standard", "fast"],
-        output_cny: &[(u64::MAX, 0.20)],
-        retires: Some((EOS_2026_11_24, "doubao-seedream-4-0-20260415")),
-        ..SEEDREAM_4
     },
 ];
 
@@ -497,9 +395,7 @@ pub async fn prepare(
                 )));
             }
             Tool::Search => {
-                return Err(err(format!(
-                    "`{model}` has no web search (`+s`) on Ark's image API (only Seedream 5.0 lite searches)"
-                )));
+                return Err(err(format!("`{model}` has no web search (`+s`) on Ark's image API")));
             }
             t => return Err(err(format!("`{model}` has no {} (`+{}`) on Ark's image API", t.describe(), t.letter()))),
         }
@@ -551,6 +447,13 @@ pub async fn prepare(
     };
 
     let ins = inputs(input.history, model, blobs).await?;
+    // A reply that edits nothing would ignore the conversation (owner's rule: an error).
+    if ins.unsent_history {
+        return Err(err(format!(
+            "`{model}` takes one prompt, not a conversation: reply to an image it generated to edit it, or start a new \
+             message"
+        )));
+    }
     if ins.images.len() > spec.max_refs {
         return Err(err(format!(
             "`{model}` takes at most {} reference images; this request has {}",
@@ -576,7 +479,7 @@ pub async fn prepare(
     let mut applied = Vec::new();
     let mut settings = Vec::new();
     let mut warnings = Vec::new();
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     let mut body = json!({"model": model, "prompt": ins.prompt});
     if !ins.images.is_empty() {
         body["image"] = if ins.images.len() == 1 { json!(ins.images[0]) } else { json!(ins.images) };
@@ -656,10 +559,7 @@ pub async fn prepare(
         body["safety_identifier"] = json!(u);
         applied.push(Applied { source: "default".into(), patch: json!({"safety_identifier": u}) });
     }
-    describe_inputs(&ins, &mut settings, &mut notes);
-    if let Some((when, instead)) = spec.retires {
-        warnings.push(format!("Ark ends service of `{model}` on {when}; it suggests `{instead}`"));
-    }
+    describe_inputs(&ins, &mut settings);
     Ok(Prepared {
         dialect: DIALECT,
         model: model.to_string(),
@@ -675,7 +575,7 @@ pub async fn prepare(
     })
 }
 
-fn describe_inputs(ins: &Inputs, settings: &mut Vec<String>, notes: &mut Vec<String>) {
+fn describe_inputs(ins: &Inputs, settings: &mut Vec<String>) {
     let attached = ins.images.len() - ins.edited;
     match (ins.edited, attached) {
         (0, 0) => {}
@@ -692,13 +592,6 @@ fn describe_inputs(ins: &Inputs, settings: &mut Vec<String>, notes: &mut Vec<Str
             settings.push(s);
         }
     }
-    if ins.unsent_history {
-        notes.push(
-            "Seedream has no conversation: earlier messages are not sent (only this message's text and images, and \
-             the images of the answer it replies to)"
-                .to_string(),
-        );
-    }
 }
 
 /// A Seedream id outside the table: the documented fields every Seedream model
@@ -706,6 +599,13 @@ fn describe_inputs(ins: &Inputs, settings: &mut Vec<String>, notes: &mut Vec<Str
 async fn unknown(cfg: &ArkConfig, input: &CallInput<'_>, blobs: &dyn BlobLoader) -> Result<Prepared, LlmError> {
     let model = input.model;
     let ins = inputs(input.history, model, blobs).await?;
+    // A reply that edits nothing would ignore the conversation (owner's rule: an error).
+    if ins.unsent_history {
+        return Err(err(format!(
+            "`{model}` takes one prompt, not a conversation: reply to an image it generated to edit it, or start a new \
+             message"
+        )));
+    }
     let mut body = json!({"model": model, "prompt": ins.prompt});
     if !ins.images.is_empty() {
         body["image"] = if ins.images.len() == 1 { json!(ins.images[0]) } else { json!(ins.images) };
@@ -717,8 +617,8 @@ async fn unknown(cfg: &ArkConfig, input: &CallInput<'_>, blobs: &dyn BlobLoader)
         Applied { source: "default".into(), patch: json!({"watermark": false}) },
     ];
     let mut settings = vec!["no watermark".to_string()];
-    let mut notes = Vec::new();
-    describe_inputs(&ins, &mut settings, &mut notes);
+    let notes = Vec::new();
+    describe_inputs(&ins, &mut settings);
     Ok(Prepared {
         dialect: DIALECT,
         model: model.to_string(),

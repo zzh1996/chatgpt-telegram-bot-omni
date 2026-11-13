@@ -51,7 +51,7 @@ priority_users = []            # may request higher-priority (pricier) tiers: +t
                                # Nobody (admins included) gets them by default.
 
 [providers.openrouter]
-api_key = "${OPENROUTER_API_KEY}"
+api_key = "${OPENROUTER_API_KEY:-}"   # empty: OpenRouter is off (like any platform without a key)
 # The id of any model the bot has ([[bots]].models) may be typed directly as a prefix
 # (`openai/gpt-6.1-sol$`), even one that also has a prefix: new models need no config
 # change. false (the default): only the prefixes below and /alias reach OpenRouter.
@@ -133,151 +133,138 @@ delays_secs = [2, 10, 30, 60]  # wait before retry 1, 2, 3, …; the last value 
 
 # ------------------------------------------------------------------ prefixes
 # `name$text` sends the text to the spec's model with the spec's options; the
-# empty name is the prefix `$text`. /models lists them in this order. Where a
-# provider has `allow_unlisted_models = true`, the id of any model the bot has works
-# as a prefix too (`openai/gpt-6.1-sol$`). Administrators can add prefixes per bot
-# with /alias. The list was chosen by the owner from the old bot's prefixes (2026-11-12).
-
+# empty name is the prefix `$text`. /models lists them in this order. Every prefix
+# uses the platform's own API (`<provider>:<model>`); the same prefix with an `o` in
+# front uses OpenRouter (`oc$`, `o$` for the empty one). Where a provider has
+# `allow_unlisted_models = true`, the id of any model the bot has works as a prefix
+# too (`openai:gpt-6.1-sol$`, `openai/gpt-6.1-sol$` on OpenRouter). Administrators
+# can add prefixes per bot with /alias. The list was chosen by the owner from the
+# old bot's prefixes (2026-11-12); direct APIs by default since 2026-11-13.
 # OpenAI (old `dev` branch; `$` is its bare prefix, ChatGPT's current Instant model)
 [[aliases]]
 name = ""
-spec = "openrouter:openai/gpt-chat-latest"
+spec = "openai:chat-latest"
 [[aliases]]
 name = "61s"
-spec = "openrouter:openai/gpt-6.1-sol"
+spec = "openai:gpt-6.1-sol"
 [[aliases]]
 name = "61t"
-spec = "openrouter:openai/gpt-6.1-terra"
+spec = "openai:gpt-6.1-terra"
 [[aliases]]
 name = "6"
-spec = "openrouter:openai/gpt-6-astra"
+spec = "openai:gpt-6-astra"
 [[aliases]]
 name = "6s"
-spec = "openrouter:openai/gpt-6-sol"
+spec = "openai:gpt-6-sol"
 [[aliases]]
 name = "6l"
-spec = "openrouter:openai/gpt-6-luna"
+spec = "openai:gpt-6-luna"
 [[aliases]]
 name = "56"
-spec = "openrouter:openai/gpt-5.6-sol"
+spec = "openai:gpt-5.6-sol"
 [[aliases]]
 name = "56t"
-spec = "openrouter:openai/gpt-5.6-terra"
+spec = "openai:gpt-5.6-terra"
 [[aliases]]
 name = "56l"
-spec = "openrouter:openai/gpt-5.6-luna"
+spec = "openai:gpt-5.6-luna"
 [[aliases]]
 name = "55"
-spec = "openrouter:openai/gpt-5.5"
+spec = "openai:gpt-5.5"
 [[aliases]]
 name = "54"
-spec = "openrouter:openai/gpt-5.4"
+spec = "openai:gpt-5.4"
 [[aliases]]
 name = "54m"
-spec = "openrouter:openai/gpt-5.4-mini"
+spec = "openai:gpt-5.4-mini"
 [[aliases]]
 name = "54n"
-spec = "openrouter:openai/gpt-5.4-nano"
-
+spec = "openai:gpt-5.4-nano"
 # Anthropic (old `claude` branch)
 [[aliases]]
 name = "c"
-spec = "openrouter:anthropic/claude-opus-5.5"
+spec = "anthropic:claude-opus-5-5"
 [[aliases]]
 name = "c5"
-spec = "openrouter:anthropic/claude-opus-5"
+spec = "anthropic:claude-opus-5"
 [[aliases]]
 name = "cf"
-spec = "openrouter:anthropic/claude-fable-5.2"
+spec = "anthropic:claude-fable-5-2"
 [[aliases]]
 name = "cf51"
-spec = "openrouter:anthropic/claude-fable-5.1"
+spec = "anthropic:claude-fable-5-1"
 [[aliases]]
 name = "cf5"
-spec = "openrouter:anthropic/claude-fable-5"
+spec = "anthropic:claude-fable-5"
 [[aliases]]
 name = "cs"
-spec = "openrouter:anthropic/claude-sonnet-5.5"
+spec = "anthropic:claude-sonnet-5-5"
 [[aliases]]
 name = "cs5"
-spec = "openrouter:anthropic/claude-sonnet-5"
+spec = "anthropic:claude-sonnet-5"
 [[aliases]]
 name = "ch"
-spec = "openrouter:anthropic/claude-haiku-5.5"
-
-# Google (old `gemini` branch)
+spec = "anthropic:claude-haiku-5-5"
+# Google (old `gemini` branch; g4h: Gemini 4 Hydrogen, added 2026-11-13)
 [[aliases]]
 name = "g"
-spec = "openrouter:google/gemini-4-carbon"
+spec = "google:gemini-4-carbon"
 [[aliases]]
 name = "g4"
-spec = "openrouter:google/gemini-4-argon"
+spec = "google:gemini-4-argon"
+[[aliases]]
+name = "g4h"
+spec = "google:gemini-4-hydrogen"
 [[aliases]]
 name = "g31"
-spec = "openrouter:google/gemini-3.1-pro-preview"
+spec = "google:gemini-3.1-pro-preview"
 [[aliases]]
 name = "gf"
-spec = "openrouter:google/gemini-3.8-flash"
+spec = "google:gemini-3.8-flash"
 [[aliases]]
 name = "g38f"
-spec = "openrouter:google/gemini-3.8-flash"
-[[aliases]]
-name = "g37f"
-spec = "openrouter:google/gemini-3.7-flash"
+spec = "google:gemini-3.8-flash"
 [[aliases]]
 name = "g36f"
-spec = "openrouter:google/gemini-3.6-flash"
-[[aliases]]
-name = "g35f"
-spec = "openrouter:google/gemini-3.5-flash"
+spec = "google:gemini-3.6-flash"
 [[aliases]]
 name = "gi"
-spec = "openrouter:google/gemini-nano-banana-2.1"
-
+spec = "google:gemini-nano-banana-2.1"
 # xAI (old `grok` branch)
 [[aliases]]
 name = "x"
-spec = "openrouter:x-ai/grok-4.7"
+spec = "xai:grok-4.7"
 [[aliases]]
 name = "x46"
-spec = "openrouter:x-ai/grok-4.6"
+spec = "xai:grok-4.6"
 [[aliases]]
 name = "x45"
-spec = "openrouter:x-ai/grok-4.5"
-
-# DeepSeek (old `deepseek` branch; its `deepseek-v4-pro` and `deepseek-flash` are these
-# dated releases)
+spec = "xai:grok-4.5"
+# DeepSeek (old `deepseek` branch; on OpenRouter its models are these dated releases)
 [[aliases]]
 name = "d"
-spec = "openrouter:deepseek/deepseek-v4-pro-0813"
+spec = "deepseek:deepseek-v4-pro"
 [[aliases]]
 name = "df"
-spec = "openrouter:deepseek/deepseek-v4.1-flash-1017"
-
+spec = "deepseek:deepseek-flash"
 # Zhipu GLM (old `glm` branch)
 [[aliases]]
 name = "z"
-spec = "openrouter:z-ai/glm-5.3"
+spec = "zhipu:glm-5.3"
 [[aliases]]
 name = "zf"
-spec = "openrouter:z-ai/glm-5.3-flash"
-
+spec = "zhipu:glm-5.3-flash"
 # Moonshot Kimi (old `moonshot` branch)
 [[aliases]]
 name = "k"
-spec = "openrouter:moonshotai/kimi-k3"
-[[aliases]]
-name = "k26"
-spec = "openrouter:moonshotai/kimi-k2.6"
-
-# Alibaba Qwen (old `qwen` branch; its `qwen3.8-max` is this dated release)
+spec = "moonshot:kimi-k3"
+# Alibaba Qwen (old `qwen` branch; on OpenRouter its `qwen3.8-max` is this dated release)
 [[aliases]]
 name = "q"
-spec = "openrouter:qwen/qwen3.8-max-0902"
+spec = "alibaba:qwen3.8-max"
 [[aliases]]
 name = "q37"
-spec = "openrouter:qwen/qwen3.7-max"
-
+spec = "alibaba:qwen3.7-max"
 # ByteDance Doubao, directly on Volcengine Ark (old `doubao` branch; needs
 # [providers.ark])
 [[aliases]]
@@ -286,6 +273,124 @@ spec = "ark:doubao-seed-evolving"
 [[aliases]]
 name = "db"
 spec = "ark:doubao-seed-2-1-pro-260915"
+# The same models through OpenRouter: `o` + the prefix (`oc$`; `o$` for the empty one)
+[[aliases]]
+name = "o"
+spec = "openrouter:openai/gpt-chat-latest"
+[[aliases]]
+name = "o61s"
+spec = "openrouter:openai/gpt-6.1-sol"
+[[aliases]]
+name = "o61t"
+spec = "openrouter:openai/gpt-6.1-terra"
+[[aliases]]
+name = "o6"
+spec = "openrouter:openai/gpt-6-astra"
+[[aliases]]
+name = "o6s"
+spec = "openrouter:openai/gpt-6-sol"
+[[aliases]]
+name = "o6l"
+spec = "openrouter:openai/gpt-6-luna"
+[[aliases]]
+name = "o56"
+spec = "openrouter:openai/gpt-5.6-sol"
+[[aliases]]
+name = "o56t"
+spec = "openrouter:openai/gpt-5.6-terra"
+[[aliases]]
+name = "o56l"
+spec = "openrouter:openai/gpt-5.6-luna"
+[[aliases]]
+name = "o55"
+spec = "openrouter:openai/gpt-5.5"
+[[aliases]]
+name = "o54"
+spec = "openrouter:openai/gpt-5.4"
+[[aliases]]
+name = "o54m"
+spec = "openrouter:openai/gpt-5.4-mini"
+[[aliases]]
+name = "o54n"
+spec = "openrouter:openai/gpt-5.4-nano"
+[[aliases]]
+name = "oc"
+spec = "openrouter:anthropic/claude-opus-5.5"
+[[aliases]]
+name = "oc5"
+spec = "openrouter:anthropic/claude-opus-5"
+[[aliases]]
+name = "ocf"
+spec = "openrouter:anthropic/claude-fable-5.2"
+[[aliases]]
+name = "ocf51"
+spec = "openrouter:anthropic/claude-fable-5.1"
+[[aliases]]
+name = "ocf5"
+spec = "openrouter:anthropic/claude-fable-5"
+[[aliases]]
+name = "ocs"
+spec = "openrouter:anthropic/claude-sonnet-5.5"
+[[aliases]]
+name = "ocs5"
+spec = "openrouter:anthropic/claude-sonnet-5"
+[[aliases]]
+name = "och"
+spec = "openrouter:anthropic/claude-haiku-5.5"
+[[aliases]]
+name = "og"
+spec = "openrouter:google/gemini-4-carbon"
+[[aliases]]
+name = "og4"
+spec = "openrouter:google/gemini-4-argon"
+[[aliases]]
+name = "og4h"
+spec = "openrouter:google/gemini-4-hydrogen"
+[[aliases]]
+name = "og31"
+spec = "openrouter:google/gemini-3.1-pro-preview"
+[[aliases]]
+name = "ogf"
+spec = "openrouter:google/gemini-3.8-flash"
+[[aliases]]
+name = "og38f"
+spec = "openrouter:google/gemini-3.8-flash"
+[[aliases]]
+name = "og36f"
+spec = "openrouter:google/gemini-3.6-flash"
+[[aliases]]
+name = "ogi"
+spec = "openrouter:google/gemini-nano-banana-2.1"
+[[aliases]]
+name = "ox"
+spec = "openrouter:x-ai/grok-4.7"
+[[aliases]]
+name = "ox46"
+spec = "openrouter:x-ai/grok-4.6"
+[[aliases]]
+name = "ox45"
+spec = "openrouter:x-ai/grok-4.5"
+[[aliases]]
+name = "od"
+spec = "openrouter:deepseek/deepseek-v4-pro-0813"
+[[aliases]]
+name = "odf"
+spec = "openrouter:deepseek/deepseek-v4.1-flash-1017"
+[[aliases]]
+name = "oz"
+spec = "openrouter:z-ai/glm-5.3"
+[[aliases]]
+name = "ozf"
+spec = "openrouter:z-ai/glm-5.3-flash"
+[[aliases]]
+name = "ok"
+spec = "openrouter:moonshotai/kimi-k3"
+[[aliases]]
+name = "oq"
+spec = "openrouter:qwen/qwen3.8-max-0902"
+[[aliases]]
+name = "oq37"
+spec = "openrouter:qwen/qwen3.7-max"
 
 # ------------------------------------------------------------------ presets
 # Default options for matching models, in the same syntax as after a prefix

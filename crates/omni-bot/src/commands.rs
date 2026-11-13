@@ -75,7 +75,7 @@ Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::u
 
 **Attachments**: photos, files or an album with the prefix in the caption, or a prefixed reply to a photo, file, album or location message, go to the model with the text. A location is the user's position for Gemini's Google Maps (`google:` models with `+m`); other models reject it.
 
-**Images and videos**: chat models that draw (Gemini's Nano Banana) answer with images; OpenAI and Grok chat models draw with `+i`. An image or video model's id (e.g. `openai:gpt-image-2.6-sunburst$`, `xai:grok-imagine-video-1.5$`) calls the platform's image or video API directly, with no chat model. Reply to a generated image (or attach images) to edit it. Options: `q=` quality, `n=` how many, `bg=` background, `sec=` video length, sizes `1 2 4` and ratios; the defaults are the highest quality, the largest size and no watermark. /raw gives the original files.
+**Images and videos**: chat models that draw (Gemini's Nano Banana) answer with images; OpenAI and Grok chat models draw with `+i`. An image or video model's id (e.g. `openai:gpt-image-2.6-sunburst$`, `xai:grok-imagine-video-1.5$`) calls the platform's image or video API directly, with no chat model. Reply to a generated image or video (or attach images) to edit it; these APIs take one prompt, so a reply they cannot edit is an error. Options: `q=` quality, `n=` how many, `bg=` background, `sec=` video length, sizes `1 2 4` and ratios; the defaults are the highest quality, the largest size and no watermark. /raw gives the original files.
 
 **Continue**: reply to any of my messages. The whole reply is the next message, exactly as typed (marker lines are plain text there), except that a leading `\` is removed, so `\/raw` sends the text `/raw`. Replying to a failed message is rejected; use /retry on it.
 
@@ -544,10 +544,13 @@ async fn admin_command(
             say(app, bot, ib, &text).await;
         }
         "credits" => {
-            let mut blocks = vec![RBlock::Paragraph(RText::bold(RText::plain("OpenRouter key")))];
-            match app.openrouter.key_info().await {
-                Ok(v) => blocks.extend(credits_blocks(&v)?),
-                Err(e) => blocks.push(RBlock::Paragraph(RText::plain(format!("⚠️ {e:#}")))),
+            let mut blocks = Vec::new();
+            if app.provider_enabled("openrouter") {
+                blocks.push(RBlock::Paragraph(RText::bold(RText::plain("OpenRouter key"))));
+                match app.openrouter.key_info().await {
+                    Ok(v) => blocks.extend(credits_blocks(&v)?),
+                    Err(e) => blocks.push(RBlock::Paragraph(RText::plain(format!("⚠️ {e:#}")))),
+                }
             }
             // The platforms' own APIs that have a balance endpoint.
             let balances = futures::future::join_all(
@@ -560,6 +563,9 @@ async fn admin_command(
                     Ok(v) => blocks.extend(balance_blocks(&v)),
                     Err(e) => blocks.push(RBlock::Paragraph(RText::plain(format!("⚠️ {e:#}")))),
                 }
+            }
+            if blocks.is_empty() {
+                blocks.push(RBlock::Paragraph(RText::plain("no configured API reports a balance")));
             }
             send(app, bot, ib, "Credits", blocks).await
         }
@@ -623,7 +629,12 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
         return Ok(());
     }
     let rows: Vec<Vec<String>> = prefixes.into_iter().map(|(n, s)| vec![format!("{n}{marker}"), s]).collect();
-    let mut blocks = vec![table(&["prefix", "spec"], rows)];
+    let mut blocks = if rows.is_empty() {
+        // Prefixes of platforms without an API key are not offered.
+        vec![RBlock::Paragraph(RText::plain("No prefix of this bot is available (their platforms have no API key)."))]
+    } else {
+        vec![table(&["prefix", "spec"], rows)]
+    };
     let own: Vec<Vec<String>> = app
         .chat_prefixes_of(&bot.name, ib.chat_id)
         .into_iter()
@@ -652,7 +663,13 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
     }
     let token = trigger::parse_spec(prefix_name(arg, marker)).ok();
     let spec = match token {
-        Some(t) => app.resolve_spec(&t, cfg, ib.chat_id, false).await.ok().flatten(),
+        Some(t) => match app.resolve_spec(&t, cfg, ib.chat_id, false).await {
+            Ok(s) => s,
+            Err(e) => {
+                say(app, bot, ib, &format!("⚠️ {e}")).await;
+                return Ok(());
+            }
+        },
         None => None,
     };
     let Some(spec) = spec else {
@@ -662,10 +679,7 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
     if spec.provider != "openrouter" {
         let title = format!("{}{marker} → {}:{}{}", spec.label, spec.provider, spec.model, spec.options_syntax());
         let name = omni_llm::provider::info(&spec.provider).map(|i| i.name).unwrap_or(spec.provider.as_str());
-        let mut text = format!("served by the {name} API directly");
-        if app.direct(&spec.provider).is_some_and(|p| !p.knows(&spec.model)) {
-            text.push_str("; not in the bot's model table for it (limits and price unknown)");
-        }
+        let text = format!("served by the {name} API directly");
         send(app, bot, ib, &title, vec![RBlock::Paragraph(RText::plain(text))]).await;
         return Ok(());
     }

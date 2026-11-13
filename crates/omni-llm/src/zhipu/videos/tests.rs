@@ -243,17 +243,23 @@ async fn replies_and_what_zhipu_cannot_take() {
     let p = prep_with("cogvideox-3", &[], &h, &blobs).await.unwrap();
     assert!(p.body["image_url"].as_str().unwrap().starts_with("data:image/png;base64,"));
     assert!(p.notes.is_empty(), "{:?}", p.notes);
-    // A reply to a generated video: Zhipu takes no video, a new one is made (noted).
+    // A reply to a generated video: Zhipu takes no video, so it cannot be edited (refused).
     let clip = BlobRef::for_bytes(b"\0\0\0\x18ftypmp42", "video/mp4");
     let video = Part::File { blob: clip, filename: Some("v.mp4".into()), generated: true };
     let h = vec![Turn::user_text("一只猫"), answer(vec![video]), Turn::user_text("改成晚上")];
-    let p = prep_with("cogvideox-3", &[], &h, &MemBlobs(vec![])).await.unwrap();
-    assert_eq!(p.body["prompt"], "改成晚上");
-    assert!(p.body.get("image_url").is_none());
-    assert!(p.notes[0].contains("the video of the answer replied to is not sent"), "{:?}", p.notes);
-    // Earlier text turns: noted, not sent.
+    let e = prep_with("cogvideox-3", &[], &h, &MemBlobs(vec![])).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "`cogvideox-3` takes no video input, so it cannot edit the video replied to: start a new message for a new \
+         video"
+    );
+    // Earlier text turns: one prompt per request, so they would be ignored (refused).
     let h = vec![Turn::user_text("讲个故事"), Turn::assistant_text("从前"), Turn::user_text("拍出来")];
-    assert!(prep_with("cogvideox-3", &[], &h, &MemBlobs(vec![])).await.unwrap().notes[0].contains("earlier turns"));
+    let e = prep_with("cogvideox-3", &[], &h, &MemBlobs(vec![])).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "`cogvideox-3` takes one prompt via Zhipu's video API, not a conversation: start a new message, or reply to a generated image or video it can take as input"
+    );
     // An attached video, a long prompt, an empty message.
     let (mp4, bm) = file("a.mp4", "video/mp4", b"\0\0\0\x18ftypmp42");
     let e = prep_with("cogvideox-3", &[], &[user(vec![Part::text("x"), mp4])], &MemBlobs(vec![bm])).await.unwrap_err();
@@ -266,17 +272,18 @@ async fn replies_and_what_zhipu_cannot_take() {
 }
 
 #[tokio::test]
-async fn unknown_models_get_no_unchecked_options() {
-    let p = prep("cogvideox-9", &[]).await.unwrap();
-    assert_eq!(
-        p.body,
-        json!({"model": "cogvideox-9", "prompt": "一只猫在玩毛线球", "quality": "quality", "with_audio": true,
-               "watermark_enabled": false, "user_id": "user-hash-1"})
-    );
-    assert!(p.warnings[0].contains("not in the bot's Zhipu video model table"), "{:?}", p.warnings);
-    let p = prep("vidu3-text", &[]).await.unwrap();
-    assert_eq!(p.body, json!({"model": "vidu3-text", "prompt": "一只猫在玩毛线球", "user_id": "user-hash-1"}));
-    assert!(err("cogvideox-9", &[flag("W")]).await.contains("cannot be checked"));
+async fn unknown_models_are_not_supported() {
+    // Their price is unknown to the bot, whatever the options.
+    for id in ["cogvideox-9", "vidu3-text"] {
+        for opts in [&[][..], &[flag("W")]] {
+            assert_eq!(
+                err(id, opts).await,
+                format!(
+                    "`{id}` is not in the bot's Zhipu BigModel model table (its price is unknown), so it is not supported"
+                )
+            );
+        }
+    }
 }
 
 // ------------------------------------------------------------------ HTTP (local fake server)

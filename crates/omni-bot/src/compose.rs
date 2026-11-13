@@ -3,7 +3,8 @@
 //! Layout (top to bottom):
 //! 1. header line: `🤖 **model**` in small text (the owner's choice: the answer
 //!    takes the space);
-//! 2. reasoning: collapsible details titled with a small 💭 only (open only
+//! 2. reasoning: collapsible details titled with a small 💭 (while the model
+//!    is thinking it, also what about: [`thinking_title`]) (open only
 //!    while thinking, before any answer);
 //! 3. tool calls: collapsible details;
 //! 4. the model's answer (rendered Markdown, or raw Markdown in raw mode / fallback);
@@ -286,6 +287,27 @@ fn tool_item(t: &ToolCall) -> RItem {
     RItem { checkbox: None, blocks }
 }
 
+/// What reasoning is about, for its fold title while the model thinks: the
+/// latest heading of a summary (a line that is all bold, `**Planning the
+/// answer**`, or a Markdown heading), else the beginning of the latest paragraph.
+fn thinking_title(text: &str) -> Option<String> {
+    const MAX: usize = 48;
+    let heading = text.lines().rev().find_map(|l| {
+        let t = l.trim();
+        let bold = t.strip_prefix("**").and_then(|x| x.strip_suffix("**")).filter(|x| !x.contains("**"));
+        let hashes = t.trim_start_matches('#');
+        let md = (hashes.len() < t.len() && hashes.starts_with(' ')).then_some(hashes);
+        bold.or(md).map(str::trim).filter(|h| !h.is_empty())
+    });
+    let picked = heading.or_else(|| text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()).last())?;
+    let line = picked.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if line.chars().count() > MAX {
+        format!("{}…", line.chars().take(MAX - 1).collect::<String>())
+    } else {
+        line
+    })
+}
+
 /// Emit the pending answer text, followed by the sources it cites: a fold of
 /// the links (with the quoted passage when the provider gives one), cited
 /// documents without a link (a PDF page), and Google's Search Suggestions as a
@@ -429,6 +451,8 @@ struct Stretch {
     blocks: Vec<RBlock>,
     reasoning: usize,
     tool_calls: usize,
+    /// What the model is thinking about right now (the stretch ends with live reasoning).
+    thinking: Option<String>,
 }
 
 impl Stretch {
@@ -448,17 +472,22 @@ impl Stretch {
         if s.tool_calls > 0 {
             title.push(format!("🔧 {}", s.tool_calls));
         }
+        // The fold one sees: it also says what the model is thinking about (only meanwhile).
+        title.extend(s.thinking);
         out.push(RBlock::Details { open, title: RText::sub(RText::plain(title.join(" · "))), blocks: s.blocks });
     }
 }
 
 /// `open_thinking`: open the reasoning fold that nothing follows yet (the model
-/// is still thinking and `render.reasoning_open` is on).
+/// is still thinking and `render.reasoning_open` is on). `live`: the reply is
+/// being generated, so the reasoning nothing follows yet is the model's current
+/// thinking: its fold title says what it is about ([`thinking_title`]); once
+/// anything follows it (or the reply is done) the title is a plain 💭 again.
 ///
 /// Strictly in production order. Each uninterrupted stretch of reasoning and
 /// tool calls with more than one fold is put in one outer fold, so that models
 /// that think and call tools many times do not flood the chat.
-fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -> Vec<RBlock> {
+fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool, live: bool) -> Vec<RBlock> {
     let mut out = Vec::new();
     let mut answer = String::new();
     let mut citations: Vec<Citation> = Vec::new();
@@ -483,13 +512,20 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool) -
                 }
                 if !text.is_empty() {
                     flush_answer(&mut out, &mut answer, &mut citations, raw, depth);
-                    // Open only while the model is thinking: nothing has come after it yet.
-                    let open = open_thinking && !parts[i..].iter().any(visible);
+                    // The model is thinking this right now: nothing has come after it yet.
+                    let current = !parts[i..].iter().any(visible);
+                    let open = open_thinking && current;
+                    let thinking = (live && current).then(|| thinking_title(&text)).flatten();
+                    let title = match &thinking {
+                        Some(t) => format!("💭 {t}"),
+                        None => "💭".to_string(),
+                    };
                     stretch.reasoning += 1;
+                    stretch.thinking = thinking;
                     // One level more for the outer fold it may end up in.
                     stretch.blocks.push(RBlock::Details {
                         open,
-                        title: RText::sub(RText::plain("💭")),
+                        title: RText::sub(RText::plain(title)),
                         blocks: ai_blocks(&text, raw, depth + 2),
                     });
                 }
@@ -576,7 +612,7 @@ fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool) -> RBlock {
     } else {
         format!("⚠️ Attempt {} failed", a.n)
     };
-    let mut blocks = output_blocks(&a.parts, raw, 1, false);
+    let mut blocks = output_blocks(&a.parts, raw, 1, false, false);
     if let Some(d) = a.error.as_ref().and_then(|e| e.details.as_ref()) {
         blocks.push(RBlock::Pre { text: pretty(&error_shown(d)), language: "json".into() });
     }
@@ -639,7 +675,8 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         out.push(prior_block(a, raw, inp.show_usage));
     }
     // 3. this attempt's output, in the order it was produced.
-    out.extend(output_blocks(inp.parts, raw, 0, inp.reasoning_open && inp.status == Status::Generating));
+    let live = inp.status == Status::Generating;
+    out.extend(output_blocks(inp.parts, raw, 0, inp.reasoning_open && live, live));
     // Images still being generated: their latest streamed preview.
     for (blob, dims) in inp.previews {
         out.push(RBlock::Photo {
@@ -687,8 +724,10 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     if inp.status == Status::Generating {
         f.push(format!("⏳ generating · {}s", inp.elapsed.as_secs()))
     }
-    if !inp.settings.is_empty() {
-        f.extend(inp.settings.iter().cloned());
+    // `+ …` settings name charges the cost estimate leaves out: shown after the cost.
+    let (extra_costs, settings): (Vec<&String>, Vec<&String>) = inp.settings.iter().partition(|s| s.starts_with("+ "));
+    if !settings.is_empty() {
+        f.extend(settings.into_iter().cloned());
     } else if !inp.options.is_empty() {
         f.push(inp.options.to_string());
     }
@@ -704,6 +743,13 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         && let Some(u) = inp.usage
     {
         f.extend(usage_parts(u));
+    }
+    if !extra_costs.is_empty() {
+        let extra = extra_costs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+        match f.last_mut().filter(|_| inp.show_usage && inp.usage.is_some_and(|u| u.cost_usd.is_some())) {
+            Some(cost) => cost.push_str(&format!(" {extra}")),
+            None => f.push(extra),
+        }
     }
     if finished && !inp.elapsed.is_zero() {
         f.push(format!("{:.1}s", inp.elapsed.as_secs_f64()));
@@ -925,6 +971,55 @@ fn write_block(f: &mut Formatted, b: &RBlock, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_title_says_what_the_model_is_thinking_while_it_thinks() {
+        // A summary's latest heading; else the start of the latest paragraph.
+        assert_eq!(
+            thinking_title("**Reading the question**\n\nThe user asks…\n\n**Checking the dates**\n\nIt was").as_deref(),
+            Some("Checking the dates")
+        );
+        assert_eq!(thinking_title("## Plan\nsteps").as_deref(), Some("Plan"));
+        assert_eq!(thinking_title("First idea.\n\nThen   the second\nline").as_deref(), Some("Then the second line"));
+        let long = "word ".repeat(30);
+        assert_eq!(thinking_title(&long).unwrap().chars().count(), 48);
+        let reasoning = |t: &str| {
+            Part::Reasoning(omni_core::Reasoning {
+                kind: omni_core::content::ReasoningKind::Summary,
+                text: Some(t.into()),
+                ..Default::default()
+            })
+        };
+        let parts = vec![reasoning("**Planning**\n\nSo")];
+        let title = |blocks: &[RBlock]| match &blocks[1] {
+            RBlock::Details { title, .. } => title.to_plain(),
+            other => panic!("{other:?}"),
+        };
+        // While generating: the heading; once the reply is done: a plain 💭.
+        assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭 Planning");
+        assert_eq!(title(&compose(&input(&parts, Status::Done))), "💭");
+        // Something after it (the answer): thinking is over.
+        let parts = vec![reasoning("**Planning**\n\nSo"), Part::text("Answer")];
+        assert_eq!(title(&compose(&input(&parts, Status::Generating))), "💭");
+    }
+
+    #[test]
+    fn extra_charges_follow_the_cost() {
+        let usage =
+            Usage { input_tokens: Some(10), output_tokens: Some(5), cost_usd: Some(0.008), ..Default::default() };
+        let settings = vec!["effort max".to_string(), "code execution".to_string(), "+ code execution".to_string()];
+        let mut i = input(&[], Status::Done);
+        i.usage = Some(&usage);
+        i.settings = &settings;
+        let blocks = compose(&i);
+        let RBlock::Footer(t) = blocks.last().unwrap() else { panic!() };
+        let footer = t.to_plain();
+        assert!(
+            footer.starts_with("effort max · code execution · in 10 · out 5 · $0.00800 + code execution · "),
+            "{footer}"
+        );
+        assert_eq!(footer.matches("+ code execution").count(), 1, "{footer}");
+    }
 
     #[test]
     fn source_titles_lose_markup() {

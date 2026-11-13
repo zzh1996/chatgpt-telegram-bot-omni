@@ -380,6 +380,9 @@ impl Provider for Xai {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         self.build(input, presets, blobs).await
     }
     async fn stream(
@@ -610,11 +613,11 @@ mod tests {
         let capped = Xai::new(DirectConfig { max_tokens_cap: Some(393_216), ..cfg("https://api.x.ai/v1") }).unwrap();
         let p = prep_with(&capped, "grok-4.7", &[], &[Turn::user_text("hi")], &MemBlobs(vec![])).await;
         assert_eq!(p.body["max_output_tokens"], 393_216);
-        // Unknown models: no guessed defaults, a warning.
-        let p = prep("grok-5", &[]).await;
-        assert!(p.body.get("reasoning").is_none() && p.body.get("max_output_tokens").is_none());
-        assert_eq!(p.body["include"], json!(["reasoning.encrypted_content"]));
-        assert!(p.warnings[0].contains("not in the bot's xAI model table"), "{}", p.warnings[0]);
+        // Unknown models: their price is unknown to the bot, so they are not supported.
+        assert_eq!(
+            err("grok-5", &[]).await,
+            "`grok-5` is not in the bot's xAI model table (its price is unknown), so it is not supported"
+        );
     }
 
     #[tokio::test]
@@ -897,11 +900,12 @@ mod tests {
         );
         assert!(matches!(&evs[0], StreamEvent::ContextSize(12879)));
         assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))));
-        // Files read by attachment_search: said, with the count (billed per call).
+        // Files read by attachment_search: said, with the count.
         let evs = terminal(json!({"input_tokens": 3000, "output_tokens": 50, "total_tokens": 3050,
             "server_side_tool_usage_details": {"document_search_calls": 2}}));
-        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Notice(n)
-            if n == "📎 xAI searched the attached files with its attachment_search tool (2 searches, billed per call)")));
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::Notice(n) if n == "📎 xAI searched the attached files (×2)"))
+        );
         assert!(!evs.iter().any(|e| matches!(e, StreamEvent::ContextSize(_))), "none reported");
     }
 
@@ -924,8 +928,36 @@ mod tests {
             ],
             native: None,
         };
-        let history = vec![Turn::user_text("draw"), other, Turn::user_text("now blue")];
         let blobs = MemBlobs(vec![(png, png_bytes), (pdf, pdf_bytes)]);
+        // What xAI cannot take (a WebP image, a video) refuses the request, every reason said.
+        let history = vec![Turn::user_text("draw"), other.clone(), Turn::user_text("now blue")];
+        let input = CallInput {
+            model: "grok-4.7",
+            options: &[],
+            history: &history,
+            session_id: None,
+            user: None,
+            known_context: None,
+            max_tokens_override: None,
+        };
+        let e = xai().prepare(&input, &[], &blobs).await.unwrap_err();
+        assert_eq!(
+            e.message,
+            "1 image from earlier answers cannot be sent: xAI takes JPEG or PNG images of up to 20 MiB; 1 video from \
+             earlier answers cannot be sent: xAI takes no video input"
+        );
+        // What it takes goes in the assistant message, in order.
+        let taken = Turn {
+            parts: other
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| ![2, 4].contains(i))
+                .map(|(_, p)| p.clone())
+                .collect(),
+            ..other
+        };
+        let history = vec![Turn::user_text("draw"), taken, Turn::user_text("now blue")];
         let p = prep_with(&xai(), "grok-4.7", &[], &history, &blobs).await;
         let a = &p.body["input"][1];
         assert_eq!(a["role"], "assistant");
@@ -937,13 +969,7 @@ mod tests {
             (content[2]["filename"].clone(), content[2]["mime_type"].clone()),
             (json!("report.pdf"), json!("application/pdf"))
         );
-        assert_eq!(
-            p.warnings,
-            [
-                "1 image from earlier answers was not sent: xAI takes JPEG or PNG images of up to 20 MiB",
-                "1 video from earlier answers was not sent: xAI takes no video input"
-            ]
-        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         // Text only: as before.
         let history = vec![Turn::user_text("hi"), Turn::assistant_text("hello"), Turn::user_text("more")];
         let p = prep_with(&xai(), "grok-4.7", &[], &history, &MemBlobs(vec![])).await;

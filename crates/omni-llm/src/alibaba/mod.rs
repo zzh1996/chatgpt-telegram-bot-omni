@@ -42,11 +42,13 @@
 //! - No cost in responses: estimated from the CNY price list (Beijing), plus
 //!   the billed searches (`tool_usage.web_search.num_requests`).
 //!
-//! The image models (Qwen-Image, Wan, Z-Image) use DashScope's own image API:
-//! [`images`].
+//! The image models (Qwen-Image, Wan, Z-Image) use DashScope's own image API
+//! ([`images`]), the video models (HappyHorse, Wan) its asynchronous video API
+//! ([`video`]).
 
 pub mod images;
 mod responses;
+pub mod video;
 
 use omni_core::Usage;
 use omni_core::content::{Part, Role, Turn};
@@ -289,12 +291,22 @@ fn has_options(req: &Requested) -> bool {
 pub struct Alibaba {
     cfg: DirectConfig,
     http: reqwest::Client,
+    /// Sends `X-DashScope-Async: enable` (creating video tasks).
+    async_http: reqwest::Client,
 }
 
 impl Alibaba {
     pub fn new(cfg: DirectConfig) -> anyhow::Result<Self> {
         let http = cfg.http()?;
-        Ok(Self { cfg, http })
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-DashScope-Async", reqwest::header::HeaderValue::from_static("enable"));
+        let async_http = reqwest::Client::builder()
+            .connect_timeout(cfg.connect_timeout)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .default_headers(headers)
+            .build()?;
+        Ok(Self { cfg, http, async_http })
     }
 
     /// An explicit output budget only when it lowers the default (the model's
@@ -318,6 +330,9 @@ impl Alibaba {
     ) -> Result<Prepared, LlmError> {
         if images::is_image_model(input.model) {
             return images::prepare(&self.cfg, input, presets, blobs).await;
+        }
+        if video::is_video_model(input.model) {
+            return video::prepare(&self.cfg, input, presets, blobs).await;
         }
         let user = crate::request::parse(input.options).map_err(LlmError::request)?;
         let mut req = Requested::default();
@@ -348,7 +363,7 @@ impl Alibaba {
         let auto_max = self.output_budget(input, spec);
         let mut p = match spec {
             Some(s) if responses => self.responses_request(input, s, &req, &user, blobs, &mut notes).await?,
-            _ => self.chat_request(input, spec, &req, &user, blobs, &mut notes).await?,
+            _ => self.chat_request(input, spec, &req, &user, blobs).await?,
         };
         if let Some(n) = auto_max {
             let key = if p.dialect == RESPONSES_DIALECT { "max_output_tokens" } else { "max_completion_tokens" };
@@ -365,7 +380,7 @@ impl Alibaba {
                 .as_ref()
                 .is_some_and(|n| n.model == input.model && [DIALECT, RESPONSES_DIALECT].contains(&n.dialect.as_str()))
         };
-        p.warnings.extend(crate::provider::unsent_media(input.history, own));
+        crate::provider::unsent_media(input.history, own)?;
         if spec.is_none() {
             p.warnings.push(format!(
                 "`{}` is not in the bot's Alibaba Model Studio model table: limits and price unknown (sent without \
@@ -383,9 +398,8 @@ impl Alibaba {
         req: &Requested,
         user: &Requested,
         blobs: &dyn BlobLoader,
-        notes: &mut Vec<String>,
     ) -> Result<Prepared, LlmError> {
-        let (messages, images) = chat_messages(input.history, input.model, spec, blobs, notes).await?;
+        let (messages, images) = chat_messages(input.history, input.model, spec, blobs).await?;
         let mut body = json!({
             "model": input.model,
             "messages": messages,
@@ -478,7 +492,7 @@ impl Alibaba {
                 spec.id
             )));
         }
-        let (items, images) = responses::input_items(input.history, input.model, spec, why, blobs, notes).await?;
+        let (items, images) = responses::input_items(input.history, input.model, spec, why, blobs).await?;
         let mut body = json!({"model": input.model, "input": items, "stream": true, "store": false});
         let mut applied = vec![Applied { source: "default".into(), patch: json!({"store": false}) }];
         let mut settings = Vec::new();
@@ -552,6 +566,9 @@ impl Alibaba {
         if p.dialect == images::DIALECT {
             return images::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
         }
+        if p.dialect == video::DIALECT {
+            return video::stream(&self.http, &self.async_http, &self.cfg, p, sink, observer, cancel).await;
+        }
         let rb = self.http.post(&p.url).bearer_auth(&self.cfg.api_key).json(&p.body);
         let spec = model_spec(&p.model);
         let rate = self.cfg.cny_per_usd;
@@ -613,7 +630,7 @@ impl Provider for Alibaba {
         NAME
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some() || images::spec(model).is_some()
+        model_spec(model).is_some() || images::spec(model).is_some() || video::spec(model).is_some()
     }
     async fn prepare(
         &self,
@@ -621,6 +638,9 @@ impl Provider for Alibaba {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         self.prepare_request(input, presets, blobs).await
     }
     async fn stream(
@@ -652,7 +672,6 @@ async fn user_content(
     model: &str,
     spec: Option<&ModelSpec>,
     blobs: &dyn BlobLoader,
-    notes: &mut Vec<String>,
 ) -> Result<Vec<Content>, LlmError> {
     let text_only = || {
         LlmError::request(format!(
@@ -701,9 +720,6 @@ async fn user_content(
                         let bytes = crate::provider::load(blobs, blob).await?;
                         let text = String::from_utf8(bytes)
                             .map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
-                        notes.push(format!(
-                            "📎 {name} inlined as a separate text part by the bot (no native text-file input on this API)"
-                        ));
                         out.push(Content::Text(text));
                     }
                     MediaClass::Pdf | MediaClass::Document => {
@@ -745,7 +761,6 @@ async fn chat_messages(
     model: &str,
     spec: Option<&ModelSpec>,
     blobs: &dyn BlobLoader,
-    notes: &mut Vec<String>,
 ) -> Result<(Vec<Value>, bool), LlmError> {
     let mut out = Vec::with_capacity(history.len());
     let mut images = false;
@@ -754,7 +769,7 @@ async fn chat_messages(
             Role::System => out.push(json!({"role": "system", "content": turn.answer_text()})),
             Role::Assistant => out.push(chat_assistant(turn, model)),
             Role::User => {
-                let parts: Vec<Value> = user_content(turn, model, spec, blobs, notes)
+                let parts: Vec<Value> = user_content(turn, model, spec, blobs)
                     .await?
                     .into_iter()
                     .map(|c| match c {

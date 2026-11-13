@@ -341,7 +341,8 @@ async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::type
             return None;
         }
         for s in &t.specs {
-            if let Ok(Some(_)) = app.resolve_spec(s, bot_cfg, chat_id, strict).await {
+            // An error (e.g. a prefix of this bot whose platform has no key) is for this bot to explain.
+            if let Ok(Some(_)) | Err(_) = app.resolve_spec(s, bot_cfg, chat_id, strict).await {
                 return Some(Kind::Trigger);
             }
         }

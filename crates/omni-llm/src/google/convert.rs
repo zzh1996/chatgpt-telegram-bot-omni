@@ -396,12 +396,12 @@ pub async fn convert(
         let mut kinds: Vec<&str> = left_out.iter().map(|(_, k)| k.as_str()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        out.warnings.push(format!(
-            "{} generated in earlier turns {} not sent: `{model}` does not take {} input",
+        // Content the model cannot take refuses the request (owner's rule).
+        return Err(LlmError::request(format!(
+            "{} generated in earlier turns cannot be sent: `{model}` does not take {} input",
             what.join(" and "),
-            if left_out.len() == 1 { "was" } else { "were" },
             kinds.join(", ")
-        ));
+        )));
     }
     Ok(out)
 }

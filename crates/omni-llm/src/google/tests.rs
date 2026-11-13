@@ -118,7 +118,7 @@ fn location(lat: f64, lng: f64) -> Part {
 
 #[test]
 fn table_covers_the_configured_aliases() {
-    // The `g g4 g31 gf g38f g37f g36f g35f gi` aliases of config/omni.example.toml.
+    // The Gemini aliases of config/omni.example.toml (retiring models are not in the table).
     let g = google();
     for id in [
         "gemini-4-hydrogen",
@@ -126,17 +126,15 @@ fn table_covers_the_configured_aliases() {
         "gemini-4-argon",
         "gemini-3.1-pro-preview",
         "gemini-3.8-flash",
-        "gemini-3.7-flash",
         "gemini-3.6-flash",
-        "gemini-3.5-flash",
         "gemini-nano-banana-2.1",
-        "gemini-2.5-flash-image",
     ] {
         assert!(g.knows(id), "{id}");
         assert!(pricing::price(id, Tier::Standard, NOW).is_some(), "{id}");
     }
-    assert_eq!(models::spec("gemini-3.7-flash").routes_to, Some("gemini-3.8-flash"));
-    assert_eq!(models::spec("gemini-3.5-flash").routes_to, Some("gemini-3.6-flash"));
+    for gone in ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash-image"] {
+        assert!(!g.knows(gone), "{gone}");
+    }
     assert!(!g.knows("gemini-3.8-flash-tts"));
     assert_eq!(g.id(), "google");
     assert_eq!(g.name(), "Gemini API");
@@ -202,26 +200,10 @@ async fn per_model_thinking_and_output_defaults() {
     assert_eq!(p.body["generationConfig"]["thinkingConfig"], json!({"includeThoughts": true}));
     assert_eq!(p.settings, vec!["reasoning on"]);
 
-    let p = prep("gemini-2.5-pro", &[], &hi()).await.unwrap();
-    assert_eq!(
-        p.body["generationConfig"]["thinkingConfig"],
-        json!({"thinkingBudget": 32_768, "includeThoughts": true})
-    );
-    assert_eq!(p.settings, vec!["thinking budget 32768"]);
-    let p = prep("gemini-2.5-flash", &[kv("e", "none")], &hi()).await.unwrap();
-    assert_eq!(p.body["generationConfig"]["thinkingConfig"], json!({"thinkingBudget": 0}));
-    assert_eq!(p.settings, vec!["thinking off"]);
-    assert_eq!(p.applied[1].source, "option");
-    let p = prep("gemini-2.5-flash-lite", &[kv("budget", "2048")], &hi()).await.unwrap();
-    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 2048);
-
     let p = prep("gemini-3.6-flash", &[kv("e", "minimal")], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal");
     assert_eq!(p.settings, vec!["effort minimal"]);
-
-    // The routing of a deprecated id is reported from the response (modelVersion), not guessed.
-    let p = prep("gemini-3.7-flash", &[], &hi()).await.unwrap();
-    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    assert_eq!(p.applied[1].source, "option");
 
     // Gemini 4 Hydrogen: the highest of its four levels; long decode like Carbon and Argon.
     let p = prep("gemini-4-hydrogen", &[], &hi()).await.unwrap();
@@ -232,19 +214,6 @@ async fn per_model_thinking_and_output_defaults() {
     assert!(prep("gemini-4-hydrogen", &[kv("e", "medium")], &hi()).await.is_ok());
     let e = prep_err("gemini-4-hydrogen", &[kv("e", "minimal")], &hi()).await;
     assert!(e.contains("levels: xhigh, high, medium, low"), "{e}");
-
-    // Gemini 2.5 Flash Image: no thinking, ratios only.
-    let p = prep("gemini-2.5-flash-image", &[flag("W")], &hi()).await.unwrap();
-    let g = &p.body["generationConfig"];
-    assert!(g.get("thinkingConfig").is_none(), "{g}");
-    assert_eq!(g["imageConfig"], json!({"aspectRatio": "16:9"}));
-    assert_eq!(g["maxOutputTokens"], 32_768);
-    let e = prep_err("gemini-2.5-flash-image", &[flag("4")], &hi()).await;
-    assert!(e.contains("has no image size option"), "{e}");
-    let e = prep_err("gemini-2.5-flash-image", &[kv("e", "high")], &hi()).await;
-    assert!(e.contains("no reasoning effort"), "{e}");
-    let e = prep_err("gemini-2.5-flash-image", &[flag("s")], &hi()).await;
-    assert!(e.contains("has no web search"), "{e}");
 }
 
 #[tokio::test]
@@ -259,12 +228,8 @@ async fn options_outside_the_api_are_rejected() {
     assert!(e.contains("levels: high, medium, minimal"), "{e}");
     let e = prep_err("gemini-4-carbon", &[kv("budget", "1000")], &hi()).await;
     assert!(e.contains("has no reasoning token budget"), "{e}");
-    let e = prep_err("gemini-2.5-pro", &[kv("budget", "64")], &hi()).await;
-    assert!(e.contains("128–32768"), "{e}");
-    let e = prep_err("gemini-2.5-pro", &[kv("e", "none")], &hi()).await;
-    assert!(e.contains("cannot turn reasoning off"), "{e}");
-    let e = prep_err("gemini-2.5-flash", &[kv("e", "high")], &hi()).await;
-    assert!(e.contains("has no reasoning effort levels"), "{e}");
+    let e = prep_err("gemini-3.8-flash", &[kv("budget", "1000")], &hi()).await;
+    assert!(e.contains("has no reasoning token budget"), "{e}");
     let e = prep_err("gemini-3-pro-image", &[kv("e", "high")], &hi()).await;
     assert!(e.contains("has no reasoning effort levels"), "{e}");
     let e = prep_err("gemini-3.8-flash", &[kv("v", "high")], &hi()).await;
@@ -275,8 +240,9 @@ async fn options_outside_the_api_are_rejected() {
     assert!(e.contains("unknown option"), "{e}");
     let e = prep_err("gemini-3.8-flash", &[OptionToken::Json(json!({"temperature": 1}))], &hi()).await;
     assert!(e.contains("JSON options are not supported"), "{e}");
+    // A resource name is not a model id of the table.
     let e = prep_err("models/gemini-3.8-flash", &[], &hi()).await;
-    assert!(e.contains("is not a Gemini API model id"), "{e}");
+    assert!(e.contains("`models/gemini-3.8-flash` is not in the bot's Gemini API model table"), "{e}");
 }
 
 #[tokio::test]
@@ -291,8 +257,8 @@ async fn tools_tiers_and_their_validation() {
     // Code execution reports its parts anyway; no tools, nothing to ask for.
     assert!(prep("gemini-4-carbon", &[flag("c")], &hi()).await.unwrap().body.get("toolConfig").is_none());
     assert!(prep("gemini-3.8-flash", &[], &hi()).await.unwrap().body.get("toolConfig").is_none());
-    // Not on Gemini 2.5, nor on the image models (the tool-combination guide names Gemini 3 and 4).
-    assert!(prep("gemini-2.5-flash", &[flag("s")], &hi()).await.unwrap().body.get("toolConfig").is_none());
+    // Not on the image models (the tool-combination guide names the Gemini 3 and 4 text models).
+    assert!(prep("gemini-3-pro-image", &[flag("s")], &hi()).await.unwrap().body.get("toolConfig").is_none());
     let p = prep("gemini-3.8-flash", &[kv("tier", "priority")], &hi()).await.unwrap();
     assert_eq!(p.body["service_tier"], "priority");
     let p = prep("gemini-3.8-flash", &[kv("tier", "default")], &hi()).await.unwrap();
@@ -394,8 +360,12 @@ async fn maps_takes_the_latest_location() {
         Part::Image { blob: img, filename: None, generated: false, dims: None, thought: false },
         Part::text("what is this place?"),
     ])];
-    let p = prep_full(&google(), "gemini-3.8-flash", &[flag("m")], &history, &[], &blobs, None).await.unwrap();
-    assert!(p.warnings.iter().any(|w| w.contains("multimodal")), "{:?}", p.warnings);
+    // Grounding with Google Maps takes text only (Google's documentation): media refuse the request.
+    let e = prep_full(&google(), "gemini-3.8-flash", &[flag("m")], &history, &[], &blobs, None).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "Google Maps grounding (`+m`) takes text only (Google's documentation): this conversation has media"
+    );
 }
 
 fn native_turn(model: &str, parts: Value) -> Turn {
@@ -537,24 +507,22 @@ async fn media_goes_natively_at_the_highest_resolution() {
 }
 
 #[tokio::test]
-async fn end_user_label_and_unknown_models() {
+async fn end_user_label_and_models_outside_the_table() {
     let hash = "a".repeat(64);
     let p = prep_full(&google(), "gemini-3.8-flash", &[], &hi(), &[], &Blobs::none(), Some(&hash)).await.unwrap();
     assert_eq!(p.body["labels"], json!({"safety_identifier": "a".repeat(63)}));
     assert!(p.applied.iter().any(|a: &Applied| a.patch.get("labels").is_some() && a.source == "default"));
     assert!(p.body.get("session_id").is_none(), "no documented cache key");
 
-    // A new Gemini 4 model: the family's defaults, with a warning.
-    let p = prep("gemini-4-neon", &[], &hi()).await.unwrap();
-    assert!(p.long_decode);
-    assert_eq!(p.body["generationConfig"]["maxOutputTokens"], 393_216);
-    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
-    assert!(p.warnings[0].contains("not in the bot's Gemini API model table"), "{:?}", p.warnings);
-    assert!(!google().knows("gemini-4-neon"));
-    // Something else: only what is asked for.
-    let p = prep("gemma-5-27b-it", &[], &hi()).await.unwrap();
-    assert!(p.body.get("generationConfig").is_none());
-    assert!(p.settings.is_empty());
+    // A new Gemini 4 model, a retired one, something else: their price is unknown to the bot,
+    // so they are not supported.
+    for id in ["gemini-4-neon", "gemini-2.5-flash", "gemma-5-27b-it"] {
+        assert!(!google().knows(id), "{id}");
+        assert_eq!(
+            prep_err(id, &[], &hi()).await,
+            format!("`{id}` is not in the bot's Gemini API model table (its price is unknown), so it is not supported")
+        );
+    }
 }
 
 // ------------------------------------------------------------------ streams
@@ -1083,13 +1051,13 @@ fn what_served_the_request_is_the_footers_and_odd_states_are_noted() {
     // Priced as served.
     assert!((usages(&evs)[0].cost_usd.unwrap() - (3.0 * 0.75 + 1.0 * 3.75) / 1e6).abs() < 1e-12);
     // A model status other than STABLE.
-    let mut c = chunk("gemini-2.5-flash-image", "standard");
-    c["modelStatus"] = json!({"modelStage": "LEGACY", "retirementTime": "2027-03-15T00:00:00Z", "message": "Use gemini-3.1-flash-lite-image."});
-    let mut p = parser("gemini-2.5-flash-image", json!({}));
+    let mut c = chunk("gemini-3.1-flash-lite-image", "standard");
+    c["modelStatus"] = json!({"modelStage": "LEGACY", "retirementTime": "2027-03-15T00:00:00Z", "message": "This model will be retired."});
+    let mut p = parser("gemini-3.1-flash-lite-image", json!({}));
     assert_eq!(
         notices(&run(&mut p, &[c])),
         vec![
-            "Google: `gemini-2.5-flash-image` is LEGACY, retiring 2027-03-15T00:00:00Z: Use gemini-3.1-flash-lite-image."
+            "Google: `gemini-3.1-flash-lite-image` is LEGACY, retiring 2027-03-15T00:00:00Z: This model will be retired."
         ]
     );
 }
@@ -1335,8 +1303,8 @@ async fn tool_parts_in_the_history_keep_the_flag_on() {
     assert_eq!(p.body["contents"][1]["parts"], parts);
     assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}));
     assert!(p.body.get("tools").is_none());
-    // A model without tool traces (Gemini 2.5): no flag.
-    let p = prep("gemini-2.5-flash", &[], &history).await.unwrap();
+    // A model without tool traces (the image models): no flag.
+    let p = prep("gemini-3-pro-image", &[], &history).await.unwrap();
     assert!(p.body.get("toolConfig").is_none());
     assert_eq!(p.body["contents"][1]["parts"], parts);
 }
@@ -1406,17 +1374,22 @@ async fn media_other_models_generated_goes_in_the_model_turn() {
         ]})
     );
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
-    // An image model edits the image (no per-part resolution there); it takes no audio.
-    let p = prep_full(&google(), "gemini-nano-banana-2.1", &[], &history, &[], &b, None).await.unwrap();
+    // An image model edits the image (no per-part resolution there) ...
+    let without_audio = Turn { parts: answer.parts[..5].to_vec(), ..answer.clone() };
+    let h = vec![Turn::user_text("a cat"), without_audio, Turn::user_text("make it blue")];
+    let p = prep_full(&google(), "gemini-nano-banana-2.1", &[], &h, &[], &b, None).await.unwrap();
     let parts = p.body["contents"][1]["parts"].as_array().unwrap().clone();
     assert_eq!(
         parts[1],
         json!({"inlineData": {"mimeType": "image/png", "data": b64(b"\x89PNG-made-by-another-model")}})
     );
     assert_eq!(parts.len(), 4, "{parts:?}");
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    // ... and takes no audio: what it cannot take refuses the request.
+    let e = prep_full(&google(), "gemini-nano-banana-2.1", &[], &history, &[], &b, None).await.unwrap_err();
     assert_eq!(
-        p.warnings,
-        vec!["1 file generated in earlier turns was not sent: `gemini-nano-banana-2.1` does not take audio input"]
+        e.message,
+        "1 file generated in earlier turns cannot be sent: `gemini-nano-banana-2.1` does not take audio input"
     );
     // An answer that is only an image is a model turn with the image.
     let only = Turn {
@@ -1583,18 +1556,6 @@ fn prices_by_tier_date_and_modality() {
 
     let flash = |g: GroundingUse, model: &str| pricing::estimate(model, &json!({}), None, NOW, &g).unwrap();
     assert!((flash(GroundingUse { queries: 3, ..Default::default() }, "gemini-3.8-flash") - 0.042).abs() < 1e-12);
-    let g25 = GroundingUse { queries: 4, web_results: true, maps_results: true };
-    assert!((flash(g25, "gemini-2.5-flash") - (0.035 + 0.025)).abs() < 1e-12, "2.5: per grounded prompt");
-    // 2.5 Pro is billed as 3.8 Flash once Google routes it there.
-    let after = pricing::estimate(
-        "gemini-2.5-pro",
-        &json!({"promptTokenCount": 1_000_000}),
-        None,
-        pricing::DEC_1_2026,
-        &GroundingUse::default(),
-    )
-    .unwrap();
-    assert!((after - 0.75).abs() < 1e-9);
     assert!(pricing::estimate("gemini-9", &json!({}), None, NOW, &GroundingUse::default()).is_none());
     assert!(pricing::price("gemini-nano-banana-2.1", Tier::Flex, NOW).is_none(), "image models have no flex tier");
 
@@ -1613,11 +1574,8 @@ fn prices_by_tier_date_and_modality() {
                    "totalTokenCount": 603, "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}]});
     let c = pricing::estimate("gemini-3.1-flash-lite-image", &u, None, NOW, &GroundingUse::default()).unwrap();
     assert!((c - (11.0 * 0.25 + 287.0 * 1.50 + 1120.0 * 30.0) / 1e6).abs() < 1e-12, "{c}");
-    // Gemini 2.5 Flash Image: $0.039 per 1,290-token image.
-    let u = json!({"promptTokenCount": 10, "candidatesTokenCount": 1290,
-                   "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1290}]});
-    let c = pricing::estimate("gemini-2.5-flash-image", &u, None, NOW, &GroundingUse::default()).unwrap();
-    assert!((c - (10.0 * 0.30 / 1e6 + 0.0387)).abs() < 1e-9, "{c}");
+    // Gemini 2.5 Flash Image (end of service announced for 2027-03-15) is not in the table: no price.
+    assert!(pricing::price("gemini-2.5-flash-image", Tier::Standard, NOW).is_none());
 }
 
 // ------------------------------------------------------------------ HTTP path (local fake server)

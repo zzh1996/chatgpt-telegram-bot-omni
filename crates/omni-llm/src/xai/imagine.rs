@@ -176,10 +176,6 @@ pub const VIDEO_MODELS: &[VideoSpec] = &[
     },
 ];
 
-/// Retired image slugs (xAI serves them with grok-imagine-image-2.0 at `low`).
-const RETIRED_IMAGE: &[(&str, &str)] =
-    &[("grok-imagine-image-quality", "2026-11-02"), ("grok-imagine-image-pro", "2026-11-02")];
-
 pub fn is_image_model(model: &str) -> bool {
     model.starts_with("grok-imagine-image")
 }
@@ -328,13 +324,15 @@ pub(crate) async fn prepare_image(
         one_of(model, "aspect ratio", r, IMAGE_RATIOS)?;
     }
 
-    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, mut notes } =
+    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, notes } =
         media::media_input(input.history, model, "xAI's image API")?;
     if !own_videos.is_empty() {
         return Err(LlmError::request(format!("`{model}` takes images, not video, via xAI")));
     }
     if answer_video.is_some() {
-        notes.push("ℹ️ the video of the answer replied to is not sent: the image API takes images".into());
+        return Err(LlmError::request(format!(
+            "`{model}` takes images, not the video of the answer replied to, via xAI's image API"
+        )));
     }
     if prompt.is_empty() {
         return Err(LlmError::request(format!("`{model}` needs a prompt (the text of the message)")));
@@ -395,17 +393,7 @@ pub(crate) async fn prepare_image(
     if let Some(u) = &input.user {
         body["user"] = json!(u);
     }
-    let mut warnings = Vec::new();
-    if spec.is_none() {
-        warnings.push(match RETIRED_IMAGE.iter().find(|(id, _)| *id == model) {
-            Some((_, d)) => format!(
-                "`{model}` was retired on {d}: xAI serves it with grok-imagine-image-2.0 at quality low (the bot's defaults are not sent)"
-            ),
-            None => format!(
-                "`{model}` is not in the bot's xAI image model table: its options are unknown (the bot's defaults are not sent)"
-            ),
-        });
-    }
+    let warnings = Vec::new();
     Ok(Prepared {
         dialect: IMAGE_DIALECT,
         model: model.to_string(),
@@ -1015,10 +1003,13 @@ mod tests {
             ["quality low", "resolution 1k", "aspect ratio 16:9", "background transparent", "4 images"]
         );
         assert_eq!(prep("grok-imagine-image-2.0", &[kv("ar", "21:9")]).await.unwrap().body["aspect_ratio"], "21:9");
-        // Retired slugs and unknown ids: only what was asked for, with a warning.
-        let p = prep("grok-imagine-image-quality", &[]).await.unwrap();
-        assert!(p.body.get("quality").is_none() && p.body.get("resolution").is_none());
-        assert!(p.warnings[0].contains("retired on 2026-11-02"), "{:?}", p.warnings);
+        // Retired slugs and unknown ids: their price is unknown to the bot, so they are not supported.
+        for id in ["grok-imagine-image-quality", "grok-imagine-image-pro", "grok-imagine-image-3.0"] {
+            assert_eq!(
+                err(id, &[]).await,
+                format!("`{id}` is not in the bot's xAI model table (its price is unknown), so it is not supported")
+            );
+        }
     }
 
     #[tokio::test]

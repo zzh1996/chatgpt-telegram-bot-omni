@@ -139,6 +139,12 @@ impl Prepared {
         if self.dialect == zhipu::videos::DIALECT {
             return zhipu::videos::continuation_request(self, item);
         }
+        if self.dialect == ark::video::DIALECT {
+            return ark::video::continuation_request(self, item);
+        }
+        if self.dialect == alibaba::video::DIALECT {
+            return alibaba::video::continuation_request(self, item);
+        }
         let mut p = self.clone();
         if let Some(msgs) = p.body.get_mut("messages").and_then(Value::as_array_mut) {
             msgs.push(serde_json::json!({"role": "assistant", "content": "", "reasoning_details": [item]}));

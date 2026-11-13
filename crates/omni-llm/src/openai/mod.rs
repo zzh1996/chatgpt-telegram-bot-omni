@@ -385,9 +385,6 @@ impl OpenAi {
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
         let model = input.model;
-        if let Some(e) = images::gone(model) {
-            return Err(e);
-        }
         let spec = model_spec(model);
         let user = request::parse(input.options).map_err(LlmError::request)?;
         let mut req = Requested::default();
@@ -602,6 +599,9 @@ impl Provider for OpenAi {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         self.build(input, presets, blobs).await
     }
     async fn stream(
@@ -868,8 +868,6 @@ mod tests {
             p.applied.iter().any(|a| a.source == "default"
                 && a.patch == json!({"store": true, "include": ["reasoning.encrypted_content"]}))
         );
-        // Unknown models too (replay must not depend on OpenAI's storage).
-        assert_eq!(prep("gpt-7-nova", &[]).await.unwrap().body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(p.settings, vec!["effort max"]);
         assert_eq!(p.applied[0].source, "default");
         assert_eq!(p.applied[1].patch, json!({"max_output_tokens": 128_000}));
@@ -905,16 +903,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_models_get_no_guessed_defaults() {
-        let p = prep("gpt-7-nova", &[]).await.unwrap();
-        assert!(p.body.get("reasoning").is_none());
-        assert!(p.body.get("max_output_tokens").is_none());
-        assert_eq!(p.warnings.len(), 1);
-        assert!(p.warnings[0].contains("not in the bot's OpenAI model table"), "{}", p.warnings[0]);
-        // Options pass to OpenAI, which checks them for the model.
-        let p = prep("gpt-7-nova", &[kv("e", "high"), kv("tier", "flex")]).await.unwrap();
-        assert_eq!(p.body["reasoning"], json!({"effort": "high"}));
-        assert_eq!(p.body["service_tier"], "flex");
+    async fn unknown_models_are_not_supported() {
+        // Their price is unknown to the bot, whatever the options.
+        for opts in [&[][..], &[kv("e", "high"), kv("tier", "flex")]] {
+            assert_eq!(
+                err("gpt-7-nova", opts).await,
+                "`gpt-7-nova` is not in the bot's OpenAI model table (its price is unknown), so it is not supported"
+            );
+        }
+        assert!(!openai().knows("gpt-7-nova"));
     }
 
     #[tokio::test]
@@ -1404,11 +1401,11 @@ mod tests {
 
     #[test]
     fn image_tool_tokens_are_priced_at_the_image_model() {
-        let r = json!({"service_tier": "default", "tools": [{"type": "image_generation", "model": "gpt-image-1.5"}],
+        let r = json!({"service_tier": "default", "tools": [{"type": "image_generation", "model": "gpt-image-2.5-flare"}],
             "tool_usage": {"image_gen": {"input_tokens": 10, "input_tokens_details": {"text_tokens": 10, "image_tokens": 0},
                 "output_tokens": 1000, "output_tokens_details": {"image_tokens": 900, "text_tokens": 100}, "total_tokens": 1010}}});
         let c = estimate_cost("gpt-6-luna", &r, &usage(0, 0, 0, 0)).unwrap();
-        assert!(close(c, (10.0 * 5.0 + 900.0 * 32.0 + 100.0 * 10.0) / 1e6), "{c}");
+        assert!(close(c, (10.0 * 5.0 + 900.0 * 30.0) / 1e6), "{c}");
         // Zero counts (no image call): nothing; an unknown image model: the cost is unknown.
         let none = json!({"tool_usage": {"image_gen": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}});
         assert!(close(estimate_cost("gpt-6-luna", &none, &usage(0, 0, 0, 0)).unwrap(), 0.0));
@@ -1418,11 +1415,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_image_models_and_gone_models_route_away_from_responses() {
+    async fn bare_image_models_route_away_from_responses() {
         let p = prep("gpt-image-2.6-flare", &[]).await.unwrap();
         assert_eq!((p.dialect, p.url.as_str()), (images::DIALECT, "https://api.openai.com/v1/images/generations"));
-        assert!(openai().knows("gpt-image-2.6-flare") && openai().knows("gpt-image-2-2026-04-21"));
-        assert!(!openai().knows("gpt-image-1"));
-        assert!(err("sora-2", &[]).await.contains("shut down the Videos API and the Sora 2 models on 2026-09-24"));
+        assert!(openai().knows("gpt-image-2.6-flare") && openai().knows("gpt-image-2.5-flare-2026-09-08"));
+        // Deprecated and shut-down ids (images, Sora) are not in the table.
+        for gone in ["gpt-image-2-2026-04-21", "gpt-image-1", "sora-2"] {
+            assert!(!openai().knows(gone), "{gone}");
+            assert!(err(gone, &[]).await.contains("is not in the bot's OpenAI model table"), "{gone}");
+        }
     }
 }

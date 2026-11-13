@@ -222,8 +222,6 @@ pub const MODELS: &[ModelSpec] = &[
         output: 15.0,
         ..MODERN
     },
-    // Sonnet 4.5: deprecated, retires 2026-11-30 (its 1M-context beta is retired: 200K).
-    ModelSpec { id: "claude-sonnet-4-5", input: 3.0, output: 15.0, ..GEN_45 },
     // Haiku 5.5: `disabled` at effort high or below; prompts over 100K tokens cost 5×.
     ModelSpec {
         id: "claude-haiku-5-5",
@@ -309,7 +307,8 @@ mod tests {
         assert_eq!(model_spec("claude-opus-5").unwrap().id, "claude-opus-5");
         assert_eq!(model_spec("claude-opus-4-5-20251101").unwrap().id, "claude-opus-4-5");
         assert_eq!(model_spec("claude-haiku-4-5-20251001").unwrap().max_output, 64_000);
-        assert_eq!(model_spec("claude-sonnet-4-5-20250929").unwrap().context, 200_000);
+        // Retiring models are not in the table (owner's rule).
+        assert!(model_spec("claude-sonnet-4-5-20250929").is_none());
         // A newer model is not taken for an older one with a shorter id.
         assert!(model_spec("claude-opus-5-6").is_none());
         assert!(model_spec("claude-fable-5-3").is_none());

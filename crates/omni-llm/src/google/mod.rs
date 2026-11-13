@@ -80,6 +80,9 @@ impl Provider for Google {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         if omni::is_video_model(input.model) {
             return omni::prepare(&self.cfg, input, presets, blobs).await;
         }

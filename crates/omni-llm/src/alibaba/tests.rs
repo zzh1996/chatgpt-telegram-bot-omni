@@ -192,11 +192,12 @@ async fn invalid_options_are_rejected() {
     assert!(!e.contains("e=xhigh"), "Qwen3.7 has no effort levels: {e}");
     let e = prepare_err("qwen3.8-max", &[kv("v", "low")]).await;
     assert!(e.contains("no verbosity"), "{e}");
-    let e = prepare_err("qwen9", &[flag("s")]).await;
-    assert!(e.contains("cannot be checked"), "{e}");
-    let p = prepare("qwen9", &[]).await.unwrap();
-    assert!(p.warnings[0].contains("not in the bot's Alibaba Model Studio model table"));
-    assert!(p.body.get("enable_thinking").is_none());
+    // Ids outside the table are not supported (their price is unknown).
+    let e = prepare_err("qwen9", &[]).await;
+    assert_eq!(
+        e,
+        "`qwen9` is not in the bot's Alibaba Model Studio model table (its price is unknown), so it is not supported"
+    );
 }
 
 #[tokio::test]
@@ -335,7 +336,7 @@ async fn media() {
     let csv = Part::File { blob: with("text/csv", &refs[3]), filename: Some("t.csv".into()), generated: false };
     let p = alibaba(None).prepare(&input("qwen3.7-max", &[], &[user(vec![csv])]), &[], &blobs).await.unwrap();
     assert_eq!(p.body["messages"][0]["content"], "a,b\n1,2");
-    assert!(p.notes[0].contains("t.csv inlined"), "{:?}", p.notes);
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
     let loc = Part::Location { latitude: 1.0, longitude: 2.0, accuracy_m: None, title: None, address: None };
     let e = alibaba(None).prepare(&input("qwen3.8-max", &[], &[user(vec![loc])]), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("does not take a location via Alibaba Model Studio"), "{}", e.message);
@@ -367,7 +368,8 @@ async fn media() {
     );
 }
 
-/// Media other models generated in earlier turns: assistant messages carry text only (both APIs).
+/// Media other models generated in earlier turns: assistant messages carry text
+/// only (both APIs), so the request is refused.
 #[tokio::test]
 async fn generated_media_of_other_models_are_not_sent() {
     let (blobs, refs) = Blobs::new(&[b"\x89PNG".to_vec(), b"\x00\x00mp4".to_vec()]);
@@ -391,19 +393,21 @@ async fn generated_media_of_other_models_are_not_sent() {
             context_tokens: None,
         }),
     };
-    let h = [Turn::user_text("draw"), gemini, Turn::user_text("describe them")];
+    let h = [Turn::user_text("draw"), gemini.clone(), Turn::user_text("describe them")];
     for opts in [vec![], vec![flag("s")]] {
-        let p = alibaba(None).prepare(&input("qwen3.8-max", &opts, &h), &[], &blobs).await.unwrap();
+        let e = alibaba(None).prepare(&input("qwen3.8-max", &opts, &h), &[], &blobs).await.unwrap_err();
         assert_eq!(
-            p.warnings,
-            vec![
-                "2 images and 1 video generated in an earlier turn were not sent: assistant messages here carry text only"
-            ],
+            e.message,
+            "2 images and 1 video generated in an earlier turn cannot be sent: assistant messages here carry text only",
             "{opts:?}"
         );
     }
+    // Drafts made while thinking are reasoning, never sent to another model: the answer goes as its text.
+    let drafts = Turn { parts: vec![image(true), Part::text("Here:")], ..gemini };
+    let h = [Turn::user_text("draw"), drafts, Turn::user_text("describe them")];
     let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &h), &[], &blobs).await.unwrap();
     assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here:"}));
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     // Nothing to say without generated media.
     let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &[Turn::user_text("hi")]), &[], &blobs).await.unwrap();
     assert!(p.warnings.is_empty());

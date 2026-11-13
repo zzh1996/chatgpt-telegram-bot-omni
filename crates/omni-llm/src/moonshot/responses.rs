@@ -34,12 +34,7 @@ use crate::{BlobLoader, chatstream};
 pub(super) const IMAGE_DETAIL: &str = "original";
 
 /// The conversation as Responses `input` items.
-pub(super) async fn input_items(
-    history: &[Turn],
-    model: &str,
-    blobs: &dyn BlobLoader,
-    notes: &mut Vec<String>,
-) -> Result<Vec<Value>, LlmError> {
+pub(super) async fn input_items(history: &[Turn], model: &str, blobs: &dyn BlobLoader) -> Result<Vec<Value>, LlmError> {
     let mut out = Vec::with_capacity(history.len());
     for turn in history {
         match turn.role {
@@ -48,7 +43,7 @@ pub(super) async fn input_items(
             Role::Assistant => out.extend(assistant_items(turn, model)),
             Role::User => {
                 let mut parts = Vec::new();
-                for c in super::user_content(turn, model, blobs, notes).await? {
+                for c in super::user_content(turn, model, blobs).await? {
                     parts.push(match c {
                         Content::Text(t) => json!({"type": "input_text", "text": t}),
                         Content::Image(u) => json!({"type": "input_image", "image_url": u, "detail": IMAGE_DETAIL}),

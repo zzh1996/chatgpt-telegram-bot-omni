@@ -4,17 +4,17 @@
 
 - **MTProto**（grammers），不是 HTTP Bot API；发送用持久化的 `random_id` 实现幂等。
 - **单进程多 bot**：每个 bot 都像独立实例（各自的模型范围、授权名单、限额、前缀和速率限制），可按模型/群组分工。
-- **OpenRouter 与各家官方 API**：默认走 OpenRouter；配了 key 的平台也可以直连它自己的 API（OpenAI、Anthropic、Gemini、xAI、DeepSeek、智谱、Moonshot、阿里云百炼、火山方舟；国内厂商接国内官网，和旧版一样），模型写成 `openai:gpt-6.1-sol` 这样，回复第一行也这样显示。
+- **各家官方 API 与 OpenRouter**：配了 key 的平台直连它自己的 API（OpenAI、Anthropic、Gemini、xAI、DeepSeek、智谱、Moonshot、阿里云百炼、火山方舟；国内厂商接国内官网，和旧版一样），模型写成 `openai:gpt-6.1-sol` 这样，回复第一行也这样显示；也可以经 OpenRouter（`openai/gpt-6.1-sol`）。示例配置的前缀都直连官方，前面加 `o` 的同名前缀走 OpenRouter（`c$` / `oc$`）——这只是配置里的写法，可以随意改。
 - **请求干净透明**：不注入任何 system prompt；所有参数（包括默认的"能力拉满"预设）都可查看（/info），并可用选项逐项覆盖（如 `+e=low`）；上游错误原样展示。
 - **重启不重不漏**：入站消息先落盘、处理完一批后才推进 Telegram 的 pts（重复投递被唯一键去重）；被重启打断的生成在原消息里重新生成（Gemini 4 long decode 从 checkpoint 接着写）；半截消息会被标注而不会悬空。
-- **多模态进出**：Telegram 能发的都能当输入（照片、相册、文件、语音、视频、贴纸、富消息、位置…）；模型生成的图片、视频、音频、文件按产生的位置显示，`/raw` 取原文件。出图和视频按各平台官方推荐的方式：聊天模型出图（Nano Banana，OpenAI/Grok 的 `+i`），或直接写出图/视频模型的 ID 调它的接口（gpt-image、Grok Imagine、Seedream、CogView/GLM-Image、千问图像/Wan）。
+- **多模态进出**：Telegram 能发的都能当输入（照片、相册、文件、语音、视频、贴纸、富消息、位置…）；模型生成的图片、视频、音频、文件按产生的位置显示，`/raw` 取原文件。出图和视频按各平台官方推荐的方式：聊天模型出图（Nano Banana，OpenAI/Grok 的 `+i`），或直接写出图/视频模型的 ID 调它的接口（gpt-image、Grok Imagine、Seedream、CogView/GLM-Image、千问图像/Wan；视频：Grok Imagine、Seedance、CogVideoX/Vidu、HappyHorse/Wan、Gemini Omni）。
 - **Telegram 富消息**：思考过程放在可折叠块里，表格/公式/代码高亮；工具调用（搜索、代码执行…）显示成可读的内容而不是裸 JSON；超出能力的部分按块回退为原始 Markdown；每条回复第一行是模型名，bot 加的其它内容都在折叠块或小字页脚里，模型输出无法伪造。
 
 ## 快速开始（Docker）
 
 ```sh
-cp .env.example .env                       # 填入 TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_BOT_TOKEN / OPENROUTER_API_KEY
-                                           # （可选：各平台官方 API 的 key，如 OPENAI_API_KEY、DEEPSEEK_API_KEY）
+cp .env.example .env                       # 填入 TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_BOT_TOKEN，以及要用的平台的 key
+                                           # （OPENROUTER_API_KEY、OPENAI_API_KEY、DEEPSEEK_API_KEY…；没填 key 的平台不提供，bot 照常运行）
 cp config/omni.example.toml config/omni.toml
 # 编辑 config/omni.toml：至少把你的 Telegram user id 填进 [access].admins
 docker compose up -d --build
@@ -33,7 +33,7 @@ docker compose logs -f
 | 写法 | 含义 |
 |---|---|
 | `$你好` | 名字为空的前缀（配置里 `[[aliases]] name = ""`） |
-| `c$你好` | 前缀（`/models` 查看）；`$` 后的正文原样发送 |
+| `c$你好` | 前缀（`/models` 查看）；`$` 后的正文原样发送。示例配置里 `c$` 直连 Anthropic，`oc$` 是同一个模型经 OpenRouter |
 | `anthropic/claude-opus-5.5$你好` | 直接写 bot 有的任意 OpenRouter 模型 ID（需 `allow_unlisted_models = true`），新模型无需改配置 |
 | `openai:gpt-6.1-sol$你好` | 直连该平台的官方 API（需配置它的 key；直接写 ID 同样需 `allow_unlisted_models = true`） |
 | `c,g,61s$比较一下` | 多个模型并行 |

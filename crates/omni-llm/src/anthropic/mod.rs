@@ -332,6 +332,9 @@ impl Provider for Anthropic {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         let model = input.model;
         let spec = models::model_spec(model);
         let user = request::parse(input.options).map_err(LlmError::request)?;
@@ -420,15 +423,13 @@ impl Provider for Anthropic {
             applied.push(Applied { source: "default".into(), patch: json!({"anthropic-beta": betas.join(",")}) });
         }
 
-        let mut notes = conv.notes;
+        let notes = conv.notes;
+        // Container time is billed apart and not in the estimate (free with web
+        // search or fetch): a marker after the cost (`crate::Prepared::settings`).
         let free_code = spec.is_none_or(|s| s.dynamic_web)
             && (req.tools.contains(&Tool::Search) || req.tools.contains(&Tool::Fetch));
         if req.tools.contains(&Tool::Code) && !free_code {
-            notes.push(
-                "code execution time is billed separately (1,550 free container-hours per organization a month, \
-                 then $0.05 per hour, 5-minute minimum) and is not in the cost estimate"
-                    .into(),
-            );
+            settings.push("+ code execution".into());
         }
         let mut warnings = std::mem::take(&mut conv.warnings);
         if spec.is_none() {

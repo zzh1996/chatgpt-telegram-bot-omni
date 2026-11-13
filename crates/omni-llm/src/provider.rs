@@ -290,11 +290,21 @@ pub fn no_location(model: &str, via: &str) -> LlmError {
     ))
 }
 
-/// What other models generated in `turns` — earlier answers that go to the API
-/// as their text, so their images and files are not sent — as a warning ending
-/// with `why`: `2 images and 1 video generated in earlier turns were not sent:
-/// assistant messages here carry text only`. Drafts made while thinking are
-/// reasoning, which never goes to another model, and are not counted.
+/// The error for a model id that is not in the provider's table: the bot
+/// cannot know its price, so it does not use it (owner's rule against
+/// unknown costs).
+pub fn not_in_table(provider: &str, model: &str) -> crate::LlmError {
+    crate::LlmError::request(format!(
+        "`{model}` is not in the bot's {provider} model table (its price is unknown), so it is not supported"
+    ))
+}
+
+/// What other models generated in `turns` — earlier answers the API can take
+/// only as their text — as the error that refuses the request (owner's rule:
+/// content a model cannot take is an error, never dropped), ending with `why`:
+/// `2 images and 1 video generated in earlier turns cannot be sent: assistant
+/// messages here carry text only`. Drafts made while thinking are reasoning,
+/// which never goes to another model, and are not counted.
 pub fn media_not_sent<'a>(turns: impl IntoIterator<Item = &'a omni_core::Turn>, why: &str) -> Option<String> {
     use omni_core::content::Part;
     let mut kinds =
@@ -317,7 +327,6 @@ pub fn media_not_sent<'a>(turns: impl IntoIterator<Item = &'a omni_core::Turn>, 
         }
         with_media += usize::from(kinds.iter().map(|k| k.2).sum::<usize>() > before);
     }
-    let n: usize = kinds.iter().map(|k| k.2).sum();
     let what: Vec<String> = kinds
         .iter()
         .filter(|k| k.2 > 0)
@@ -328,17 +337,23 @@ pub fn media_not_sent<'a>(turns: impl IntoIterator<Item = &'a omni_core::Turn>, 
         (last, rest) => format!("{} and {last}", rest.join(", ")),
     };
     let turns = if with_media == 1 { "an earlier turn" } else { "earlier turns" };
-    Some(format!("{what} generated in {turns} {} not sent: {why}", if n == 1 { "was" } else { "were" }))
+    Some(format!("{what} generated in {turns} cannot be sent: {why}"))
 }
 
 /// [`media_not_sent`] for the assistant turns of `history` that are not `own`
 /// (the model's own answers, replayed natively), in Chat Completions APIs whose
-/// assistant messages carry text only.
-pub fn unsent_media(history: &[omni_core::Turn], own: impl Fn(&omni_core::Turn) -> bool) -> Option<String> {
-    media_not_sent(
+/// assistant messages carry text only: an error when there are any.
+pub fn unsent_media(
+    history: &[omni_core::Turn],
+    own: impl Fn(&omni_core::Turn) -> bool,
+) -> Result<(), crate::LlmError> {
+    match media_not_sent(
         history.iter().filter(|t| t.role == omni_core::Role::Assistant && !own(t)),
         "assistant messages here carry text only",
-    )
+    ) {
+        Some(why) => Err(crate::LlmError::request(why)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

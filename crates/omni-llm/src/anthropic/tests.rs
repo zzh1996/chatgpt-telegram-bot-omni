@@ -199,7 +199,7 @@ async fn defaults_are_the_highest_the_model_offers() {
     assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}));
     assert_eq!(p.body["output_config"], json!({"effort": "high"}));
     assert_eq!(p.settings, vec!["effort high", "thinking budget 63999"]);
-    for model in ["claude-sonnet-4-5", "claude-haiku-4-5-20251001"] {
+    for model in ["claude-haiku-4-5", "claude-haiku-4-5-20251001"] {
         let p = prep_ok(model, &[]).await;
         assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}), "{model}");
         assert!(p.body.get("output_config").is_none(), "{model}: no effort parameter");
@@ -231,7 +231,7 @@ async fn effort_and_thinking_options() {
     assert!(e.contains("levels: max, high, medium, low"), "{e}");
     let e = prep_err("claude-opus-4-5", &["e=max"]).await;
     assert!(e.contains("levels: high, medium, low"), "{e}");
-    let e = prep_err("claude-sonnet-4-5", &["e=high"]).await;
+    let e = prep_err("claude-haiku-4-5", &["e=high"]).await;
     assert!(e.contains("has no reasoning effort levels"), "{e}");
 
     // Thinking off: impossible on always-thinking models.
@@ -245,7 +245,7 @@ async fn effort_and_thinking_options() {
     assert!(p.body.get("output_config").is_none(), "effort stays at the API default (high), as between_tools needs");
     assert_eq!(p.settings, vec!["thinking between_tools (no up-front thinking)"]);
     // `disabled` elsewhere; the effort is left at the API default (high or below, as Opus 5 and Haiku 5.5 need).
-    for model in ["claude-haiku-5-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-sonnet-4-5"] {
+    for model in ["claude-haiku-5-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5"] {
         let p = prep_ok(model, &["e=none"]).await;
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
         assert!(p.body.get("output_config").is_none(), "{model}");
@@ -259,7 +259,7 @@ async fn effort_and_thinking_options() {
 
 #[tokio::test]
 async fn thinking_budget_option() {
-    let p = prep_ok("claude-sonnet-4-5", &["budget=20000"]).await;
+    let p = prep_ok("claude-haiku-4-5", &["budget=20000"]).await;
     assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 20_000}));
     assert_eq!(p.settings, vec!["thinking budget 20000"]);
     // Opus 4.5 keeps its (highest) effort alongside the budget.
@@ -268,8 +268,8 @@ async fn thinking_budget_option() {
     // Deprecated but still accepted on 4.6.
     let p = prep_ok("claude-sonnet-4-6", &["budget=4096"]).await;
     assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 4096}));
-    assert!(prep_err("claude-sonnet-4-5", &["budget=500"]).await.contains("at least 1024"));
-    assert!(prep_err("claude-sonnet-4-5", &["budget=64000"]).await.contains("below max_tokens (64000)"));
+    assert!(prep_err("claude-haiku-4-5", &["budget=500"]).await.contains("at least 1024"));
+    assert!(prep_err("claude-haiku-4-5", &["budget=64000"]).await.contains("below max_tokens (64000)"));
     for model in ["claude-opus-5-5", "claude-opus-4-8", "claude-sonnet-5-5", "claude-haiku-5-5"] {
         let e = prep_err(model, &["budget=4096"]).await;
         assert!(e.contains("has no reasoning token budget"), "{model}: {e}");
@@ -331,10 +331,18 @@ async fn server_tools_at_their_current_versions() {
         "web fetch cites the fetched pages (off by default)"
     );
     assert_eq!(p.settings, vec!["effort max", "web search", "URL fetching", "code execution"]);
-    // Code execution alone is billed by container time, which the estimate leaves out.
+    // Code execution alone is billed by container time, which the estimate leaves
+    // out: a "+ code execution" marker after the cost, not a note.
     let p = prep_ok("claude-haiku-5-5", &["c"]).await;
     assert_eq!(p.body["tools"], json!([{"type": "code_execution_20260521", "name": "code_execution"}]));
-    assert!(p.notes.iter().any(|n| n.contains("not in the cost estimate")), "{:?}", p.notes);
+    assert_eq!(p.settings, vec!["effort max", "code execution", "+ code execution"]);
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    // With dynamic-filtering web search or fetch it is free: no marker.
+    let p = prep_ok("claude-haiku-5-5", &["cs"]).await;
+    assert!(!p.settings.iter().any(|s| s == "+ code execution"), "{:?}", p.settings);
+    // The basic web tools (4.5 generation) do not make it free.
+    let p = prep_ok("claude-haiku-4-5", &["cs"]).await;
+    assert_eq!(p.settings.last().map(String::as_str), Some("+ code execution"), "{:?}", p.settings);
     // Before Claude 4.6: the basic web tools, and interleaved thinking with a manual budget.
     let p = prep_ok("claude-opus-4-5", &["su"]).await;
     assert_eq!(
@@ -347,8 +355,8 @@ async fn server_tools_at_their_current_versions() {
         p.settings,
         vec!["effort high", "thinking budget 63999", "interleaved thinking", "web search", "URL fetching"]
     );
-    let p = prep_ok("claude-sonnet-4-5", &["s", "e=none"]).await;
-    assert!(betas("claude-sonnet-4-5", &p.body).is_empty(), "no manual thinking, no interleaving header");
+    let p = prep_ok("claude-opus-4-5", &["s", "e=none"]).await;
+    assert!(betas("claude-opus-4-5", &p.body).is_empty(), "no manual thinking, no interleaving header");
     let p = prep_ok("claude-haiku-4-5", &["s"]).await;
     assert!(betas("claude-haiku-4-5", &p.body).is_empty(), "Haiku 4.5 has no interleaved thinking");
     // Adaptive thinking interleaves on its own.
@@ -360,26 +368,15 @@ async fn server_tools_at_their_current_versions() {
 }
 
 #[tokio::test]
-async fn unknown_models_get_the_api_defaults_and_a_warning() {
-    let p = prep_ok("claude-opus-6", &[]).await;
-    assert!(p.body.get("thinking").is_none() && p.body.get("output_config").is_none());
-    assert_eq!(p.body["max_tokens"], UNKNOWN_MODEL_MAX_TOKENS);
-    assert_eq!(p.settings, vec!["thinking: API default"]);
-    assert!(p.warnings[0].contains("not in the bot's Anthropic model table"), "{:?}", p.warnings);
+async fn unknown_models_are_not_supported() {
+    // Its price is unknown, so the bot does not use it, whatever the options.
+    for o in [&[][..], &["e=xhigh", "s", "tier=fast"]] {
+        assert_eq!(
+            prep_err("claude-opus-6", o).await,
+            "`claude-opus-6` is not in the bot's Anthropic model table (its price is unknown), so it is not supported"
+        );
+    }
     assert!(!provider().knows("claude-opus-6") && provider().knows("claude-opus-5-5"));
-    // Options go to the API unchecked.
-    let p = prep_ok("claude-opus-6", &["e=xhigh", "s", "tier=fast"]).await;
-    assert_eq!(p.body["thinking"], json!({"type": "adaptive", "display": "summarized"}));
-    assert_eq!(p.body["output_config"], json!({"effort": "xhigh"}));
-    assert_eq!(p.body["tools"][0]["type"], "web_search_20260318");
-    assert_eq!(p.body["speed"], "fast");
-    let h = [Turn::user_text("hi")];
-    let o = opts(&[]);
-    let p = provider_at("https://api.anthropic.com/v1", Some(32_000))
-        .prepare(&input("claude-opus-6", &o, &h), &[], &Blobs::default())
-        .await
-        .unwrap();
-    assert_eq!(p.body["max_tokens"], 32_000);
 }
 
 #[tokio::test]
@@ -393,7 +390,7 @@ async fn output_budget_follows_context_cap_and_overrides() {
         .unwrap();
     assert_eq!(p.body["max_tokens"], 50_000);
     // After a context overflow: the bot's smaller value, and the budget below it.
-    let mut i = input("claude-sonnet-4-5", &o, &h);
+    let mut i = input("claude-haiku-4-5", &o, &h);
     i.max_tokens_override = Some(5000);
     let p = provider().prepare(&i, &[], &Blobs::default()).await.unwrap();
     assert_eq!(p.body["max_tokens"], 5000);
@@ -622,7 +619,7 @@ async fn user_media_is_sent_natively() {
 }
 
 #[tokio::test]
-async fn generated_media_of_other_models_is_a_warning() {
+async fn generated_media_of_other_models_is_an_error() {
     let mut blobs = Blobs::default();
     let png = blobs.add(b"png", "image/png");
     let draft = blobs.add(b"draft", "image/png");
@@ -638,26 +635,29 @@ async fn generated_media_of_other_models_is_a_warning() {
         native: None,
     };
     let history = vec![Turn::user_text("draw"), answer.clone(), Turn::user_text("describe it")];
-    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
-    // The text only: nothing is moved into a user message.
-    assert_eq!(p.body["messages"][1]["content"], json!([{"type": "text", "text": "Here it is."}]));
-    assert_eq!(p.body["messages"].as_array().unwrap().len(), 3);
+    let e = prep("claude-opus-5-5", &[], &history).await.unwrap_err();
     assert_eq!(
-        p.warnings,
-        vec!["1 image generated in an earlier turn was not sent: Claude's assistant messages carry text only"],
+        e.message, "1 image generated in an earlier turn cannot be sent: Claude's assistant messages carry text only",
         "the draft made while thinking is reasoning, not counted"
     );
-    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    assert_eq!(e.retry, Retry::Never);
+    // A draft alone is reasoning, which never goes to another model: the text only,
+    // nothing moved into a user message.
+    let drafted = Turn { parts: answer.parts[..2].to_vec(), ..answer.clone() };
+    let p = prep("claude-opus-5-5", &[], &[Turn::user_text("draw"), drafted, Turn::user_text("describe it")])
+        .await
+        .unwrap();
+    assert_eq!(p.body["messages"][1]["content"], json!([{"type": "text", "text": "Here it is."}]));
+    assert_eq!(p.body["messages"].as_array().unwrap().len(), 3);
+    assert!(p.warnings.is_empty() && p.notes.is_empty(), "{:?} {:?}", p.warnings, p.notes);
     // Two answers with media.
     let mut video = answer.clone();
     video.parts.push(Part::File { blob: mp4, filename: Some("clip.mp4".into()), generated: true });
     let history = vec![Turn::user_text("draw"), answer, Turn::user_text("film it"), video, Turn::user_text("more")];
-    let p = prep("claude-opus-5-5", &[], &history).await.unwrap();
+    let e = prep("claude-opus-5-5", &[], &history).await.unwrap_err();
     assert_eq!(
-        p.warnings,
-        vec![
-            "2 images and 1 video generated in earlier turns were not sent: Claude's assistant messages carry text only"
-        ]
+        e.message,
+        "2 images and 1 video generated in earlier turns cannot be sent: Claude's assistant messages carry text only"
     );
     // An answer that is only an image has nothing Claude can take.
     let only = Turn {

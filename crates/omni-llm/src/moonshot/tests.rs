@@ -84,9 +84,11 @@ fn native(dialect: &str, model: &str, payload: Value, text: &str) -> Turn {
 fn model_table() {
     assert!(model_spec("kimi-k3").unwrap().responses);
     assert!(model_spec("kimi-k3.1-pro-highspeed").unwrap().responses);
-    assert!(!model_spec("kimi-k2.6").unwrap().responses);
-    assert_eq!(model_spec("kimi-k2.7-code").unwrap().thinking, Thinking::Always);
-    assert_eq!(model_spec("kimi-k2.6").unwrap().context, 262_144);
+    assert!(MODELS.iter().all(|m| m.thinking == Thinking::Effort && m.context == 1_048_576), "the K3 series");
+    // The K2 series retires at the end of 2026-12: not in the table (owner's rule).
+    for k2 in ["kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed"] {
+        assert!(model_spec(k2).is_none(), "{k2}");
+    }
     assert!(model_spec("kimi-k2.5").is_none(), "retired (404 since 2026-08)");
     // Exact ids only: no prefix matching onto another model's limits and prices.
     assert!(model_spec("kimi-k3.1").is_none());
@@ -140,38 +142,13 @@ async fn k3_defaults() {
 }
 
 #[tokio::test]
-async fn k2_thinking() {
-    let h = [Turn::user_text("hi")];
-    let p = prepare("kimi-k2.6", &[], &h).await.unwrap();
-    assert_eq!(p.body["thinking"], json!({"type": "enabled"}));
-    assert!(p.body.get("reasoning_effort").is_none());
-    assert_eq!(p.settings, vec!["thinking on"]);
-    // Within the 256K window.
-    assert!(p.body["max_completion_tokens"].as_u64().unwrap() < 262_144);
-    let p = prepare("kimi-k2.6", &[kv("e", "none")], &h).await.unwrap();
-    assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
-    assert_eq!(p.settings, vec!["thinking off"]);
-    assert_eq!(p.applied[0].source, "option");
-    // kimi-k2.7-code: always thinks, no parameter at all.
-    let p = prepare("kimi-k2.7-code", &[], &h).await.unwrap();
-    assert!(p.body.get("thinking").is_none() && p.body.get("reasoning_effort").is_none());
-    assert_eq!(p.settings, vec!["thinking (always on)"]);
-}
-
-#[tokio::test]
 async fn invalid_options_are_rejected() {
     let e = prepare_err("kimi-k3", &[kv("e", "xhigh")]).await;
     assert!(e.contains("levels: max, high, low"), "{e}");
     let e = prepare_err("kimi-k3", &[kv("e", "none")]).await;
     assert!(e.contains("cannot turn reasoning off"), "{e}");
-    let e = prepare_err("kimi-k2.6", &[kv("e", "low")]).await;
-    assert!(e.contains("no reasoning effort levels"), "{e}");
-    let e = prepare_err("kimi-k2.7-code", &[kv("e", "none")]).await;
-    assert!(e.contains("cannot turn reasoning off"), "{e}");
     let e = prepare_err("kimi-k3", &[kv("budget", "1000")]).await;
     assert!(e.contains("no reasoning token budget") && e.contains("e=max|high|low"), "{e}");
-    let e = prepare_err("kimi-k2.6", &[flag("s")]).await;
-    assert!(e.contains("K3 series"), "{e}");
     let e = prepare_err("kimi-k3", &[flag("c")]).await;
     assert_eq!(e, "`kimi-k3` has no code execution (`+c`)");
     let e = prepare_err("kimi-k3", &[flag("u")]).await;
@@ -193,13 +170,17 @@ async fn invalid_options_are_rejected() {
 
 #[tokio::test]
 async fn unknown_models() {
-    let h = [Turn::user_text("hi")];
-    let p = prepare("kimi-k9", &[], &h).await.unwrap();
-    assert!(p.body.get("reasoning_effort").is_none() && p.body.get("thinking").is_none());
-    assert!(p.body.get("max_completion_tokens").is_none(), "no cap configured: Moonshot's default");
-    assert!(p.warnings[0].contains("not in the bot's Moonshot model table"), "{:?}", p.warnings);
-    let e = prepare_err("kimi-k9", &[kv("e", "max")]).await;
-    assert!(e.contains("cannot be checked"), "{e}");
+    // Newer and retiring ids alike: their price is unknown to the bot, so they are not supported.
+    for id in ["kimi-k9", "kimi-k2.6", "kimi-k2.7-code"] {
+        for opts in [&[][..], &[kv("e", "max")]] {
+            assert_eq!(
+                prepare_err(id, opts).await,
+                format!(
+                    "`{id}` is not in the bot's Moonshot model table (its price is unknown), so it is not supported"
+                )
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -228,7 +209,7 @@ async fn web_search_uses_the_responses_api() {
         ])
     );
     assert_eq!(p.settings, vec!["effort max", "web search"]);
-    assert!(p.notes.iter().any(|n| n.contains("not recommended for production")));
+    assert!(p.notes.is_empty() && p.warnings.is_empty(), "{:?} {:?}", p.notes, p.warnings);
     assert!(p.applied.iter().any(|a| a.source == "option" && a.patch["tools"][0]["type"] == "web_search"));
 }
 
@@ -307,11 +288,11 @@ async fn media() {
     );
     let e = moonshot(None).prepare(&input("kimi-k3", &[flag("s")], &h), &[], &blobs).await.unwrap_err();
     assert!(e.message.contains("takes no video on Moonshot's Responses API"), "{}", e.message);
-    // A text file is inlined, with a note.
+    // A text file is inlined.
     let code = Part::File { blob: with("text/x-rust", &refs[3]), filename: Some("main.rs".into()), generated: false };
-    let p = moonshot(None).prepare(&input("kimi-k2.6", &[], &[user(vec![code])]), &[], &blobs).await.unwrap();
+    let p = moonshot(None).prepare(&input("kimi-k3", &[], &[user(vec![code])]), &[], &blobs).await.unwrap();
     assert_eq!(p.body["messages"][0]["content"], "fn main() {}");
-    assert!(p.notes[0].contains("main.rs inlined as a separate text part"), "{:?}", p.notes);
+    assert!(p.notes.is_empty(), "{:?}", p.notes);
     // PDFs, audio, SVG, remote media, locations: rejected with the reason.
     let pdf = Part::File { blob: with("application/pdf", &refs[2]), filename: Some("a.pdf".into()), generated: false };
     let e = moonshot(None).prepare(&input("kimi-k3", &[], &[user(vec![pdf])]), &[], &blobs).await.unwrap_err();
@@ -589,7 +570,8 @@ async fn end_to_end_search_notice() {
     }
 }
 
-/// Media other models generated in earlier turns: assistant messages carry text only (both APIs).
+/// Media other models generated in earlier turns: assistant messages carry text
+/// only (both APIs), so the request is refused.
 #[tokio::test]
 async fn generated_media_of_other_models_are_not_sent() {
     let (blobs, refs) = Blobs::new(&[b"\x89PNG", b"\x00\x00mp4"]);
@@ -610,17 +592,21 @@ async fn generated_media_of_other_models_are_not_sent() {
         ],
         native: None,
     };
-    let h = vec![Turn::user_text("make a video"), earlier, Turn::user_text("describe it")];
+    let h = vec![Turn::user_text("make a video"), earlier.clone(), Turn::user_text("describe it")];
     for opts in [vec![], vec![flag("s")]] {
-        let p = moonshot(None).prepare(&input("kimi-k3", &opts, &h), &[], &blobs).await.unwrap();
+        let e = moonshot(None).prepare(&input("kimi-k3", &opts, &h), &[], &blobs).await.unwrap_err();
         assert_eq!(
-            p.warnings,
-            vec![
-                "1 image and 1 video generated in an earlier turn were not sent: assistant messages here carry text only"
-            ],
+            e.message,
+            "1 image and 1 video generated in an earlier turn cannot be sent: assistant messages here carry text only",
             "{opts:?}"
         );
     }
+    // The answer's text alone goes as an assistant message.
+    let text = Turn { parts: vec![Part::text("Here you go.")], ..earlier };
+    let h = vec![Turn::user_text("make a video"), text, Turn::user_text("describe it")];
+    let p = moonshot(None).prepare(&input("kimi-k3", &[], &h), &[], &blobs).await.unwrap();
+    assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here you go."}));
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
 }
 
 #[test]

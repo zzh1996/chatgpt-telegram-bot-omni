@@ -14,7 +14,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 ```
 
 - `$正文`：名字为空的前缀，和其它前缀一样定义（配置里 `[[aliases]] name = ""`，或管理员 `/alias $ <spec>`）。没有定义它的 bot 不认这个前缀。
-- `alias$`：前缀，即配置文件 `[[aliases]]`（所有 bot 共用）或管理员 `/alias`（只对执行它的那个 bot）定义的快捷名；`/models` 列出当前 bot 的全部前缀（只列它有的模型）。
+- `alias$`：前缀，即配置文件 `[[aliases]]`（所有 bot 共用）或管理员 `/alias`（只对执行它的那个 bot）定义的快捷名；`/models` 列出当前 bot 的全部前缀（只列它有的模型）。前缀指向哪个平台完全由配置决定：示例配置里的前缀都直连官方 API（`c$` = `anthropic:claude-opus-5-5`），前面加 `o` 的同名前缀是同一个模型经 OpenRouter（`oc$` = `openrouter:anthropic/claude-opus-5.5`，`o$` 对应空前缀）；这只是示例配置的命名，bot 对前缀的名字没有任何约定。
 - `author/model$`：直接写 OpenRouter 模型 ID（另有前缀的模型也可以），新模型无需改配置。需要 `[providers.openrouter].allow_unlisted_models = true`（代码默认 false，示例配置为 true），而且模型在该 bot 的 `[[bots]].models` 里；否则只有前缀能用到 OpenRouter。群里只接受目录里存在的 ID（避免误触发）；本地目录里没有时会先立即刷新一次目录再判断，所以刚上线的模型也能马上用。私聊会直接把错误告诉你。
 - `<provider>:<模型 ID>$`（如 `openai:gpt-6.1-sol$`、`ark:doubao-seed-2-1-pro-260915$`）：直连该平台的官方 API，需要它配了 key，而且它的 `allow_unlisted_models = true`（默认 false：只能用前缀），见下文"直连各平台的官方 API"。
 - 多个 spec 用逗号分隔，会并行生成多条回答（上限见 `max_parallel_specs`）。逗号之间留空表示空前缀：`c,,g$` = c、`$`、g 各答一次，`,c$` = `$` 和 c。多 bot 部署时，每个 bot 回答它有的那些 spec（几个 bot 都有的，各答一次）。
@@ -62,13 +62,13 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 ### 直连各平台的官方 API
 
-配置了 key 的平台（`[providers.<id>]`，见示例配置）才有它的模型，写成 `<id>:<模型 ID>`（如 `openai:gpt-6.1-sol`、`deepseek:deepseek-v4-pro`），回复第一行也这样显示，经 OpenRouter 的则是 `author/model`，一眼能看出走的哪条路。没有 key 的平台和它的模型都不存在。直接写 `<id>:<模型 ID>$` 需要该 provider 的 `allow_unlisted_models = true`（默认 false：只能用前缀）；群里只接受 bot 模型表里有的 ID。国内厂商接国内官网（和旧版一样）。
+配置了 key 的平台（`[providers.<id>]`，见示例配置）才有它的模型，写成 `<id>:<模型 ID>`（如 `openai:gpt-6.1-sol`、`deepseek:deepseek-v4-pro`），回复第一行也这样显示，经 OpenRouter 的则是 `author/model`，一眼能看出走的哪条路。**没有 key 的平台（OpenRouter 也一样）不提供它的模型**：`/models` 不列出它的前缀；直接写它的模型 ID 或用指向它的前缀，回复"没有配置"的错误（群里直接写 `author/model$` 这种 OpenRouter ID 时不回复，因为可能只是普通文字）；之前用它的对话继续时也报这个错。bot 照常运行，配上 key 重启就有了。直接写 `<id>:<模型 ID>$` 需要该 provider 的 `allow_unlisted_models = true`（默认 false：只能用前缀），而且只接受 bot 模型表里有的 ID。国内厂商接国内官网（和旧版一样）。
 
 - 选项和上面一样按官方 API 校验，官方没有的报错；`p=` 只用于 OpenRouter，在这里报错。默认参数同样是官方允许的"最大"（各平台的具体值见下）。
-- 费用：各平台的响应基本都不带费用（xAI 例外），统计和限额用 bot 内置的价目表（按日期标注来源）估算：未缓存输入、缓存读/写、输出（推理按输出计），以及搜索等工具按次的费用；人民币价目按 `cny_per_usd` 折算。不在模型表里的模型照样能用（如果允许直接写 ID），但会提示上限和价格未知、费用记为未知。
+- 费用：各平台的响应基本都不带费用（xAI 例外），统计和限额用 bot 内置的价目表（按日期标注来源）估算：未缓存输入、缓存读/写、输出（推理按输出计），以及搜索等工具按次的费用；人民币价目按 `cny_per_usd` 折算。**只支持 bot 模型表里的模型**：表里没有的 ID 价格未知，直接不支持（防止被滥用）；即将下线和已经下线的模型也不在表里。价目表里没有的额外收费（如 Claude 代码执行的容器时间）在页脚费用后标注（`≈$0.008 + code execution`）；没有公布价格的功能不支持。
 - 更贵的服务等级（`tier=priority` 之类、Anthropic fast、Moonshot 的 `-highspeed` 模型）只有 `[access].priority_users` 能用。
 - `+s` 要求了搜索、但 API 报告这次没有搜索时，回答里注明（搜不搜由模型决定）。
-- 之前回合里**别的模型生成的图片、文件**：接口允许放进 assistant/model 消息的就放进去（Gemini、xAI），不允许的不发送并注明（不会改放进 user 消息）；如果那一轮回答只有图片、没有文字，而新模型只收文字（Claude 等），会直接报错说明。
+- 之前回合里**别的模型生成的图片、文件**：接口允许放进 assistant/model 消息的就放进去（Gemini、xAI），不允许的直接报错（不会偷偷丢掉，也不会改放进 user 消息）；要让这个模型看这张图，就把图作为附件发给它。
 
 | id | 平台 | 接口 | key（环境变量） |
 |---|---|---|---|
@@ -88,13 +88,13 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 **Anthropic**：`claude-opus-5-5`、`claude-fable-5-2`、`claude-sonnet-5-5`、`claude-haiku-5-5` 等（官方 ID 用连字符：OpenRouter 的 `anthropic/claude-opus-5.5` 在官方叫 `claude-opus-5-5`）。默认自适应思考 + `effort=max`，思考显示 summarized（官方默认 omitted 会看不到思考）；4.5 代是思考预算（最大）。`e=` 按模型的档位；`e=none` 在能关的模型上关闭思考，Sonnet 5.5 上是官方说的最低档 `between_tools`，Opus 5.5、Fable 不能关。`budget=` 只用于有思考预算的模型。`+s` 网页搜索、`+u` 网页抓取、`+c` 代码执行（都是 Anthropic 自己的服务端工具）；`tier=fast`（`speed: fast`，只给 `priority_users`）。PDF 和文本文件都按文档原生发送（文本文件不再内联）。回放：同模型、同工具的回答原样回放全部内容块（思考及签名、工具调用和结果）；换了工具（如后来加了 `+s`）就只发文字，避免官方的"保留思考"校验报 400。自动提示缓存（5 分钟），不改变输出，只降低后续轮的输入费用。回答被 `pause_turn` 暂停时自动接着请求（最多 5 次），费用逐次累加。引用：`web_fetch` 抓取的网页和用户发的 PDF、文本文件都开启 citations（从对话第一轮起一直开，否则会改动之前的消息），📚 Sources 里显示被引用的原文、文档名和页码。代码执行生成的文件用 Files API 立即下载（图片显示在回答里，其它作附件）。拒答的错误标题写拒答类别（如 `refusal (bio)`）。每次请求带 `diagnostics`（上一条同模型回答的 ID），缓存因为对话或工具变了而没命中时提示。
 
-**Gemini API**：`gemini-4-carbon`、`gemini-4-argon`、`gemini-3.8-flash`、`gemini-3.1-pro-preview`、`gemini-nano-banana-2.1` 等（官方 ID 就是 OpenRouter ID 去掉 `google/`；3.7/3.5 Flash 实际由更新的模型服务，页脚的 `served …` 会写出来）。默认最高 `thinkingLevel` 并带思考摘要，输出上限为模型最大（Gemini 4 是 long decode：跨多次续写的总预算 `long_decode_budget`，到了回复 `/continue`；流断了从最近的 checkpoint 接着写，重启也一样）。图片用最高的 media resolution（视频、PDF 为 high）。安全过滤：Google 的可调过滤器在 2.5 以后默认就是关闭的，bot 不另发参数。`+s` Google 搜索（来源和 Google 要求展示的 Search Suggestions 都显示；Nano Banana 2.1 和 3.1 Flash Image 同时用图片搜索，页脚写 `web and image search`）、`+c` 代码执行、`+u` URL context、`+m` Google Maps；Gemini 3/4 的文字模型带这些工具时请求 `includeServerSideToolInvocations`，搜索、URL、地图的调用和结果按实际顺序出现（其它模型只在流的最后报告，显示在它支撑的回答之前）；`e=` 按模型的档位（只有 2.5 Flash 系列能 `e=none`），`budget=` 只用于 2.5；出图模型 `1` `2` `4` 和比例按模型校验（预设默认最大尺寸）；`tier=flex`，`tier=priority` 只给 `priority_users`。图片、PDF、音频、视频、Office 文档、文本文件都按原生输入内联发送，YouTube 链接作为 `fileData`。用户哈希写在 `labels.safety_identifier`。费用含 >200K 的长上下文价、搜索/地图每次 $0.014（网页和图片搜索分开计次；每月 5000 次的免费额度 bot 看不到，所以是上限估计）。安全评级为 MEDIUM/HIGH 或被拦截时提示。其它模型生成的图片和文件作为 model 消息的 `inlineData` 发送。
+**Gemini API**：`gemini-4-hydrogen`（2026-11-12 发布，多一档推理强度 `xhigh`）、`gemini-4-carbon`、`gemini-4-argon`、`gemini-3.8-flash`、`gemini-3.6-flash`、`gemini-3.1-pro-preview`、`gemini-nano-banana-2.1` 等（官方 ID 就是 OpenRouter ID 去掉 `google/`；实际由别的模型服务时，页脚的 `served …` 会写出来）。默认最高 `thinkingLevel` 并带思考摘要，输出上限为模型最大（Gemini 4 是 long decode：跨多次续写的总预算 `long_decode_budget`，到了回复 `/continue`；流断了从最近的 checkpoint 接着写，重启也一样）。图片用最高的 media resolution（视频、PDF 为 high）。安全过滤：Google 的可调过滤器在 2.5 以后默认就是关闭的，bot 不另发参数。`+s` Google 搜索（来源和 Google 要求展示的 Search Suggestions 都显示；Nano Banana 2.1 和 3.1 Flash Image 同时用图片搜索，页脚写 `web and image search`）、`+c` 代码执行、`+u` URL context、`+m` Google Maps；Gemini 3/4 的文字模型带这些工具时请求 `includeServerSideToolInvocations`，搜索、URL、地图的调用和结果按实际顺序出现（其它模型只在流的最后报告，显示在它支撑的回答之前）；`e=` 按模型的档位；出图模型 `1` `2` `4` 和比例按模型校验（预设默认最大尺寸）；`tier=flex`，`tier=priority` 只给 `priority_users`。图片、PDF、音频、视频、Office 文档、文本文件都按原生输入内联发送，YouTube 链接作为 `fileData`。用户哈希写在 `labels.safety_identifier`。费用含 >200K 的长上下文价、搜索/地图每次 $0.014（网页和图片搜索分开计次；每月 5000 次的免费额度 bot 看不到，所以是上限估计）。安全评级为 MEDIUM/HIGH 或被拦截时提示。其它模型生成的图片和文件作为 model 消息的 `inlineData` 发送。
 
-**DeepSeek**：`deepseek-v4-pro`、`deepseek-flash`（及仍被接受的旧名）。默认开思考、`reasoning_effort=max`；`e=max|high|low`，`e=none` 关闭思考；`max_tokens` 显式发送（最多 393216）。`+s` 只有 `deepseek-v4-pro` 有（官方的服务端搜索只在它的 Anthropic 兼容接口和 Responses 接口上），bot 把这样的请求发到 Anthropic 兼容接口；有搜索失败或没有结果时注明次数。图片只有 flash 能读。不发 `user_id`：DeepSeek 用它按用户隔离 KV 缓存，群里几个人接着同一段对话聊就会互相用不上缓存（flash 缓存命中价是未命中的 1/50），旧版也没发。峰谷价：北京时间工作日 9–12 点、14–18 点为高峰（法定节假日按官方放假安排算平时），按请求发出的时刻计价。
+**DeepSeek**：`deepseek-v4-pro`、`deepseek-flash`。默认开思考、`reasoning_effort=max`；`e=max|high|low`，`e=none` 关闭思考；`max_tokens` 显式发送（最多 393216）。`+s` 只有 `deepseek-v4-pro` 有（官方的服务端搜索只在它的 Anthropic 兼容接口和 Responses 接口上），bot 把这样的请求发到 Anthropic 兼容接口；有搜索失败或没有结果时注明次数。图片只有 flash 能读。不发 `user_id`：DeepSeek 用它按用户隔离 KV 缓存，群里几个人接着同一段对话聊就会互相用不上缓存（flash 缓存命中价是未命中的 1/50），旧版也没发。峰谷价：北京时间工作日 9–12 点、14–18 点为高峰（法定节假日按官方放假安排算平时），按请求发出的时刻计价。
 
 **智谱**：`glm-5.3`（纯文本）、`glm-5.3-flash`（图片、视频、文件）等。思考默认开、`reasoning_effort=max`；5.3 系列 `e=max|high|low`、不能关思考；5.2 `e=max|high`，可 `e=none`。保留思考（`clear_thinking: false`，否则智谱会丢掉回传的上一轮推理）。`+s` 是智谱自己的 `search_pro` 搜索（每次 0.03 元），取官方允许的最多 50 条结果、`content_size: high`（每条内容更全，输入 token 会多很多），结果（标题、网站、日期、摘录）先于回答显示，智谱判断不需要搜索时注明；视觉模型（如 `glm-5.3-flash`）没有搜索。
 
-**Moonshot**：`kimi-k3`、`kimi-k3.1-pro`、`kimi-k2.6` 等。K3 系列始终思考，`e=max|high|low`（默认 max）；`kimi-k2.6` 可 `e=none`。输出上限用 `max_completion_tokens`。`+s` 只有 K3 系列有，走 Moonshot 的 Responses API 的 `web_search`（Moonshot 说它"暂不建议用于生产"，回答里会注明），来源列在 📚 Sources，没有搜索时注明。PDF 和文档要先上传到 Moonshot（有状态），bot 不支持；图片、视频按 base64 发送。`-highspeed` 模型价格翻倍，只给 `priority_users`。账户余额见 `/credits`。
+**Moonshot**：`kimi-k3`、`kimi-k3.1-pro` 等（K2 系列年底停用，不在表里）。始终思考，`e=max|high|low`（默认 max）。输出上限用 `max_completion_tokens`。`+s` 走 Moonshot 的 Responses API 的 `web_search`，来源列在 📚 Sources，没有搜索时注明。PDF 和文档要先上传到 Moonshot（有状态），bot 不支持；图片、视频按 base64 发送。`-highspeed` 模型价格翻倍，只给 `priority_users`。账户余额见 `/credits`。
 
 **阿里云百炼**：`qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-max`、`qwen3.7-plus` 等。思考默认开；qwen3.8 默认 `reasoning_effort=xhigh`（`e=xhigh|medium|low`），`e=none` 关闭思考，`budget=<n>` 设思考预算（`thinking_budget`）。`+s`（联网搜索）、`+u`（网页抓取 `web_extractor`）、`+c`（代码解释器）都走百炼的 Responses API：搜索词和来源都显示（📚 Sources），每次搜索 0.004 元，没有搜索时注明；这个接口没有思考预算（带 `budget=` 报错），图片按默认分辨率发送（会注明），视频只能用公网 URL（带视频报错），对话超过上下文的 80% 报错。默认地址是旧版用的 `dashscope.aliyuncs.com`：2026-09-30 之后不再加新功能，请求 600 秒超时、请求体上限 16 MiB（几张 base64 大图或视频就可能超过）；建议把 `base_url` 设成工作空间域名 `https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`。
 
@@ -151,10 +151,10 @@ Arr!
 - **相册**在 Telegram 里是每张一条消息，bot 把整个相册当作一条消息处理一次：所有图片按顺序附上，其它几张各自的说明文字接在正文后面。新对话的前缀写在任意一张的说明里都行；回复 bot 的回答发相册，只继续一次（不会每张一次）。
 - **位置**（定位、地点、实时位置——取处理时的当前位置）作为一个位置附件，供 Gemini 的 Google Maps 工具使用（`google:` 模型加 `+m`，对话里最新的位置就是"用户所在的位置"，见"选项"）。其它模型和经 OpenRouter 都没有位置输入，带着位置会直接报错，不会把坐标改写成文字。
 - **富消息**（用户发的或经 inline bot 发的 rich message）按 Markdown 交给模型：标题、列表、表格、代码块、引用、公式等结构都保留；其中的图片、文件作为附件（在正文前面），地图块作为位置。前缀写在第一段开头。
-- **Telegram 的各种消息都能用**：照片和相册、不压缩发送的文件（图片当图片，其它当文件）、语音消息（OGG 音频）、视频和圆形视频消息、GIF（MP4）、贴纸（静态贴纸是 WebP 图片，视频贴纸是 WebM 视频；动画贴纸是 Lottie 动画，没有模型能读，发的是它的静态预览图，回答里会注明）、投票（问题、选项和已知的票数）、联系人、骰子（表情和点数）、待办清单——后几种作为文字交给模型。模型的 API 不接受某种输入时会直接报错，不会偷偷转换。
+- **Telegram 的各种消息都能用**：照片和相册、不压缩发送的文件（图片当图片，其它当文件）、语音消息（OGG 音频）、视频和圆形视频消息、GIF（MP4）、贴纸（静态贴纸是 WebP 图片，视频贴纸是 WebM 视频；动画贴纸是 Lottie 动画，没有模型能读，直接报错）、投票（问题、选项和已知的票数）、联系人、骰子（表情和点数）、待办清单——后几种作为文字交给模型。模型的 API 不接受某种输入时会直接报错，不会偷偷转换。
 - 下载按 Telegram 文件 ID 去重缓存，同一张图只下载一次。
 - PDF、音频、视频：仅当模型在 OpenRouter 上原生支持该输入模态时才发送，否则报错（绝不本地转换冒充）。
-- 纯文本类文件（.txt/.py/.md…）：Chat Completions、Responses、Messages 都没有原生文本文件输入，因此作为**独立的 text 段**原样内联，并在回答中注明。
+- 纯文本类文件（.txt/.py/.md…）：Chat Completions、Responses、Messages 都没有原生文本文件输入，因此作为**独立的 text 段**原样内联。
 - 单个文件不能超过 `general.max_file_mb`（默认 50 MB），超过则报错。
 - `@https://www.youtube.com/watch?v=…` / `@https://youtu.be/…`：把 YouTube 视频作为 URL 附件交给模型（仅 Gemini 经 AI Studio 支持），正文不变。
 
@@ -163,7 +163,7 @@ Arr!
 两种方式，按各平台官方推荐的用法：
 
 - **聊天里出图**：出图的聊天模型（Gemini 的 Nano Banana 系列）直接写就行；OpenAI、Grok 的聊天模型加 `+i`，用它们自己的 `image_generation` 工具（`openai:gpt-6.1-sol+i$画一只猫`）。图片和文字按产生的顺序出现在回答里；回复它就是带着上下文接着改。
-- **直接用出图/视频模型**：写出图模型的 ID（`openai:gpt-image-2.6-sunburst$…`、`ark:doubao-seedream-5-5-261028$…`），bot 直接调该平台的图片/视频接口，不经过任何聊天模型。消息带图片、或者回复一张生成的图时是**编辑**：被回复的那张生成图放在最前面，接着是消息自己带的图；更早的对话不发送（有文字被略去时会注明）。
+- **直接用出图/视频模型**：写出图模型的 ID（`openai:gpt-image-2.6-sunburst$…`、`ark:doubao-seedream-5-5-261028$…`），bot 直接调该平台的图片/视频接口，不经过任何聊天模型。消息带图片、或者回复一张生成的图（视频）时是**编辑**：被回复的那张生成图放在最前面，接着是消息自己带的图。这些接口一次只收一个提示，不能带上对话：回复一条不能编辑的回答（比如只有文字，或者模型不收图片），直接报错，不会忽略上下文生成一张无关的图。
 
 共同点：
 
@@ -175,12 +175,14 @@ Arr!
 
 各平台：
 
-- **OpenAI**：`+i`（聊天模型，工具用 `gpt-image-2.6-sunburst`、`quality: max`、`moderation: low`，流式预览 3 张）；直接写 `gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`（及带日期的快照）调 Images API：生成或编辑（最多 16 张输入图，PNG/JPEG/WebP），`n=1`–`10`，一张时流式预览；`q=` 默认最高（2.5/2.6 为 `max`），`bg=`，2.6 上 `e=` 对应 `complexity`（默认 high）。`gpt-image-2`、`gpt-image-1.5`、`gpt-image-1-mini`、`chatgpt-image-latest` 还能用但会提示下线日期；DALL·E、`gpt-image-1` 和 Sora 已被 OpenAI 关停（Videos API 2026-09-24 停用），会直接报错。
+- **OpenAI**：`+i`（聊天模型，工具用 `gpt-image-2.6-sunburst`、`quality: max`、`moderation: low`，流式预览 3 张）；直接写 `gpt-image-2.6-sunburst`、`gpt-image-2.6-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`（及带日期的快照）调 Images API：生成或编辑（最多 16 张输入图，PNG/JPEG/WebP），`n=1`–`10`，一张时流式预览；`q=` 默认最高（`max`），`bg=`，2.6 上 `e=` 对应 `complexity`（默认 high）。OpenAI 的视频接口（Sora）已关停。
 - **xAI**：`+i`（工具没有参数，不能选尺寸、质量）；`grok-imagine-image-2.0`（推荐）、`grok-imagine-image` 生成或编辑（1–5 张输入图），`n=1`–`10`，`1` `2` = 1k / 2k（默认 2k），比例按 xAI 的列表，`q=` 只有 2.0，`bg=`。视频：`grok-imagine-video-1.5`、`-1.5-lite`、`grok-imagine-video`：只有文字时文生视频，一张图是首帧，两张以上是参考图；回复一个生成的视频（或附 MP4）是编辑（仅 `grok-imagine-video`）；`sec=1`–`15`（参考视频最长 10），不写时用 xAI 的默认 8 秒；`1` `2` = 720p / 1080p，默认最大。
-- **Gemini**：出图的是聊天模型 Nano Banana（`gemini-nano-banana-2.1`、`gemini-3.1-flash-image` 等），没有 `n=` `q=` `bg=`；Imagen 已被 Google 关停。视频是 `gemini-omni-1.2-flash`（Interactions API 的后台任务）：只有文字时文生视频，带图片、视频（最多 6 张图、3 段视频）时按它们生成，带声音；`sec=3`–`15`（不写时 Google 默认 10 秒），`1` `2` `4` = 720p / 1080p / 4K（默认 4K，约 $0.21 每秒，默认的 10 秒约 $2.1），比例 `W` `H`（或 `ar=16:9`/`9:16`）。回复同一模型生成的视频时用 Google 保存的那次交互（`previous_interaction_id`，官方的编辑方式）接着改。`gemini-omni-1.1-flash` 会提示（2026-12-03 起 Google 转到 1.2）；Veo 已全部关停，直接报错。
-- **火山方舟 Seedream**（`ark:doubao-seedream-…`）：5.5（`doubao-seedream-5-5-261028`）、5.0 pro、5.0 flash 一次一张；5.0 lite、4.5、4.0 支持组图（`n=`，输入图加生成图不超过 15 张）和流式，这三个 2026-11-24 14:00（北京时间）停止服务，会提示。默认最大分辨率档（5.x 为 2K，其余 4K，比例交给模型）、不加水印、PNG（4.x 只有 JPEG）；`q=standard|fast` 是提示词优化模式（`fast` 只有 5.0 pro 和 4.0）；`+s`（只有 5.0 lite）联网搜索，这时不流式。组图里有一张被拒时注明，其余照常显示。
-- **智谱**：`glm-image`（异步任务，重启后接着查）、`cogview-4-250304`、`cogview-4`、`cogview-3-flash`。默认最大尺寸（GLM-Image 2048×2048，CogView 1440×1440）、`quality: hd`、不加水印；`q=hd|standard` 只有 CogView；一次一张；没有图片输入（带图报错，回复生成的图不能编辑，会注明）。视频：`cogvideox-3`（文生、首帧、首尾帧，按附图张数；5 或 10 秒；最大 3840×2160；AI 音效；1 元）、`cogvideox-2`（0.5 元）、`cogvideox-flash`（免费），Vidu 每种模式是一个模型（`viduq1-text`、`viduq1-image`、`viduq1-start-end` 2.5 元；`vidu2-image`、`vidu2-start-end` 1.25 元，`vidu2-reference` 2.5 元，1–3 张参考图）。默认最高质量、60 fps、带声音、不加水印，文生视频 3840×2160（带图时保持图的比例）；`q=quality|speed`（CogVideoX），`sec=` 取模型的可选时长，`1` `2` `4` = 短边 720 / 1080 / 2160；回复生成的视频是用文字重新生成（会注明）。
-- **阿里云百炼**：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.1-pro`/`-turbo`、`qwen-image-2.0(-pro)`、`wan2.7-image(-pro)`、`wan2.6-image`（只能编辑）、`wan2.6-t2i`、`z-image-turbo`，走百炼推荐的同步接口。默认最大尺寸（千问编辑保持输入图的比例）、`n` 默认 1（Wan 2.6 官方默认 4 张，bot 显式发 1）、不加水印、有思考的模型开思考（z-image 的 `prompt_extend` 会让价格翻倍到 0.2 元）；`n=` 千问 1–6、Wan 1–4，`e=none` 关闭思考。千问图像和 Wan 2.6 默认会改写提示词，审核始终开启（官方没有开关）。Qwen-Image 1.x 已下线、更早的 Wan 模型只有异步接口，会直接报错。
+- **Gemini**：出图的是聊天模型 Nano Banana（`gemini-nano-banana-2.1`、`gemini-3.1-flash-image` 等），没有 `n=` `q=` `bg=`；Imagen 已被 Google 关停。视频是 `gemini-omni-1.2-flash`（Interactions API 的后台任务）：只有文字时文生视频，带图片、视频（最多 6 张图、3 段视频）时按它们生成，带声音；`sec=3`–`15`（不写时 Google 默认 10 秒），`1` `2` `4` = 720p / 1080p / 4K（默认 4K，约 $0.21 每秒，默认的 10 秒约 $2.1），比例 `W` `H`（或 `ar=16:9`/`9:16`）。回复同一模型生成的视频时用 Google 保存的那次交互（`previous_interaction_id`，官方的编辑方式）接着改。Veo 已全部关停。
+- **火山方舟 Seedream**（`ark:doubao-seedream-…`）：5.5（`doubao-seedream-5-5-261028`）、5.0 pro、5.0 flash，一次一张。默认最大分辨率档（2K，比例交给模型）、不加水印、PNG；`q=standard|fast` 是提示词优化模式（`fast` 只有 5.0 pro）。需要先在方舟控制台开通模型。
+- **火山方舟 Seedance**（视频，`ark:doubao-seedance-…`）：2.5（`doubao-seedance-2-5-260628`，4–30 秒，最高 1080p）、2.0（4–15 秒，最高 4K）、2.0 fast、2.0 mini（720p），都带声音。只有文字时文生视频，一张图是首帧，两张是首尾帧，三张以上（或提示词里点名"图片1"）是参考图；带音频、或回复一个 Seedance 生成的视频（24 小时内）是全模态参考，由 Seedance 按提示词决定编辑、延长还是新生成。默认最高分辨率、带声音、不加水印；`1` `2` `4` = 720p / 1080p / 4K，比例 16:9、4:3、1:1、3:4、9:16、21:9，`sec=` 按模型；2.5 的 `q=draft` 先出 480p 草稿，回复草稿发 `q=final` 生成 1080p 成片；`+s` 联网搜索没有公布价格，不支持。按 token 计价（人民币，分辨率和是否有输入视频不同价）。需要先在方舟控制台开通（Seedance 2.x 还要求余额或资源包）。
+- **智谱**：`glm-image`（异步任务，重启后接着查）、`cogview-4-250304`、`cogview-4`、`cogview-3-flash`。默认最大尺寸（GLM-Image 2048×2048，CogView 1440×1440）、`quality: hd`、不加水印；`q=hd|standard` 只有 CogView；一次一张；没有图片输入（带图报错，回复生成的图不能编辑，会注明）。视频：`cogvideox-3`（文生、首帧、首尾帧，按附图张数；5 或 10 秒；最大 3840×2160；AI 音效；1 元）、`cogvideox-2`（0.5 元）、`cogvideox-flash`（免费），Vidu 每种模式是一个模型（`viduq1-text`、`viduq1-image`、`viduq1-start-end` 2.5 元；`vidu2-image`、`vidu2-start-end` 1.25 元，`vidu2-reference` 2.5 元，1–3 张参考图）。默认最高质量、60 fps、带声音、不加水印，文生视频 3840×2160（带图时保持图的比例）；`q=quality|speed`（CogVideoX），`sec=` 取模型的可选时长，`1` `2` `4` = 短边 720 / 1080 / 2160；它们不收视频，回复生成的视频直接报错。
+- **阿里云百炼**：`qwen-image-3.0-pro`、`qwen-image-3.0`、`qwen-image-2.1-pro`/`-turbo`、`qwen-image-2.0(-pro)`、`wan2.7-image(-pro)`、`wan2.6-image`（只能编辑）、`wan2.6-t2i`、`z-image-turbo`，走百炼推荐的同步接口。默认最大尺寸（千问编辑保持输入图的比例）、`n` 默认 1（Wan 2.6 官方默认 4 张，bot 显式发 1）、不加水印、有思考的模型开思考（z-image 的 `prompt_extend` 会让价格翻倍到 0.2 元）；`n=` 千问 1–6、Wan 1–4，`e=none` 关闭思考。千问图像和 Wan 2.6 默认会改写提示词，审核始终开启（官方没有开关）。
+- **阿里云百炼视频**（北京，异步任务）：HappyHorse 1.1/1.0（`happyhorse-1.1-t2v`、`-i2v`、`-r2v` 等）、Wan 3.0（`wan3.0-video`、`-prime`，2–30 秒）、Wan 2.7（`wan2.7-t2v`、`-i2v`、`-r2v`、`-videoedit`）、Wan 2.6、2.5、2.2、2.1（`wanx2.1-…`）的文生、图生、首尾帧、参考图和视频编辑模型。图片按 base64 发送；百炼只收视频的 URL，所以只能用回复的那条百炼生成的视频（24 小时内）去编辑或续写，附带的视频报错。默认最高分辨率、不加水印、有开关的模型带声音，提示词改写保持百炼默认（开）；`1` `2` = 720P / 1080P，比例按模型，`sec=` 按模型（只有 5 秒的模型写 `sec=` 报错）；wan3.0 带 `+u` 时把消息里的网址作为参考网页。按秒计价。
 - DeepSeek、Moonshot、Anthropic 没有出图或视频生成。
 
 ## 2. 继续对话
@@ -212,8 +214,10 @@ effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) �
 - Markdown 按 CommonMark 解析，另加"CJK 友好"的强调规则：中文、日文、韩文里 `**注意：**内容`、`这是**“引用”**的` 这种标点贴着星号、两边没有空格的写法也会加粗。
 - **工具调用**的标题写它做了什么，以及不寻常的结局：退出码（`exit 1`）、超时、错误码（`error: max_uses_exceeded`）、网址抓取失败的原因（`paywall`）。展开后是可读的内容，不是裸 JSON：搜索词，找到的来源（标题链接、网站、日期、摘录），打开或在里面查找的网页，抓取的网页和时间，代码和它的输出（stdout、stderr、退出码），生成的文件，出图用的尺寸、质量等。认不出的格式原样显示 JSON；认得的格式里没展示的字段也以 JSON 列在后面，所以不丢信息。只有加密内容之类人读不了的数据不显示，在 `/dump` 里。
 - **📚 Sources** 列出回答引用的链接；提供方给了被引用的原文时，链接下面是这段原文（截短）。引用的是文档（如用户发的 PDF）时写文档名和页码。Gemini 的 Search Suggestions（Google 要求和搜索支撑的回答一起展示）是来源下面的一行小字链接，不折叠。
+- 模型正在思考时，推理折叠的标题写它此刻在想什么：思考摘要里最新的一个小标题（如 `💭 Checking the dates`），没有小标题时是最新一段的开头；推理块外面还有一层折叠时，外层标题后面也带上这句。这一段思考一结束（后面出现了工具调用或回答，或回答生成完），标题就回到只有 💭。
 - reasoning token 数在页脚（`out … (reasoning …)`），是整轮的总数：各家 API 都不给分段的数。API 没返回推理内容（只有加密的推理）时也照常显示这个数，不加额外标注。
-- 费用前有 `≈` 的是 bot 按价目表估算的（API 没给费用），没有的是 API 报告的（OpenRouter、xAI）。
+- 费用前有 `≈` 的是 bot 按价目表估算的（API 没给费用），没有的是 API 报告的（OpenRouter、xAI）；价目表外的额外收费只在费用后简短标注（`+ code execution`），不解释计费细节。
+- ℹ️ 提示只在有新情况时出现：关于请求本身的提示（如回放方式的变化），如果回复的那条回答已经显示过，就不再重复。
 - 实际服务的情况和请求不同时，页脚写出来：`served gemini-3.8-flash`（回答的不是请求的模型；同一模型带日期的快照不算），`tier priority→default`（请求的等级没给到），`tier priority`（没指定等级、却按非默认等级服务），`geo us`（Claude 在美国推理，价格 1.1 倍），`effort medium`（请求没写推理强度时，API 实际用的强度）。方舟降级到别的模型、某项限流额度只剩不到 10%、xAI 给输出加了水印时，各有一条 ℹ️ 提示。
 - 用量：Claude 一开始就显示输入 token 数；直连方舟、智谱、Gemini 的用量（和估算费用）实时更新；经 OpenRouter 的其他模型在结束时才有用量（OpenRouter 不转发中途用量）。
 - **没有正常完成**（出错、被拒答或内容过滤、提供方以错误结束）时，错误块里是完整的原始错误对象（只去掉账户的 `user_id`；OpenRouter 回显的请求在 `/info`）。输出到长度上限不算出错，页脚会注明。

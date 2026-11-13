@@ -213,6 +213,23 @@ async fn save_checkpoint(app: &App, attempt_id: i64, cp: Option<&Checkpoint>) {
         .await;
 }
 
+/// The notes shown on the answer that `turn_id` replies to (its parent's parent,
+/// latest attempt), so that the same notes are not repeated on every turn.
+async fn notes_shown_before(app: &App, turn_id: i64) -> Vec<String> {
+    let Ok(this) = conv::get_turn(&app.db, turn_id).await else { return vec![] };
+    let Some(user) = this.parent_id else { return vec![] };
+    let Ok(user) = conv::get_turn(&app.db, user).await else { return vec![] };
+    let Some(answer) = user.parent_id else { return vec![] };
+    let Ok(attempts) = conv::attempts_of(&app.db, answer).await else { return vec![] };
+    let Some(last) = attempts.last() else { return vec![] };
+    conv::attempt_meta(&app.db, last.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| serde_json::from_value(m["notes"].clone()).ok())
+        .unwrap_or_default()
+}
+
 /// When an attempt resumed after a restart began, and the upstream ids of its calls
 /// before the restart.
 async fn attempt_origin(app: &App, attempt_id: i64) -> (Option<i64>, Vec<String>) {
@@ -275,6 +292,7 @@ impl Ctx {
         };
         let blobs = Blobs(self.app.blobs.clone());
         let p = match self.spec.provider.as_str() {
+            "openrouter" if !self.app.provider_enabled("openrouter") => Err(not_configured("openrouter")),
             "openrouter" => self.app.openrouter.prepare_chat(&input, &presets, &blobs).await,
             id => match self.app.direct(id) {
                 Some(p) => p.prepare(&input, &presets, &blobs).await,
@@ -283,15 +301,17 @@ impl Ctx {
         }?;
         crate::policy::check(&self.app, self.user_id, &self.spec.provider, &self.spec.model, &p.body)
             .map_err(LlmError::request)?;
-        let mut p = p;
-        // An animated sticker went as its still preview (intake): say so.
-        let preview = self.history.iter().rev().find(|t| t.role == Role::User).is_some_and(|t| {
+        // An animated (Lottie) sticker: no model reads those, and its still preview
+        // would be a substitute (owner's rule: content a model cannot take is an error).
+        let animated = self.history.iter().rev().find(|t| t.role == Role::User).is_some_and(|t| {
             t.parts.iter().any(
                 |p| matches!(p, Part::Image { filename: Some(f), .. } if f == crate::media::ANIMATED_STICKER_PREVIEW),
             )
         });
-        if preview {
-            p.notes.push("the animated sticker was sent as its still preview: no model reads Lottie animations".into());
+        if animated {
+            return Err(LlmError::request(
+                "animated stickers (Lottie animations) cannot be sent to a model: send a static or video sticker, or an image",
+            ));
         }
         Ok(p)
     }
@@ -1051,7 +1071,10 @@ async fn stream(
 
 /// A turn of a provider that is no longer configured (its key was removed).
 fn not_configured(id: &str) -> LlmError {
-    let (name, env) = omni_llm::provider::info(id).map(|i| (i.name, i.env)).unwrap_or((id, "its API key"));
+    let (name, env) = match id {
+        "openrouter" => ("OpenRouter", "OPENROUTER_API_KEY"),
+        _ => omni_llm::provider::info(id).map(|i| (i.name, i.env)).unwrap_or((id, "its API key")),
+    };
     LlmError::request(format!("the {name} provider is not configured (set {env} / [providers.{id}] api_key)"))
 }
 
@@ -1074,7 +1097,12 @@ async fn run_attempt(
         let mut state = ctx.base_state.clone();
         state.attempt = attempt.n;
         state.started = Instant::now();
-        state.notes = prepared.warnings.iter().chain(prepared.notes.iter()).cloned().collect();
+        // A note about the request that the answer replied to already showed is not
+        // repeated (history-derived notes would otherwise come back every turn).
+        let shown = notes_shown_before(app, ctx.turn_id).await;
+        let (repeated, new): (Vec<String>, Vec<String>) =
+            prepared.warnings.iter().chain(prepared.notes.iter()).cloned().partition(|n| shown.contains(n));
+        state.notes = new;
         let append_mode = match &start {
             Start::Append(_) => true,
             Start::Resume(cp) => cp.append,
@@ -1291,9 +1319,12 @@ async fn run_attempt(
                 sink.acc.attach_image(b, dims, thought);
             }
         }
-        let _ = conv::set_attempt_meta(&app.db, attempt.id, &sink.meta_json()).await;
         let usage = sink.total_usage();
         let mut final_state = sink.render();
+        let mut meta = sink.meta_json();
+        // The notes that apply, shown or not (so the next turn does not show them again).
+        meta["notes"] = json!(final_state.notes.iter().chain(&repeated).collect::<Vec<_>>());
+        let _ = conv::set_attempt_meta(&app.db, attempt.id, &meta).await;
         // Previews only stand in for images still being generated.
         final_state.previews.clear();
         final_state.show_usage = show_usage(app, usage.as_ref());

@@ -104,10 +104,14 @@ pub(crate) fn media_input(history: &[Turn], model: &str, via: &str) -> Result<Me
             }
         }
     }
+    // One prompt per request: continuing a conversation only works on what the
+    // answer replied to generated (an image or video to edit or extend); anything
+    // else would ignore the conversation and pay for an unrelated result (owner's rule).
     if !earlier.is_empty() && m.answer_images.is_empty() && m.answer_video.is_none() {
-        m.notes.push(format!(
-            "ℹ️ {via} takes one prompt: only this message (and its images) is sent, not the earlier turns of the conversation"
-        ));
+        return Err(LlmError::request(format!(
+            "`{model}` takes one prompt via {via}, not a conversation: start a new message, or reply to a generated \
+             image or video it can take as input"
+        )));
     }
     Ok(m)
 }
@@ -440,11 +444,14 @@ pub(crate) mod tests {
 
     #[test]
     fn what_cannot_be_sent_is_said_or_refused() {
-        // Earlier turns that are not an edit chain: a note.
+        // Earlier turns that are not an edit chain: one prompt per request, so they would be
+        // ignored, which is refused.
         let history = vec![Turn::user_text("q"), Turn::assistant_text("text answer"), Turn::user_text("draw it")];
-        let m = media_input(&history, "m", "the Images API").unwrap();
-        assert_eq!(m.notes.len(), 1);
-        assert!(m.notes[0].contains("not the earlier turns"), "{}", m.notes[0]);
+        let e = media_input(&history, "m", "the Images API").unwrap_err();
+        assert_eq!(
+            e.message,
+            "`m` takes one prompt via the Images API, not a conversation: start a new message, or reply to a generated image or video it can take as input"
+        );
         // A system prompt or a prefill: errors.
         let sys =
             Turn { role: Role::System, origin: Origin::Synthetic, parts: vec![Part::text("be nice")], native: None };

@@ -51,7 +51,7 @@ pub async fn convert_history(
     info: Option<&ModelInfo>,
     blobs: &dyn BlobLoader,
 ) -> Result<(Option<Value>, Vec<Value>, Vec<String>), LlmError> {
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     let mut system: Vec<Value> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
     for turn in history {
@@ -100,9 +100,6 @@ pub async fn convert_history(
                                 MediaClass::Text => {
                                     let text = String::from_utf8(bytes)
                                         .map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
-                                    notes.push(format!(
-                                        "📎 {name} inlined as a separate text part by the bot (no native text-file input on this API)"
-                                    ));
                                     content.push(json!({"type": "text", "text": text}));
                                 }
                                 MediaClass::Document | MediaClass::Audio | MediaClass::Video | MediaClass::Other => {

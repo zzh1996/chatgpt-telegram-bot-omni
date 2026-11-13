@@ -696,7 +696,7 @@ async fn the_previous_turn_is_the_prompt_cache_comparison() {
 }
 
 #[tokio::test]
-async fn media_of_other_answers_are_not_sent_and_said() {
+async fn media_of_other_answers_cannot_be_sent() {
     let o = OpenAi::new(cfg("https://api.openai.com/v1")).unwrap();
     let png = BlobRef::for_bytes(b"\x89PNG-gen", "image/png");
     let draft = BlobRef::for_bytes(b"\x89PNG-draft", "image/png");
@@ -713,13 +713,27 @@ async fn media_of_other_answers_are_not_sent_and_said() {
         ],
         native: None,
     };
-    let history = vec![Turn::user_text("draw"), gemini, Turn::user_text("now blue")];
-    let p = prepared(&o, "gpt-6.1-sol", &[], &history).await;
-    assert_eq!(p.body["input"][1], json!({"type": "message", "role": "assistant", "content": "Here it is."}));
+    let history = vec![Turn::user_text("draw"), gemini.clone(), Turn::user_text("now blue")];
+    let input = CallInput {
+        model: "gpt-6.1-sol",
+        options: &[],
+        history: &history,
+        session_id: Some("tg-1".into()),
+        user: None,
+        known_context: None,
+        max_tokens_override: None,
+    };
+    // What the API cannot take refuses the request; the draft made while thinking is not counted.
+    let e = o.prepare(&input, &[], &MemBlobs(vec![])).await.unwrap_err();
     assert_eq!(
-        p.warnings,
-        ["2 images and 1 video from earlier answers were not sent: OpenAI's assistant messages carry text only"]
+        e.message,
+        "2 images and 1 video from earlier answers cannot be sent: OpenAI's assistant messages carry text only"
     );
+    // A draft alone is reasoning, which never goes to another model: the answer goes as its text.
+    let drafted = Turn { parts: gemini.parts[..2].to_vec(), ..gemini };
+    let p = prepared(&o, "gpt-6.1-sol", &[], &[Turn::user_text("draw"), drafted, Turn::user_text("now blue")]).await;
+    assert_eq!(p.body["input"][1], json!({"type": "message", "role": "assistant", "content": "Here it is."}));
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
 }
 
 #[test]

@@ -120,14 +120,13 @@ async fn sizes_ratios_and_quality() {
     }
     assert!(prep("glm-image", &[flag("i")]).await.unwrap_err().message.contains("without `+i`"));
     assert!(prep("glm-image", &[kv("e", "high")]).await.is_err());
-    // Not in the table: no options, Zhipu's defaults.
-    let p = prep("cogview-5", &[]).await.unwrap();
-    assert_eq!(
-        p.body,
-        json!({"model": "cogview-5", "prompt": "一只猫", "watermark_enabled": false, "user_id": "user-hash-1"})
-    );
-    assert!(p.warnings[0].contains("not in the bot's Zhipu image model table"));
-    assert!(prep("cogview-5", &[flag("W")]).await.unwrap_err().message.contains("cannot be checked"));
+    // Not in the table: its price is unknown to the bot, so it is not supported, with or without options.
+    for opts in [&[][..], &[flag("W")]] {
+        assert_eq!(
+            prep("cogview-5", opts).await.unwrap_err().message,
+            "`cogview-5` is not in the bot's Zhipu BigModel model table (its price is unknown), so it is not supported"
+        );
+    }
 }
 
 #[tokio::test]
@@ -158,12 +157,21 @@ async fn text_only_and_no_conversation() {
         }],
         native: None,
     };
+    // A reply to an image: it cannot be edited (no input image), which is refused.
     let reply = vec![Turn::user_text("画猫"), answer, Turn::user_text("改成蓝色")];
-    let p = prep_h("glm-image", &[], &reply).await.unwrap();
-    assert_eq!(p.body["prompt"], "改成蓝色");
-    assert!(p.notes[0].contains("the replied-to image is not sent"), "{:?}", p.notes);
+    let e = prep_h("glm-image", &[], &reply).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "`glm-image` takes no input image, so it cannot edit the image replied to: start a new message"
+    );
+    // One prompt per request: a conversation would be ignored, which is refused.
     let chat = vec![Turn::user_text("讲个故事"), Turn::assistant_text("从前"), Turn::user_text("画出来")];
-    assert!(prep_h("cogview-4", &[], &chat).await.unwrap().notes[0].contains("no conversation"));
+    let e = prep_h("cogview-4", &[], &chat).await.unwrap_err();
+    assert_eq!(e.message, "`cogview-4` takes one prompt, not a conversation: start a new message");
+    // A new message: its text only, nothing to say.
+    let p = prep_h("cogview-4", &[], &[Turn::user_text("画出来")]).await.unwrap();
+    assert_eq!(p.body["prompt"], "画出来");
+    assert!(p.notes.is_empty() && p.warnings.is_empty(), "{:?} {:?}", p.notes, p.warnings);
     let long = "猫".repeat(1001);
     assert!(prep_h("glm-image", &[], &[Turn::user_text(long.as_str())]).await.unwrap_err().message.contains("1000"));
     let system = vec![

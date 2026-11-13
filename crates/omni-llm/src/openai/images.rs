@@ -104,19 +104,12 @@ pub struct ImageSpec {
     /// `input_fidelity: high` on edits.
     pub input_fidelity: bool,
     pub price: ImagePrice,
-    /// When OpenAI removes the (deprecated) model.
-    pub removal: Option<&'static str>,
 }
 
 const MAX: &[&str] = &["max", "xhigh", "high", "medium", "low"];
-const HIGH: &[&str] = &["high", "medium", "low"];
 
 const P2: ImagePrice =
     ImagePrice { text_in: 5.0, text_cached: 1.25, image_in: 8.0, image_cached: 2.0, image_out: 30.0, text_out: 0.0 };
-const P15: ImagePrice =
-    ImagePrice { text_in: 5.0, text_cached: 1.25, image_in: 8.0, image_cached: 2.0, image_out: 32.0, text_out: 10.0 };
-const PMINI: ImagePrice =
-    ImagePrice { text_in: 2.0, text_cached: 0.2, image_in: 2.5, image_cached: 0.25, image_out: 8.0, text_out: 0.0 };
 
 const SPEC26: ImageSpec = ImageSpec {
     id: "",
@@ -126,7 +119,6 @@ const SPEC26: ImageSpec = ImageSpec {
     complexity: true,
     input_fidelity: false,
     price: P2,
-    removal: None,
 };
 
 /// OpenAI's image models, 2026-11-13 (see the module docs). Quality levels:
@@ -145,49 +137,7 @@ pub const IMAGE_MODELS: &[ImageSpec] = &[
         ..SPEC26
     },
     ImageSpec { id: "gpt-image-2.5-flare", aliases: &["gpt-image-2.5-flare-2026-09-08"], complexity: false, ..SPEC26 },
-    ImageSpec {
-        id: "gpt-image-2",
-        aliases: &["gpt-image-2-2026-04-21"],
-        qualities: HIGH,
-        complexity: false,
-        removal: Some("2027-02-10"),
-        ..SPEC26
-    },
-    ImageSpec {
-        id: "gpt-image-1.5",
-        aliases: &["gpt-image-1.5-2025-12-16"],
-        qualities: HIGH,
-        flexible: false,
-        complexity: false,
-        input_fidelity: true,
-        price: P15,
-        removal: Some("2026-12-01"),
-    },
-    ImageSpec {
-        id: "gpt-image-1-mini",
-        aliases: &[],
-        qualities: HIGH,
-        flexible: false,
-        complexity: false,
-        input_fidelity: false,
-        price: PMINI,
-        removal: Some("2026-12-01"),
-    },
-    ImageSpec {
-        id: "chatgpt-image-latest",
-        aliases: &[],
-        qualities: HIGH,
-        flexible: false,
-        complexity: false,
-        input_fidelity: false,
-        price: P15,
-        removal: Some("2026-12-01"),
-    },
 ];
-
-/// Ids that are gone, with the date OpenAI shut them down.
-const SHUT_DOWN: &[(&str, &str)] =
-    &[("dall-e-2", "2026-05-12"), ("dall-e-3", "2026-05-12"), ("gpt-image-1", "2026-10-23")];
 
 /// A bare image-model id (served by the Images API, not the Responses API).
 pub fn is_image_model(model: &str) -> bool {
@@ -196,21 +146,6 @@ pub fn is_image_model(model: &str) -> bool {
 
 pub fn image_spec(model: &str) -> Option<&'static ImageSpec> {
     IMAGE_MODELS.iter().find(|s| s.id == model || s.aliases.contains(&model))
-}
-
-/// Requests that cannot work: shut-down models (and OpenAI's video models).
-pub fn gone(model: &str) -> Option<LlmError> {
-    if model.starts_with("sora-") {
-        return Some(LlmError::request(format!(
-            "`{model}`: OpenAI shut down the Videos API and the Sora 2 models on 2026-09-24, with no replacement"
-        )));
-    }
-    let base = super::strip_snapshot(model);
-    SHUT_DOWN.iter().find(|(id, _)| *id == model || *id == base).map(|(id, date)| {
-        LlmError::request(format!(
-            "`{model}`: OpenAI shut down {id} on {date}; current image models: gpt-image-2.6-sunburst, gpt-image-2.6-flare"
-        ))
-    })
 }
 
 // ------------------------------------------------------------------ sizes
@@ -470,9 +405,6 @@ pub(crate) async fn prepare(
     blobs: &dyn BlobLoader,
 ) -> Result<Prepared, LlmError> {
     let model = input.model;
-    if let Some(e) = gone(model) {
-        return Err(e);
-    }
     let spec = image_spec(model);
     if req.tools.contains(&Tool::Image) {
         return Err(LlmError::request(format!(
@@ -501,7 +433,9 @@ pub(crate) async fn prepare(
         return Err(LlmError::request(format!("`{model}` takes images, not video, via the Images API")));
     }
     if answer_video.is_some() {
-        notes.push("ℹ️ the video of the answer replied to is not sent: the Images API takes images".into());
+        return Err(LlmError::request(format!(
+            "`{model}` takes images, not the video of the answer replied to, via the Images API"
+        )));
     }
     if prompt.is_empty() {
         return Err(LlmError::request(format!("`{model}` needs a prompt (the text of the message)")));
@@ -575,9 +509,6 @@ pub(crate) async fn prepare(
         body["background"] = json!(b);
         applied.push(Applied { source: src(user.background.is_some()), patch: json!({"background": b}) });
         settings.push(format!("background {b}"));
-        if b == "transparent" && spec.is_some_and(|s| s.id == "gpt-image-2") {
-            notes.push("ℹ️ transparent backgrounds are a preview on gpt-image-2 (OpenAI)".into());
-        }
     }
     if n > 1 {
         body["n"] = json!(n);
@@ -598,20 +529,7 @@ pub(crate) async fn prepare(
     if let Some(u) = &input.user {
         body["safety_identifier"] = json!(u);
     }
-    let mut warnings = Vec::new();
-    match spec {
-        None => warnings.push(format!(
-            "`{model}` is not in the bot's OpenAI image model table: its options and price are unknown (the bot's \
-             defaults are not sent; cost not estimated)"
-        )),
-        Some(s) => {
-            if let Some(d) = s.removal {
-                warnings.push(format!(
-                    "`{model}` is deprecated: OpenAI removes it on {d} (replacements: gpt-image-2.6-sunburst, gpt-image-2.6-flare)"
-                ));
-            }
-        }
-    }
+    let warnings = Vec::new();
     Ok(Prepared {
         dialect: DIALECT,
         model: model.to_string(),
@@ -919,11 +837,6 @@ mod tests {
         }
         assert!(largest_size(4, 1, MAX_PIXELS).unwrap_err().contains("between 1:3 and 3:1"));
         assert!(largest_size(997, 991, MAX_PIXELS).unwrap_err().contains("no size of exactly"));
-        // The older models: the standard sizes only.
-        let s = choose_size("gpt-image-1.5", false, None, Some("3:2")).unwrap();
-        assert_eq!(s.wh, Some((1536, 1024)));
-        assert!(choose_size("gpt-image-1.5", false, Some("2K"), None).unwrap_err().message.contains("sizes: 1K"));
-        assert!(choose_size("gpt-image-1.5", false, None, Some("16:9")).unwrap_err().message.contains("1:1, 3:2, 2:3"));
         assert_eq!(choose_size("m", true, None, None).unwrap().wh, None);
         let s = choose_size("m", true, Some("2K"), None).unwrap();
         assert_eq!((s.wh, s.desc.as_str()), (Some((2048, 2048)), "size 2048x2048 (2K, 1:1)"));
@@ -943,19 +856,32 @@ mod tests {
         assert_eq!(p.settings, ["quality max", "complexity high", "moderation low"]);
         assert!(p.applied.iter().all(|a| a.source == "default"));
         assert!(p.warnings.is_empty() && p.notes.is_empty());
-        // Older models: their highest quality, no complexity.
-        let p = prep("gpt-image-2", &[]).await.unwrap();
-        assert_eq!(p.body["quality"], "high");
-        assert!(p.body.get("complexity").is_none());
-        assert!(p.warnings[0].contains("removes it on 2027-02-10"), "{:?}", p.warnings);
-        assert_eq!(prep("gpt-image-2.5-flare-2026-09-08", &[]).await.unwrap().body["quality"], "max");
-        // Not in the table: only what was asked for, no stream.
-        let p = prep("gpt-image-3", &[kv("q", "high")]).await.unwrap();
-        assert_eq!(
-            p.body,
-            json!({"model": "gpt-image-3", "prompt": "a cat", "quality": "high", "safety_identifier": "u-hash"})
-        );
-        assert!(p.warnings[0].contains("not in the bot's OpenAI image model table"));
+        // 2.5: the same highest quality, no complexity (also by its dated alias).
+        for model in ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare-2026-09-08"] {
+            let p = prep(model, &[]).await.unwrap();
+            assert_eq!(p.body["quality"], "max", "{model}");
+            assert!(p.body.get("complexity").is_none(), "{model}");
+            assert!(p.warnings.is_empty(), "{model}: {:?}", p.warnings);
+        }
+        // Not in the table (newer, deprecated and shut-down ids alike): not supported, the price is unknown.
+        for model in [
+            "gpt-image-3",
+            "gpt-image-2",
+            "gpt-image-2-2026-04-21",
+            "gpt-image-1.5",
+            "gpt-image-1-mini",
+            "chatgpt-image-latest",
+            "gpt-image-1",
+            "dall-e-3",
+            "sora-2-pro",
+        ] {
+            assert_eq!(
+                err(model, &[kv("q", "high")]).await,
+                format!(
+                    "`{model}` is not in the bot's OpenAI model table (its price is unknown), so it is not supported"
+                )
+            );
+        }
     }
 
     #[tokio::test]
@@ -987,16 +913,15 @@ mod tests {
         );
         assert!(p.notes[0].contains("experimental"));
         assert_eq!(prep("gpt-image-2.6-flare", &[flag("1h")]).await.unwrap().body["size"], "864x1152");
-        assert_eq!(prep("gpt-image-2", &[kv("ar", "21:9")]).await.unwrap().body["size"], "3808x1632");
-        let p = prep("gpt-image-2-2026-04-21", &[kv("bg", "transparent")]).await.unwrap();
-        assert!(p.notes.iter().any(|n| n.contains("preview on gpt-image-2")), "{:?}", p.notes);
-        assert_eq!(prep("gpt-image-1.5", &[flag("S")]).await.unwrap().body["size"], "1024x1024");
+        assert_eq!(prep("gpt-image-2.5-flare", &[kv("ar", "21:9")]).await.unwrap().body["size"], "3808x1632");
+        let p = prep("gpt-image-2.5-sunburst", &[kv("bg", "transparent")]).await.unwrap();
+        assert_eq!(p.body["background"], "transparent");
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
         assert_eq!(prep("gpt-image-2.5-sunburst", &[kv("q", "auto")]).await.unwrap().body["quality"], "auto");
     }
 
     #[tokio::test]
     async fn what_the_images_api_does_not_take_is_an_error() {
-        assert!(err("gpt-image-2", &[kv("q", "max")]).await.contains("levels: high, medium, low, auto"));
         assert!(
             err("gpt-image-2.6-sunburst", &[kv("q", "ultra")])
                 .await
@@ -1016,13 +941,10 @@ mod tests {
         assert!(err("gpt-image-2.6-sunburst", &[kv("tier", "flex")]).await.contains("no service tiers"));
         assert!(err("gpt-image-2.6-sunburst", &[kv("v", "low")]).await.contains("no verbosity"));
         assert!(err("gpt-image-2.6-sunburst", &[kv("ar", "4:1")]).await.contains("between 1:3 and 3:1"));
-        assert!(err("gpt-image-1-mini", &[flag("4")]).await.contains("sizes: 1K"));
-        assert!(err("dall-e-3", &[]).await.contains("shut down dall-e-3 on 2026-05-12"));
-        assert!(err("gpt-image-1", &[]).await.contains("shut down gpt-image-1 on 2026-10-23"));
-        assert!(err("sora-2-pro", &[]).await.contains("shut down the Videos API"));
         // A system prompt cannot be sent.
         let sys = Turn { role: Role::System, origin: Default::default(), parts: vec![Part::text("x")], native: None };
-        let e = prep_with("gpt-image-2", &[], &[sys, Turn::user_text("a")], &MemBlobs(vec![])).await.unwrap_err();
+        let e =
+            prep_with("gpt-image-2.6-flare", &[], &[sys, Turn::user_text("a")], &MemBlobs(vec![])).await.unwrap_err();
         assert!(e.message.contains("no system prompt"), "{}", e.message);
     }
 
@@ -1032,12 +954,12 @@ mod tests {
         let prev = omni_core::BlobRef::for_bytes(b"\x89PNG-prev", "image/png");
         let blobs = MemBlobs(vec![b1, (prev.clone(), b"\x89PNG-prev".to_vec())]);
         // A message with an image: an edit of it.
-        let p = prep_with("gpt-image-1.5", &[], &[user(vec![Part::text("watercolor"), img.clone()])], &blobs)
+        let p = prep_with("gpt-image-2.5-flare", &[], &[user(vec![Part::text("watercolor"), img.clone()])], &blobs)
             .await
             .unwrap();
         assert_eq!(p.url, "https://api.openai.com/v1/images/edits");
         assert!(p.body["images"][0]["image_url"].as_str().unwrap().starts_with("data:image/webp;base64,"));
-        assert_eq!(p.body["input_fidelity"], "high");
+        assert!(p.body.get("input_fidelity").is_none(), "no model in the table takes it");
         assert!(p.settings.contains(&"edit (1 input image)".to_string()));
         // A reply to a generated image (plus an attached one): the previous image first.
         let answer = Turn {
@@ -1057,13 +979,23 @@ mod tests {
         assert!(p.notes.is_empty());
         // GIF input is not taken by edits.
         let (gif, b3) = photo("image/gif", b"GIF89a");
-        let e =
-            prep_with("gpt-image-2", &[], &[user(vec![Part::text("x"), gif])], &MemBlobs(vec![b3])).await.unwrap_err();
+        let e = prep_with("gpt-image-2.6-flare", &[], &[user(vec![Part::text("x"), gif])], &MemBlobs(vec![b3]))
+            .await
+            .unwrap_err();
         assert!(e.message.contains("formats: png, jpeg, webp"), "{}", e.message);
         // No prompt.
         let (img2, b4) = photo("image/png", b"\x89PNG");
-        let e = prep_with("gpt-image-2", &[], &[user(vec![img2])], &MemBlobs(vec![b4])).await.unwrap_err();
+        let e = prep_with("gpt-image-2.6-flare", &[], &[user(vec![img2])], &MemBlobs(vec![b4])).await.unwrap_err();
         assert!(e.message.contains("needs a prompt"));
+        // A conversation without an image to edit: one prompt per request, so it would be ignored,
+        // which is refused.
+        let chat =
+            vec![Turn::user_text("a story"), Turn::assistant_text("Once upon a time"), Turn::user_text("draw it")];
+        let e = prep_with("gpt-image-2.6-flare", &[], &chat, &MemBlobs(vec![])).await.unwrap_err();
+        assert_eq!(
+            e.message,
+            "`gpt-image-2.6-flare` takes one prompt via the Images API, not a conversation: start a new message, or reply to a generated image or video it can take as input"
+        );
     }
 
     #[test]
@@ -1074,12 +1006,12 @@ mod tests {
             "output_tokens": 4000, "output_tokens_details": {"image_tokens": 4000, "text_tokens": 0}, "total_tokens": 5050});
         let c = usage_cost(&p, &u);
         assert!((c - (50.0 * 5.0 + 1000.0 * 8.0 + 4000.0 * 30.0) / 1e6).abs() < 1e-12, "{c}");
-        // The tool's usage reports cached counts; GPT Image 1.5 bills text output.
+        // The tool's usage reports cached counts; text output is not billed on GPT Image 2.x.
         let u = json!({"input_tokens": 1100, "input_tokens_details": {"text_tokens": 100, "image_tokens": 1000},
             "cached_tokens": 600, "cached_tokens_details": {"cached_text_tokens": 100, "cached_image_tokens": 500},
             "output_tokens": 300, "output_tokens_details": {"image_tokens": 200, "text_tokens": 100}});
-        let c = usage_cost(&image_spec("gpt-image-1.5").unwrap().price, &u);
-        let want = (100.0 * 1.25 + 500.0 * 8.0 + 500.0 * 2.0 + 200.0 * 32.0 + 100.0 * 10.0) / 1e6;
+        let c = usage_cost(&image_spec("gpt-image-2.5-flare").unwrap().price, &u);
+        let want = (100.0 * 1.25 + 500.0 * 8.0 + 500.0 * 2.0 + 200.0 * 30.0) / 1e6;
         assert!((c - want).abs() < 1e-12, "{c} vs {want}");
         // Without details: input as text, output as image tokens.
         let c = usage_cost(&p, &json!({"input_tokens": 10, "output_tokens": 100}));
@@ -1135,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn several_images_come_in_one_json_response() {
-        let p = prep("gpt-image-2", &[kv("n", "2")]).await.unwrap();
+        let p = prep("gpt-image-2.5-sunburst", &[kv("n", "2")]).await.unwrap();
         let png = crate::provider::b64(b"\x89PNG-1");
         let jpg = crate::provider::b64(b"\xff\xd8\xff-2");
         let body = json!({"created": 1, "data": [{"b64_json": png}, {"b64_json": jpg}], "output_format": "png", "size": "1024x1024",

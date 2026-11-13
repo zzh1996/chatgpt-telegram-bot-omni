@@ -95,7 +95,15 @@ async fn run(cfg: Config) -> Result<()> {
     let seeded: Vec<i64> = cfg.access.allowed_chats.iter().chain(&cfg.access.admins).copied().collect();
     access::seed(&db, &bot_names, &seeded).await?;
 
-    let orc = cfg.providers.openrouter.clone().context("[providers.openrouter] is required")?;
+    // Without a key (or the section) OpenRouter is off: its models are not offered.
+    let orc = match cfg.providers.openrouter.clone() {
+        Some(c) => c,
+        None => toml::from_str("").context("OpenRouter defaults")?,
+    };
+    let openrouter_on = !orc.api_key.trim().is_empty();
+    if !openrouter_on {
+        info!("OpenRouter is off (no api_key)");
+    }
     let openrouter = OpenRouter::new(OpenRouterConfig {
         api_key: orc.api_key.clone(),
         base_url: orc.base_url.clone(),
@@ -146,9 +154,11 @@ async fn run(cfg: Config) -> Result<()> {
         info!(provider = info.id, "{} provider enabled", info.name);
         direct.insert(info.id.to_string(), p);
     }
-    match openrouter.refresh_catalog().await {
-        Ok(n) => info!(models = n, "loaded OpenRouter model catalog"),
-        Err(e) => warn!(error = %format!("{e:#}"), "could not load the OpenRouter model catalog (will retry)"),
+    if openrouter_on {
+        match openrouter.refresh_catalog().await {
+            Ok(n) => info!(models = n, "loaded OpenRouter model catalog"),
+            Err(e) => warn!(error = %format!("{e:#}"), "could not load the OpenRouter model catalog (will retry)"),
+        }
     }
 
     let api_id = cfg.telegram.api_id.as_i32()?;
@@ -212,7 +222,7 @@ async fn run(cfg: Config) -> Result<()> {
     }
 
     // Prefetch endpoint limits of the configured models, so `max_tokens` budgeting never waits.
-    {
+    if openrouter_on {
         let app = app.clone();
         tokio::spawn(async move {
             let specs: Vec<String> = app.aliases.read().values().flat_map(|m| m.values().cloned()).collect();
@@ -230,7 +240,7 @@ async fn run(cfg: Config) -> Result<()> {
     }
 
     // Periodic catalog refresh.
-    {
+    if openrouter_on {
         let app = app.clone();
         tokio::spawn(async move {
             loop {

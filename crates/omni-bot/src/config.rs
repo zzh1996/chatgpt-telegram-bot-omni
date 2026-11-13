@@ -221,6 +221,8 @@ fn default_cny_per_usd() -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRouterConfig {
+    /// Empty: OpenRouter is off (its models are not offered), like a platform without a key.
+    #[serde(default)]
     pub api_key: String,
     /// Whether users may type the id of a model of this provider that no prefix
     /// names, as a prefix of its own (`author/model$`, `ark:model$`). Off: only
@@ -604,5 +606,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("NOPE"));
+    }
+
+    /// Production with only the Telegram settings: every provider is optional
+    /// (without a key it is off), and OpenRouter's section has defaults.
+    #[test]
+    fn no_provider_key_is_required() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/omni.example.toml"))
+            .expect("example config exists");
+        let env = |k: &str| match k {
+            "TELEGRAM_API_ID" => Some("12345".to_string()),
+            "TELEGRAM_API_HASH" => Some("x".to_string()),
+            "TELEGRAM_BOT_TOKEN" => Some("123:abc".to_string()),
+            _ => None,
+        };
+        let cfg = Config::parse(&raw, &env).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.providers.openrouter.as_ref().is_some_and(|c| c.api_key.is_empty()));
+        for id in ["openai", "anthropic", "google", "xai", "deepseek", "zhipu", "moonshot", "alibaba", "ark"] {
+            assert!(cfg.providers.direct(id).is_none_or(|c| c.api_key.trim().is_empty()), "{id}");
+        }
+        let defaults: OpenRouterConfig = toml::from_str("").unwrap();
+        assert!(defaults.api_key.is_empty() && defaults.require_parameters);
     }
 }

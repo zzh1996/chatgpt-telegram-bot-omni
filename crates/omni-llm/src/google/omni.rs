@@ -17,12 +17,9 @@
 //!
 //! - **Models** ([`MODELS`]): `gemini-omni-1.2-flash` (GA 2026-11-05: 3–15 s
 //!   videos with native audio, 360p / 720p / 1080p / 4K at 24 fps, up to 6
-//!   reference images, conversational editing and extension), and
-//!   `gemini-omni-1.1-flash` (3–10 s; Google routes it to 1.2 from
-//!   2026-12-03, billed at 1.2's rates: a warning). `gemini-omni-flash-preview`
-//!   and every Veo model of the Gemini API are shut down (Veo 3.1 previews on
-//!   2026-10-22, Veo 3.0 and 2.0 on 2026-06-30, the 3.0 previews on
-//!   2025-11-12): an error naming the replacement ([`SHUT_DOWN`]).
+//!   reference images, conversational editing and extension). Deprecated
+//!   and shut-down ids (`gemini-omni-1.1-flash`, which Google routes to 1.2
+//!   from 2026-12-03; the preview; every Veo model) are not in the table.
 //! - **The job**: created with `background: true` (it runs on Google's side,
 //!   stored as background execution requires; `store` is left at its
 //!   default, true), the interaction id checkpointed at once, then polled
@@ -122,8 +119,6 @@ pub struct Spec {
     pub max_images: Option<usize>,
     /// Videos per request (references, or one to edit or extend).
     pub max_videos: Option<usize>,
-    /// `(date, replacement)`: Google routes the id to the replacement from that date.
-    pub routed: Option<(&'static str, &'static str)>,
     /// USD per 1M tokens: input (text, image, video), text and thinking output, video output.
     pub input: f64,
     pub text_output: f64,
@@ -132,41 +127,15 @@ pub struct Spec {
 
 /// The models and prices, 2026-11-13: the model page, the Omni guide, the
 /// deprecations page and the price list (Standard; Omni has no other tier).
-pub const MODELS: &[Spec] = &[
-    Spec {
-        id: "gemini-omni-1.2-flash",
-        max_seconds: 15,
-        max_images: Some(6),
-        max_videos: Some(3),
-        routed: None,
-        input: 1.50,
-        text_output: 9.00,
-        video_output: 12.00,
-    },
-    Spec {
-        id: "gemini-omni-1.1-flash",
-        max_seconds: 10,
-        max_images: None,
-        max_videos: None,
-        routed: Some(("2026-12-03", "gemini-omni-1.2-flash")),
-        input: 1.50,
-        text_output: 9.00,
-        video_output: 17.50,
-    },
-];
-
-/// Shut-down video models of the Gemini API: (id, date, replacement).
-pub const SHUT_DOWN: &[(&str, &str, &str)] = &[
-    ("gemini-omni-flash-preview", "2026-10-22", "gemini-omni-1.2-flash"),
-    ("veo-3.1-generate-preview", "2026-10-22", "gemini-omni-1.2-flash"),
-    ("veo-3.1-fast-generate-preview", "2026-10-22", "gemini-omni-1.2-flash"),
-    ("veo-3.1-lite-generate-preview", "2026-10-22", "gemini-omni-1.2-flash"),
-    ("veo-3.0-generate-001", "2026-06-30", "gemini-omni-1.2-flash"),
-    ("veo-3.0-fast-generate-001", "2026-06-30", "gemini-omni-1.2-flash"),
-    ("veo-2.0-generate-001", "2026-06-30", "gemini-omni-1.2-flash"),
-    ("veo-3.0-generate-preview", "2025-11-12", "gemini-omni-1.2-flash"),
-    ("veo-3.0-fast-generate-preview", "2025-11-12", "gemini-omni-1.2-flash"),
-];
+pub const MODELS: &[Spec] = &[Spec {
+    id: "gemini-omni-1.2-flash",
+    max_seconds: 15,
+    max_images: Some(6),
+    max_videos: Some(3),
+    input: 1.50,
+    text_output: 9.00,
+    video_output: 12.00,
+}];
 
 pub fn spec(model: &str) -> Option<&'static Spec> {
     MODELS.iter().find(|s| s.id == model)
@@ -175,21 +144,6 @@ pub fn spec(model: &str) -> Option<&'static Spec> {
 /// Whether `model` is a video model of the Gemini API (served by this module).
 pub fn is_video_model(model: &str) -> bool {
     model.starts_with("gemini-omni") || model.starts_with("veo-")
-}
-
-/// The error for a shut-down model, if `model` is one.
-fn shut_down(model: &str) -> Option<String> {
-    if let Some((_, date, next)) = SHUT_DOWN.iter().find(|(id, ..)| *id == model) {
-        return Some(format!(
-            "`{model}` was shut down on {date} (Gemini API deprecations page); its replacement is `{next}` (`google:{next}`)"
-        ));
-    }
-    model.starts_with("veo-").then(|| {
-        format!(
-            "`{model}`: Veo on the Gemini API is shut down (the last models on 2026-10-22); video generation is \
-             Gemini Omni Flash (`google:gemini-omni-1.2-flash`)"
-        )
-    })
 }
 
 /// The video output tokens per second of each resolution (the price list).
@@ -302,9 +256,6 @@ pub async fn prepare(
     blobs: &dyn BlobLoader,
 ) -> Result<Prepared, LlmError> {
     let model = input.model;
-    if let Some(gone) = shut_down(model) {
-        return Err(err(gone));
-    }
     let user = request::parse(input.options).map_err(LlmError::request)?;
     let mut req = Requested::default();
     for p in presets {
@@ -354,16 +305,8 @@ pub async fn prepare(
         )));
     }
     let previous = previous_interaction(input.history, model);
-    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, notes: earlier } =
-        media::media_input(input.history, model, NAME)?;
-    let mut notes = Vec::new();
-    if previous.is_none() && !earlier.is_empty() {
-        notes.push(
-            "ℹ️ only this message (and its images and videos) is sent, not the earlier turns of the conversation \
-             (Gemini Omni continues its own videos by `previous_interaction_id`)"
-                .to_string(),
-        );
-    }
+    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, notes } =
+        media::media_input(input.history, model, "the Gemini API")?;
     let videos: Vec<&BlobRef> = answer_video.iter().filter(|_| previous.is_none()).chain(&own_videos).collect();
     let images: Vec<&BlobRef> = answer_images.iter().chain(&own_images).collect();
     if let Some(max) = spec.and_then(|s| s.max_images)
@@ -453,16 +396,7 @@ pub async fn prepare(
         applied.push(Applied { source: "default".into(), patch: json!({"labels": {"safety_identifier": l}}) });
         body["labels"] = json!({"safety_identifier": l});
     }
-    let mut warnings = Vec::new();
-    match spec {
-        Some(Spec { routed: Some((date, next)), .. }) => warnings
-            .push(format!("`{model}` is deprecated: from {date} Google routes it to `{next}` (billed at its rates)")),
-        Some(_) => {}
-        None => warnings.push(format!(
-            "`{model}` is not in the bot's Gemini Omni table: its limits and price are unknown (the bot's defaults \
-             are not sent; cost not estimated)"
-        )),
-    }
+    let warnings = Vec::new();
     Ok(Prepared {
         dialect: DIALECT,
         model: model.to_string(),

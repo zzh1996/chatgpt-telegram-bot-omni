@@ -84,9 +84,6 @@ pub struct ImageOut {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
     pub id: &'static str,
-    /// Google serves this id with another model (deprecated ids that are
-    /// "automatically routed"); limits, levels and prices are the target's.
-    pub routes_to: Option<&'static str>,
     pub family: Family,
     /// Input token limit; for `unified` models the window input and output share.
     pub context: u64,
@@ -152,7 +149,6 @@ const fn text_model(
 ) -> ModelSpec {
     ModelSpec {
         id,
-        routes_to: None,
         family,
         context: 1_048_576,
         max_output: 65_536,
@@ -175,10 +171,6 @@ const fn gemini4(id: &'static str) -> ModelSpec {
     ModelSpec { unified: true, long_decode: true, ..text_model(id, Family::Gemini4, LEVELS_HML, true) }
 }
 
-const fn routed(spec: ModelSpec, id: &'static str, target: &'static str) -> ModelSpec {
-    ModelSpec { id, routes_to: Some(target), ..spec }
-}
-
 const fn image_model(
     id: &'static str,
     context: u64,
@@ -190,7 +182,6 @@ const fn image_model(
 ) -> ModelSpec {
     ModelSpec {
         id,
-        routes_to: None,
         family: Family::Gemini3,
         context,
         max_output,
@@ -209,16 +200,6 @@ const fn image_model(
     }
 }
 
-const fn gemini25(id: &'static str, min: u64, max: u64, can_disable: bool) -> ModelSpec {
-    ModelSpec {
-        family: Family::Gemini25,
-        thinking: Thinking::Budget { min, max, can_disable },
-        search_with_maps: false,
-        per_part_media_resolution: false,
-        ..text_model(id, Family::Gemini25, LEVELS_HML, false)
-    }
-}
-
 const GEMINI_38_FLASH: ModelSpec = text_model("gemini-3.8-flash", Family::Gemini3, LEVELS_HML, true);
 const GEMINI_36_FLASH: ModelSpec = text_model("gemini-3.6-flash", Family::Gemini3, LEVELS_ALL, true);
 
@@ -230,12 +211,7 @@ pub const MODELS: &[ModelSpec] = &[
     gemini4("gemini-4-carbon"),
     gemini4("gemini-4-argon"),
     GEMINI_38_FLASH,
-    // Deprecated; "the endpoint is not shutting down and automatically routes API
-    // requests to gemini-3.8-flash" (deprecations page).
-    routed(GEMINI_38_FLASH, "gemini-3.7-flash", "gemini-3.8-flash"),
     GEMINI_36_FLASH,
-    // Deprecated; routed to gemini-3.6-flash.
-    routed(GEMINI_36_FLASH, "gemini-3.5-flash", "gemini-3.6-flash"),
     // "Gemini 3.5 Flash and later" for Search + Maps: taken to include 3.5 Flash-Lite
     // (UNVERIFIED; Google answers with an error if not).
     text_model("gemini-3.5-flash-lite", Family::Gemini3, LEVELS_ALL, true),
@@ -286,26 +262,6 @@ pub const MODELS: &[ModelSpec] = &[
         PRO_IMAGE,
         ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_BASE },
     ),
-    // Legacy (shut down on 2027-03-15; replacement gemini-3.1-flash-lite-image): input
-    // "Image and Text", 65,536 / 32,768 tokens, no thinking, no grounding, no Flex or
-    // Priority; one size ("up to 1024x1024px"), the ten base ratios.
-    ModelSpec {
-        family: Family::Gemini25,
-        ..image_model(
-            "gemini-2.5-flash-image",
-            65_536,
-            32_768,
-            Thinking::Unsupported,
-            NO_TOOLS,
-            PRO_IMAGE,
-            ImageOut { sizes: &[], ratios: RATIOS_BASE },
-        )
-    },
-    // Gemini 2.5 (deprecated, access limited to earlier users; routed to 3.8 Flash /
-    // 3.5 Flash-Lite from 2026-12-01). Budget ranges from the thinking guide.
-    gemini25("gemini-2.5-pro", 128, 32_768, false),
-    gemini25("gemini-2.5-flash", 0, 24_576, true),
-    gemini25("gemini-2.5-flash-lite", 512, 24_576, true),
 ];
 
 /// The model's spec: the table entry, else a guess from its family.
@@ -340,7 +296,6 @@ fn guess(model: &str) -> ModelSpec {
     let gemini4 = family == Family::Gemini4;
     ModelSpec {
         id: "",
-        routes_to: None,
         family,
         context: if gemini4 { 1_048_576 } else { 0 },
         max_output: if gemini4 { 65_536 } else { 0 },

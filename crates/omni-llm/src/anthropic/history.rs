@@ -140,7 +140,11 @@ pub async fn convert(
                 .to_string(),
         );
     }
-    let warnings = media_not_sent(as_text, ASSISTANT_TEXT_ONLY).into_iter().collect();
+    // Media of answers that go back as text cannot go along: an error (owner's rule).
+    if let Some(why) = media_not_sent(as_text, ASSISTANT_TEXT_ONLY) {
+        return Err(LlmError::request(why));
+    }
+    let warnings = Vec::new();
     Ok(Converted { system: (!system.is_empty()).then_some(Value::Array(system)), messages, notes, warnings, documents })
 }
 

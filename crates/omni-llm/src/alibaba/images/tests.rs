@@ -135,13 +135,16 @@ async fn options_per_model() {
         assert!(e.contains(what), "{e}");
     }
     assert!(prep("qwen-image-3.0", &[flag("i")]).await.unwrap_err().message.contains("without `+i`"));
-    assert!(prep("qwen-image-plus", &[]).await.unwrap_err().message.contains("shut down by Alibaba on 2026-10-10"));
-    assert!(prep("wan2.5-t2i-preview", &[]).await.unwrap_err().message.contains("asynchronous tasks"));
-    // Not in the table: Alibaba's defaults, no options.
-    let p = prep("qwen-image-4.0", &[]).await.unwrap();
-    assert!(p.body.get("parameters").is_none());
-    assert!(p.warnings[0].contains("not in the bot's Alibaba image model table"));
-    assert!(prep("qwen-image-4.0", &[flag("W")]).await.unwrap_err().message.contains("cannot be checked"));
+    // Not in the table (retired, task-only and unknown ids alike): not supported, their price is unknown.
+    for id in ["qwen-image-plus", "wan2.5-t2i-preview", "qwen-image-4.0"] {
+        let e = prep(id, &[]).await.unwrap_err().message;
+        assert_eq!(
+            e,
+            format!(
+                "`{id}` is not in the bot's Alibaba Model Studio model table (its price is unknown), so it is not supported"
+            )
+        );
+    }
 }
 
 #[tokio::test]
@@ -198,8 +201,12 @@ async fn edits_and_inputs() {
         Turn::user_text("x"),
     ];
     assert!(prep_with("qwen-image-3.0", &[], &system, &blobs).await.unwrap_err().message.contains("no system prompt"));
+    // A conversation without a replied-to image to edit is refused (one prompt per request).
     let chat = vec![Turn::user_text("讲个故事"), Turn::assistant_text("从前"), Turn::user_text("画出来")];
-    assert!(prep_with("qwen-image-3.0", &[], &chat, &blobs).await.unwrap().notes[0].contains("no conversation"));
+    let e = prep_with("qwen-image-3.0", &[], &chat, &blobs).await.unwrap_err().message;
+    assert!(e.contains("`qwen-image-3.0` takes one prompt, not a conversation"), "{e}");
+    // Edits keep working: only the replied-to answer's images and this message go.
+    assert!(prep_with("qwen-image-3.0", &[], &history, &blobs).await.unwrap().notes.is_empty());
 }
 
 #[test]

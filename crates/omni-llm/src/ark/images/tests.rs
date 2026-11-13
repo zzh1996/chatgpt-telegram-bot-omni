@@ -1,6 +1,6 @@
 //! Seedream tests: requests per model and option, the conversation rules,
-//! responses (whole and streamed) written per Ark's documented shapes, cost,
-//! and the HTTP path against a local fake server.
+//! responses written per Ark's documented shapes, cost, and the HTTP path
+//! against a local fake server.
 
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::chatstream::EventParser;
 use crate::provider::Provider;
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nimage-bytes";
@@ -87,9 +86,6 @@ async fn prep_err(model: &str, options: &[OptionToken]) -> String {
 const S55: &str = "doubao-seedream-5-5-261028";
 const PRO: &str = "doubao-seedream-5-0-pro-260628";
 const FLASH: &str = "doubao-seedream-5-0-flash-260915";
-const LITE_ID: &str = "doubao-seedream-5-0-260128";
-const S45: &str = "doubao-seedream-4-5-251128";
-const S40: &str = "doubao-seedream-4-0-250828";
 
 // ------------------------------------------------------------------ requests
 
@@ -113,29 +109,13 @@ async fn defaults_are_the_largest_size_without_watermark() {
     assert_eq!(p.settings, vec!["size 2K", "png", "no watermark"]);
     assert!(p.warnings.is_empty() && p.notes.is_empty(), "{:?} {:?}", p.warnings, p.notes);
     assert_eq!(p.max_tokens(), None);
-    assert!(ark().knows(S55) && ark().knows("doubao-seedream-5-0-lite-260128"));
-
-    // The group models: 4K, one image unless n= asks, streamed, jpeg only on 4.x.
-    let p = prep(S45, &[]).await;
-    assert_eq!(
-        p.body,
-        json!({
-            "model": S45,
-            "prompt": "一只猫",
-            "size": "4K",
-            "sequential_image_generation": "disabled",
-            "stream": true,
-            "response_format": "b64_json",
-            "watermark": false,
-        })
-    );
-    assert_eq!(p.settings, vec!["size 4K", "no watermark"]);
-    assert!(p.warnings[0].contains("2026-11-24") && p.warnings[0].contains(PRO), "{:?}", p.warnings);
-    let p = prep(LITE_ID, &[]).await;
-    assert_eq!((p.body["size"].as_str(), p.body["output_format"].as_str()), (Some("4K"), Some("png")));
-    assert!(p.body.get("safety_identifier").is_none(), "not documented for 5.0 lite");
-    assert_eq!(prep(S40, &[]).await.body["size"], "4K");
-    assert_eq!(prep(FLASH, &[]).await.body["size"], "2K");
+    assert!(ark().knows(S55) && ark().knows(PRO) && ark().knows(FLASH));
+    for model in [PRO, FLASH] {
+        let p = prep(model, &[]).await;
+        assert_eq!(p.body["size"], "2K", "{model}");
+        assert_eq!(p.settings, vec!["size 2K", "png", "no watermark"], "{model}");
+        assert!(p.warnings.is_empty(), "{model}: {:?}", p.warnings);
+    }
 }
 
 #[tokio::test]
@@ -143,9 +123,8 @@ async fn sizes_and_ratios() {
     // Ark's tier × ratio table.
     assert_eq!(prep(S55, &[flag("W")]).await.body["size"], "2816x1584");
     assert_eq!(prep(S55, &[flag("1h")]).await.body["size"], "864x1152");
-    assert_eq!(prep(LITE_ID, &[flag("2W")]).await.body["size"], "2848x1600");
-    assert_eq!(prep(S40, &[flag("1W")]).await.body["size"], "1280x720");
-    assert_eq!(prep(S45, &[kv("ar", "21:9")]).await.body["size"], "6240x2656");
+    assert_eq!(prep(FLASH, &[flag("1W")]).await.body["size"], "1424x800");
+    assert_eq!(prep(PRO, &[kv("ar", "21:9")]).await.body["size"], "3136x1344");
     let p = prep(PRO, &[flag("1")]).await;
     assert_eq!((p.body["size"].as_str(), p.settings[0].as_str()), (Some("1K"), "size 1K"));
     let p = prep(S55, &[flag("H")]).await;
@@ -154,27 +133,21 @@ async fn sizes_and_ratios() {
     // Other ratios: the exact ratio at the tier's pixel count.
     assert_eq!(prep(S55, &[kv("ar", "5:4")]).await.body["size"], "2285x1828");
     assert_eq!(prep(S55, &[kv("ar", "10:8")]).await.body["size"], "2285x1828", "reduced first");
-    assert_eq!(prep(S45, &[kv("ar", "1:4")]).await.body["size"], "2048x8192");
+    assert_eq!(prep(S55, &[kv("ar", "1:4")]).await.body["size"], "1024x4096");
     // Outside what Ark takes.
     assert!(prep_err(S55, &[kv("ar", "1:20")]).await.contains("1:16 to 16:1"));
-    let e = prep_err(S45, &[flag("1")]).await;
-    assert!(e.contains("sizes: 2K, 4K"), "{e}");
     let e = prep_err(S55, &[flag("4")]).await;
     assert!(e.contains("sizes: 1K, 2K"), "{e}");
     assert_eq!(dimensions(spec(S55).unwrap(), "1.5K", "16:9"), Ok((2048, 1152)));
 }
 
 #[tokio::test]
-async fn groups_background_quality_search() {
-    let p = prep(LITE_ID, &[kv("n", "4")]).await;
-    assert_eq!(p.body["sequential_image_generation"], "auto");
-    assert_eq!(p.body["sequential_image_generation_options"], json!({"max_images": 4}));
-    assert_eq!(p.body["stream"], true);
-    assert!(p.settings.contains(&"image group: up to 4 images".to_string()), "{:?}", p.settings);
-    assert_eq!(prep(S45, &[kv("n", "1")]).await.body["sequential_image_generation"], "disabled");
-    let e = prep_err(S55, &[kv("n", "2")]).await;
-    assert!(e.contains("(`n=`)"), "{e}");
-    assert!(prep_err(S40, &[kv("n", "16")]).await.contains("at most 15"));
+async fn background_quality_and_refused_options() {
+    // One image per request: no model in the table makes image groups.
+    for model in [S55, PRO, FLASH] {
+        let e = prep_err(model, &[kv("n", "2")]).await;
+        assert!(e.contains("(`n=`)"), "{model}: {e}");
+    }
 
     let p = prep(PRO, &[kv("bg", "transparent"), kv("q", "fast")]).await;
     assert_eq!(p.body["background"], "transparent");
@@ -184,17 +157,16 @@ async fn groups_background_quality_search() {
     assert_eq!(prep(S55, &[kv("bg", "auto")]).await.body["background"], "auto");
     let e = prep_err(PRO, &[kv("bg", "auto")]).await;
     assert!(e.contains("backgrounds: transparent, opaque"), "{e}");
-    assert!(prep_err(S45, &[kv("bg", "opaque")]).await.contains("(`bg=`)"));
     let e = prep_err(S55, &[kv("q", "fast")]).await;
     assert!(e.contains("modes: standard"), "{e}");
-    assert_eq!(prep(S40, &[kv("q", "fast")]).await.body["optimize_prompt_options"]["mode"], "fast");
+    let e = prep_err(FLASH, &[kv("q", "fast")]).await;
+    assert!(e.contains("modes: standard"), "{e}");
 
-    // Web search (5.0 lite): not streamed, so the search shows before the images.
-    let p = prep(LITE_ID, &[flag("s")]).await;
-    assert_eq!(p.body["tools"], json!([{"type": "web_search"}]));
-    assert!(p.body.get("stream").is_none());
-    assert!(p.warnings.iter().any(|w| w.contains("web search")), "{:?}", p.warnings);
-    assert!(prep_err(S55, &[flag("s")]).await.contains("only Seedream 5.0 lite searches"));
+    // No model in the table searches the web.
+    for model in [S55, PRO, FLASH] {
+        let e = prep_err(model, &[flag("s")]).await;
+        assert!(e.contains("has no web search (`+s`) on Ark's image API"), "{model}: {e}");
+    }
     assert!(prep_err(S55, &[flag("i")]).await.contains("draws without `+i`"));
     assert!(prep_err(S55, &[flag("c")]).await.contains("has no code execution"));
     assert!(prep_err(S55, &[kv("e", "high")]).await.contains("reasoning effort"));
@@ -258,12 +230,17 @@ async fn replies_edit_the_generated_images() {
     let p = prep_with(S55, &[], &fresh, &blobs).await.unwrap();
     assert_eq!(p.body["image"], json!(format!("data:image/jpeg;base64,{}", crate::provider::b64(JPEG))));
     assert!(p.settings.contains(&"1 reference image".to_string()));
-    // Switched here from a chat answer (no images): the conversation is not sent, and the bot says so.
+    // Switched here from a chat answer (no images to edit): one prompt per request, so the
+    // conversation would be ignored, which is refused.
     let switched = vec![Turn::user_text("讲个故事"), Turn::assistant_text("从前……"), Turn::user_text("画出来")];
-    let p = prep_with(S55, &[], &switched, &blobs).await.unwrap();
-    assert!(p.body.get("image").is_none());
-    assert_eq!(p.body["prompt"], "画出来");
-    assert!(p.notes[0].contains("no conversation"), "{:?}", p.notes);
+    let e = prep_with(S55, &[], &switched, &blobs).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        format!(
+            "`{S55}` takes one prompt, not a conversation: reply to an image it generated to edit it, or start a new \
+             message"
+        )
+    );
 }
 
 #[tokio::test]
@@ -311,7 +288,7 @@ async fn inputs_the_api_does_not_take() {
     }];
     let blobs = Blobs(vec![photo.clone()]);
     assert!(prep_with(S55, &[], &silent, &blobs).await.unwrap_err().message.contains("needs a prompt"));
-    // Reference limits: 10 on 5.x, references + images ≤ 15 in a group.
+    // At most 10 reference images.
     let many = |n: usize| {
         let mut parts = vec![Part::text("x")];
         parts.extend((0..n).map(|_| Part::Image {
@@ -325,21 +302,32 @@ async fn inputs_the_api_does_not_take() {
     };
     let e = prep_with(S55, &[], &many(11), &blobs).await.unwrap_err();
     assert!(e.message.contains("at most 10 reference images"), "{e}");
-    assert!(prep_with(S45, &[], &many(14), &blobs).await.is_ok());
-    let e = prep_with(S45, &[kv("n", "3")], &many(13), &blobs).await.unwrap_err();
-    assert!(e.message.contains("can be at most 2"), "{e}");
+    let p = prep_with(S55, &[], &many(10), &blobs).await.unwrap();
+    assert!(p.settings.contains(&"10 reference images".to_string()), "{:?}", p.settings);
 }
 
 #[tokio::test]
 async fn ids_outside_the_table() {
-    let p = prep("doubao-seedream-4-0-20260415", &[]).await;
-    assert_eq!(
-        p.body,
-        json!({"model": "doubao-seedream-4-0-20260415", "prompt": "一只猫", "response_format": "b64_json", "watermark": false})
-    );
-    assert!(p.warnings[0].contains("not in the bot's Seedream table"), "{:?}", p.warnings);
-    assert!(!ark().knows("doubao-seedream-4-0-20260415"));
-    assert!(prep_err("doubao-seedream-9-0-261231", &[flag("W")]).await.contains("cannot be checked"));
+    // Newer ids, and the retiring and retired models (5.0 lite, 4.5, 4.0): their price is
+    // unknown to the bot, so they are not supported, with or without options.
+    for id in [
+        "doubao-seedream-4-0-20260415",
+        "doubao-seedream-9-0-261231",
+        "doubao-seedream-5-0-260128",
+        "doubao-seedream-5-0-lite-260128",
+        "doubao-seedream-4-5-251128",
+        "doubao-seedream-4-0-250828",
+    ] {
+        assert!(!ark().knows(id), "{id}");
+        for options in [&[][..], &[flag("W")]] {
+            assert_eq!(
+                prep_err(id, options).await,
+                format!(
+                    "`{id}` is not in the bot's Volcengine Ark model table (its price is unknown), so it is not supported"
+                )
+            );
+        }
+    }
     // Chat models still go to the Chat API.
     let p = prep("doubao-seed-2-1-pro-260915", &[]).await;
     assert_eq!(p.dialect, crate::ark::DIALECT);
@@ -407,94 +395,6 @@ fn a_whole_response() {
 }
 
 #[test]
-fn a_streamed_group_with_a_failed_image() {
-    // Ark's 流式输出 example (b64_json), with one image refused by moderation.
-    let evs_in = [
-        json!({"type": "image_generation.partial_succeeded", "model": S45, "created": 1757396757, "image_index": 0, "b64_json": b64(JPEG), "size": "2496x1664"}),
-        json!({"type": "image_generation.partial_failed", "model": S45, "created": 1757396785, "image_index": 1,
-               "error": {"code": "OutputImageSensitiveContentDetected", "message": "The request failed because the output image may contain sensitive information."}}),
-        json!({"type": "image_generation.partial_succeeded", "model": S45, "created": 1757396825, "image_index": 2, "b64_json": b64(JPEG), "size": "2496×1664"}),
-        json!({"type": "image_generation.completed", "model": S45, "created": 1757396825,
-               "usage": {"generated_images": 2, "output_tokens": 32448, "total_tokens": 32448}}),
-    ];
-    let mut p = parser_for(S45, json!({"stream": true}));
-    let mut evs = Vec::new();
-    for v in &evs_in {
-        let name = v["type"].as_str().map(str::to_string);
-        evs.extend(p.event(name.as_deref(), v).unwrap());
-    }
-    assert!(p.finished());
-    let images = evs.iter().filter(|e| matches!(e, StreamEvent::Image { mime, .. } if mime == "image/jpeg")).count();
-    assert_eq!(images, 2);
-    assert!(evs.iter().any(|e| matches!(e, StreamEvent::Notice(n)
-        if n.starts_with("image 2 of the group was not generated: OutputImageSensitiveContentDetected"))));
-    // Two images at ¥0.25 each.
-    assert!((usages(&evs)[0].cost_usd.unwrap() - 0.5 / 7.0).abs() < 1e-12);
-    assert!(p.failure().is_none(), "the other images are kept");
-    assert_eq!(p.native_payload()["data"].as_array().unwrap().len(), 3);
-
-    // Every image refused: a content-filter failure with Ark's errors.
-    let mut p = parser_for(LITE_ID, json!({"stream": true}));
-    p.event(None, &evs_in[1]).unwrap();
-    let evs = p
-        .event(None, &json!({"type": "image_generation.completed", "model": LITE_ID, "usage": {"generated_images": 0, "output_tokens": 0, "total_tokens": 0}}))
-        .unwrap();
-    assert!(evs.contains(&StreamEvent::Finish {
-        reason: Some("content_filter".into()),
-        native: Some("OutputImageSensitiveContentDetected".into())
-    }));
-    let e = p.failure().unwrap();
-    assert!(e.message.starts_with("OutputImageSensitiveContentDetected: "), "{e}");
-    assert_eq!(e.retry, Retry::Never);
-    assert_eq!(usages(&evs)[0].cost_usd, Some(0.0));
-
-    // An error event.
-    let mut p = parser_for(S45, json!({"stream": true}));
-    let e = p
-        .event(Some("error"), &json!({"error": {"code": "ModelAccountIpmRateLimitExceeded", "message": "IPM (Images Per Minute) limit of the model is exceeded."}}))
-        .unwrap_err();
-    assert_eq!(e.retry, Retry::After(20));
-}
-
-#[test]
-fn search_is_reported_before_the_images() {
-    let v = json!({
-        "model": LITE_ID, "created": 1757321139,
-        "data": [{"b64_json": b64(PNG), "size": "3104x1312"}],
-        "tools": [{"type": "web_search"}],
-        "usage": {"generated_images": 1, "output_tokens": 15912, "total_tokens": 15912, "tool_usage": {"web_search": 1}}
-    });
-    let mut p = parser_for(LITE_ID, json!({"output_format": "png", "tools": [{"type": "web_search"}]}));
-    let evs = p.response(&v).unwrap();
-    let tool = evs.iter().position(|e| matches!(e, StreamEvent::Tool(t) if t.name == "web_search")).unwrap();
-    let image = evs.iter().position(|e| matches!(e, StreamEvent::Image { .. })).unwrap();
-    assert!(tool < image);
-    assert!(
-        matches!(&evs[tool], StreamEvent::Tool(t) if t.id.as_deref() == Some("web_search_1") && t.output.is_none())
-    );
-    assert_eq!(evs.iter().filter(|e| matches!(e, StreamEvent::Tool(_))).count(), 1, "one call per reported search");
-    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))));
-    // Searches have no listed price: ¥0.22 for the image only.
-    assert!((usages(&evs)[0].cost_usd.unwrap() - 0.22 / 7.0).abs() < 1e-12);
-}
-
-/// "如果为 0 表示未搜索": no call, a note.
-#[test]
-fn a_search_that_did_not_run() {
-    let v = json!({
-        "model": LITE_ID, "created": 1757321139,
-        "data": [{"b64_json": b64(PNG), "size": "3104x1312"}],
-        "tools": [{"type": "web_search"}],
-        "usage": {"generated_images": 1, "output_tokens": 15912, "total_tokens": 15912, "tool_usage": {"web_search": 0}}
-    });
-    let mut p = parser_for(LITE_ID, json!({"output_format": "png", "tools": [{"type": "web_search"}]}));
-    let evs = p.response(&v).unwrap();
-    assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Tool(_))));
-    assert!(evs.iter().any(|e| matches!(e, StreamEvent::Notice(n) if n == "no web search ran (the model decides)")));
-    assert!(evs.iter().any(|e| matches!(e, StreamEvent::Image { .. })));
-}
-
-#[test]
 fn prices_by_pixels_and_inputs() {
     let pro = spec(PRO).unwrap();
     assert!((cost_cny(pro, 0, &[(1536, 1536)], 1) - 0.30).abs() < 1e-12);
@@ -505,8 +405,10 @@ fn prices_by_pixels_and_inputs() {
     assert!((cost_cny(s55, 2, &[(1424, 800)], 1) - 0.23).abs() < 1e-12);
     // Generated images without a reported size: the highest price.
     assert!((cost_cny(s55, 0, &[], 1) - 0.23).abs() < 1e-12);
-    assert!((cost_cny(spec(S40).unwrap(), 0, &[(4096, 4096)], 3) - 0.60).abs() < 1e-12);
-    assert_eq!(cost_cny(spec(FLASH).unwrap(), 5, &[], 0), 0.0);
+    // 5.0 flash: one price for every size, input images free.
+    let flash = spec(FLASH).unwrap();
+    assert!((cost_cny(flash, 3, &[(2048, 2048)], 1) - 0.12).abs() < 1e-12);
+    assert_eq!(cost_cny(flash, 5, &[], 0), 0.0);
 }
 
 // ------------------------------------------------------------------ HTTP (local fake server)
@@ -567,7 +469,7 @@ async fn exchange(
 }
 
 #[tokio::test]
-async fn end_to_end_whole_and_streamed() {
+async fn end_to_end() {
     let body = json!({
         "model": S55, "created": 1757321139,
         "data": [{"b64_json": b64(PNG), "size": "1424x800"}],
@@ -581,20 +483,6 @@ async fn end_to_end_whole_and_streamed() {
     assert_eq!(r.unwrap()["usage"]["generated_images"], 1);
     assert!(evs.iter().any(|e| matches!(e, StreamEvent::Image { data, .. } if data == PNG)));
     assert!((usages(&evs)[0].cost_usd.unwrap() - 0.13 / 7.0).abs() < 1e-12);
-
-    let sse: String = [
-        json!({"type": "image_generation.partial_succeeded", "model": S45, "created": 1, "image_index": 0, "b64_json": b64(JPEG), "size": "4096x4096"}),
-        json!({"type": "image_generation.completed", "model": S45, "created": 2, "usage": {"generated_images": 1, "output_tokens": 65536, "total_tokens": 65536}}),
-    ]
-    .iter()
-    .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
-    .chain(std::iter::once("data: [DONE]\n\n".to_string()))
-    .collect();
-    let (r, _, evs, _, sent) = exchange(200, "text/event-stream", sse, S45, &[]).await;
-    assert_eq!(sent["stream"], true);
-    assert!(r.is_ok());
-    assert!(evs.iter().any(|e| matches!(e, StreamEvent::Image { mime, .. } if mime == "image/jpeg")));
-    assert!((usages(&evs)[0].cost_usd.unwrap() - 0.25 / 7.0).abs() < 1e-12);
 
     // An HTTP error, verbatim and classified.
     let err = r#"{"error":{"code":"InputTextSensitiveContentDetected","message":"The request failed because the input text may contain sensitive information.","param":"","type":"BadRequest"}}"#;

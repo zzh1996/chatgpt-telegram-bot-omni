@@ -193,8 +193,6 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec { id: "glm-4.7-flashx", prices: &[flat(0.5, 3.0, 0.1)], ..TEXT },
     ModelSpec { id: "glm-4.7-flash", prices: &[FREE], ..TEXT },
-    // Not on the CN price list.
-    ModelSpec { id: "glm-4.6", ..TEXT },
     ModelSpec {
         id: "glm-4.6v",
         context: 131_072,
@@ -217,8 +215,6 @@ pub const MODELS: &[ModelSpec] = &[
         prices: &[short_reply(0.8, 2.0, 0.16), short(0.8, 6.0, 0.16), flat(1.2, 8.0, 0.24)],
         ..TEXT
     },
-    // Not on the CN price list.
-    ModelSpec { id: "glm-4.5-airx", context: 131_072, max_output: 98_304, ..TEXT },
     ModelSpec { id: "glm-4.5-flash", context: 131_072, max_output: 98_304, prices: &[FREE], ..TEXT },
 ];
 
@@ -288,6 +284,9 @@ impl Provider for Zhipu {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         if images::is_image_model(input.model) {
             return images::prepare(&self.cfg, input, presets).await;
         }
@@ -399,7 +398,7 @@ impl Provider for Zhipu {
         let mut warnings = Vec::new();
         // This model's own answers are replayed (text and reasoning); other turns go as their text.
         let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
-        warnings.extend(crate::provider::unsent_media(input.history, own));
+        crate::provider::unsent_media(input.history, own)?;
         match spec {
             None => warnings.push(format!(
                 "`{model}` is not in the bot's Zhipu model table: limits, price and reasoning options unknown \
@@ -538,15 +537,9 @@ async fn data_url(blobs: &dyn BlobLoader, blob: &omni_core::BlobRef) -> Result<S
 }
 
 /// A text file inlined as a separate text part.
-async fn inline_text(
-    blobs: &dyn BlobLoader,
-    blob: &omni_core::BlobRef,
-    name: &str,
-    notes: &mut Vec<String>,
-) -> Result<Value, LlmError> {
+async fn inline_text(blobs: &dyn BlobLoader, blob: &omni_core::BlobRef, name: &str) -> Result<Value, LlmError> {
     let text = String::from_utf8(provider::load(blobs, blob).await?)
         .map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
-    notes.push(format!("📎 {name} inlined as a separate text part by the bot (no native text-file input on this API)"));
     Ok(json!({"type": "text", "text": text}))
 }
 
@@ -564,7 +557,7 @@ async fn chat_messages(
 ) -> Result<(Vec<Value>, Vec<String>), LlmError> {
     // Unknown ids: media go natively and the API judges (text files are inlined).
     let (image, video, file) = spec.map_or((true, true, false), |s| (s.image, s.video, s.file));
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     let mut out = Vec::with_capacity(history.len());
     for turn in history {
         match turn.role {
@@ -640,7 +633,7 @@ async fn chat_messages(
                             content.push(file_part(data_url(blobs, blob).await?, name));
                         }
                         // No text-file input on this model: inlined verbatim as a separate part.
-                        MediaClass::Text => content.push(inline_text(blobs, blob, name, &mut notes).await?),
+                        MediaClass::Text => content.push(inline_text(blobs, blob, name).await?),
                         MediaClass::Audio => return Err(no_input(model, "audio", name, spec)),
                         MediaClass::Other => {
                             return Err(LlmError::request(format!("unsupported file type {mime} ({name})")));
@@ -1057,21 +1050,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_models_get_the_platform_defaults() {
+    async fn models_outside_the_table_are_not_supported() {
+        // Unknown ids, and those without a price on Zhipu's CN price list (glm-4.6, glm-4.5-airx):
+        // the cost cannot be known, so they are not supported, whatever the options.
         let h = vec![Turn::user_text("hi")];
-        let p = prepare("glm-6", &[], &h).await.unwrap();
-        for k in ["thinking", "reasoning_effort", "max_tokens"] {
-            assert!(p.body.get(k).is_none(), "{k}");
+        for id in ["glm-6", "glm-4.6", "glm-4.5-airx"] {
+            for opts in [&[][..], &[kv("e", "high"), flag("s")]] {
+                let e = prepare(id, opts, &h).await.unwrap_err();
+                assert_eq!(
+                    e.message,
+                    format!(
+                        "`{id}` is not in the bot's Zhipu BigModel model table (its price is unknown), so it is not \
+                         supported"
+                    )
+                );
+            }
+            assert!(!zp().knows(id), "{id}");
         }
-        assert_eq!(p.settings, vec!["reasoning: Zhipu's default"]);
-        assert!(p.warnings[0].contains("not in the bot's Zhipu model table"), "{:?}", p.warnings);
-        let p = prepare("glm-6", &[kv("e", "high"), flag("s")], &h).await.unwrap();
-        assert_eq!(p.body["thinking"], json!({"type": "enabled"}));
-        assert_eq!(p.body["reasoning_effort"], "high");
-        assert!(p.body.get("tools").is_some());
-        let p = prepare("glm-4.6", &[], &h).await.unwrap();
-        assert!(p.warnings[0].contains("not on Zhipu's CN price list"), "{:?}", p.warnings);
-        assert!(zp().knows("glm-5.3-flashx-legal") && !zp().knows("glm-6"));
+        assert!(zp().knows("glm-5.3-flashx-legal"));
     }
 
     #[tokio::test]
@@ -1149,10 +1145,7 @@ mod tests {
         );
         assert_eq!(c[4]["file"]["filename"], "notes.txt");
         assert_eq!(c[5], json!({"type": "text", "text": "print(1)"}));
-        assert_eq!(
-            p.notes,
-            vec!["📎 x.py inlined as a separate text part by the bot (no native text-file input on this API)"]
-        );
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
         // GLM-5.3 is text only: text files are inlined, media rejected.
         let p = run("glm-5.3", user(vec![Part::text("x"), file(&txt, "notes.txt")])).await.unwrap();
         assert_eq!(p.body["messages"][0]["content"][1], json!({"type": "text", "text": "notes"}));
@@ -1540,7 +1533,8 @@ mod tests {
         assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Notice(_))));
     }
 
-    /// Media other models generated in earlier turns: assistant messages carry text only.
+    /// Media other models generated in earlier turns: assistant messages carry
+    /// text only, so the request is refused.
     #[tokio::test]
     async fn generated_media_of_other_models_are_not_sent() {
         let png = BlobRef::for_bytes(b"\x89PNG", "image/png");
@@ -1555,15 +1549,17 @@ mod tests {
             ],
             native: None,
         };
-        let h = vec![Turn::user_text("make"), earlier, Turn::user_text("summarize")];
-        let p = prepare("glm-5.3", &[], &h).await.unwrap();
+        let h = vec![Turn::user_text("make"), earlier.clone(), Turn::user_text("summarize")];
+        let e = prepare("glm-5.3", &[], &h).await.unwrap_err();
         assert_eq!(
-            p.warnings,
-            vec![
-                "1 image and 1 file generated in an earlier turn were not sent: assistant messages here carry text only"
-            ]
+            e.message,
+            "1 image and 1 file generated in an earlier turn cannot be sent: assistant messages here carry text only"
         );
+        // The answer's text alone goes as an assistant message.
+        let text = Turn { parts: vec![Part::text("Done:")], ..earlier };
+        let p = prepare("glm-5.3", &[], &[Turn::user_text("make"), text, Turn::user_text("summarize")]).await.unwrap();
         assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Done:"}));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[tokio::test]

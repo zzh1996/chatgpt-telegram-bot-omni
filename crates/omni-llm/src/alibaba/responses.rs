@@ -45,7 +45,6 @@ pub(super) async fn input_items(
     spec: &ModelSpec,
     why: &str,
     blobs: &dyn BlobLoader,
-    notes: &mut Vec<String>,
 ) -> Result<(Vec<Value>, bool), LlmError> {
     let mut out = Vec::with_capacity(history.len());
     let mut images = false;
@@ -58,7 +57,7 @@ pub(super) async fn input_items(
             Role::Assistant => out.extend(assistant_items(turn, model)),
             Role::User => {
                 let mut parts = Vec::new();
-                for c in super::user_content(turn, model, Some(spec), blobs, notes).await? {
+                for c in super::user_content(turn, model, Some(spec), blobs).await? {
                     parts.push(match c {
                         Content::Text(t) => json!({"type": "input_text", "text": t}),
                         Content::Image(u) => {

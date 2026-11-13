@@ -187,8 +187,12 @@ impl App {
 
     /// Whether a provider exists in this deployment (a platform's own API only
     /// when it has a key).
+    /// A provider exists only with an API key (D43): OpenRouter too.
     pub fn provider_enabled(&self, provider: &str) -> bool {
-        provider == "openrouter" || self.direct.contains_key(provider)
+        match provider {
+            "openrouter" => self.cfg.providers.openrouter.as_ref().is_some_and(|c| !c.api_key.trim().is_empty()),
+            id => self.direct.contains_key(id),
+        }
     }
 
     /// Total output budget of a long-decode answer (Gemini 4) on `provider`.
@@ -273,11 +277,24 @@ impl App {
         if provider == "openrouter" && !model.contains('/') {
             return Ok(None);
         }
-        if model.is_empty()
-            || !self.provider_enabled(&provider)
-            || !bot.serves(&format!("{provider}:{model}"))
-            || !via_alias && !self.unlisted_models_allowed(&provider)
-        {
+        if model.is_empty() || !bot.serves(&format!("{provider}:{model}")) {
+            return Ok(None);
+        }
+        if !self.provider_enabled(&provider) {
+            // This bot would serve it, but the platform has no API key here: a prefix
+            // of this bot or a platform named explicitly gets an error, never silence.
+            // (A bare `author/model` in a group may be ordinary text: ignored there.)
+            if via_alias || provider != "openrouter" || !strict {
+                let name = omni_llm::provider::info(&provider).map(|i| i.name).unwrap_or("OpenRouter");
+                return Err(format!(
+                    "`{}{}` is not available: {name} is not configured on this bot (no API key)",
+                    token.raw,
+                    self.marker()
+                ));
+            }
+            return Ok(None);
+        }
+        if !via_alias && !self.unlisted_models_allowed(&provider) {
             return Ok(None);
         }
         // Strict mode never blocks on the network (it runs in the update loop):
@@ -286,8 +303,9 @@ impl App {
             self.refresh_catalog_soon();
             return Ok(None);
         }
-        // A model id typed directly in a group must be in the provider's model table.
-        if strict && !via_alias && self.direct(&provider).is_some_and(|p| !p.knows(&model)) {
+        // A platform's model must be in its model table (anywhere, also through a
+        // prefix): the bot cannot know the price of anything else (owner's rule).
+        if self.direct(&provider).is_some_and(|p| !p.knows(&model)) {
             return Ok(None);
         }
         if label.contains(':') && label == model_token {

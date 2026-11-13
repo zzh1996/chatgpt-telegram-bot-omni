@@ -121,9 +121,6 @@ pub const MODELS: &[ModelSpec] = &[
         peak: cny(9.0, 0.30, 27.0),
         ..FLASH
     },
-    // Legacy names, still accepted: served by V4.1-Flash-1017 at the Flash price.
-    ModelSpec { id: "deepseek-v4-flash", ..FLASH },
-    ModelSpec { id: "deepseek-v4-flash-vision-exp", ..FLASH },
 ];
 
 pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
@@ -200,6 +197,9 @@ impl Provider for DeepSeek {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         let user = request::parse(input.options).map_err(LlmError::request)?;
         let mut req = Requested::default();
         for p in presets {
@@ -236,15 +236,17 @@ impl Provider for DeepSeek {
         let mut warnings = Vec::new();
         let (mut body, url, dialect, notes) = if search {
             let (system, msgs, notes) = messages_request(input.history, model, blobs).await?;
-            // Answers that go back as text: what they generated is not sent.
+            // Answers that go back as text: what they generated cannot go along (an error).
             let as_text = input.history.iter().filter(|t| {
                 t.role == Role::Assistant
                     && !t.native.as_ref().is_some_and(|n| n.dialect == MESSAGES_DIALECT && n.model == model)
             });
-            warnings.extend(crate::anthropic::history::media_not_sent(
+            if let Some(why) = crate::anthropic::history::media_not_sent(
                 as_text,
                 "the assistant messages of DeepSeek's Anthropic-compatible API carry text only",
-            ));
+            ) {
+                return Err(LlmError::request(why));
+            }
             let mut body = json!({"model": model, "messages": msgs, "stream": true});
             if let Some(s) = system {
                 body["system"] = s;
@@ -280,7 +282,7 @@ impl Provider for DeepSeek {
         if dialect == DIALECT {
             // This model's own Chat answers are replayed; other turns go as their text.
             let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
-            warnings.extend(crate::provider::unsent_media(input.history, own));
+            crate::provider::unsent_media(input.history, own)?;
         }
         if spec.is_none() {
             warnings.push(format!(
@@ -290,10 +292,10 @@ impl Provider for DeepSeek {
             ));
         }
         if beijing_now().0 > CN_HOLIDAYS_UNTIL {
-            warnings.push(format!(
-                "The bot's calendar of Chinese public holidays ends with {CN_HOLIDAYS_UNTIL}: holidays on weekdays \
-                 are estimated at DeepSeek's peak price"
-            ));
+            tracing::warn!(
+                "the calendar of Chinese public holidays ends with {CN_HOLIDAYS_UNTIL}: weekday holidays are priced at \
+                 DeepSeek's peak rate; extend the calendar"
+            );
         }
         Ok(Prepared {
             dialect,
@@ -419,12 +421,10 @@ async fn inline_text(
     blobs: &dyn BlobLoader,
     blob: &omni_core::BlobRef,
     filename: &Option<String>,
-    notes: &mut Vec<String>,
 ) -> Result<Value, LlmError> {
     let name = file_name(filename);
     let text = String::from_utf8(provider::load(blobs, blob).await?)
         .map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
-    notes.push(format!("📎 {name} inlined as a separate text part by the bot (no native text-file input on this API)"));
     Ok(json!({"type": "text", "text": text}))
 }
 
@@ -466,7 +466,7 @@ async fn chat_messages(
 ) -> Result<(Vec<Value>, Vec<String>), LlmError> {
     // Unknown ids: let the API decide about images.
     let vision = spec.is_none_or(|s| s.vision);
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     let mut out = Vec::with_capacity(history.len());
     for turn in history {
         match turn.role {
@@ -492,7 +492,7 @@ async fn chat_messages(
                             MediaClass::Image => {
                                 content.push(image_part(model, vision, blob, file_name(filename), blobs).await?)
                             }
-                            MediaClass::Text => content.push(inline_text(blobs, blob, filename, &mut notes).await?),
+                            MediaClass::Text => content.push(inline_text(blobs, blob, filename).await?),
                             MediaClass::Pdf => return Err(no_media(model, "PDF", file_name(filename), vision)),
                             _ => return Err(no_media(model, &blob.mime, file_name(filename), vision)),
                         },
@@ -528,7 +528,7 @@ async fn messages_request(
     model: &str,
     blobs: &dyn BlobLoader,
 ) -> Result<(Option<Value>, Vec<Value>, Vec<String>), LlmError> {
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     let mut system = Vec::new();
     let mut out = Vec::with_capacity(history.len());
     for turn in history {
@@ -564,7 +564,7 @@ async fn messages_request(
                             content.push(image_part(model, false, blob, file_name(filename), blobs).await?)
                         }
                         Part::File { blob, filename, .. } => match classify_mime(&blob.mime, filename.as_deref()) {
-                            MediaClass::Text => content.push(inline_text(blobs, blob, filename, &mut notes).await?),
+                            MediaClass::Text => content.push(inline_text(blobs, blob, filename).await?),
                             MediaClass::Image => {
                                 content.push(image_part(model, false, blob, file_name(filename), blobs).await?)
                             }
@@ -1098,17 +1098,14 @@ mod tests {
         let h = turn(vec![Part::Image { blob: bmp, filename: None, generated: false, dims: None, thought: false }]);
         let e = ds().prepare(&input("deepseek-flash", &[], &h), &[], &blobs).await.unwrap_err();
         assert!(e.message.contains("not image/bmp"), "{}", e.message);
-        // Text files are inlined as their own part, with a note.
+        // Text files are inlined as their own part.
         let h = turn(vec![
             Part::text("review"),
             Part::File { blob: txt.clone(), filename: Some("main.rs".into()), generated: false },
         ]);
         let p = ds().prepare(&input("deepseek-v4-pro", &[], &h), &[], &blobs).await.unwrap();
         assert_eq!(p.body["messages"][0]["content"][1], json!({"type": "text", "text": "fn main() {}"}));
-        assert_eq!(
-            p.notes,
-            vec!["📎 main.rs inlined as a separate text part by the bot (no native text-file input on this API)"]
-        );
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
         let h = turn(vec![Part::File { blob: pdf, filename: Some("a.pdf".into()), generated: false }]);
         let e = ds().prepare(&input("deepseek-flash", &[], &h), &[], &blobs).await.unwrap_err();
         assert!(e.message.contains("does not take PDF input via DeepSeek (a.pdf)"), "{}", e.message);
@@ -1118,7 +1115,8 @@ mod tests {
         assert!(e.message.contains("does not take a location via DeepSeek"), "{}", e.message);
     }
 
-    /// Media other models generated in earlier turns: Chat assistant messages carry text only.
+    /// Media other models generated in earlier turns: Chat assistant messages
+    /// carry text only, so the request is refused.
     #[tokio::test]
     async fn generated_media_of_other_models_are_not_sent() {
         let png = BlobRef::for_bytes(b"\x89PNG", "image/png");
@@ -1141,19 +1139,23 @@ mod tests {
                 context_tokens: None,
             }),
         };
-        let h = vec![Turn::user_text("draw"), earlier, Turn::user_text("which is better?")];
-        let p = prepare("deepseek-flash", &[], &h).await.unwrap();
+        let h = vec![Turn::user_text("draw"), earlier.clone(), Turn::user_text("which is better?")];
+        let e = prepare("deepseek-flash", &[], &h).await.unwrap_err();
         assert_eq!(
-            p.warnings,
-            vec![
-                "2 images and 1 audio file generated in an earlier turn were not sent: assistant messages here carry text only"
-            ]
+            e.message,
+            "2 images and 1 audio file generated in an earlier turn cannot be sent: assistant messages here carry text only"
         );
+        // Its text alone goes as an assistant message.
+        let text = Turn { parts: vec![Part::text("Here:")], ..earlier };
+        let p = prepare("deepseek-flash", &[], &[Turn::user_text("draw"), text, Turn::user_text("which is better?")])
+            .await
+            .unwrap();
         assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here:"}));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[tokio::test]
-    async fn budget_and_unknown_models() {
+    async fn budget_and_models_outside_the_table() {
         // A long conversation leaves less room in the context.
         let h = vec![Turn::user_text("字".repeat(800_000))];
         let p = prepare("deepseek-flash", &[], &h).await.unwrap();
@@ -1165,11 +1167,17 @@ mod tests {
         i.max_tokens_override = Some(5_000);
         let p = ds().prepare(&i, &[], &Blobs(vec![])).await.unwrap();
         assert_eq!(p.body["max_tokens"], 5_000);
-        // Unknown ids are allowed, with a warning.
-        let p = prepare("deepseek-v5", &[], &h).await.unwrap();
-        assert_eq!(p.body["max_tokens"], 393_216);
-        assert!(p.warnings.iter().any(|w| w.contains("not in the bot's DeepSeek model table")), "{:?}", p.warnings);
-        assert!(!ds().knows("deepseek-v5") && ds().knows("deepseek-v4-flash-vision-exp"));
+        // Ids outside the table (newer ones, the legacy names) are not supported: their price is unknown.
+        for id in ["deepseek-v5", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"] {
+            let e = prepare(id, &[], &h).await.unwrap_err();
+            assert_eq!(
+                e.message,
+                format!(
+                    "`{id}` is not in the bot's DeepSeek model table (its price is unknown), so it is not supported"
+                )
+            );
+            assert!(!ds().knows(id), "{id}");
+        }
     }
 
     fn feed(p: &mut impl EventParser, chunks: &[Value]) -> Result<Vec<StreamEvent>, LlmError> {
@@ -1385,7 +1393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_of_other_answers_is_a_warning_on_messages() {
+    async fn media_of_other_answers_is_an_error_on_messages() {
         let png = BlobRef::for_bytes(b"\x89PNG", "image/png");
         let answer = Turn {
             role: Role::Assistant,
@@ -1396,16 +1404,19 @@ mod tests {
             ],
             native: None,
         };
-        let h = vec![Turn::user_text("chart"), answer, Turn::user_text("latest numbers?")];
+        let h = vec![Turn::user_text("chart"), answer.clone(), Turn::user_text("latest numbers?")];
+        let e = prepare("deepseek-v4-pro", &[flag("s")], &h).await.unwrap_err();
+        assert_eq!(
+            e.message,
+            "1 image generated in an earlier turn cannot be sent: the assistant messages of DeepSeek's \
+             Anthropic-compatible API carry text only"
+        );
+        // Its text alone goes as an assistant message.
+        let text = Turn { parts: vec![Part::text("Here is the chart.")], ..answer };
+        let h = vec![Turn::user_text("chart"), text, Turn::user_text("latest numbers?")];
         let p = prepare("deepseek-v4-pro", &[flag("s")], &h).await.unwrap();
         assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "Here is the chart."}));
-        assert_eq!(
-            p.warnings,
-            vec![
-                "1 image generated in an earlier turn was not sent: the assistant messages of DeepSeek's \
-                 Anthropic-compatible API carry text only"
-            ]
-        );
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[test]
@@ -1436,7 +1447,8 @@ mod tests {
         };
         // 0.6M × 1 + 0.4M × 0.02 + 0.1M × 4 CNY = 1.008 CNY
         assert!((estimate_cost("deepseek-flash", &u, false, 7.0).unwrap() - 1.008 / 7.0).abs() < 1e-12);
-        assert!((estimate_cost("deepseek-v4-flash", &u, true, 7.0).unwrap() - 2.016 / 7.0).abs() < 1e-12);
+        // Peak hours: twice as much.
+        assert!((estimate_cost("deepseek-flash", &u, true, 7.0).unwrap() - 2.016 / 7.0).abs() < 1e-12);
         assert!(estimate_cost("deepseek-v5", &u, false, 7.0).is_none());
     }
 
@@ -1482,9 +1494,9 @@ mod tests {
     fn model_table() {
         assert_eq!(model_spec("deepseek-v4-pro").unwrap().serves, "DeepSeek-V4-Pro-0813");
         assert_eq!(model_spec("deepseek-flash").unwrap().serves, "DeepSeek-V4.1-Flash-1017");
+        // The legacy names (served by V4.1-Flash) are not in the table.
         for legacy in ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"] {
-            let s = model_spec(legacy).unwrap();
-            assert_eq!((s.serves, s.vision, s.off_peak), (FLASH.serves, true, FLASH.off_peak));
+            assert!(model_spec(legacy).is_none(), "{legacy}");
         }
         assert!(model_spec("deepseek-chat").is_none(), "retired 2026-07-24");
         assert!(MODELS.iter().all(|m| m.peak.output == 2.0 * m.off_peak.output));

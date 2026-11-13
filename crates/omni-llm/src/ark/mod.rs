@@ -27,10 +27,12 @@
 //!   (`service_status.model_fallback`) are read from the response envelope by
 //!   [`crate::meta`].
 //!
-//! Seedream image models (`doubao-seedream-…`) have no chat API: their ids go to
-//! Ark's image API ([`images`]).
+//! Seedream image models (`doubao-seedream-…`) and Seedance video models
+//! (`doubao-seedance-…`) have no chat API: their ids go to Ark's image API
+//! ([`images`]) and video generation API ([`video`]).
 
 pub mod images;
+pub mod video;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -239,7 +241,7 @@ impl Ark {
         let mut warnings = Vec::new();
         // This model's own answers are replayed (with their reasoning); other turns go as their text.
         let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == input.model);
-        warnings.extend(crate::provider::unsent_media(input.history, own));
+        crate::provider::unsent_media(input.history, own)?;
         if model_spec(input.model).is_none() {
             warnings.push(format!(
                 "`{}` is not in the bot's Ark model table: limits and price unknown (max_tokens {}; cost not estimated)",
@@ -307,7 +309,7 @@ impl crate::provider::Provider for Ark {
         "Volcengine Ark"
     }
     fn knows(&self, model: &str) -> bool {
-        model_spec(model).is_some() || images::spec(model).is_some()
+        model_spec(model).is_some() || images::spec(model).is_some() || video::spec(model).is_some()
     }
     async fn prepare(
         &self,
@@ -315,8 +317,14 @@ impl crate::provider::Provider for Ark {
         presets: &[crate::request::Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         if images::is_image_model(input.model) {
             return images::prepare(&self.cfg, input, presets, blobs).await;
+        }
+        if video::is_video_model(input.model) {
+            return video::prepare(&self.cfg, input, presets, blobs).await;
         }
         self.prepare_chat(input, presets, blobs).await
     }
@@ -329,6 +337,9 @@ impl crate::provider::Provider for Ark {
     ) -> (Result<Value, LlmError>, CallOutcome) {
         if p.dialect == images::DIALECT {
             return images::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
+        }
+        if p.dialect == video::DIALECT {
+            return video::stream(&self.http, &self.cfg, p, sink, observer, cancel).await;
         }
         self.stream_chat(p, sink, observer, cancel).await
     }
@@ -744,7 +755,7 @@ mod tests {
                 context_tokens: None,
             }),
         };
-        let history = vec![Turn::user_text("画猫"), earlier, Turn::user_text("描述一下")];
+        let history = vec![Turn::user_text("画猫"), earlier.clone(), Turn::user_text("描述一下")];
         let input = CallInput {
             model: MODEL,
             options: &[],
@@ -754,11 +765,17 @@ mod tests {
             known_context: None,
             max_tokens_override: None,
         };
-        let p = ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap();
+        // Assistant messages carry text only: the image cannot go along, which refuses the request.
+        let e = ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap_err();
         assert_eq!(
-            p.warnings,
-            vec!["1 image generated in an earlier turn was not sent: assistant messages here carry text only"]
+            e.message,
+            "1 image generated in an earlier turn cannot be sent: assistant messages here carry text only"
         );
+        // The answer's text alone goes as an assistant message.
+        let text_only = Turn { parts: vec![Part::text("画好了")], ..earlier };
+        let history = vec![Turn::user_text("画猫"), text_only, Turn::user_text("描述一下")];
+        let p = ark().prepare_chat(&CallInput { history: &history, ..input }, &[], &NoBlobs).await.unwrap();
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         assert_eq!(p.body["messages"][1], json!({"role": "assistant", "content": "画好了"}));
     }
 

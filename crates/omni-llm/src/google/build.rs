@@ -252,11 +252,9 @@ pub async fn prepare(
         });
     }
     if maps && conv.media.multimodal() {
-        warnings.push(
-            "Google documents that Grounding with Google Maps does not support multimodal inputs beyond text; \
-             this request has media"
-                .to_string(),
-        );
+        return Err(LlmError::request(
+            "Google Maps grounding (`+m`) takes text only (Google's documentation): this conversation has media",
+        ));
     }
 
     if spec.image_out.is_some() {

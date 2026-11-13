@@ -135,16 +135,20 @@ pub(crate) async fn convert_history(
             }
         }
     }
-    c.warnings = unsent.warnings();
+    // Media of earlier answers the API cannot take refuse the request (owner's rule:
+    // content a model cannot take is an error, never dropped).
+    if let Some(why) = unsent.message() {
+        return Err(LlmError::request(why));
+    }
     Ok(c)
 }
 
-/// What media of earlier answers were not sent, by reason (warnings).
+/// What media of earlier answers cannot be sent, by reason.
 #[derive(Debug, Default)]
 struct Unsent(Vec<(&'static str, [usize; 4])>);
 
 impl Unsent {
-    /// One medium (`kind`: image, video, audio, other file) not sent, and why.
+    /// One medium (`kind`: image, video, audio, other file) that cannot be sent, and why.
     fn add(&mut self, kind: usize, why: &'static str) {
         match self.0.iter_mut().find(|(w, _)| *w == why) {
             Some((_, n)) => n[kind] += 1,
@@ -156,7 +160,8 @@ impl Unsent {
         }
     }
 
-    fn warnings(&self) -> Vec<String> {
+    /// The error message, when anything cannot be sent.
+    fn message(&self) -> Option<String> {
         const NAMES: [(&str, &str); 4] =
             [("image", "images"), ("video", "videos"), ("audio file", "audio files"), ("file", "files")];
         self.0
@@ -173,10 +178,9 @@ impl Unsent {
                     Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
                     None => String::new(),
                 };
-                let verb = if n.iter().sum::<usize>() == 1 { "was" } else { "were" };
-                format!("{list} from earlier answers {verb} not sent: {why}")
+                format!("{list} from earlier answers cannot be sent: {why}")
             })
-            .collect()
+            .reduce(|a, b| format!("{a}; {b}"))
     }
 }
 
@@ -679,9 +683,6 @@ async fn openai_file(
             let bytes = provider::load(blobs, blob).await?;
             let text =
                 String::from_utf8(bytes).map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
-            c.notes.push(format!(
-                "📎 {name} inlined as a separate text part by the bot (OpenAI's input_file does not take this file type)"
-            ));
             content.push(json!({"type": "input_text", "text": text}));
         }
         None => {
@@ -1250,10 +1251,7 @@ impl Parser {
                     .and_then(Value::as_u64)
                     .filter(|n| *n > 0)
                 {
-                    evs.push(StreamEvent::Notice(format!(
-                        "📎 xAI searched the attached files with its attachment_search tool ({n} search{}, billed per call)",
-                        if n == 1 { "" } else { "es" }
-                    )));
+                    evs.push(StreamEvent::Notice(format!("📎 xAI searched the attached files (×{n})")));
                 }
             }
             evs.push(StreamEvent::Usage(self.usage(r, u)));
@@ -1662,13 +1660,12 @@ pub(crate) mod tests {
                 .unwrap()
                 .starts_with("data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,")
         );
-        // A text type input_file does not list: inlined, with the note.
+        // A text type input_file does not list: inlined as its own part.
         assert_eq!(content[4], json!({"type": "input_text", "text": "<template/>"}));
         assert_eq!(content[5]["type"], "input_image");
         assert_eq!(content[5]["detail"], "high");
         assert!(content[5]["image_url"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
-        assert_eq!(c.notes.len(), 1);
-        assert!(c.notes[0].starts_with("📎 App.vue inlined as a separate text part by the bot"), "{}", c.notes[0]);
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
         assert_eq!((c.images, c.pdfs, c.files), (1, 1, 3));
         assert_eq!(openai_file_mime("text/x-R", None).as_deref(), Some("text/x-r"));
         assert_eq!(openai_file_mime("application/octet-stream", Some("Makefile")).as_deref(), Some("text/x-makefile"));

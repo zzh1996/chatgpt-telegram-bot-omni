@@ -20,8 +20,8 @@
 //!   window, so it never causes a context overflow.
 //! - `reasoning_content` is replayed verbatim for the same model (required
 //!   on K3: Preserved Thinking is always on). Other assistant turns go as their
-//!   text: media other models generated there are not sent (a warning says
-//!   what; Moonshot describes its image and video parts as "用于多模态输入",
+//!   text: media other models generated there cannot go along, which is an
+//!   error (Moonshot describes its image and video parts as "用于多模态输入",
 //!   for input).
 //! - Only `data: [DONE]` ends a Chat stream ("do not use finish_reason",
 //!   Moonshot's streaming guide).
@@ -59,9 +59,6 @@ pub const WEB_SEARCH_CNY: f64 = 0.03;
 /// A `+s` answer without a `web_search_call`: Moonshot judged that the input
 /// needs no search (platform.kimi.com/docs/api/responses, 2026-11-13).
 const NO_SEARCH: &str = "no web search ran (Moonshot decides from the input whether to search)";
-/// Shown with every `+s` answer (Moonshot's K3.1 Pro guide, 2026-11-12).
-const SEARCH_NOTE: &str =
-    "Moonshot says its web search \"is being updated, not recommended for production workflows in the near term\"";
 
 /// How a model thinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,17 +90,12 @@ const fn cny(input: f64, cached_input: f64, cache_write: f64, output: f64) -> To
 }
 
 const K3_WINDOW: u64 = 1_048_576;
-const K2_WINDOW: u64 = 262_144;
 
 /// Kimi models of the China site: platform.kimi.com/docs `models`, `pricing/chat`,
 /// `api/models-overview`, `api/chat` (fetched 2026-11-12).
 /// - K3 series: 1,048,576-token window; `max_completion_tokens` default 131,072,
 ///   up to 1,048,576. Cache writes are billed: 5 min = the input price (1 h =
 ///   2×, never requested by the bot).
-/// - K2 series: 262,144-token window; no output maximum is documented, so the
-///   window is the limit (Moonshot lowers the budget to what fits); no
-///   cache-write charge (written tokens cost the input price). Closed to
-///   accounts registered from 2026-11-01, retired at the end of 2026-12.
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "kimi-k3.1-pro",
@@ -128,30 +120,6 @@ pub const MODELS: &[ModelSpec] = &[
         thinking: Thinking::Effort,
         responses: true,
         price: cny(20.0, 2.0, 20.0, 100.0),
-    },
-    ModelSpec {
-        id: "kimi-k2.7-code",
-        context: K2_WINDOW,
-        max_output: K2_WINDOW,
-        thinking: Thinking::Always,
-        responses: false,
-        price: cny(6.5, 1.3, 6.5, 27.0),
-    },
-    ModelSpec {
-        id: "kimi-k2.7-code-highspeed",
-        context: K2_WINDOW,
-        max_output: K2_WINDOW,
-        thinking: Thinking::Always,
-        responses: false,
-        price: cny(13.0, 2.6, 13.0, 54.0),
-    },
-    ModelSpec {
-        id: "kimi-k2.6",
-        context: K2_WINDOW,
-        max_output: K2_WINDOW,
-        thinking: Thinking::Switch,
-        responses: false,
-        price: cny(6.5, 1.1, 6.5, 27.0),
     },
 ];
 
@@ -306,19 +274,19 @@ impl Moonshot {
             None => {}
         }
         let search = req.tools.contains(&Tool::Search);
-        let mut notes = Vec::new();
+        let notes = Vec::new();
         let mut applied = Vec::new();
         let mut settings = Vec::new();
         let auto_max = self.output_budget(input, spec);
         let (dialect, url, mut body) = if search {
-            let items = responses::input_items(input.history, input.model, blobs, &mut notes).await?;
+            let items = responses::input_items(input.history, input.model, blobs).await?;
             let mut body = json!({"model": input.model, "input": items, "stream": true});
             if let Some(n) = auto_max {
                 body["max_output_tokens"] = json!(n);
             }
             (RESPONSES_DIALECT, self.cfg.url("/responses"), body)
         } else {
-            let messages = chat_messages(input.history, input.model, blobs, &mut notes).await?;
+            let messages = chat_messages(input.history, input.model, blobs).await?;
             let mut body = json!({
                 "model": input.model,
                 "messages": messages,
@@ -369,7 +337,6 @@ impl Moonshot {
                 patch: json!({"tools": body["tools"], "include": body["include"]}),
             });
             settings.push("web search".into());
-            notes.push(SEARCH_NOTE.to_string());
         }
         // Moonshot's documented identity / cache-routing fields.
         if let Some(k) = &input.session_id {
@@ -387,7 +354,7 @@ impl Moonshot {
                 .as_ref()
                 .is_some_and(|n| n.model == input.model && [DIALECT, RESPONSES_DIALECT].contains(&n.dialect.as_str()))
         };
-        warnings.extend(crate::provider::unsent_media(input.history, own));
+        crate::provider::unsent_media(input.history, own)?;
         if spec.is_none() {
             warnings.push(format!(
                 "`{}` is not in the bot's Moonshot model table: limits and price unknown (sent without reasoning \
@@ -488,6 +455,9 @@ impl Provider for Moonshot {
         presets: &[Requested],
         blobs: &dyn BlobLoader,
     ) -> Result<Prepared, LlmError> {
+        if !self.knows(input.model) {
+            return Err(crate::provider::not_in_table(self.name(), input.model));
+        }
         self.prepare_request(input, presets, blobs).await
     }
     async fn stream(
@@ -533,12 +503,7 @@ enum Content {
 }
 
 /// The user parts Moonshot takes (images and videos as base64 data URLs).
-async fn user_content(
-    turn: &Turn,
-    model: &str,
-    blobs: &dyn BlobLoader,
-    notes: &mut Vec<String>,
-) -> Result<Vec<Content>, LlmError> {
+async fn user_content(turn: &Turn, model: &str, blobs: &dyn BlobLoader) -> Result<Vec<Content>, LlmError> {
     let mut out = Vec::new();
     for part in &turn.parts {
         match part {
@@ -560,9 +525,6 @@ async fn user_content(
                         let bytes = crate::provider::load(blobs, blob).await?;
                         let text = String::from_utf8(bytes)
                             .map_err(|_| LlmError::request(format!("{name} is not valid UTF-8 text")))?;
-                        notes.push(format!(
-                            "📎 {name} inlined as a separate text part by the bot (no native text-file input on this API)"
-                        ));
                         out.push(Content::Text(text));
                     }
                     MediaClass::Pdf | MediaClass::Document => {
@@ -615,19 +577,14 @@ async fn image(
 }
 
 /// The conversation as Chat Completions `messages`.
-async fn chat_messages(
-    history: &[Turn],
-    model: &str,
-    blobs: &dyn BlobLoader,
-    notes: &mut Vec<String>,
-) -> Result<Vec<Value>, LlmError> {
+async fn chat_messages(history: &[Turn], model: &str, blobs: &dyn BlobLoader) -> Result<Vec<Value>, LlmError> {
     let mut out = Vec::with_capacity(history.len());
     for turn in history {
         match turn.role {
             Role::System => out.push(json!({"role": "system", "content": turn.answer_text()})),
             Role::Assistant => out.push(chat_assistant(turn, model)),
             Role::User => {
-                let content = user_content(turn, model, blobs, notes).await?;
+                let content = user_content(turn, model, blobs).await?;
                 let parts: Vec<Value> = content
                     .into_iter()
                     .map(|c| match c {

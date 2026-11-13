@@ -402,17 +402,15 @@ pub async fn prepare(
     basic.aspect_ratio = None;
     request::validate(model, &basic, &Caps(spec)).map_err(LlmError::request)?;
 
-    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, mut notes } =
+    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, notes } =
         media::media_input(input.history, model, "Zhipu's video API")?;
     if !own_videos.is_empty() {
         return Err(err(format!("`{model}` takes no video input: Zhipu's video API takes a prompt and images")));
     }
     if answer_video.is_some() {
-        notes.push(
-            "ℹ️ the video of the answer replied to is not sent: Zhipu's video models take no video input, so this \
-             message makes a new video"
-                .into(),
-        );
+        return Err(err(format!(
+            "`{model}` takes no video input, so it cannot edit the video replied to: start a new message for a new video"
+        )));
     }
     let chars = prompt.chars().count();
     if chars > PROMPT_CHARS {

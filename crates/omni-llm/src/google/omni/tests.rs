@@ -1,4 +1,4 @@
-//! Gemini Omni tests: requests per option and input, shut-down models, the
+//! Gemini Omni tests: requests per option and input, ids outside the table, the
 //! background job against a local fake Gemini API (shapes of the Interactions
 //! API reference and the Omni guide), errors and cost.
 
@@ -91,7 +91,7 @@ async fn defaults_are_4k_in_the_background() {
     assert!(p.applied.iter().all(|a| a.source == "default"));
     assert!(p.warnings.is_empty() && p.notes.is_empty());
     assert_eq!(p.max_tokens(), None);
-    assert!(google().knows(OMNI) && google().knows("gemini-omni-1.1-flash"));
+    assert!(google().knows(OMNI) && !google().knows("gemini-omni-1.1-flash"));
     assert!(!google().knows("veo-3.1-generate-preview") && !google().knows("gemini-omni-flash-preview"));
     // The chat models stay on generateContent.
     assert_eq!(prep("gemini-3.8-flash", &[]).await.unwrap().dialect, super::super::DIALECT);
@@ -116,7 +116,6 @@ async fn options_map_to_the_response_format() {
     assert!(err(OMNI, &[flag("w")]).await.contains("ratios: 16:9, 9:16"));
     assert!(err(OMNI, &[kv("sec", "16")]).await.contains("videos of 3–15 s (sec=16)"));
     assert!(err(OMNI, &[kv("sec", "2")]).await.contains("3–15 s"));
-    assert!(err("gemini-omni-1.1-flash", &[kv("sec", "15")]).await.contains("3–10 s"));
     for (opt, what) in [
         (kv("q", "high"), "(`q=`)"),
         (kv("n", "2"), "(`n=`)"),
@@ -132,20 +131,27 @@ async fn options_map_to_the_response_format() {
     }
 }
 
+/// Shut-down (Veo, the Omni preview), deprecated (1.1, routed to 1.2) and unknown
+/// ids: their price is unknown to the bot, so they are not supported.
 #[tokio::test]
-async fn shut_down_and_retiring_models() {
-    let e = err("veo-3.1-generate-preview", &[]).await;
-    assert!(e.contains("shut down on 2026-10-22") && e.contains("`google:gemini-omni-1.2-flash`"), "{e}");
-    assert!(err("veo-2.0-generate-001", &[]).await.contains("shut down on 2026-06-30"));
-    assert!(err("gemini-omni-flash-preview", &[]).await.contains("shut down on 2026-10-22"));
-    assert!(err("veo-4.0-generate", &[]).await.contains("Veo on the Gemini API is shut down"));
-    let p = prep("gemini-omni-1.1-flash", &[]).await.unwrap();
-    assert!(p.warnings[0].contains("from 2026-12-03 Google routes it to `gemini-omni-1.2-flash`"), "{:?}", p.warnings);
-    // Unknown Omni ids: only what was asked for.
-    let p = prep("gemini-omni-1.3-flash", &[]).await.unwrap();
-    assert!(p.body.get("response_format").is_none());
-    assert!(p.warnings[0].contains("not in the bot's Gemini Omni table"), "{:?}", p.warnings);
-    assert!(prep("gemini-omni-1.3-flash", &[kv("sec", "20")]).await.unwrap_err().message.contains("3–15"));
+async fn ids_outside_the_table() {
+    for id in [
+        "veo-3.1-generate-preview",
+        "veo-2.0-generate-001",
+        "veo-4.0-generate",
+        "gemini-omni-flash-preview",
+        "gemini-omni-1.1-flash",
+        "gemini-omni-1.3-flash",
+    ] {
+        for opts in [&[][..], &[kv("sec", "20")]] {
+            assert_eq!(
+                err(id, opts).await,
+                format!(
+                    "`{id}` is not in the bot's Gemini API model table (its price is unknown), so it is not supported"
+                )
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -185,10 +191,14 @@ async fn images_and_videos_go_as_content() {
     assert!(e.message.contains("no system prompt"), "{}", e.message);
     let e = prep_with(OMNI, &[], &[user(vec![])], &blobs).await.unwrap_err();
     assert!(e.message.contains("needs a prompt"), "{}", e.message);
-    // Earlier turns of another model: noted.
+    // A conversation with nothing to edit (earlier turns of another model): one prompt per
+    // request, so it would be ignored, which is refused.
     let h = vec![Turn::user_text("a story"), Turn::assistant_text("Once upon a time"), Turn::user_text("film it")];
-    let p = prep_with(OMNI, &[], &h, &blobs).await.unwrap();
-    assert!(p.notes[0].contains("not the earlier turns"), "{:?}", p.notes);
+    let e = prep_with(OMNI, &[], &h, &blobs).await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "`gemini-omni-1.2-flash` takes one prompt via the Gemini API, not a conversation: start a new message, or reply to a generated image or video it can take as input"
+    );
 }
 
 #[tokio::test]
@@ -566,8 +576,7 @@ fn cost_by_the_serving_model_and_without_usage() {
     let c = |model: &str, served: Option<&str>| usage(model, served, Some(&u), &body).cost_usd.unwrap();
     // 10 s at 720p on 1.2: ≈ $0.70 (the price list's own example).
     assert!((c(OMNI, None) - (1000.0 * 1.5 + 57_920.0 * 12.0) / 1e6).abs() < 1e-12);
-    assert!((c("gemini-omni-1.1-flash", None) - (1000.0 * 1.5 + 57_920.0 * 17.5) / 1e6).abs() < 1e-12);
-    // 1.1 served by 1.2 (routed from 2026-12-03): 1.2's rates.
+    // Priced by the model that served it: an id outside the table served by 1.2 costs 1.2's rates.
     assert!((c("gemini-omni-1.1-flash", Some(OMNI)) - c(OMNI, None)).abs() < 1e-12);
     // Without a breakdown, the output is the video.
     let u2 = json!({"total_input_tokens": 0, "total_output_tokens": 1_000_000});
@@ -576,5 +585,7 @@ fn cost_by_the_serving_model_and_without_usage() {
     let est = usage(OMNI, None, None, &json!({"response_format": {"resolution": "4k", "duration": "15s"}}));
     assert!((est.cost_usd.unwrap() - 17_376.0 * 15.0 * 12.0 / 1e6).abs() < 1e-9);
     assert_eq!(est.cost_source, CostSource::Estimated);
-    assert_eq!(usage("gemini-omni-1.3-flash", None, Some(&u), &body).cost_source, CostSource::Unknown);
+    for id in ["gemini-omni-1.1-flash", "gemini-omni-1.3-flash"] {
+        assert_eq!(usage(id, None, Some(&u), &body).cost_source, CostSource::Unknown, "{id}");
+    }
 }

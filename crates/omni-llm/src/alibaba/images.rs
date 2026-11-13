@@ -241,43 +241,6 @@ pub fn is_image_model(model: &str) -> bool {
         || (model.starts_with("wan") && (model.contains("-image") || model.contains("-t2i")))
 }
 
-/// Image ids this API does not serve, and why (`model-depreciation`, notice
-/// 118434; the older Wan text-to-image / editing protocol).
-fn not_served(model: &str) -> Option<String> {
-    const RETIRED: &[&str] = &[
-        "qwen-image",
-        "qwen-image-plus",
-        "qwen-image-plus-2026-01-09",
-        "qwen-image-max",
-        "qwen-image-max-2025-12-30",
-        "qwen-image-edit",
-        "qwen-image-edit-plus",
-        "qwen-image-edit-plus-2025-10-30",
-        "qwen-image-edit-plus-2025-12-15",
-        "qwen-image-edit-max",
-        "qwen-image-edit-max-2026-01-16",
-    ];
-    const TASK_ONLY: &[&str] = &[
-        "wan2.5-t2i-preview",
-        "wan2.5-i2i-preview",
-        "wan2.2-t2i-plus",
-        "wan2.2-t2i-flash",
-        "wanx2.1-t2i-plus",
-        "wanx2.1-t2i-turbo",
-        "wanx2.0-t2i-turbo",
-        "wanx2.1-imageedit",
-    ];
-    if RETIRED.contains(&model) {
-        return Some(format!("`{model}` was shut down by Alibaba on 2026-10-10 (its replacement is `qwen-image-3.0`)"));
-    }
-    TASK_ONLY.contains(&model).then(|| {
-        format!(
-            "`{model}` is one of Alibaba's older Wan image models, which run only as asynchronous tasks on their own \
-             endpoint; the bot uses DashScope's image API for wan2.6 / wan2.7, Qwen-Image 2.0+ and Z-Image"
-        )
-    })
-}
-
 /// The native API's root from the configured (OpenAI-compatible) base URL:
 /// `https://dashscope.aliyuncs.com/compatible-mode/v1` → `https://dashscope.aliyuncs.com`.
 pub fn native_root(base_url: &str) -> String {
@@ -497,9 +460,6 @@ pub async fn prepare(
     if req.providers.is_some() {
         return Err(err(format!("`p=` (provider choice) does not apply to {NAME}")));
     }
-    if let Some(why) = not_served(model) {
-        return Err(err(why));
-    }
     if req.tools.contains(&Tool::Image) {
         return Err(err(format!("`{model}` is an image model: it draws without `+i` (the image tool of chat models)")));
     }
@@ -525,7 +485,7 @@ pub async fn prepare(
     let mut applied = Vec::new();
     let mut settings = Vec::new();
     let mut warnings = Vec::new();
-    let mut notes = Vec::new();
+    let notes = Vec::new();
     if let Some(s) = spec {
         if ins.images.len() > s.max_refs {
             return Err(err(if s.max_refs == 0 {
@@ -612,8 +572,11 @@ pub async fn prepare(
             settings.push(s);
         }
     }
+    // A reply that edits nothing would ignore the conversation (owner's rule: an error).
     if ins.unsent_history {
-        notes.push(format!("`{model}` has no conversation: earlier messages are not sent"));
+        return Err(err(format!(
+            "`{model}` takes one prompt, not a conversation: reply to an image or video it generated to edit it, or start a new message"
+        )));
     }
     let mut content: Vec<Value> = ins.images.iter().map(|u| json!({"image": u})).collect();
     content.push(json!({"text": ins.prompt}));
