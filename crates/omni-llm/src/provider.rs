@@ -6,7 +6,8 @@
 //! Conventions shared by all of them (see docs/decisions.md D26, D3):
 //! - options are validated against what the platform officially offers, and
 //!   anything it does not offer is an error, never silently dropped;
-//! - defaults are the highest the model offers (effort, output, detail);
+//! - reasoning defaults to the model's official level (`request::resolve_reasoning`,
+//!   D77); the other defaults are the highest the model offers (output, detail);
 //! - the request is sent as built (visible in /info), nothing is injected;
 //! - the platform's error objects are kept verbatim.
 

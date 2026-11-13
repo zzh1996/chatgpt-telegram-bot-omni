@@ -5,8 +5,9 @@
 //! - `max_tokens` counts the **answer only** and defaults to 4096 (silent
 //!   truncation), so it is always sent; the reasoning has its own model limit.
 //!   Ark pre-deducts TPM quota by `prompt + max_tokens`, hence a cap.
-//! - Thinking is on by default; the highest effort is `high` (`xhigh`/`max`
-//!   are accepted and mapped to it).
+//! - Thinking is on by default at the model's official effort (2.1 and
+//!   Evolving `high`, 2.0 and Character `medium`); the highest effort is `high`
+//!   (`xhigh`/`max` are accepted and mapped to it).
 //! - Summary-mode models (2.1, Evolving, 2.0-lite-260428) return a summary in
 //!   `reasoning_content` plus the encrypted original in `encrypted_content`;
 //!   both are replayed verbatim for the same model.
@@ -907,7 +908,7 @@ mod tests {
         let keyed = CallInput { session_id: Some("tg-9".into()), user: None, ..input };
         let p = ark().prepare_chat(&keyed, &[], &NoBlobs).await.unwrap();
         assert_eq!(p.body["prompt_cache_key"], "tg-9", "the conversation routes to one implicit cache");
-        // Defaults without options: max effort, explicit max_tokens (answer only, capped).
+        // Defaults without options: the official effort, explicit max_tokens (answer only, capped).
         let input = CallInput { options: &[], ..input };
         let p = ark().prepare_chat(&input, &[], &NoBlobs).await.unwrap();
         assert_eq!(p.body["reasoning_effort"], "high");

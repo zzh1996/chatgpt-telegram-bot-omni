@@ -8,8 +8,8 @@
 //!
 //! - **Chat Completions** (`alibaba.chat`) for every request without a tool.
 //!   Thinking is hybrid (`enable_thinking`, on by default, sent explicitly);
-//!   Qwen3.8 adds `reasoning_effort` low | medium | xhigh, sent explicitly as
-//!   xhigh (unset, the thinking budget is 131,072 instead of xhigh's 262,144);
+//!   Qwen3.8 adds `reasoning_effort` low | medium | xhigh, not sent by default
+//!   (Qwen's default: a thinking budget of 131,072 instead of xhigh's 262,144);
 //!   `budget=` maps to `thinking_budget`.
 //! - **Web search and the code interpreter** (`+s`, `+c`, together too, and
 //!   `+su` with the web extractor): the Responses API (`alibaba.responses`, see

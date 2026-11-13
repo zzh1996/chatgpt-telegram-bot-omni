@@ -5,8 +5,8 @@
 //! it links (fetched 2026-11-11/12).
 //!
 //! - [`models`]: model table (limits, thinking levels, tools, tiers, inputs, image options);
-//! - `build`: options, defaults (highest thinking level, thought summaries,
-//!   full output budget, highest media resolution) and the request body;
+//! - `build`: options, defaults (the model's official thinking level, thought
+//!   summaries, full output budget, highest media resolution) and the request body;
 //! - [`convert`]: history → `contents` / `systemInstruction`, native replay;
 //! - [`stream`]: the SSE chunk parser (thoughts, text, images, code
 //!   execution, grounding, URL context, long-decode checkpoints, usage, blocks);

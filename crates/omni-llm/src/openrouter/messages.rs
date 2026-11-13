@@ -4,9 +4,9 @@
 //! - History: earlier assistant turns of the same model are replayed as their
 //!   original content blocks (thinking with signatures, text with citations,
 //!   server tool use and results); other turns become plain text.
-//! - Thinking: adaptive with `output_config.effort` (the highest level by
-//!   default) on models with effort levels, a token budget on older ones;
-//!   `display: summarized` where the model has the option (its default,
+//! - Thinking: adaptive with `output_config.effort` (the catalog's default level
+//!   unless an option sets one) on models with effort levels, a token budget on
+//!   older ones; `display: summarized` where the model has the option (its default,
 //!   `omitted`, would hide the thinking).
 //! - Stream: Anthropic's events (`content_block_*`, `message_delta`, …).
 
