@@ -313,7 +313,7 @@ async fn drafts_are_480p_on_seedance_2_5() {
     assert!(prep_err(S25, &[kv("q", "draft"), flag("2")]).await.contains("a draft is 480p"));
     assert!(prep_err(S25, &[kv("q", "high")]).await.contains("modes: draft"));
     assert!(prep_err(S20, &[kv("q", "draft")]).await.contains("draft mode is on Seedance 2.5"));
-    assert!(prep_err(S25, &[kv("q", "final")]).await.contains("reply to a draft video"));
+    assert!(prep_err(S25, &[kv("q", "final")]).await.contains("`+q=final` to a draft video"));
 }
 
 #[tokio::test]
@@ -474,7 +474,7 @@ async fn the_final_video_of_a_draft() {
         Turn::user_text("正片"),
     ];
     let e = prep_with(S25, &[kv("q", "final")], &not_draft, &Blobs(vec![])).await.unwrap_err();
-    assert!(e.message.contains("reply to a draft video"), "{}", e.message);
+    assert!(e.message.contains("`+q=final` to a draft video"), "{}", e.message);
     let stale = vec![
         Turn::user_text("猫"),
         video_answer(DIALECT, S25, task("cgt-s", S25, now - 15 * 86_400, true)),

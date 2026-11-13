@@ -203,8 +203,9 @@ impl RouteCaps for Caps<'_> {
         NAME
     }
     fn tool(&self, tool: Tool) -> bool {
-        // Search, code interpreter, web extractor: all Qwen3.8/3.7 models (Beijing).
-        tool != Tool::Maps
+        // Search, code interpreter, web extractor: all Qwen3.8/3.7 models (Beijing);
+        // no image generation tool in a chat.
+        matches!(tool, Tool::Search | Tool::Fetch | Tool::Code)
     }
     fn efforts(&self) -> Option<Vec<String>> {
         self.spec.effort.then(|| EFFORTS.map(String::from).to_vec())

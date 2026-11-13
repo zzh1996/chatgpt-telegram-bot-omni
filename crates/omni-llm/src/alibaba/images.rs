@@ -575,7 +575,7 @@ pub async fn prepare(
     // A reply that edits nothing would ignore the conversation (owner's rule: an error).
     if ins.unsent_history {
         return Err(err(format!(
-            "`{model}` takes one prompt, not a conversation: reply to an image or video it generated to edit it, or start a new message"
+            "`{model}` takes one prompt, not a conversation: reply to an image it generated to edit it, or start a new message"
         )));
     }
     let mut content: Vec<Value> = ins.images.iter().map(|u| json!({"image": u})).collect();

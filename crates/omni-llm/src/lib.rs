@@ -108,7 +108,7 @@ pub struct Prepared {
     /// Patches that were applied, in order, with their source (for transparency).
     pub applied: Vec<openrouter::options::Applied>,
     pub warnings: Vec<String>,
-    /// Notes about input conversion (e.g. text file inlined).
+    /// Notes about the request shown with the answer (once per conversation).
     pub notes: Vec<String>,
     pub show_debug: bool,
     /// The `max_tokens` the bot chose automatically (None if the user set it or none was set).

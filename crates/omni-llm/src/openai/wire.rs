@@ -84,7 +84,7 @@ pub(crate) struct Inputs<'a> {
 #[derive(Debug, Default)]
 pub(crate) struct Converted {
     pub input: Vec<Value>,
-    /// Shown with the answer (e.g. a text file the bot inlined).
+    /// Shown with the answer (e.g. reasoning OpenAI withheld).
     pub notes: Vec<String>,
     /// Media of earlier answers the API cannot take (see [`Unsent`]).
     pub warnings: Vec<String>,

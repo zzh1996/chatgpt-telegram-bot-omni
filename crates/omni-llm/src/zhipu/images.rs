@@ -30,9 +30,9 @@
 //!   `S W H w h ar=` the largest size of that ratio (computed: Zhipu has no
 //!   ratio parameter, only pixel sizes), `q=hd|standard` (CogView).
 //! - **Input**: the message's text only (GLM-Image: "最大输入 1000 字符"). Zhipu
-//!   documents no image input, so images in the message are an error, and a
-//!   reply to a generated image cannot edit it (noted: the text alone makes a
-//!   new image). Earlier messages are not sent (no conversation).
+//!   documents no image input, so images in the message are an error, and so
+//!   is a reply to a generated image (it cannot be edited). Earlier messages
+//!   are not sent (no conversation).
 //! - **Output**: images as temporary URLs ("有效期为`30`天"), downloaded by the
 //!   bot; `content_filter` is kept in the replay payload.
 //! - Errors: Zhipu's `{"error":{"code","message"}}` ([`super::error_from_json`];

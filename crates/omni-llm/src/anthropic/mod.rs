@@ -166,8 +166,9 @@ impl RouteCaps for Caps {
         NAME
     }
     fn tool(&self, tool: Tool) -> bool {
-        // web_search, web_fetch and code_execution run on every current model.
-        tool != Tool::Maps
+        // web_search, web_fetch and code_execution run on every current model;
+        // Claude has no image generation tool.
+        matches!(tool, Tool::Search | Tool::Fetch | Tool::Code)
     }
     fn efforts(&self) -> Option<Vec<String>> {
         let levels = self.0.map_or(ALL_EFFORTS, |s| s.efforts);

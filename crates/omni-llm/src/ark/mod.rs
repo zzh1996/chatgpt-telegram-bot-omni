@@ -12,7 +12,7 @@
 //!   both are replayed verbatim for the same model.
 //! - Images default to `detail: "xhigh"` (up to 9 MP). Assistant messages
 //!   carry text only (`content` is a string): media other models generated in
-//!   earlier turns are not sent (a warning says what).
+//!   earlier turns are an error (never dropped quietly).
 //! - Web search (`+s`): Doubao Search through `web_search_options: {}`; the
 //!   model decides whether to search. Ark reports the searches it actually ran
 //!   only as a count (`usage.tool_usage.web_search`), so each becomes a
@@ -236,7 +236,7 @@ impl Ark {
             settings.push("Doubao search".into());
             applied.push(Applied { source: "option".into(), patch: json!({"web_search_options": {}}) });
         }
-        if let Some(t) = &req.tier {
+        if let Some(t) = req.tier.as_deref().filter(|t| !matches!(*t, "default" | "auto")) {
             body["service_tier"] = json!(t);
             settings.push(format!("tier {t}"));
             applied.push(Applied { source: "option".into(), patch: json!({"service_tier": t}) });

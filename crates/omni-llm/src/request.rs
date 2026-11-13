@@ -81,31 +81,6 @@ pub struct Requested {
     pub seconds: Option<u32>,
 }
 
-/// Help for the option vocabulary.
-pub const HELP: &str = "\
-s                 the provider's own web search
-c                 the provider's own code execution
-u                 let the model read URLs from the prompt (provider's own tool)
-m                 Google Maps grounding (Gemini API); a Telegram location in the conversation
-                  (sent, or replied to) is the user's position
-i                 the provider's own image generation tool in a chat (OpenAI, xAI)
-e=<level>         reasoning effort, from the levels the model supports; e=none turns reasoning off
-                  (Volcengine Ark: e=minimal turns thinking off too)
-budget=<n>        reasoning token budget (models with budget-based thinking)
-v=<level>         verbosity (low|medium|high; OpenAI)
-1 2 4             image size 1K / 2K / 4K (image models)
-S W H w h         image aspect ratio 1:1 / 16:9 / 9:16 / 4:3 / 3:4;  ar=<w:h> for any ratio the model supports
-q=<level>         image quality, from the levels the image model has (highest by default)
-n=<count>         number of images (image models that make several per request; 1 by default)
-bg=<background>   image background: auto | opaque | transparent (models that have it)
-sec=<seconds>     video length (video models)
-p=<slug>          another official provider of the model (e.g. p=google-vertex); p=a|b: any of these
-                  (OpenRouter only)
-tier=<tier>       service tier (flex; higher tiers only for users on the priority list;
-                  default / auto change nothing)
-Letters can be combined: gi+4W$ = 4K, 16:9.
-Anything else is an error: there are no free-form request fields.";
-
 fn set<T: PartialEq + std::fmt::Debug>(slot: &mut Option<T>, v: T, what: &str) -> Result<(), String> {
     match slot {
         Some(old) if *old != v => Err(format!("conflicting {what} options ({old:?} and {v:?})")),
@@ -238,8 +213,8 @@ pub mod official {
             ("x-ai", Tool::Search | Tool::Code) => true,
             ("x-ai", Tool::Fetch) => false,
             ("deepseek" | "z-ai" | "moonshotai" | "bytedance-seed" | "bytedance", Tool::Search) => true,
-            ("qwen", Tool::Search | Tool::Code) => true,
-            ("deepseek" | "z-ai" | "moonshotai" | "bytedance-seed" | "bytedance" | "qwen", _) => false,
+            ("qwen", Tool::Search | Tool::Code | Tool::Fetch) => true, // web_search, code_interpreter, web_extractor
+            ("deepseek" | "z-ai" | "moonshotai" | "bytedance-seed" | "bytedance", _) => false,
             _ => return None,
         })
     }
@@ -351,10 +326,15 @@ pub fn validate(model: &str, r: &Requested, route: &dyn RouteCaps) -> Result<(),
     }
     if let Some(n) = r.budget {
         if !route.budget() {
-            return Err(format!("`{model}` has no reasoning token budget via {via} (use e= instead)"));
+            let instead = if route.efforts().is_some() { " (use e= instead)" } else { "" };
+            return Err(format!("`{model}` has no reasoning token budget via {via}{instead}"));
         }
         if n == 0 {
-            return Err("budget= must be at least 1 (use e=none to turn reasoning off)".into());
+            let off = route.can_disable_reasoning() || route.efforts().is_some_and(|l| l.iter().any(|x| x == "none"));
+            return Err(format!(
+                "budget= must be at least 1{}",
+                if off { " (e=none turns reasoning off)" } else { "" }
+            ));
         }
     }
     if let Some(v) = &r.verbosity {

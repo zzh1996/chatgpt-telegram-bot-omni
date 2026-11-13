@@ -59,6 +59,8 @@ pub struct RenderState {
     /// Effective request settings, described (see `omni_llm::settings`).
     pub settings: Vec<String>,
     pub show_usage: bool,
+    /// Costs above this (USD) are bold; 0: never (`render.bold_cost_usd`).
+    pub bold_cost: f64,
     pub reasoning_open: bool,
     pub mode: Mode,
     /// Earlier attempts of this reply (shown above, in the same messages).
@@ -90,6 +92,7 @@ impl RenderState {
             notes: &self.notes,
             elapsed: self.elapsed_override.unwrap_or_else(|| self.as_of.saturating_duration_since(self.started)),
             show_usage: self.show_usage,
+            bold_cost: self.bold_cost,
             reasoning_open: self.reasoning_open,
             mode: self.mode,
             raw_ai,

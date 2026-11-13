@@ -78,9 +78,10 @@ max_tokens_cap = 393216        # cap for the automatic max_tokens (0 = model max
 # replying /continue to an answer that hit it extends it by the same amount.
 long_decode = ["google/gemini-4*"]
 long_decode_budget = 393216
-# Salt of the stable per-user hash (sha256 of salt + Telegram user id, abuse attribution) that
-# every platform gets: OpenRouter `user`; OpenAI, xAI, Moonshot, Ark images/video `safety_identifier`;
-# Anthropic `metadata.user_id`; Gemini `labels.safety_identifier`; Zhipu `user_id`; xAI Imagine `user`.
+# Salt of the stable per-user hash (sha256 of salt + Telegram user id, abuse attribution), for
+# OpenRouter and the platforms' own APIs: OpenRouter `user`; OpenAI, xAI, Moonshot, Ark images/video
+# `safety_identifier`; Anthropic `metadata.user_id`; Gemini `labels.safety_identifier`; Zhipu
+# `user_id`; xAI Imagine `user`. DeepSeek, Alibaba and Ark Chat get no user id.
 # Empty: no user id is sent anywhere.
 user_id_salt = "${OPENROUTER_USER_SALT:-}"
 # Official providers users may switch to with `+p=<slug>` (per model author;
@@ -98,7 +99,8 @@ user_id_salt = "${OPENROUTER_USER_SALT:-}"
 # then `<provider>:<model id>` (`openai:gpt-6.1-sol`). The Chinese platforms are
 # their domestic sites (as in the old bot). Keys every section accepts, with
 # their defaults:
-#   allow_unlisted_models = false # true: any `<provider>:<model id>$` works as a prefix
+#   allow_unlisted_models = false # true: `<provider>:<model id>$` works as a prefix, for the
+#                                # models in the bot's model table (other prices are unknown)
 #   base_url = "…"               # the platform's official API
 #   connect_timeout_secs = 15
 #   idle_timeout_secs = 3600     # Ark: 1800
@@ -127,7 +129,7 @@ api_key = "${DASHSCOPE_API_KEY:-}"
 # base_url = "https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 [providers.ark]                # Volcengine Ark (火山方舟, Doubao): https://ark.cn-beijing.volces.com/api/v3
 api_key = "${ARK_API_KEY:-}"
-allow_unlisted_models = false  # only the `db…` prefixes below; true: any `ark:<model id>$`
+allow_unlisted_models = false  # only the `db…` prefixes below; true: also `ark:<model id>$` (models in the bot's table)
 
 [render]
 markdown = "clean"             # clean | raw (raw = the model's exact Markdown source)
@@ -135,6 +137,7 @@ first_flush_delay_secs = 1.0   # wait before a new reply's first message, to bat
 reasoning_open = false         # keep the reasoning fold open while the model thinks (every edit would
                                # re-open it for readers who closed it)
 show_usage = "always"          # always | never | USD threshold such as "0.05"
+bold_cost_usd = 0.2            # a reply's cost above this (USD) is bold in its footer; 0: never
 
 [retry]
 max_attempts = 4               # including the first; only retryable errors are retried
@@ -146,9 +149,13 @@ delays_secs = [2, 10, 30, 60]  # wait before retry 1, 2, 3, …; the last value 
 # uses the platform's own API (`<provider>:<model>`); the same prefix with an `o` in
 # front uses OpenRouter (`oc$`, `o$` for the empty one). Where a provider has
 # `allow_unlisted_models = true`, the id of any model the bot has works as a prefix
-# too (`openai:gpt-6.1-sol$`, `openai/gpt-6.1-sol$` on OpenRouter). Administrators
-# can add prefixes per bot with /alias. The list was chosen by the owner from the
-# old bot's prefixes (2026-11-12); direct APIs by default since 2026-11-13.
+# too (`openai:gpt-6.1-sol$`, `openai/gpt-6.1-sol$` on OpenRouter). On a platform's
+# own API only models in the bot's model table work (other prices are unknown):
+# /models leaves out prefixes of other models, and using one is an error.
+# Administrators can add prefixes per bot with /alias. The list was chosen by the
+# owner from the old bot's prefixes (2026-11-12); direct APIs by default since 2026-11-13;
+# the newest and strongest model of every series and the image and video models
+# added 2026-11-13 (coding-only, special-purpose and inaccessible models left out).
 # OpenAI (old `dev` branch; `$` is its bare prefix, ChatGPT's current Instant model)
 [[aliases]]
 name = ""
@@ -239,6 +246,9 @@ spec = "google:gemini-3.6-flash"
 [[aliases]]
 name = "gi"
 spec = "google:gemini-nano-banana-2.1"
+[[aliases]]
+name = "gl"
+spec = "google:gemini-3.5-flash-lite"
 # xAI (old `grok` branch)
 [[aliases]]
 name = "x"
@@ -267,6 +277,9 @@ spec = "zhipu:glm-5.3-flash"
 [[aliases]]
 name = "k"
 spec = "moonshot:kimi-k3"
+[[aliases]]
+name = "k31"
+spec = "moonshot:kimi-k3.1-pro"
 # Alibaba Qwen (old `qwen` branch; on OpenRouter its `qwen3.8-max` is this dated release)
 [[aliases]]
 name = "q"
@@ -274,15 +287,91 @@ spec = "alibaba:qwen3.8-max"
 [[aliases]]
 name = "q37"
 spec = "alibaba:qwen3.7-max"
-# ByteDance Doubao, directly on Volcengine Ark (old `doubao` branch; needs
-# [providers.ark])
+[[aliases]]
+name = "qf"
+spec = "alibaba:qwen3.8-flash"
+# ByteDance Doubao, directly on Volcengine Ark (old `doubao` branch)
 [[aliases]]
 name = "dbe"
 spec = "ark:doubao-seed-evolving"
 [[aliases]]
 name = "db"
 spec = "ark:doubao-seed-2-1-pro-260915"
-# The same models through OpenRouter: `o` + the prefix (`oc$`; `o$` for the empty one)
+[[aliases]]
+name = "dbl"
+spec = "ark:doubao-seed-2-1-lite-260915"
+[[aliases]]
+name = "dbt"
+spec = "ark:doubao-seed-2-1-turbo-260628"
+# Image and video models (the platforms' own image and video APIs): <platform letter>i
+# for images, v for videos (i alone: OpenAI); w = Wan, h = HappyHorse, vq = Vidu Q1;
+# f = flash/flare/fast, l = lite, m = mini, p = prime
+[[aliases]]
+name = "i"
+spec = "openai:gpt-image-2.6-sunburst"
+[[aliases]]
+name = "if"
+spec = "openai:gpt-image-2.6-flare"
+[[aliases]]
+name = "xi"
+spec = "xai:grok-imagine-image-2.0"
+[[aliases]]
+name = "xv"
+spec = "xai:grok-imagine-video-1.5"
+[[aliases]]
+name = "xvl"
+spec = "xai:grok-imagine-video-1.5-lite"
+[[aliases]]
+name = "gv"
+spec = "google:gemini-omni-1.2-flash"
+[[aliases]]
+name = "zi"
+spec = "zhipu:glm-image"
+[[aliases]]
+name = "zif"
+spec = "zhipu:cogview-3-flash"
+[[aliases]]
+name = "zv"
+spec = "zhipu:cogvideox-3"
+[[aliases]]
+name = "zvf"
+spec = "zhipu:cogvideox-flash"
+[[aliases]]
+name = "vq"
+spec = "zhipu:viduq1-text"
+[[aliases]]
+name = "qi"
+spec = "alibaba:qwen-image-3.0-pro"
+[[aliases]]
+name = "wi"
+spec = "alibaba:wan2.7-image-pro"
+[[aliases]]
+name = "wv"
+spec = "alibaba:wan3.0-video"
+[[aliases]]
+name = "wvp"
+spec = "alibaba:wan3.0-video-prime"
+[[aliases]]
+name = "hv"
+spec = "alibaba:happyhorse-1.1-t2v"
+[[aliases]]
+name = "dbi"
+spec = "ark:doubao-seedream-5-5-261028"
+[[aliases]]
+name = "dbif"
+spec = "ark:doubao-seedream-5-0-flash-260915"
+[[aliases]]
+name = "dbv"
+spec = "ark:doubao-seedance-2-5-260628"
+[[aliases]]
+name = "dbvf"
+spec = "ark:doubao-seedance-2-0-fast-260128"
+[[aliases]]
+name = "dbvm"
+spec = "ark:doubao-seedance-2-0-mini-260615"
+# The same models through OpenRouter: `o` + the prefix (`oc$`; `o$` for the empty one).
+# o6p, o61sp, o61tp, oqp: the strongest models OpenRouter has as their own ids
+# (GPT pro variants, Qwen3.8 Max Prime); the platforms' own APIs have no such ids
 [[aliases]]
 name = "o"
 spec = "openrouter:openai/gpt-chat-latest"
@@ -322,6 +411,15 @@ spec = "openrouter:openai/gpt-5.4-mini"
 [[aliases]]
 name = "o54n"
 spec = "openrouter:openai/gpt-5.4-nano"
+[[aliases]]
+name = "o6p"
+spec = "openrouter:openai/gpt-6-astra-pro"
+[[aliases]]
+name = "o61sp"
+spec = "openrouter:openai/gpt-6.1-sol-pro"
+[[aliases]]
+name = "o61tp"
+spec = "openrouter:openai/gpt-6.1-terra-pro"
 [[aliases]]
 name = "oc"
 spec = "openrouter:anthropic/claude-opus-5.5"
@@ -371,6 +469,9 @@ spec = "openrouter:google/gemini-3.6-flash"
 name = "ogi"
 spec = "openrouter:google/gemini-nano-banana-2.1"
 [[aliases]]
+name = "ogl"
+spec = "openrouter:google/gemini-3.5-flash-lite"
+[[aliases]]
 name = "ox"
 spec = "openrouter:x-ai/grok-4.7"
 [[aliases]]
@@ -395,11 +496,20 @@ spec = "openrouter:z-ai/glm-5.3-flash"
 name = "ok"
 spec = "openrouter:moonshotai/kimi-k3"
 [[aliases]]
+name = "ok31"
+spec = "openrouter:moonshotai/kimi-k3.1-pro"
+[[aliases]]
 name = "oq"
 spec = "openrouter:qwen/qwen3.8-max-0902"
 [[aliases]]
 name = "oq37"
 spec = "openrouter:qwen/qwen3.7-max"
+[[aliases]]
+name = "oqf"
+spec = "openrouter:qwen/qwen3.8-flash"
+[[aliases]]
+name = "oqp"
+spec = "openrouter:qwen/qwen3.8-max-prime"
 
 # ------------------------------------------------------------------ presets
 # Default options for matching models, in the same syntax as after a prefix

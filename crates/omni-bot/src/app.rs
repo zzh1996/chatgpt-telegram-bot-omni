@@ -231,7 +231,9 @@ impl App {
         let ok = self.provider_enabled(provider)
             && !model.is_empty()
             && (provider != "openrouter" || model.contains('/'))
-            && bot.serves(&canonical);
+            && bot.serves(&canonical)
+            // A platform's model the bot has no price for cannot be used.
+            && self.direct(provider).is_none_or(|p| p.knows(model));
         ok.then_some(canonical)
     }
 
@@ -305,7 +307,11 @@ impl App {
         }
         // A platform's model must be in its model table (anywhere, also through a
         // prefix): the bot cannot know the price of anything else (owner's rule).
-        if self.direct(&provider).is_some_and(|p| !p.knows(&model)) {
+        // A prefix or a private chat says so; in a group a typed id may be text.
+        if let Some(p) = self.direct(&provider).filter(|p| !p.knows(&model)) {
+            if via_alias || !strict {
+                return Err(omni_llm::provider::not_in_table(p.name(), &model).message);
+            }
             return Ok(None);
         }
         if label.contains(':') && label == model_token {

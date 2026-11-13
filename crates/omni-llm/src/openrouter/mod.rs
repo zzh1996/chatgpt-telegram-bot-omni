@@ -193,6 +193,17 @@ impl OpenRouter {
                 "model `{model}` is not in OpenRouter's catalog (yet); sending without capability-based defaults"
             ));
         }
+        // Media other models generated in earlier turns: these APIs' assistant
+        // messages carry text only (the model's own answers are replayed), so
+        // they are an error, never dropped quietly.
+        let own_dialect = match dialect {
+            options::Dialect::Chat => chat::DIALECT,
+            options::Dialect::Responses => responses::DIALECT,
+            options::Dialect::Messages => messages::DIALECT,
+        };
+        crate::provider::unsent_media(input.history, |t| {
+            t.native.as_ref().is_some_and(|n| n.dialect == own_dialect && n.model == model)
+        })?;
         let (mut body, notes, path, mut applied) = match dialect {
             options::Dialect::Chat => {
                 let (messages, notes) = chat::convert_history(input.history, model, info.as_deref(), blobs).await?;

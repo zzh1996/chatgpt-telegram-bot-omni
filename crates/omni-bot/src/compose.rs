@@ -66,6 +66,8 @@ pub struct ComposeInput<'a> {
     pub notes: &'a [String],
     pub elapsed: Duration,
     pub show_usage: bool,
+    /// A cost above this (USD) is bold; 0: never.
+    pub bold_cost: f64,
     /// Open the reasoning fold while the model is thinking (`render.reasoning_open`).
     pub reasoning_open: bool,
     pub mode: Mode,
@@ -604,7 +606,7 @@ fn output_blocks(parts: &[Part], raw: bool, depth: usize, open_thinking: bool, l
 }
 
 /// An earlier attempt of this reply: its output and error, folded.
-fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool) -> RBlock {
+fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool, bold_cost: f64) -> RBlock {
     let title = if a.interrupted {
         format!("⚠️ Attempt {} interrupted by a bot restart", a.n)
     } else if let Some(e) = &a.error {
@@ -617,19 +619,51 @@ fn prior_block(a: &PriorAttempt, raw: bool, show_usage: bool) -> RBlock {
         blocks.push(RBlock::Pre { text: pretty(&error_shown(d)), language: "json".into() });
     }
     let mut f = Vec::new();
+    let mut bold = None;
     if show_usage && let Some(u) = &a.usage {
         f.extend(usage_parts(u));
+        bold = bold_cost_at(&f, u, bold_cost);
     }
     if let Some(t) = a.elapsed.filter(|t| !t.is_zero()) {
         f.push(format!("{:.1}s", t.as_secs_f64()));
     }
     if !f.is_empty() {
-        blocks.push(RBlock::Footer(RText::plain(f.join(" · "))));
+        blocks.push(RBlock::Footer(footer_text(&f, bold)));
     }
     if blocks.is_empty() {
         blocks.push(RBlock::Footer(RText::plain("no output")));
     }
     RBlock::Details { open: false, title: RText::plain(title), blocks }
+}
+
+/// Where the cost is in footer parts that end with [`usage_parts`], when it is
+/// above `threshold` (USD, 0: never): its index and the length of the amount
+/// (`≈$0.250`, without what may be appended to it later).
+fn bold_cost_at(f: &[String], u: &Usage, threshold: f64) -> Option<(usize, usize)> {
+    let cost = u.cost_usd?;
+    (threshold > 0.0 && cost > threshold).then(|| (f.len() - 1, f[f.len() - 1].len()))
+}
+
+/// Footer parts joined with ` · `; the amount at `bold` (index, length) in bold.
+fn footer_text(f: &[String], bold: Option<(usize, usize)>) -> RText {
+    let Some((at, len)) = bold.filter(|(at, len)| f.get(*at).is_some_and(|s| s.len() >= *len)) else {
+        return RText::plain(f.join(" · "));
+    };
+    let mut t = Vec::new();
+    for (i, s) in f.iter().enumerate() {
+        if i > 0 {
+            t.push(RText::plain(" · "));
+        }
+        if i == at {
+            t.push(RText::bold(RText::plain(&s[..len])));
+            if len < s.len() {
+                t.push(RText::plain(&s[len..]));
+            }
+        } else {
+            t.push(RText::plain(s.clone()));
+        }
+    }
+    RText::concat(t)
 }
 
 /// Usage in words: input (cache), output (reasoning), cost.
@@ -672,7 +706,7 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
 
     // 2. earlier attempts of this reply (failed or interrupted), oldest first, folded.
     for a in inp.prior {
-        out.push(prior_block(a, raw, inp.show_usage));
+        out.push(prior_block(a, raw, inp.show_usage, inp.bold_cost));
     }
     // 3. this attempt's output, in the order it was produced.
     let live = inp.status == Status::Generating;
@@ -715,6 +749,8 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         _ => {}
     }
     for n in inp.notes {
+        // Some notes come with their ℹ️ already.
+        let n = n.trim_start_matches("ℹ\u{fe0f}").trim_start_matches('ℹ').trim_start();
         lines.push(format!("ℹ️ {n}"));
     }
     out.extend(lines.into_iter().map(|l| RBlock::Footer(RText::plain(l))));
@@ -739,10 +775,12 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
     } else if inp.attempt > 1 {
         f.push(format!("attempt {}/{}", inp.attempt, inp.max_attempts));
     }
+    let mut bold = None;
     if inp.show_usage
         && let Some(u) = inp.usage
     {
         f.extend(usage_parts(u));
+        bold = bold_cost_at(&f, u, inp.bold_cost);
     }
     if !extra_costs.is_empty() {
         let extra = extra_costs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
@@ -768,7 +806,7 @@ pub fn compose(inp: &ComposeInput<'_>) -> Vec<RBlock> {
         f.push(format!("finish: {fr}"));
     }
     if !f.is_empty() {
-        out.push(RBlock::Footer(RText::plain(f.join(" · "))));
+        out.push(RBlock::Footer(footer_text(&f, bold)));
     }
     out
 }
@@ -1021,6 +1059,38 @@ mod tests {
         assert_eq!(footer.matches("+ code execution").count(), 1, "{footer}");
     }
 
+    /// A cost above `render.bold_cost_usd` is bold, without what follows it.
+    #[test]
+    fn costs_above_the_threshold_are_bold() {
+        let footer = |cost: f64, threshold: f64, extra: bool| {
+            let usage =
+                Usage { input_tokens: Some(10), output_tokens: Some(5), cost_usd: Some(cost), ..Default::default() };
+            let settings = if extra { vec!["+ code execution".to_string()] } else { vec![] };
+            let mut i = input(&[], Status::Done);
+            i.usage = Some(&usage);
+            i.settings = &settings;
+            i.bold_cost = threshold;
+            let Some(RBlock::Footer(t)) = compose(&i).pop() else { panic!() };
+            t
+        };
+        let bold = |t: &RText| match t {
+            RText::Concat(v) => v
+                .iter()
+                .filter_map(|x| match x {
+                    RText::Bold(b) => Some(b.to_plain()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        assert!(bold(&footer(0.2, 0.2, false)).is_empty(), "not above it");
+        assert_eq!(bold(&footer(0.25, 0.2, false)), ["$0.250"]);
+        let t = footer(0.25, 0.2, true);
+        assert_eq!(bold(&t), ["$0.250"]);
+        assert!(t.to_plain().contains("out 5 · $0.250 + code execution · "), "{}", t.to_plain());
+        assert!(bold(&footer(5.0, 0.0, false)).is_empty(), "0: never");
+    }
+
     #[test]
     fn source_titles_lose_markup() {
         assert_eq!(plain_title("<b>Oriental Pearl Tower</b> - Wikipedia"), "Oriental Pearl Tower - Wikipedia");
@@ -1109,6 +1179,7 @@ mod tests {
             notes: &[],
             elapsed: Duration::from_secs(3),
             show_usage: true,
+            bold_cost: 0.2,
             reasoning_open: true,
             mode: Mode::Clean,
             raw_ai: false,

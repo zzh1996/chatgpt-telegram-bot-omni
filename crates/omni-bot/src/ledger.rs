@@ -1,6 +1,8 @@
 //! Usage & cost ledger: one row per billed upstream call, idempotent by the
-//! upstream generation id, so a call is never counted twice and never lost —
-//! across stream drops, long-decode hops, restarts and crashes.
+//! upstream generation id, so a call is never counted twice — across stream
+//! drops, long-decode hops, restarts and crashes. OpenRouter calls whose usage
+//! never arrived are looked up afterwards (`/generation`); the platforms' own
+//! APIs have no such lookup.
 //!
 //! - When a call's generation id becomes known (response headers), it is
 //!   registered in `pending_costs`.

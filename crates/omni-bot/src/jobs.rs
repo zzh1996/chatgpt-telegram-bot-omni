@@ -399,6 +399,7 @@ async fn load_ctx(app: &Arc<App>, row: &TurnRow) -> Result<Option<(Ctx, Vec<Turn
         attachments: Vec::new(),
         settings: Vec::new(),
         show_usage: true,
+        bold_cost: app.cfg.render.bold_cost_usd,
         reasoning_open: app.cfg.render.reasoning_open,
         mode: app.cfg.render.markdown,
         prior: Vec::new(),

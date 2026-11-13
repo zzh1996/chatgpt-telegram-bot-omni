@@ -56,9 +56,9 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 - 每个 bot 一个 grammers 连接、一个更新循环、一组按 chat 的限速门（`Gates`）。
 - 层级是 bot → 聊天 → 人。每个 bot 是独立实例；一个 bot 下群和私聊是平等的"聊天"，授权（允许的聊天、群内封禁）、限额（每个聊天一个桶，每个"聊天 + 成员"一个桶）和统计都在聊天之内，一个聊天里的设置和统计不影响别的聊天。运行时前缀（`aliases`）按 bot 分开，配置里的 `[[aliases]]` 所有 bot 共用。`[[bots]].models`（通配符，默认 `*`）不匹配的模型、未配置的 provider 的模型，对该 bot 不存在。
 - 成员关系 `bot_chats` 从入群事件和收到的消息学习（只记录，不参与路由）。
-- 触发：每个 bot 独立解析前缀，只回答它能解析的 spec；群里不认识的 spec 静默跳过（可能属于别的 bot），私聊和 `/m` 里报错。几个 bot 都认识同一个前缀时各自回答。直接写的模型 ID 只在该 provider 的 `allow_unlisted_models = true` 时可用。
+- 触发：每个 bot 独立解析前缀，只回答它能解析的 spec；群里不认识的 spec 静默跳过（可能属于别的 bot），私聊和 `/m` 里报错。几个 bot 都认识同一个前缀时各自回答。直接写的模型 ID 只在该 provider 的 `allow_unlisted_models = true` 时可用。直连平台的模型（直接写或经前缀）还必须在 bot 的模型表里（`Provider::knows`）：否则私聊和前缀报错，群里直接写的不理，`/models` 不列出。
 - 回复：由发出被回复消息的 bot 处理（按 bot 维度查 `tg_messages`）。
-- 命令：每个 bot 都回答发给它（`@`）或未加 @ 的命令；回复类命令（`/m` `/raw` `/dump` `/info` `/retry` `/continue`）未加 @ 时只由发出被回复消息的 bot 处理。
+- 命令：每个 bot 都回答发给它（`@`）或未加 @ 的命令；回复类命令（`/m` `/raw` `/dump` `/info` `/retry` `/continue`，以及作为回复的 `/prefix`）未加 @ 时只由发出被回复消息的 bot 处理。
 - 启动时为每个 bot 注册命令菜单：先重置旧版本可能留下的按语言/聊天类型的列表（它们会盖住默认列表），再设所有聊天、所有语言共用的一份；管理员的私聊（和 bot 说过话之后）另设含管理命令的列表。
 
 ## 5. 渲染与限速
@@ -66,6 +66,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 - 输入（`intake`、`handler`、`media`、`tg::richin`）：消息的文字（富消息转成 Markdown）、媒体（照片、文件，富消息里的图片和文件）、位置（定位/地点/实时位置，富消息的地图块）记入 `inbound`；相册每张一条，等 1.5 秒后只由第一条被记录的消息处理（`conv::album_leader`），附上整个相册和其它张的说明；被回复的非 bot 消息只附上它的媒体和位置。
 - `prefixes`：本聊天的前缀（自定义 chatbot，表 `chat_prefixes`，按 bot + 聊天）：创建时把模型和选项解析定死，内存里缓存；`App::resolve_spec` 先查 bot 的前缀，再查本聊天的；新对话里每个这样的前缀单独一条链（它的 system prompt 和历史以 synthetic 回合写在用户消息前面），所以删除前缀不影响已有对话。
 - `compose`：把回合状态组装为富消息块（头部、折叠的推理/工具/来源、正文、提示、错误、页脚），每条消息第一行是 bot 的头部（小字），bot 生成的其它部分只用模型 Markdown 永远不会产生的块（details、footer），保证模型输出无法冒充。工具调用的内容由 `toolview` 按常见格式（搜索、来源、网页、代码输出、文件、错误）显示成可读的块，认不出的、没展示的字段显示为 JSON（D60）。
+- `help`：`/help` 的全部文字（D68），英文和中文（`/help_zh`）各一份：一条富消息，快速上手、命令表，每个主题一个折叠块；`/help <主题或命令>`、`/help_<主题>` 只看一个主题；管理员另有所在聊天类型的管理主题。文字是 Markdown（主题里 `::: 标题` … `:::` 是折叠块），`$` 换成配置的前缀标记，文件大小上限、`bold_cost_usd`、能否直接写模型 ID 按部署填入；不写具体的厂商和模型。测试保证每个命令都有主题、整个 `/help` 是一条消息。
 - `paginate`：按 32640 字 / 499 块切成多条消息（富消息上限 32768 / 500，留出续页头部的位置），超大块按结构拆分（代码按行、列表按项、表格按行并重复表头、折叠块按子块）。
 - `view`：每次尝试一个同步任务，只渲染最新状态（watch 通道合并中间状态）；与已发出内容哈希比较，只编辑变化的分段，新增分段回复前一段发送；最终状态多余的分段删除。
 - 降级链：富消息被拒（400 类内容错误）→ 模型部分改为原始 Markdown 块 → 仍被拒则纯文本 entities。
@@ -74,7 +75,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 ## 6. OpenRouter 请求构建
 
 1. 接口（`options::dialect_for`）：OpenAI、xAI 走 Responses，Anthropic 走 Messages，其余走 Chat Completions；方舟用同一套 Chat Completions 转换（图片 `detail: xhigh`）。
-2. 历史转换（`chat` / `responses` / `messages` 的 `convert_history`）：同方言同模型的 assistant 回合回放 native（CC：`content` + `reasoning_details`；Responses：全部输出项，含加密推理与 `phase`；Messages：原始 content block），否则只发文本；用户内容按模态转换（图片：OpenAI `detail` original 或 high、xAI high、CC 不发 detail；PDF 走各接口的原生文件输入；音频 `input_audio`、视频/YouTube `video_url` 只在 CC 上；文本文件内联为独立 text 段并提示）；不支持的输入模态直接报错。
+2. 历史转换（`chat` / `responses` / `messages` 的 `convert_history`）：同方言同模型的 assistant 回合回放 native（CC：`content` + `reasoning_details`；Responses：全部输出项，含加密推理与 `phase`；Messages：原始 content block），否则只发文本（别的模型生成的图片、文件放不进 assistant 消息，报错，`provider::unsent_media`）；用户内容按模态转换（图片：OpenAI `detail` original 或 high、xAI high、CC 不发 detail；PDF 走各接口的原生文件输入；音频 `input_audio`、视频/YouTube `video_url` 只在 CC 上；文本文件内联为独立 text 段）；不支持的输入模态直接报错。
 3. 选项（`request::parse`：封闭的小集合，没有任意 JSON）：配置预设 → 用户选项逐项覆盖（`options::overlay`）→ 先按官方能力、再按 OpenRouter 能力校验（`request::validate`）→ `options::plan`：没指定的取能力拉满的默认值（来自 `/models` 实时目录），每项记录来源（`/info`）。
 4. 额外检查：原生搜索在所选 endpoint 不存在时拒绝；service tier 自动加入对应 tier endpoint；PDF 强制 native 引擎；最终请求体再按 provider 白名单和 priority 名单检查（`policy::check`）。
 5. 流解析（`chat::ChunkParser`，Responses/Messages 各有 `EventParser`）：跳过 `:` 注释心跳；`reasoning_details` 按 `index` 合并；图片 data URL 解码；`url_citation` 转为引用；带内错误（HTTP 200 后的 `error` 块）按 `error_type` 分类；没有 finish/`[DONE]` 就断开视为可重试的网络错误；空闲超时（默认 3600 秒，方舟 1800 秒；保活注释也算数据，每个请求结束时日志记录最长间隔 `longest_gap_ms`）。

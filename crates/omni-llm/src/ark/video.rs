@@ -25,8 +25,7 @@
 //! **Modes, from the inputs** (the conversation rule of [`super::images`]: the
 //! new message's text and media; a reply to a generated answer uses what it
 //! made, first):
-//! - text only: text-to-video (`+s`: Ark's `web_search` tool, text-only
-//!   requests; each executed search is a `web_search` call, none is noted);
+//! - text only: text-to-video;
 //! - images: one is the first frame, two the first and last frames, three or
 //!   more (or a prompt that names them, "图片1", "@image 1", the reference
 //!   syntax Seedance asks for) reference images;
@@ -697,7 +696,8 @@ pub async fn prepare(
             let task = ins.answer_task.as_ref().filter(|t| t.get("draft").and_then(Value::as_bool) == Some(true));
             let Some(task) = task else {
                 return Err(err(
-                    "`q=final` makes the final video of a Seedance 2.5 draft: reply to a draft video (made with q=draft)",
+                    "`q=final` makes the final video of a Seedance 2.5 draft: reply /m with this model and `+q=final` to a \
+                     draft video (one made with `+q=draft`)",
                 ));
             };
             if ins.answer_model.as_deref() != Some(model) {

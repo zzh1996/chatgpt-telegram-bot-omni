@@ -278,7 +278,7 @@ async fn remember_peers(app: &App, chat_id: i64, peers: &PeerMap) {
 }
 
 /// Parse `/cmd`, `/cmd@bot` at the very start of a message.
-pub fn parse_command<'a>(text: &'a str, our_username: &str) -> Option<(String, &'a str, bool)> {
+pub fn parse_command(text: &str, our_username: &str) -> Option<(String, String, bool)> {
     let rest = text.strip_prefix('/')?;
     let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
     let (head, args) = rest.split_at(end);
@@ -286,7 +286,12 @@ pub fn parse_command<'a>(text: &'a str, our_username: &str) -> Option<(String, &
         Some((n, t)) => (n, Some(t)),
         None => (head, None),
     };
-    let name = name.to_ascii_lowercase();
+    // `/help_options` is `/help options`, `/help_zh options` `/help zh options`
+    // (Telegram links the whole command).
+    let (name, args) = match name.get(..5).filter(|h| h.eq_ignore_ascii_case("help_")).map(|_| &name[5..]) {
+        Some(topic) if !topic.is_empty() => ("help".to_string(), format!("{topic}{args}")),
+        _ => (name.to_ascii_lowercase(), args.to_string()),
+    };
     if !COMMANDS.contains(&name.as_str()) {
         return None;
     }
@@ -299,7 +304,7 @@ pub fn parse_command<'a>(text: &'a str, our_username: &str) -> Option<(String, &
         }
         None => false,
     };
-    Some((name, args.trim_start(), addressed))
+    Some((name, args.trim_start().to_string(), addressed))
 }
 
 async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::types::Message) -> Option<Kind> {
@@ -384,8 +389,13 @@ mod tests {
 
     #[test]
     fn commands() {
-        assert_eq!(parse_command("/raw", "omnibot"), Some(("raw".into(), "", false)));
-        assert_eq!(parse_command("/m@OmniBot g$ hi", "omnibot"), Some(("m".into(), "g$ hi", true)));
+        assert_eq!(parse_command("/raw", "omnibot"), Some(("raw".into(), "".into(), false)));
+        assert_eq!(parse_command("/m@OmniBot g$ hi", "omnibot"), Some(("m".into(), "g$ hi".into(), true)));
+        assert_eq!(parse_command("/help_options", "omnibot"), Some(("help".into(), "options".into(), false)));
+        assert_eq!(parse_command("/Help_Stats@OmniBot", "omnibot"), Some(("help".into(), "Stats".into(), true)));
+        assert_eq!(parse_command("/help_", "omnibot"), None);
+        assert_eq!(parse_command("/help_zh_options", "omnibot"), Some(("help".into(), "zh_options".into(), false)));
+        assert_eq!(parse_command("/help_zh options", "omnibot"), Some(("help".into(), "zh options".into(), false)));
         assert_eq!(parse_command("/m@other g$ hi", "omnibot"), None);
         assert_eq!(parse_command("/usr/bin is", "omnibot"), None);
         assert_eq!(parse_command("not a command", "omnibot"), None);

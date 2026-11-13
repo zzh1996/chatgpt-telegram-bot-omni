@@ -9,6 +9,7 @@ mod config;
 mod conv;
 mod devinject;
 mod handler;
+mod help;
 mod intake;
 mod jobs;
 mod ledger;
@@ -306,6 +307,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
     let continue_with = format!("Reply: continue with another model (spec{marker}text)");
     let public = [
         ("help", "How to use this bot"),
+        ("help_zh", "使用帮助（中文）"),
         ("models", "List model prefixes / search models"),
         ("model", "Show a model's capabilities"),
         ("m", continue_with.as_str()),
@@ -329,7 +331,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("quota", "Admin: spend limits of a chat and its members"),
         ("alias", "Admin: add a model prefix"),
         ("unalias", "Admin: remove a model prefix"),
-        ("credits", "Admin: OpenRouter key balance"),
+        ("credits", "Admin: OpenRouter key spending and platform balances"),
     ];
     let list = |cmds: &[(&str, &str)]| -> Vec<tl::enums::BotCommand> {
         cmds.iter()

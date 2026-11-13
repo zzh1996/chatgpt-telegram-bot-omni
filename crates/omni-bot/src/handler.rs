@@ -156,8 +156,9 @@ pub async fn resolve_specs(
         }
     }
     if !unknown.is_empty() && explicit {
-        let ids =
-            crate::commands::direct_ids(app).map(|ids| format!("; a model id ({ids}) works too")).unwrap_or_default();
+        let ids = crate::commands::direct_ids(app)
+            .map(|ids| format!("; so does the id of a model it has ({ids})"))
+            .unwrap_or_default();
         return Err(format!("unknown prefix: {}. The prefixes are listed by /models{ids}", unknown.join(", ")));
     }
     Ok(out)

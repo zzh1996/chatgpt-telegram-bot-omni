@@ -378,6 +378,8 @@ pub struct RenderConfig {
     pub reasoning_open: bool,
     /// Show usage/cost footer: `always`, `never`, or a USD threshold like `0.05`.
     pub show_usage: String,
+    /// A cost above this (USD) is bold where a reply shows it; 0: never.
+    pub bold_cost_usd: f64,
 }
 
 impl Default for RenderConfig {
@@ -387,6 +389,7 @@ impl Default for RenderConfig {
             first_flush_delay_secs: 1.0,
             reasoning_open: false,
             show_usage: "always".into(),
+            bold_cost_usd: 0.2,
         }
     }
 }
@@ -674,6 +677,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("NOPE"));
+    }
+
+    /// Every prefix of the example config that names a platform's own model
+    /// names one in that platform's table (the bot has its price): a typo or a
+    /// retired model would be a prefix that only errs.
+    #[test]
+    fn example_prefixes_name_known_models() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/omni.example.toml"))
+            .expect("example config exists");
+        let env =
+            |k: &str| k.starts_with("TELEGRAM_").then(|| if k.ends_with("TOKEN") { "1:a" } else { "1" }.to_string());
+        let cfg = Config::parse(&raw, &env).unwrap();
+        let mut checked = 0;
+        for a in &cfg.aliases {
+            let spec = omni_core::trigger::parse_spec(&a.spec).unwrap();
+            let Some((provider, model)) = spec.model.split_once(':').filter(|(p, _)| *p != "openrouter") else {
+                continue;
+            };
+            let info = omni_llm::provider::info(provider).unwrap_or_else(|| panic!("{}: {provider}", a.name));
+            let p = omni_llm::provider::build(
+                provider,
+                omni_llm::provider::DirectConfig {
+                    api_key: "x".into(),
+                    base_url: info.base_url.into(),
+                    connect_timeout: std::time::Duration::from_secs(1),
+                    idle_timeout: std::time::Duration::from_secs(1),
+                    max_tokens_cap: None,
+                    cny_per_usd: 7.0,
+                    long_decode_budget: 1,
+                },
+            )
+            .unwrap();
+            assert!(p.knows(model), "prefix `{}`: `{provider}:{model}` is not in the table", a.name);
+            checked += 1;
+        }
+        assert!(checked > 40, "{checked}");
     }
 
     /// Production with only the Telegram settings: every provider is optional

@@ -36,10 +36,11 @@ fn with_marker(text: &str, marker: &str) -> String {
 pub fn direct_ids(app: &App) -> Option<String> {
     let m = app.marker();
     let mut forms = Vec::new();
-    if app.unlisted_models_allowed("openrouter") {
+    let typed = |id: &str| app.provider_enabled(id) && app.unlisted_models_allowed(id);
+    if typed("openrouter") {
         forms.push(format!("`author/model{m}` on OpenRouter"));
     }
-    for p in omni_llm::provider::PROVIDERS.iter().filter(|p| app.unlisted_models_allowed(p.id)) {
+    for p in omni_llm::provider::PROVIDERS.iter().filter(|p| typed(p.id)) {
         forms.push(format!("`{}:model{m}` on {}", p.id, p.name));
     }
     (!forms.is_empty()).then(|| forms.join(", "))
@@ -56,49 +57,12 @@ pub const BANNED: &str = "⛔ You are banned from using this bot in this chat.";
 
 const HINT: &str = "Start a conversation with `prefix$question` (the prefixes are listed by /models), or reply to one of my answers to continue. /help for details.";
 
-const HELP: &str = r#"**Start a conversation**: `prefix$text`
-- PREFIXES Everything after `$` is sent exactly as typed, including a leading space.
-- Several models at once: `c,g$compare these`. (Examples use prefixes of the default configuration; /models lists this bot's.)
-- Options after `+`: `c+s$` the provider's own web search, `c+e=low$` reasoning effort (`e=none` turns reasoning off), `gi+4W$` image size and aspect ratio, `+p=<provider>` another official provider of the model. The full (closed) list: /help options; anything else is an error.
-- Define a system prompt and fake history with marker lines:
-```
-c$::system
-You are a pirate.
-::user
-hi
-::assistant
-Arr!
-::user
-who are you?
-```
-Short forms: `::sys`, `::u`, `::a` (or `::model`). A line that literally is `::user` is sent by writing `\::user` (one backslash is removed).
-
-**Attachments**: photos, files or an album with the prefix in the caption, or a prefixed reply to a photo, file, album or location message, go to the model with the text. A location is the user's position for Gemini's Google Maps (`google:` models with `+m`); other models reject it.
-
-**Images and videos**: chat models that draw (Gemini's Nano Banana) answer with images; OpenAI and Grok chat models draw with `+i`. An image or video model's id (e.g. `openai:gpt-image-2.6-sunburst$`, `xai:grok-imagine-video-1.5$`) calls the platform's image or video API directly, with no chat model. Reply to a generated image or video (or attach images) to edit it; these APIs take one prompt, so a reply they cannot edit is an error. Options: `q=` quality, `n=` how many, `bg=` background, `sec=` video length, sizes `1 2 4` and ratios; the defaults are the highest quality, the largest size and no watermark. /raw gives the original files.
-
-**Continue**: reply to any of my messages. The whole reply is the next message, exactly as typed (marker lines are plain text there), except that a leading `\` is removed, so `\/raw` sends the text `/raw`. Replying to a failed message is rejected; use /retry on it.
-
-**Prefixes of this chat**: anyone allowed here (and not banned) can make a custom chatbot for this chat: a model with its options, a system prompt and a history put before every new message. `/prefix name prefix$::system …` (with `::user` / `::assistant` lines for the history) creates `name$`; or reply `/prefix name` to one of my answers to turn that conversation into one. Names: 3–16 letters and digits, not taken. Anyone here can use it; replies, billing and stats are the model's own. /prefix lists this chat's, /prefix `name` shows one, /unprefix `name` deletes one (its creator or an admin; replies to its answers keep working).
-
-**Commands (reply to a bot message)**: /m `prefix$text` continue with another model · /raw original Markdown and files · /dump the whole conversation up to that message as a JSON file · /info request details · /retry regenerate a failed answer · /continue keep writing an answer that stopped at the long-decode budget.
-
-**Other**: /models [search] · /model `prefix` · /stats [today|7d|30d|all] this chat's usage (calendar days in the bot's time zone, today since 00:00, default 30d; in a group also one member: `/stats user_id`, or reply /stats to their message) · /usage · /ping (ids and access here)
-
-Where the bot is not allowed, only /ping (and an admin's /allow) is answered. Where it is, commands that only show information work for everyone, also for people banned there; requests that cost money tell banned people that they are banned.
-
-By default every request maxes out capability (highest reasoning effort, max output tokens), pins the model's first-party provider on OpenRouter, and never adds a system prompt. In a reply, the first line names the model; everything else the bot adds (reasoning, sources, errors, notes, usage) is in collapsible blocks or small text, so the model's answer is always unambiguous."#;
-
 /// Commands only administrators may run: in their private chat for anything of
 /// this bot, inside a group only those in [`GROUP_ADMIN_COMMANDS`], for that group.
 const ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota", "alias", "unalias", "credits"];
 /// Admin commands that work inside a group; they only see and change that group,
 /// never anything about other chats.
 const GROUP_ADMIN_COMMANDS: &[&str] = &["allow", "deny", "ban", "unban", "acl", "quota"];
-
-const ADMIN_HELP_PRIVATE: &str = r#"**Admin** (in private chat: every chat of this bot; group ids are negative, a private chat's id is the user's id): /allow `chat_id` · /deny `chat_id` · /ban `user_id` `group_id` · /unban `user_id` `group_id` · /acl · /quota [`chat_id` [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]]] · /stats [period] (every chat: rankings by model, chat, user and chat · user; one of them, longer: /stats `model|chat|user|chat-user` [period]) · /stats `chat_id` [`user_id`] [period] · /prefix `chat_id` (a chat's own prefixes) · /unprefix `chat_id` `name` · /alias `prefix$` `spec` · /unalias `prefix$` · /credits"#;
-
-const ADMIN_HELP_GROUP: &str = r#"**Admin** (in a group: this group only): /allow (also where the group is not allowed yet) · /deny · /ban `user_id` (or reply to their message) · /unban `user_id` (or reply) · /acl · /quota [`chat`|`members`|`user_id` [`capacity_usd` `refill_usd_per_day` | `off`]] (`chat`: the whole group; `members`: each member by default; as a reply: that person) · /unprefix `name` (anyone's). Everything else in private chat."#;
 
 fn label(s: &str) -> RText {
     RText::bold(RText::plain(s))
@@ -198,32 +162,34 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     }
     match name {
         "start" | "help" => {
-            if args.trim() == "options" {
-                send(
-                    app,
-                    bot,
-                    ib,
-                    "Options",
-                    vec![RBlock::Pre {
-                        text: with_marker(omni_llm::request::HELP, app.marker()),
-                        language: String::new(),
-                    }],
-                )
-                .await;
-            } else {
-                let prefixes = match direct_ids(app) {
-                    Some(ids) => format!(
-                        "The prefix is one of those listed by /models, or a model id typed directly ({ids}), for any \
-                         model this bot has, so new models need no config change."
-                    ),
-                    None => "The prefix is one of those listed by /models.".to_string(),
-                };
-                let mut b = md(&with_marker(HELP, app.marker()).replacen("PREFIXES", &prefixes, 1));
-                if admin {
-                    let admin_help = if ib.chat_id < 0 { ADMIN_HELP_GROUP } else { ADMIN_HELP_PRIVATE };
-                    b.extend(md(&with_marker(admin_help, app.marker())));
+            let enabled_ids = |id: &str| app.provider_enabled(id) && app.unlisted_models_allowed(id);
+            let ctx = crate::help::Ctx {
+                marker: app.marker().to_string(),
+                ids_openrouter: enabled_ids("openrouter"),
+                ids_platforms: omni_llm::provider::PROVIDERS.iter().any(|p| enabled_ids(p.id)),
+                max_file_mb: app.cfg.general.max_file_mb,
+                bold_cost_usd: app.cfg.render.bold_cost_usd,
+                admin,
+                group: ib.chat_id < 0,
+                lang: crate::help::Lang::En,
+            };
+            // `/start` may carry a deep-link payload: always the overview.
+            let raw = if name == "start" { "" } else { args.trim() };
+            // `/help_zh …` (or `/help zh …`): the same help in Chinese.
+            let (ctx, topic) = match raw.strip_prefix("zh") {
+                Some(rest) if rest.is_empty() || rest.starts_with(['_', ' ']) => {
+                    (crate::help::Ctx { lang: crate::help::Lang::Zh, ..ctx }, rest.trim_start_matches(['_', ' ']))
                 }
-                send(app, bot, ib, "Help", b).await;
+                _ => (ctx, raw),
+            };
+            let help = if ctx.lang == crate::help::Lang::Zh { "帮助" } else { "Help" };
+            if topic.is_empty() {
+                send(app, bot, ib, help, crate::help::overview(&ctx)).await;
+            } else {
+                match crate::help::topic(&ctx, topic) {
+                    Ok((title, blocks)) => send(app, bot, ib, &format!("{help} · {title}"), blocks).await,
+                    Err(e) => send(app, bot, ib, help, md(&e)).await,
+                }
             }
         }
         "models" => cmd_models(app, bot, ib, args.trim()).await?,
@@ -712,7 +678,8 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
             blocks.push(RBlock::Paragraph(RText::plain(format!("{} is not in the OpenRouter catalog", spec.model))))
         }
     }
-    send(app, bot, ib, &format!("{}{marker} → {}{}", spec.label, spec.model, spec.options_syntax()), blocks).await;
+    send(app, bot, ib, &format!("{}{marker} → {}{}", spec.label, spec.canonical(), spec.options_syntax()), blocks)
+        .await;
     Ok(())
 }
 
@@ -1533,9 +1500,9 @@ impl Dim {
         );
         let user = format!("{} || ' (' || l.user_id || ')'", name("l.user_id"));
         match self {
-            // As shown in replies: OpenRouter ids as they are, the platforms' own APIs as `provider:model`.
+            // As shown in replies: `provider:model`, OpenRouter included.
             Dim::Model => (
-                "CASE WHEN COALESCE(l.provider, 'openrouter') = 'openrouter' THEN l.model ELSE l.provider || ':' || l.model END".into(),
+                "COALESCE(l.provider, 'openrouter') || ':' || l.model".into(),
                 "COALESCE(l.provider, 'openrouter'), l.model",
             ),
             Dim::Chat => (chat, "l.chat_id"),
@@ -1731,10 +1698,14 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
         }
     };
     // The target: a keyword, a user id, the replied person, or (none) the whole list.
+    // Two numbers alone are a capacity and a refill (for the replied person);
+    // a number and `off` are a user id and `off`.
     let target = match w.first().copied() {
         Some("chat") => Some(Target::Chat),
         Some("members") => Some(Target::Members),
-        Some(x) if x.parse::<i64>().is_ok_and(|u| u > 0) && w.len() != 2 => Some(Target::Member(x.parse().unwrap())),
+        Some(x) if x.parse::<i64>().is_ok_and(|u| u > 0) && (w.len() != 2 || w[1] == "off") => {
+            Some(Target::Member(x.parse().unwrap()))
+        }
         _ => None,
     };
     if target.is_some() {
