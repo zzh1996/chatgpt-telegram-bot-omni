@@ -21,20 +21,25 @@
 //! - **Conversation**: as for Seedream (one request = the new message's text
 //!   and images; a reply to a generated image sends that image first, then the
 //!   attached ones; earlier messages are not sent).
-//! - **Defaults** (D3, the owner): the largest size (Qwen-Image text-to-image
-//!   2048*2048, edits keep the input's aspect at the model's size; Wan 2.7
-//!   `4K` (pro, text-to-image) / `2K`; wan2.6-image `2K`; wan2.6-t2i
-//!   1440*1440; z-image 2048*2048), `n: 1` sent explicitly (Wan 2.6's default
-//!   is 4), `watermark: false`, thinking on where the model has it
-//!   (`enable_thinking`, Wan 2.7 `thinking_mode` for text-to-image, z-image's
-//!   "智能思考" `prompt_extend`, which doubles its price). Alibaba's prompt
-//!   rewriting (`prompt_extend`, default on and recommended on Qwen-Image and
-//!   Wan 2.6) stays at its default: no option turns it off. Moderation is
-//!   always on ("所有 prompt … 都会经过内容安全审核"; the
+//! - **Defaults** (D3, D79, the owner): the largest size where every size
+//!   costs the same (Qwen-Image 3.0 / 2.x text-to-image 2048*2048, edits keep
+//!   the input's aspect at the model's size; Wan 2.7 `4K` (pro,
+//!   text-to-image) / `2K`; wan2.6-image `2K`; wan2.6-t2i 1440*1440; z-image
+//!   2048*2048); Qwen-Image 3.0 pro, whose sizes above 2,250,000 pixels cost
+//!   double, gets the model's own size (`ar=` alone: the largest of that ratio
+//!   within 2,250,000 pixels) and a note naming `+size=2K`. `n: 1` sent
+//!   explicitly (Wan 2.6's default is 4), `watermark: false`, thinking on where
+//!   the model has it (`enable_thinking`, Wan 2.7 `thinking_mode` for
+//!   text-to-image). z-image's "智能思考" rewriting (`prompt_extend`, which
+//!   doubles its price) is off, Alibaba's default, with a note; `rewrite=on`
+//!   turns it on. Alibaba's prompt rewriting on Qwen-Image and Wan 2.6
+//!   (`prompt_extend`, default on and recommended there) stays at its default:
+//!   no option turns it off. Moderation is always on ("所有 prompt … 都会经过内容安全审核"; the
 //!   `X-DashScope-DataInspection` header adds a paid check, it removes none).
-//! - **Options**: `1 2 4` (Wan tiers; elsewhere a size of about that many
-//!   pixels), `S W H w h ar=` (pixels of that ratio within the model's limits),
-//!   `n=` (Qwen-Image 1–6, Wan 1–4), `e=none` (thinking off). Not mapped (no
+//! - **Options**: `size=1K` `2K` `4K` (Wan tiers; elsewhere a size of about
+//!   that many pixels), `ar=` (pixels of that ratio within the model's limits),
+//!   `n=` (Qwen-Image 1–6, Wan 1–4), `e=none` (thinking off), `rewrite=`
+//!   (z-image's `prompt_extend`). Not mapped (no
 //!   option): negative prompt, seed, Wan 2.7 image sets, colour palettes and
 //!   box selection, Qwen's agent rewriting, wan2.6-image's text-and-image
 //!   (streamed) mode.
@@ -60,7 +65,7 @@ use crate::error::{ErrorKind, LlmError, Retry};
 use crate::event::StreamEvent;
 use crate::openrouter::options::{Applied, overlay};
 use crate::provider::{Currency, DirectConfig, usd};
-use crate::request::{self, Generation, Requested, RouteCaps, Tool};
+use crate::request::{self, Generation, Raise, Requested, RouteCaps, Tool};
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, MediaClass, Observer, Prepared, classify_mime};
 
 pub const DIALECT: &str = "alibaba.images";
@@ -74,8 +79,6 @@ pub enum Thinking {
     EnableThinking,
     /// `thinking_mode` (Wan 2.7; text-to-image only).
     ThinkingMode,
-    /// `prompt_extend` (z-image: rewriting with reasoning, "智能思考").
-    PromptExtend,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +110,9 @@ pub struct Spec {
     pub output_cny: &'static [(u64, f64)],
     /// CNY per image with `prompt_extend` on (z-image).
     pub extended_cny: Option<f64>,
+    /// `prompt_extend` is a paid switch, off by default (z-image's "智能思考"
+    /// rewriting): `rewrite=`.
+    pub rewrite: bool,
 }
 
 const P512: u64 = 512 * 512;
@@ -135,6 +141,7 @@ const QWEN3: Spec = Spec {
     input_cny: 0.02,
     output_cny: &[(u64::MAX, 0.18)],
     extended_cny: None,
+    rewrite: false,
 };
 
 const QWEN21: Spec = Spec { max_refs: 10, input_cny: 0.0, ..QWEN3 };
@@ -162,11 +169,13 @@ const WAN27: Spec = Spec {
     input_cny: 0.0,
     output_cny: &[(u64::MAX, 0.20)],
     extended_cny: None,
+    rewrite: false,
 };
 
 /// Alibaba's image models in Beijing (2026-11-13).
 pub const MODELS: &[Spec] = &[
-    Spec { id: "qwen-image-3.0-pro", output_cny: &[(QIMA_1K, 0.25), (u64::MAX, 0.5)], ..QWEN3 },
+    // Larger than 2,250,000 pixels costs double: the model's own size by default (D79).
+    Spec { id: "qwen-image-3.0-pro", default_t2i: None, output_cny: &[(QIMA_1K, 0.25), (u64::MAX, 0.5)], ..QWEN3 },
     Spec { id: "qwen-image-3.0", ..QWEN3 },
     Spec { id: "qwen-image-2.1-pro", output_cny: &[(u64::MAX, 0.25)], ..QWEN21 },
     Spec { id: "qwen-image-2.1-turbo", output_cny: &[(u64::MAX, 0.1)], ..QWEN21 },
@@ -221,11 +230,12 @@ pub const MODELS: &[Spec] = &[
         default_t2i: Some("2048*2048"),
         default_edit: None,
         max_n: 1,
-        thinking: Thinking::PromptExtend,
+        thinking: Thinking::None,
         watermark: false,
         input_cny: 0.0,
         output_cny: &[(u64::MAX, 0.1)],
         extended_cny: Some(0.2),
+        rewrite: true,
     },
 ];
 
@@ -285,7 +295,11 @@ impl RouteCaps for Caps {
         Vec::new()
     }
     fn generation(&self) -> Generation {
-        Generation { count: self.0.is_some_and(|s| s.max_n > 1), ..Default::default() }
+        Generation {
+            count: self.0.is_some_and(|s| s.max_n > 1),
+            rewrite: self.0.is_some_and(|s| s.rewrite),
+            ..Default::default()
+        }
     }
 }
 
@@ -392,6 +406,15 @@ fn has_options(req: &Requested) -> bool {
     r != Requested::default()
 }
 
+/// The pixel budget of a size chosen for `ar=` alone: the largest, unless
+/// larger sizes cost more (then the largest at the cheapest price).
+fn default_pixels(spec: &Spec, range: (u64, u64)) -> u64 {
+    match spec.output_cny {
+        [(first, _), _, ..] => (*first).min(range.1),
+        _ => range.1,
+    }
+}
+
 /// The `size` to send (and how it was chosen), `None` for the model's own.
 fn size(spec: &Spec, req: &Requested, edit: bool, model: &str) -> Result<Option<String>, LlmError> {
     let range = if edit { spec.pixels_edit } else { spec.pixels };
@@ -436,7 +459,8 @@ fn size(spec: &Spec, req: &Requested, edit: bool, model: &str) -> Result<Option<
     match (&req.aspect_ratio, target) {
         (Some(a), t) => {
             let r = ratio(a).ok_or_else(|| err(format!("`{a}` is not an aspect ratio")))?;
-            let t = t.unwrap_or(range.1);
+            // `ar=` alone: the largest size at the default price.
+            let t = t.unwrap_or_else(|| default_pixels(spec, range));
             pixels_for(range, spec.max_ratio, t, r).map(Some).map_err(|e| err(format!("`{model}`: {e}")))
         }
         (None, Some(px)) => pixels_for(range, spec.max_ratio, px, (1, 1)).map(Some).map_err(LlmError::request),
@@ -485,7 +509,9 @@ pub async fn prepare(
     let mut applied = Vec::new();
     let mut settings = Vec::new();
     let mut warnings = Vec::new();
-    let notes = Vec::new();
+    let mut notes = Vec::new();
+    // Settings written while `set` holds `settings`.
+    let mut deferred: Vec<String> = Vec::new();
     if let Some(s) = spec {
         if ins.images.len() > s.max_refs {
             return Err(err(if s.max_refs == 0 {
@@ -509,9 +535,17 @@ pub async fn prepare(
                 settings.push(w);
             }
         };
-        if let Some(sz) = size(s, &req, edit, model)? {
+        let sz = size(s, &req, edit, model)?;
+        if let Some(sz) = &sz {
             let what = Some(format!("size {sz}"));
             set("size", json!(sz), user.image_size.is_some() || user.aspect_ratio.is_some(), what);
+        } else {
+            deferred.push("size: the model's choice".to_string());
+        }
+        // Tiered price: the default stays in the cheapest tier (D79).
+        if s.output_cny.len() > 1 && user.image_size.is_none() {
+            let default = sz.clone().unwrap_or_else(|| "the model's choice".into());
+            notes.extend(request::raise_note(&[Raise::new("image size", default, "2K", "+size=2K")]));
         }
         if s.max_n > 1 {
             let n = req.count.unwrap_or(1);
@@ -540,12 +574,22 @@ pub async fn prepare(
                 user.effort.is_some(),
                 Some(if off { "thinking off" } else { "thinking on" }.into()),
             ),
-            Thinking::PromptExtend => set(
+        }
+        if s.rewrite {
+            let on = req.rewrite.unwrap_or(false);
+            set(
                 "prompt_extend",
-                json!(!off),
-                user.effort.is_some(),
-                Some(if off { "thinking off" } else { "smart rewriting with thinking (prompt_extend)" }.into()),
-            ),
+                json!(on),
+                user.rewrite.is_some(),
+                Some(if on { "smart rewriting with thinking (prompt_extend)" } else { "prompt rewriting off" }.into()),
+            );
+            if !on && user.rewrite.is_none() {
+                notes.push(request::switch_note(
+                    "prompt rewriting with thinking (智能思考)",
+                    "+rewrite=on",
+                    "it doubles the price",
+                ));
+            }
         }
         if s.watermark {
             set("watermark", json!(false), false, Some("no watermark".into()));
@@ -556,6 +600,7 @@ pub async fn prepare(
              defaults; cost not estimated)"
         ));
     }
+    settings.extend(deferred);
     let attached = ins.images.len() - ins.edited;
     match (ins.edited, attached) {
         (0, 0) => {}

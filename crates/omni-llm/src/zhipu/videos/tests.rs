@@ -92,6 +92,10 @@ async fn cogvideox_defaults_are_the_best_the_api_has() {
     );
     assert!(p.applied.iter().all(|a| a.source == "default"));
     assert!(p.warnings.is_empty() && p.notes.is_empty());
+    // `audio=off`: no sound effects (on by default: the price is per video either way).
+    let p = prep("cogvideox-3", &[kv("audio", "off")]).await.unwrap();
+    assert_eq!(p.body["with_audio"], false);
+    assert!(p.settings.contains(&"no AI sound effects".to_string()), "{:?}", p.settings);
     // CogVideoX-2 and Flash: the same fields; Flash is free.
     let p = prep("cogvideox-flash", &[]).await.unwrap();
     assert_eq!((p.body["size"].clone(), p.body["fps"].clone()), (json!("3840x2160"), json!(60)));

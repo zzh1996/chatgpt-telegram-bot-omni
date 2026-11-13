@@ -71,11 +71,13 @@ pub struct ModelSpec {
     pub thinking: Thinking,
     /// `output_config.effort` levels, highest first (empty: no effort parameter).
     pub efforts: &'static [&'static str],
-    /// The default level: `high` on most models, `medium` on Opus 5.5 and
-    /// Haiku 5.5 (effort docs); `none` where thinking needs a budget (Opus 4.5,
-    /// Haiku 4.5: no thinking unless asked). Opus/Sonnet 4.6–4.8 run without
+    /// The default level, as Anthropic recommends it (D78): `high` on most
+    /// models, `medium` on Opus 5.5 and Haiku 5.5 (effort docs) and on Sonnet
+    /// 4.6 ("Medium effort (recommended)", the API default being high); `none`
+    /// where thinking needs a budget (Opus 4.5, Haiku 4.5: no thinking unless
+    /// asked, and no advice to turn it on). Opus/Sonnet 4.6–4.8 run without
     /// thinking when it is omitted, but Anthropic recommends adaptive thinking:
-    /// the bot turns it on at the default level.
+    /// the bot turns it on.
     pub effort: &'static str,
     pub off: Off,
     /// `thinking.display` defaults to `"omitted"` (empty thinking text): the
@@ -91,6 +93,11 @@ pub struct ModelSpec {
     pub interleaved_beta: bool,
     /// Accepts `role: "system"` messages after the start of the conversation.
     pub mid_system: bool,
+    /// Strips earlier turns' thinking by default ("last-turn-only": Haiku 4.5
+    /// and older Haiku). With thinking on, the bot keeps it through the
+    /// `clear_thinking_20251015` strategy with `keep: "all"` (beta
+    /// `context-management-2025-06-27`; owner, 2026-11-14).
+    pub strips_thinking: bool,
     pub fast: Option<Fast>,
     /// USD per MTok.
     pub input: f64,
@@ -124,6 +131,7 @@ const MODERN: ModelSpec = ModelSpec {
     dynamic_web: true,
     interleaved_beta: false,
     mid_system: true,
+    strips_thinking: false,
     fast: None,
     input: 0.0,
     output: 0.0,
@@ -144,6 +152,7 @@ const GEN_45: ModelSpec = ModelSpec {
     dynamic_web: false,
     interleaved_beta: true,
     mid_system: false,
+    strips_thinking: false,
     us_geo_premium: false,
     ..MODERN
 };
@@ -223,6 +232,7 @@ pub const MODELS: &[ModelSpec] = &[
         id: "claude-sonnet-4-6",
         thinking: Thinking::Adaptive { budget: true },
         efforts: NO_XHIGH,
+        effort: "medium",
         off: Off::Disabled,
         display_omitted: false,
         interleaved_beta: true,
@@ -242,7 +252,14 @@ pub const MODELS: &[ModelSpec] = &[
         ..MODERN
     },
     // Haiku 4.5: no effort parameter, no interleaved thinking.
-    ModelSpec { id: "claude-haiku-4-5", interleaved_beta: false, input: 1.0, output: 5.0, ..GEN_45 },
+    ModelSpec {
+        id: "claude-haiku-4-5",
+        interleaved_beta: false,
+        strips_thinking: true,
+        input: 1.0,
+        output: 5.0,
+        ..GEN_45
+    },
 ];
 
 /// The spec of `model`: its exact id or a dated snapshot of it

@@ -78,18 +78,22 @@ fn answer(parts: Vec<Part>, native: Option<NativeOutput>) -> Turn {
 }
 
 #[tokio::test]
-async fn defaults_are_4k_in_the_background() {
+async fn defaults_are_720p_in_the_background() {
     let p = prep(OMNI, &[]).await.unwrap();
     assert_eq!((p.dialect, p.url.as_str()), (DIALECT, "https://generativelanguage.googleapis.com/v1beta/interactions"));
+    // The API's default resolution (720p, not sent; D79), with the note naming the option.
     assert_eq!(
         p.body,
         json!({"model": OMNI, "input": "A marble rolling fast on a chain reaction track",
-               "response_format": {"type": "video", "resolution": "4k", "delivery": "uri"},
                "background": true, "labels": {"safety_identifier": "ab12cd34"}})
     );
-    assert_eq!(p.settings, ["text-to-video", "resolution 4k"]);
+    assert_eq!(p.settings, ["text-to-video", "resolution 720p"]);
     assert!(p.applied.iter().all(|a| a.source == "default"));
-    assert!(p.warnings.is_empty() && p.notes.is_empty());
+    assert!(p.warnings.is_empty());
+    assert_eq!(p.notes, ["video resolution is 720p by default, not the highest (4k, upscaled); add +size=4K"]);
+    let p = prep(OMNI, &[kv("size", "4K")]).await.unwrap();
+    assert_eq!(p.body["response_format"], json!({"type": "video", "resolution": "4k", "delivery": "uri"}));
+    assert!(p.notes.is_empty());
     assert_eq!(p.max_tokens(), None);
     assert!(google().knows(OMNI) && !google().knows("gemini-omni-1.1-flash"));
     assert!(!google().knows("veo-3.1-generate-preview") && !google().knows("gemini-omni-flash-preview"));
@@ -222,7 +226,7 @@ async fn a_reply_continues_the_interaction_or_sends_the_video() {
     assert_eq!(p.body["previous_interaction_id"], "v1_prev");
     assert_eq!(p.body["input"], "Make the violin invisible.");
     assert_eq!(p.settings[0], "follow-up of the previous video");
-    assert!(p.notes.is_empty(), "{:?}", p.notes);
+    assert!(p.notes.iter().all(|n| n.starts_with("video resolution is")), "{:?}", p.notes);
     // Another model's video (or another Omni model): sent inline, first.
     let other = NativeOutput { model: "gemini-omni-1.1-flash".into(), ..own };
     let h2 = vec![h[0].clone(), answer(vec![video.clone()], Some(other)), h[2].clone()];
@@ -238,7 +242,7 @@ async fn a_reply_continues_the_interaction_or_sends_the_video() {
     let h3 = vec![Turn::user_text("a cat"), answer(vec![gen_img], None), Turn::user_text("animate it")];
     let p = prep_with(OMNI, &[], &h3, &blobs2).await.unwrap();
     assert_eq!(p.body["input"][0]["type"], "image");
-    assert!(p.notes.is_empty());
+    assert!(p.notes.iter().all(|n| n.starts_with("video resolution is")), "{:?}", p.notes);
 }
 
 // ------------------------------------------------------------------ HTTP (local fake Gemini API)
@@ -421,11 +425,7 @@ async fn a_background_job_is_checkpointed_polled_and_its_video_decoded() {
     evs.into_iter().for_each(|e| acc.apply(e));
     let Part::ToolCall(t) = &acc.parts()[0] else { panic!("{:?}", acc.parts()) };
     assert_eq!(t.name, "video_generation");
-    assert_eq!(
-        t.input,
-        Some(json!({"prompt": "A marble rolling fast on a chain reaction track",
-                    "response_format": {"type": "video", "resolution": "4k", "delivery": "uri"}}))
-    );
+    assert_eq!(t.input, Some(json!({"prompt": "A marble rolling fast on a chain reaction track"})));
     assert_eq!(
         t.output,
         Some(json!({"status": "completed", "model": OMNI, "video": [{"type": "video", "mime_type": "video/mp4"}]}))

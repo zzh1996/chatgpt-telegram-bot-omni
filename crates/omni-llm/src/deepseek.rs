@@ -28,7 +28,9 @@
 //!   `{"error":…}` frame).
 //! - **Replay** only within the same dialect and model: Chat `content` +
 //!   `reasoning_content` (the official multi-turn sample sends it back; without
-//!   `tools` the API ignores it), Messages content blocks verbatim (thinking
+//!   function tools the API ignores it unless `preserve_thinking: true`, which
+//!   the bot sends: undocumented, tested 2026-11-14, owner's choice; the web
+//!   tools ignore it), Messages content blocks verbatim (thinking
 //!   with its signature, the search call and its results). Assistant messages
 //!   carry text only on both endpoints: media other models generated in
 //!   earlier turns are not sent (a warning says what).
@@ -78,7 +80,7 @@ const MAX_TOKENS_LIMIT: u64 = 393_216;
 /// → high) are not offered: they would be remapped silently.
 const EFFORTS: &[&str] = &["max", "high", "low"];
 /// The default level of both models (`/models` `effort.default_level`, 2026-11-13).
-const DEFAULT_EFFORT: &str = "high";
+pub(crate) const DEFAULT_EFFORT: &str = "high";
 /// The server-side search tool of the Messages endpoint (both documented
 /// versions select the same tool). `max_uses` is left at its default, which is
 /// also the cap (5).
@@ -327,6 +329,16 @@ impl Provider for DeepSeek {
             applied.push(Applied { source: source(by_user).into(), patch: json!({"tools": tools}) });
         }
 
+        // Earlier turns' reasoning: without function tools the API ignores the replayed
+        // `reasoning_content` unless `preserve_thinking: true` (undocumented except as
+        // "ignored" with the web tools; live 2026-11-14: the prompt grows by the replayed
+        // reasoning). Owner, 2026-11-14: keep it. Not with the web tools, which ignore it.
+        let web_tools_on = web == WebTools::DeepSeek && (wants_search || wants_fetch);
+        if dialect == DIALECT && effort != "none" && !web_tools_on {
+            body["preserve_thinking"] = json!(true);
+            applied.push(Applied { source: "default".into(), patch: json!({"preserve_thinking": true}) });
+            settings.push("earlier reasoning kept".into());
+        }
         if dialect == DIALECT {
             // This model's own Chat answers are replayed; other turns go as their text.
             let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
@@ -1083,7 +1095,9 @@ mod tests {
         for k in ["temperature", "top_p", "tools", "service_tier", "metadata"] {
             assert!(p.body.get(k).is_none(), "{k} must not be sent");
         }
-        assert_eq!(p.settings, vec!["effort high"]);
+        // Earlier turns' reasoning is read back (undocumented switch; owner, 2026-11-14).
+        assert_eq!(p.body["preserve_thinking"], true);
+        assert_eq!(p.settings, vec!["effort high", "earlier reasoning kept"]);
         assert_eq!(p.applied[0].source, "default");
         assert_eq!(p.applied[0].patch, json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high"}));
         assert_eq!(p.applied[1].patch, json!({"max_tokens": 393_216}));
@@ -1094,6 +1108,10 @@ mod tests {
         assert!(p.notes.is_empty(), "{:?}", p.notes);
         let p = prepare("deepseek-flash", &[flag("l")], &h).await.unwrap();
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}));
+        assert!(p.body.get("preserve_thinking").is_none(), "no reasoning to keep");
+        // The web tools ignore it: not sent with them.
+        let p = prepare("deepseek-flash", &[flag("s")], &h).await.unwrap();
+        assert!(p.body.get("preserve_thinking").is_none());
     }
 
     #[tokio::test]
@@ -1101,7 +1119,7 @@ mod tests {
         let h = vec![Turn::user_text("hi")];
         let p = prepare("deepseek-flash", &[kv("e", "low")], &h).await.unwrap();
         assert_eq!(p.body["reasoning_effort"], "low");
-        assert_eq!(p.settings, vec!["effort low"]);
+        assert_eq!(p.settings, vec!["effort low", "earlier reasoning kept"]);
         assert_eq!(p.applied[0].source, "option");
         let p = prepare("deepseek-flash", &[kv("e", "none")], &h).await.unwrap();
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}));

@@ -5,7 +5,7 @@
 - **MTProto**（grammers），不是 HTTP Bot API；发送用持久化的 `random_id` 实现幂等。
 - **单进程多 bot**：每个 bot 都像独立实例（各自的模型范围、授权名单、限额、前缀和速率限制），可按模型/群组分工。
 - **各家官方 API 与 OpenRouter**：配了 key 的平台直连它自己的 API（OpenAI、Anthropic、Gemini、xAI、DeepSeek、智谱、Moonshot、阿里云百炼、火山方舟；国内厂商接国内官网，和旧版一样），模型写成 `openai:gpt-6.1-sol` 这样，回复第一行也这样显示；也可以经 OpenRouter（写作 `openai/gpt-6.1-sol`，回复第一行是 `openrouter:openai/gpt-6.1-sol`）。示例配置的前缀都直连官方，前面加 `o` 的同名前缀走 OpenRouter（`c$` / `oc$`）——这只是配置里的写法，可以随意改。
-- **请求干净透明**：不注入任何 system prompt；所有参数（包括默认的"能力拉满"预设）都可查看（/info），并可用选项逐项覆盖（如 `+e=low`）；上游错误原样展示。
+- **请求干净透明**：不注入任何 system prompt；所有参数（推理用厂商推荐的档位、输入用最高精度、生成用平台默认质量，不是最高时回答里写出拉高的选项）都可查看（/info），并可用选项逐项覆盖（如 `+e=low`、`+h`、`+size=4K`）；上游错误原样展示。
 - **重启不重不漏**：入站消息先落盘、处理完一批后才推进 Telegram 的 pts（重复投递被唯一键去重）；被重启打断的生成在原消息里重新生成（Gemini 4 long decode 从 checkpoint 接着写）；半截消息会被标注而不会悬空。
 - **多模态进出**：Telegram 能发的都能当输入（照片、相册、文件、语音、视频、贴纸、富消息、位置…）；模型生成的图片、视频、音频、文件按产生的位置显示，`/raw` 取原文件。出图和视频按各平台官方推荐的方式：聊天模型出图（Nano Banana，OpenAI/Grok 的 `+i`），或直接调出图/视频模型的接口（gpt-image、Grok Imagine、Seedream、CogView/GLM-Image、千问图像/Wan；视频：Grok Imagine、Seedance、CogVideoX/Vidu、HappyHorse/Wan、Gemini Omni）。
 - **Telegram 富消息**：思考过程放在可折叠块里，表格/公式/代码高亮；工具调用（搜索、代码执行…）显示成可读的内容而不是裸 JSON；超出能力的部分按块回退为原始 Markdown；每条回复第一行是模型名，bot 加的其它内容都在折叠块或小字页脚里，模型输出无法伪造。
@@ -36,7 +36,7 @@ docker compose logs -f
 | `anthropic/claude-opus-5.5$你好` | 直接写 bot 有的任意 OpenRouter 模型 ID（需 `allow_unlisted_models = true`），新模型无需改配置 |
 | `openai:gpt-6.1-sol$你好` | 直连该平台的官方 API（需配置它的 key；直接写 ID 同样需 `allow_unlisted_models = true`，而且只接受 bot 模型表里的模型） |
 | `c,g,61s$比较一下` | 多个模型并行 |
-| `c+s$` / `c+h$` / `gi+size=4K+ar=16:9$` | 选项：官方搜索、最高推理强度（`h`；`l` 最低）、图片尺寸/比例…（本地校验，`/help options`） |
+| `c+s$` / `c+h$` / `gi+size=4K+ar=16:9$` | 选项：官方搜索、最高推理强度（`h`；`l` 最低）、图片尺寸/比例、视频声音 `audio=`…（本地校验，`/help options`） |
 | `i$一只猫`、`dbv$海浪` | 直接调出图/视频模型：示例配置里平台字母加 `i`/`v` 是出图/视频模型（`i` = OpenAI GPT Image，`dbv` = Seedance，全部见 /models）；直接写 ID（`openai:gpt-image-2.6-sunburst$`）需该平台 `allow_unlisted_models = true`，示例配置里没开。回复生成的图 = 编辑它；`+n=` `+q=` `+bg=` `+sec=` |
 | `c$::system` + 换行 + 角色段落 | 自定义 system prompt 和前文历史 |
 | 图片/文件/相册的说明里写前缀，或带前缀回复图片/文件/相册/位置 | 附件交给模型；相册当一条消息；位置给 Gemini 的 Google Maps（`+m`）；富消息按 Markdown |

@@ -186,7 +186,9 @@ impl OpenRouter {
             Some(v) => Some(v),
             None => self.auto_max_tokens(input, info.as_deref()),
         };
-        let level_note = crate::request::resolve_reasoning(model, &mut req, &caps).map_err(LlmError::request)?;
+        let level_note = crate::request::resolve_reasoning(model, &mut req, &caps)
+            .map_err(LlmError::request)?
+            .or_else(|| options::unsent_default_note(model, &req, &caps));
         let plan = options::plan(model, info.as_deref(), &caps, &req, &user, auto_max).map_err(LlmError::request)?;
         let mut warnings = Vec::new();
         if info.is_none() {
@@ -270,7 +272,7 @@ impl OpenRouter {
             body,
             applied: all_applied,
             warnings,
-            notes: level_note.into_iter().chain(notes).collect(),
+            notes: level_note.into_iter().chain(plan.notes.iter().cloned()).chain(notes).collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: dialect == options::Dialect::Chat && self.cfg.fidelity.is_long_decode(model),

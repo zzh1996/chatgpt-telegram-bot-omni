@@ -41,14 +41,15 @@
 //!   prompt, inputs, length, ratio, seed and audio (the message's text is not
 //!   sent).
 //!
-//! **Defaults** (D3, the owner): the largest resolution (2.5: 1080p, 2.0: 4K,
-//! fast / mini / flash: 720p, 1.0: 1080p), audio on (`generate_audio: true`),
-//! `watermark: false`, Ark's own length (2.5: `-1`, the model picks) and aspect
-//! ratio (`adaptive` on 2.x), `safety_identifier` = the hashed user. Ark
-//! documents no moderation switch.
+//! **Defaults** (D79, the owner): Ark's default resolution, 720p, sent
+//! explicitly (the highest: 2.5 1080p, 2.0 4K, fast / mini 720p; the reply
+//! notes it and the option that raises it), audio on (`generate_audio: true`,
+//! Ark's default; `audio=off` turns it off), `watermark: false`, Ark's own
+//! length (2.5: `-1`, the model picks) and aspect ratio (`adaptive` on 2.x),
+//! `safety_identifier` = the hashed user. Ark documents no moderation switch.
 //!
-//! **Options**: `1` `2` `4` = 720p / 1080p / 4K (480p has no letter); `S W H w
-//! h ar=` = 16:9, 4:3, 1:1, 3:4, 9:16, 21:9; `sec=`; `q=draft|final` (2.5);
+//! **Options**: `size=1K` `2K` `4K` = 720p / 1080p / 4K (480p has no size);
+//! `ar=` = 16:9, 4:3, 1:1, 3:4, 9:16, 21:9; `sec=`; `audio=`; `q=draft|final` (2.5);
 //! no `+s` (Ark publishes no price for the video API's web search). Options a mode cannot use (a conversation's
 //! options carry over to replies) are not sent, with a note: 2.5 keeps the first
 //! frame's or the source video's aspect ratio, and an edit the source's length.
@@ -83,7 +84,7 @@ use crate::error::{ErrorKind, LlmError, Retry};
 use crate::event::StreamEvent;
 use crate::openai::media::{self, Http};
 use crate::openrouter::options::{Applied, overlay};
-use crate::request::{self, Generation, Requested, RouteCaps, Tool};
+use crate::request::{self, Generation, Raise, Requested, RouteCaps, Tool};
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, MediaClass, Observer, Prepared, classify_mime};
 
 pub const DIALECT: &str = "ark.videos";
@@ -140,7 +141,8 @@ pub struct Spec {
     pub prefix: bool,
     pub name: &'static str,
     pub family: Family,
-    /// `resolution` values, lowest first (the last is the default).
+    /// `resolution` values, lowest first (the last is the highest; Ark's
+    /// default is 720p).
     pub resolutions: &'static [&'static str],
     /// `duration` range, seconds.
     pub seconds: (u32, u32),
@@ -243,7 +245,7 @@ impl RouteCaps for Caps {
         if self.0.flex { vec!["flex".into()] } else { Vec::new() }
     }
     fn generation(&self) -> Generation {
-        Generation { quality: self.0.draft, count: false, background: false, seconds: true }
+        Generation { quality: self.0.draft, seconds: true, audio: self.0.audio, ..Default::default() }
     }
 }
 
@@ -565,6 +567,18 @@ fn src(by_user: bool) -> String {
 }
 
 /// `1` `2` `4` as Seedance resolutions.
+/// Ark's default `resolution` on every Seedance 2.x model.
+const DEFAULT_RESOLUTION: &str = "720p";
+
+/// The `size=` value of a resolution.
+fn size_for(resolution: &str) -> &'static str {
+    match resolution {
+        "1080p" => "2K",
+        "4k" => "4K",
+        _ => "1K",
+    }
+}
+
 fn resolution_for(size: &str) -> Option<&'static str> {
     match size {
         "1K" => Some("720p"),
@@ -737,7 +751,8 @@ pub async fn prepare(
             return Err(err(format!("a draft is 480p, which has no size letter: drop size {s}")));
         }
         (_, None) if draft => "480p",
-        (_, None) => spec.resolutions.last().copied().unwrap_or("720p"),
+        // Ark's default.
+        (_, None) => DEFAULT_RESOLUTION,
         (_, Some(s)) => match resolution_for(s).filter(|r| spec.resolutions.contains(r)) {
             Some(r) => r,
             None => {
@@ -852,6 +867,14 @@ pub async fn prepare(
     }
     set(&mut body, "resolution", json!(resolution), src(user.image_size.is_some()));
     settings.push(format!("resolution {resolution}"));
+    if let Some(top) = spec
+        .resolutions
+        .last()
+        .filter(|t| user.image_size.is_none() && !draft && mode != Mode::DraftFinal && **t != resolution)
+    {
+        let option = format!("+size={}", size_for(top));
+        notes.extend(request::raise_note(&[Raise::new("video resolution", resolution, *top, option)]));
+    }
     if let Some(d) = duration {
         set(&mut body, "duration", json!(d), src(user.seconds.is_some()));
         settings.push(format!("{d} s"));
@@ -861,8 +884,19 @@ pub async fn prepare(
         settings.push(format!("aspect ratio {r}"));
     }
     if spec.audio && mode != Mode::DraftFinal {
-        set(&mut body, "generate_audio", json!(true), "default".into());
-        settings.push("with audio".into());
+        let on = req.audio.unwrap_or(true);
+        set(&mut body, "generate_audio", json!(on), src(user.audio.is_some()));
+        settings.push(if on { "with audio" } else { "no audio" }.into());
+    } else if let Some(a) = req.audio {
+        notes.push(format!(
+            "ℹ️ audio={} not sent: {}",
+            if a { "on" } else { "off" },
+            if mode == Mode::DraftFinal {
+                "the final video reuses the draft's audio"
+            } else {
+                "this model makes no audio"
+            }
+        ));
     }
     set(&mut body, "watermark", json!(false), "default".into());
     settings.push("no watermark".into());

@@ -33,7 +33,7 @@ use super::{DIALECT, NAME};
 use crate::error::LlmError;
 use crate::openrouter::options::{Applied, overlay};
 use crate::provider::DirectConfig;
-use crate::request::{self, Requested, Tool};
+use crate::request::{self, Raise, Requested, Tool};
 use crate::{BlobLoader, CallInput, Prepared};
 
 /// `labels.safety_identifier`: Cloud label values are at most 63 characters of
@@ -262,7 +262,8 @@ pub async fn prepare(
         ));
     }
 
-    if spec.image_out.is_some() {
+    let mut image_note = None;
+    if let Some(img) = spec.image_out {
         // The image models' default, sent explicitly.
         let modalities = json!(["TEXT", "IMAGE"]);
         applied.push(Applied {
@@ -271,13 +272,20 @@ pub async fn prepare(
         });
         generation.insert("responseModalities".into(), modalities);
         let mut ic = Map::new();
-        if let Some(s) = &req.image_size {
+        // D79: Google's default size (1K, not sent), or a larger one at the same price.
+        if let Some(s) = req.image_size.as_deref().or(img.free_size) {
             ic.insert("imageSize".into(), json!(s));
             settings.push(format!("image size {s}"));
             applied.push(Applied {
                 source: src(user.image_size.is_some()),
                 patch: json!({"generationConfig": {"imageConfig": {"imageSize": s}}}),
             });
+        } else if img.sizes.len() > 1 {
+            settings.push("image size 1K".into());
+        }
+        let size = req.image_size.as_deref().or(img.free_size).unwrap_or("1K");
+        if let Some(top) = img.sizes.last().filter(|t| user.image_size.is_none() && **t != size) {
+            image_note = request::raise_note(&[Raise::new("image size", size, *top, format!("+size={top}"))]);
         }
         if let Some(a) = &req.aspect_ratio {
             ic.insert("aspectRatio".into(), json!(a));
@@ -345,7 +353,7 @@ pub async fn prepare(
         body,
         applied,
         warnings,
-        notes: level_note.into_iter().collect(),
+        notes: level_note.into_iter().chain(image_note).collect(),
         show_debug: false,
         auto_max_tokens: max_tokens,
         long_decode: spec.long_decode,

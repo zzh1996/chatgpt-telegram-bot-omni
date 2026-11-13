@@ -244,8 +244,13 @@ const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0frame";
 
 // ------------------------------------------------------------------ requests
 
+/// The notes other than the default-resolution one.
+fn other_notes(notes: &[String]) -> Vec<&str> {
+    notes.iter().map(String::as_str).filter(|n| !n.starts_with("video resolution is")).collect()
+}
+
 #[tokio::test]
-async fn defaults_are_the_largest_resolution_with_audio_and_no_watermark() {
+async fn defaults_are_arks_resolution_with_audio_and_no_watermark() {
     let p = prep(S25, &[]).await.unwrap();
     assert_eq!(
         (p.dialect, p.url.as_str()),
@@ -253,22 +258,35 @@ async fn defaults_are_the_largest_resolution_with_audio_and_no_watermark() {
     );
     assert_eq!(
         p.body,
-        json!({"model": S25, "content": [{"type": "text", "text": "一只猫"}], "resolution": "1080p",
+        json!({"model": S25, "content": [{"type": "text", "text": "一只猫"}], "resolution": "720p",
                "generate_audio": true, "watermark": false, "safety_identifier": "u-hash"})
     );
-    assert_eq!(p.settings, ["text-to-video", "resolution 1080p", "with audio", "no watermark"]);
-    assert!(p.warnings.is_empty() && p.notes.is_empty(), "{:?} {:?}", p.warnings, p.notes);
+    assert_eq!(p.settings, ["text-to-video", "resolution 720p", "with audio", "no watermark"]);
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    // Ark's default (720p) costs less than the highest: the note names the option (D79).
+    assert_eq!(p.notes, ["video resolution is 720p by default, not the highest (1080p); add +size=2K"]);
+    // Asked for: no note.
+    let p = prep(S25, &[kv("size", "2K")]).await.unwrap();
+    assert_eq!((p.body["resolution"].as_str(), p.notes.len()), (Some("1080p"), 0));
     assert_eq!(p.max_tokens(), None);
     assert!(ark().knows(S25) && ark().knows(S20) && ark().knows(FAST) && ark().knows(MINI));
-    // 2.0: 4K; fast and mini: 720p.
-    assert_eq!(prep(S20, &[]).await.unwrap().body["resolution"], "4k");
-    assert_eq!(prep(FAST, &[]).await.unwrap().body["resolution"], "720p");
-    assert_eq!(prep(MINI, &[]).await.unwrap().body["resolution"], "720p");
-    for model in [S20, FAST, MINI] {
+    // 2.0: 720p of up to 4K, with the note; fast and mini: 720p, their highest, no note.
+    let p = prep(S20, &[]).await.unwrap();
+    assert_eq!(p.body["resolution"], "720p");
+    assert_eq!(p.notes, ["video resolution is 720p by default, not the highest (4k); add +size=4K"]);
+    for model in [FAST, MINI] {
         let p = prep(model, &[]).await.unwrap();
-        assert_eq!(p.body["generate_audio"], true, "{model}");
+        assert_eq!(p.body["resolution"], "720p", "{model}");
         assert!(p.warnings.is_empty() && p.notes.is_empty(), "{model}: {:?} {:?}", p.warnings, p.notes);
     }
+    for model in [S20, FAST, MINI] {
+        assert_eq!(prep(model, &[]).await.unwrap().body["generate_audio"], true, "{model}");
+    }
+    // `audio=off`: a silent video (Ark's default is on).
+    let p = prep(S25, &[kv("audio", "off")]).await.unwrap();
+    assert_eq!(p.body["generate_audio"], false);
+    assert!(p.settings.iter().any(|s| s == "no audio"));
+    assert!(p.applied.iter().any(|a| a.source == "option" && a.patch == json!({"generate_audio": false})));
 }
 
 #[tokio::test]
@@ -350,7 +368,7 @@ async fn images_are_frames_or_references() {
     let history = vec![Turn::user_text("画猫"), answer, user(vec![Part::text("让它跑"), b.clone()])];
     let p = prep_with(S25, &[], &history, &blobs2).await.unwrap();
     assert_eq!(p.settings[0], "image-to-video: first frame (the previous image) + last frame");
-    assert!(p.notes.is_empty(), "an edit chain: {:?}", p.notes);
+    assert!(other_notes(&p.notes).is_empty(), "an edit chain: {:?}", p.notes);
     // What models cannot take.
     let ten: Vec<Part> = std::iter::once(Part::text("x")).chain((0..10).map(|_| a.clone())).collect();
     let e = prep_with(S20, &[], &[user(ten)], &blobs).await.unwrap_err();
@@ -370,11 +388,14 @@ async fn ratios_a_mode_cannot_use_are_noted_not_sent() {
     // 2.5 keeps the first frame's ratio (Ark: "仅支持 adaptive").
     let p = prep_with(S25, &[kv("ar", "16:9")], &[user(vec![a.clone()])], &blobs).await.unwrap();
     assert!(p.body.get("ratio").is_none());
-    assert_eq!(p.notes, ["ℹ️ aspect ratio 16:9 not sent: Seedance 2.5 keeps the first frame's aspect ratio"]);
+    assert_eq!(
+        other_notes(&p.notes),
+        ["ℹ️ aspect ratio 16:9 not sent: Seedance 2.5 keeps the first frame's aspect ratio"]
+    );
     // 2.0 crops the image to it.
     let p = prep_with(S20, &[kv("ar", "16:9")], &[user(vec![a])], &blobs).await.unwrap();
     assert_eq!(p.body["ratio"], "16:9");
-    assert!(p.notes.is_empty());
+    assert!(other_notes(&p.notes).is_empty());
     // Web search is not offered (no published price).
     let (a, ba) = photo(PNG, "image/png", false);
     let e = prep_with(S25, &[flag("s")], &[user(vec![Part::text("x"), a])], &Blobs(vec![ba])).await.unwrap_err();

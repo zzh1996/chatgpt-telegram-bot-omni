@@ -13,13 +13,17 @@
 //!   its encrypted content, messages with `phase`, hosted tool calls); other
 //!   assistant turns are their text (OpenAI's assistant messages carry text
 //!   only: their images and files are not sent, which a warning says).
-//! - Defaults (D3): the model's highest `reasoning.effort` with
-//!   `reasoning.summary: "detailed"`; the full output budget
+//! - Defaults (D3, D77, D78): the reasoning level OpenAI recommends (`medium`
+//!   on every model but gpt-5.5-pro `high`; on GPT-5.4/5.2/5.1, whose API
+//!   default `none` is the low-latency choice, too) with
+//!   `reasoning.summary: "detailed"` and `reasoning.context: "all_turns"`
+//!   (earlier turns' reasoning stays in context; the API default keeps only
+//!   the current turn's before GPT-5.6; GPT-5.2, 5.1 and 5 reject it); the full output budget
 //!   (`max_output_tokens`, which counts reasoning too); images at
 //!   `detail: "original"` where the vision guide documents it, else `"high"`;
 //!   PDFs at `detail: "high"`. `chat-latest` documents no effort levels: only
 //!   the summary is requested, as the old bot did.
-//! - Left at OpenAI's defaults: `reasoning.context` and `reasoning.mode`,
+//! - Left at OpenAI's defaults: `reasoning.mode`,
 //!   `truncation` (`disabled`: an overflow is a 400, after which the bot
 //!   shrinks the budget), the prompt cache TTL, web search
 //!   `search_context_size` / `user_location` / `search_content_types`, the
@@ -90,10 +94,17 @@ pub struct ModelSpec {
     pub max_output: u64,
     /// `reasoning.effort` levels, highest first; `None`: the model documents none.
     pub efforts: Option<&'static [&'static str]>,
-    /// The default level (the model pages): `medium` on the GPT-6, GPT-5.6 and
-    /// GPT-5.5 families, `none` on GPT-5.4/5.2/5.1, `high` on gpt-5.5-pro;
-    /// `None`: undocumented (nothing is sent, the API decides).
+    /// The default level, as OpenAI recommends it (D78): `medium` on the
+    /// GPT-6, GPT-5.6, GPT-5.5 and pro families ("Default configuration for
+    /// most workloads"), also on GPT-5.4/5.2/5.1 whose API default `none` is
+    /// "ideal for latency-sensitive workloads"; `high` on gpt-5.5-pro (its API
+    /// default). Checked live 2026-11-14 (`response.reasoning.effort`).
+    /// `None`: no effort parameter.
     pub effort: Option<&'static str>,
+    /// Takes `reasoning.context: "all_turns"` (live 2026-11-14: GPT-5.4 and
+    /// later, the pro models and chat-latest; GPT-5.2, 5.2-pro, 5.1 and 5 take
+    /// only `auto` / `current_turn`).
+    pub all_turns: bool,
     /// Takes `reasoning.summary`.
     pub summary: bool,
     /// Takes `text.verbosity`.
@@ -138,6 +149,7 @@ const BASE: ModelSpec = ModelSpec {
     verbosity: true,
     image_detail: "high",
     effort: Some("medium"),
+    all_turns: true,
     price: price(0.0, 0.0, None, 0.0),
     price_from: None,
     long_context: true,
@@ -223,7 +235,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4",
-        effort: Some("none"),
+        effort: Some("medium"),
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
         price: price(2.5, 0.25, None, 15.0),
@@ -232,7 +244,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4-mini",
-        effort: Some("none"),
+        effort: Some("medium"),
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
@@ -243,7 +255,7 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.4-nano",
-        effort: Some("none"),
+        effort: Some("medium"),
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         image_detail: "original",
@@ -264,7 +276,8 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.2",
-        effort: Some("none"),
+        effort: Some("medium"),
+        all_turns: false,
         context: 400_000,
         efforts: Some(XHIGH_TO_NONE),
         price: price(1.75, 0.175, None, 14.0),
@@ -274,7 +287,8 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         id: "gpt-5.2-pro",
-        effort: None,
+        effort: Some("medium"),
+        all_turns: false,
         context: 400_000,
         efforts: Some(PRO),
         price: price(21.0, 21.0, None, 168.0),
@@ -287,7 +301,8 @@ pub const MODELS: &[ModelSpec] = &[
     // Deprecated.
     ModelSpec {
         id: "gpt-5.1",
-        effort: Some("none"),
+        effort: Some("medium"),
+        all_turns: false,
         context: 400_000,
         efforts: Some(&["high", "medium", "low", "none"]),
         price: price(1.25, 0.125, None, 10.0),
@@ -298,6 +313,7 @@ pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "gpt-5",
         effort: Some("medium"),
+        all_turns: false,
         context: 400_000,
         efforts: Some(&["high", "medium", "low", "minimal"]),
         price: price(1.25, 0.125, None, 10.0),
@@ -476,9 +492,19 @@ impl OpenAi {
         let reasoning = match (spec, req.effort.as_deref()) {
             (_, Some("none")) => Some((json!({"effort": "none"}), "reasoning off".to_string())),
             (Some(s), Some(e)) if s.efforts.is_some() => {
-                Some((json!({"effort": e, "summary": "detailed"}), format!("effort {e}")))
+                let mut r = json!({"effort": e, "summary": "detailed"});
+                if s.all_turns {
+                    r["context"] = json!("all_turns");
+                }
+                Some((r, format!("effort {e}")))
             }
-            (Some(s), _) if s.summary => Some((json!({"summary": "detailed"}), String::new())),
+            (Some(s), _) if s.summary => {
+                let mut r = json!({"summary": "detailed"});
+                if s.all_turns {
+                    r["context"] = json!("all_turns");
+                }
+                Some((r, String::new()))
+            }
             (Some(_), _) => None,
             // Not in the table: only what the user asked for.
             (None, Some(e)) => Some((json!({"effort": e}), format!("effort {e}"))),
@@ -872,7 +898,12 @@ mod tests {
         assert_eq!(p.url, "https://api.openai.com/v1/responses");
         assert_eq!(p.dialect, DIALECT);
         let b = &p.body;
-        assert_eq!(b["reasoning"], json!({"effort": "medium", "summary": "detailed"}), "OpenAI's default level");
+        // OpenAI's recommended level; earlier turns' reasoning kept (D78).
+        assert_eq!(
+            b["reasoning"],
+            json!({"effort": "medium", "summary": "detailed", "context": "all_turns"}),
+            "OpenAI's default level"
+        );
         assert_eq!(b["max_output_tokens"], 128_000);
         assert_eq!(p.auto_max_tokens, Some(128_000));
         // Stored (a broken stream is recovered from it), with the encrypted reasoning for replay.
@@ -912,12 +943,18 @@ mod tests {
         assert!(p.warnings.is_empty());
         assert_eq!(p.notes, ["reasoning effort is medium by default, not the highest (max); add +h for the highest"]);
 
-        // The official defaults per family; +h the top, +l off where it can be.
-        assert_eq!(prep("gpt-5.4", &[]).await.unwrap().body["reasoning"]["effort"], "none");
-        assert!(
-            prep("gpt-5.4", &[]).await.unwrap().notes[0]
-                .starts_with("reasoning is off by default (the highest level is xhigh)")
-        );
+        // The recommended defaults per family; +h the top, +l off where it can be. GPT-5.4/5.2/5.1:
+        // medium, not their API default `none` (the low-latency choice; D78).
+        for model in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.2", "gpt-5.1", "gpt-5.2-pro"] {
+            let p = prep(model, &[]).await.unwrap();
+            assert_eq!(p.body["reasoning"]["effort"], "medium", "{model}");
+            assert!(p.notes[0].starts_with("reasoning effort is medium by default, not the highest"), "{model}");
+        }
+        // `all_turns` where the API takes it (GPT-5.4 and later); 5.2, 5.1 and 5 reject it.
+        assert_eq!(prep("gpt-5.4", &[]).await.unwrap().body["reasoning"]["context"], "all_turns");
+        for model in ["gpt-5.2", "gpt-5.2-pro", "gpt-5.1", "gpt-5"] {
+            assert!(prep(model, &[]).await.unwrap().body["reasoning"].get("context").is_none(), "{model}");
+        }
         assert_eq!(prep("gpt-5.5-pro", &[]).await.unwrap().body["reasoning"]["effort"], "high");
         assert_eq!(prep("gpt-5", &[]).await.unwrap().body["reasoning"]["effort"], "medium");
         assert_eq!(prep("gpt-6.1-sol", &[flag("h")]).await.unwrap().body["reasoning"]["effort"], "max");
@@ -928,14 +965,14 @@ mod tests {
             "6.1 Sol has no none"
         );
         assert_eq!(prep("gpt-6-luna", &[flag("l")]).await.unwrap().body["reasoning"]["effort"], "none");
-        // gpt-5.2-pro documents no default: only the summary is sent.
-        let p = prep("gpt-5.2-pro", &[]).await.unwrap();
-        assert_eq!((p.body["reasoning"].clone(), p.notes.len()), (json!({"summary": "detailed"}), 0));
-        // chat-latest: no effort levels documented, only the summary (as the old bot sent).
+        // chat-latest: no effort levels documented, only the summary (as the old bot sent), and context.
         let p = prep("chat-latest", &[]).await.unwrap();
-        assert_eq!(p.body["reasoning"], json!({"summary": "detailed"}));
+        assert_eq!(p.body["reasoning"], json!({"summary": "detailed", "context": "all_turns"}));
         assert!(p.settings.is_empty());
-        assert_eq!(prep("chat-latest", &[flag("h")]).await.unwrap().body["reasoning"], json!({"summary": "detailed"}));
+        assert_eq!(
+            prep("chat-latest", &[flag("h")]).await.unwrap().body["reasoning"],
+            json!({"summary": "detailed", "context": "all_turns"})
+        );
         // The cap and the context window bound the budget.
         let capped =
             OpenAi::new(DirectConfig { max_tokens_cap: Some(32_000), ..cfg("https://api.openai.com/v1") }).unwrap();
@@ -974,7 +1011,7 @@ mod tests {
     async fn options_map_to_the_request() {
         let p = prep("gpt-6.1-sol", &[flag("sc"), kv("e", "low"), kv("v", "high"), kv("tier", "flex")]).await.unwrap();
         let b = &p.body;
-        assert_eq!(b["reasoning"], json!({"effort": "low", "summary": "detailed"}));
+        assert_eq!(b["reasoning"], json!({"effort": "low", "summary": "detailed", "context": "all_turns"}));
         assert_eq!(
             b["tools"],
             json!([{"type": "web_search"}, {"type": "code_interpreter", "container": {"type": "auto"}}])
@@ -1320,16 +1357,28 @@ mod tests {
         let p = prep("gpt-6.1-sol", &[flag("i")]).await.unwrap();
         assert_eq!(
             p.body["tools"],
-            json!([{"type": "image_generation", "model": "gpt-image-2.6-sunburst", "quality": "max", "moderation": "low", "partial_images": 3}])
+            json!([{"type": "image_generation", "model": "gpt-image-2.6-sunburst", "moderation": "low", "partial_images": 3}])
         );
         assert_eq!(p.body["include"], json!(["reasoning.encrypted_content"]), "the images come in the items");
         assert_eq!(
             p.settings,
-            ["effort medium", "image generation (gpt-image-2.6-sunburst)", "image quality max", "moderation low"]
+            ["effort medium", "image generation (gpt-image-2.6-sunburst)", "image quality auto", "moderation low"]
+        );
+        // OpenAI's default quality and size, with the note (D79).
+        assert!(
+            p.notes.contains(
+                &"image quality is auto, image size auto by default, not the highest (max, 4K); add +q=max+size=4K"
+                    .to_string()
+            ),
+            "{:?}",
+            p.notes
         );
         assert!(p.applied.iter().any(|a| a.source == "default" && a.patch["tools"][0]["moderation"] == "low"));
         // Its options: size and ratio, quality, background (on any model in the table).
-        let p = prep("chat-latest", &[flag("i"), kv("ar", "16:9"), kv("q", "high"), kv("bg", "opaque")]).await.unwrap();
+        let p =
+            prep("chat-latest", &[flag("i"), kv("size", "4K"), kv("ar", "16:9"), kv("q", "high"), kv("bg", "opaque")])
+                .await
+                .unwrap();
         let t = &p.body["tools"][0];
         assert_eq!(
             (t["size"].clone(), t["quality"].clone(), t["background"].clone()),

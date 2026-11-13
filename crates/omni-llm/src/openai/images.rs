@@ -17,15 +17,16 @@
 //! on 2026-10-23: errors, as is every `sora-*` id (OpenAI shut down the Videos
 //! API and the Sora 2 models on 2026-09-24, with no replacement).
 //!
-//! What the bot sends (defaults = the most the model offers, D3):
-//! - `quality`: the model's highest (`max` on 2.5/2.6, `high` before);
-//!   `q=` picks any of its levels or `auto`.
-//! - `size`: OpenAI's `size` fixes the aspect ratio as well, so "the largest
-//!   size" needs a ratio. With `S W H w h` / `ar=`: the largest size of
-//!   exactly that ratio; without one: `auto` (OpenAI picks size and ratio for
-//!   the prompt). `1` `2` `4` pick the size class — about 1024² and 2048²
-//!   pixels, and OpenAI's maximum (8,294,400 = 3840×2160) — at the given
-//!   ratio, 1:1 when none is given. The 2.x models take any `WIDTHxHEIGHT`
+//! What the bot sends (output at OpenAI's default quality, D79; the reply
+//! notes what is below the highest and the option that raises it):
+//! - `quality`: not sent (OpenAI's `auto`); `q=` picks any of the model's
+//!   levels (`max` is the highest on 2.5/2.6) or `auto`.
+//! - `size`: OpenAI's `size` fixes the aspect ratio as well. Without `size=`
+//!   and `ar=`: `auto` (OpenAI picks size and ratio for the prompt). `size=1K`
+//!   `2K` `4K` pick the size class — about 1024² and 2048² pixels, and
+//!   OpenAI's maximum (8,294,400 = 3840×2160) — at the `ar=` ratio, 1:1 when
+//!   none is given; `ar=` alone uses the 1K class (the default size). The
+//!   largest size of exactly the ratio within the class is sent. The 2.x models take any `WIDTHxHEIGHT`
 //!   with both edges multiples of 16 and at most 3840, a ratio within
 //!   1:3–3:1 and 655,360–8,294,400 pixels ("above 2560x1440 experimental");
 //!   the older ones only 1024x1024, 1536x1024, 1024x1536.
@@ -62,7 +63,7 @@ use crate::error::{ErrorKind, LlmError, Retry};
 use crate::event::StreamEvent;
 use crate::openrouter::options::Applied;
 use crate::provider::DirectConfig;
-use crate::request::{self, Generation, Requested, RouteCaps, Tool};
+use crate::request::{self, Generation, Raise, Requested, RouteCaps, Tool};
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared};
 
 pub const DIALECT: &str = "openai.images";
@@ -251,7 +252,8 @@ pub(crate) fn choose_size(
         };
         return Ok(Size { wh: Some(*wh), desc: format!("size {}x{} ({r})", wh.0, wh.1), note: None });
     }
-    let c = class.unwrap_or("4K");
+    // `ar=` alone: the default size class.
+    let c = class.unwrap_or("1K");
     let (width, height) =
         largest_size(w, h, budget(c)).map_err(|e| LlmError::request(format!("aspect ratio {r} for `{model}`: {e}")))?;
     let note = (u64::from(width) * u64::from(height) > EXPERIMENTAL_ABOVE)
@@ -293,7 +295,7 @@ impl RouteCaps for Caps {
         Vec::new()
     }
     fn generation(&self) -> Generation {
-        Generation { quality: true, count: true, background: true, seconds: false }
+        Generation { quality: true, count: true, background: true, ..Default::default() }
     }
 }
 
@@ -331,6 +333,28 @@ fn check_quality_background(model: &str, spec: Option<&ImageSpec>, req: &Request
     Ok(())
 }
 
+/// The note items for a quality and a size below the highest that the user
+/// did not choose (a preset's value counts as a default).
+fn raises(spec: &ImageSpec, req: &Requested, user: &Requested) -> Vec<Raise> {
+    let mut out = Vec::new();
+    let top = spec.qualities[0];
+    let q = req.quality.as_deref().unwrap_or("auto");
+    if user.quality.is_none() && q != top {
+        out.push(Raise::new("image quality", q, top, format!("+q={top}")));
+    }
+    if spec.flexible && user.image_size.is_none() {
+        let size = match (&req.image_size, &req.aspect_ratio) {
+            (Some(c), _) => c.as_str(),
+            (None, Some(_)) => "1K",
+            (None, None) => "auto",
+        };
+        if size != "4K" {
+            out.push(Raise::new("image size", size, "4K", "+size=4K"));
+        }
+    }
+    out
+}
+
 /// The `image_generation` tool of the Responses API (`+i`): the plan for its
 /// parameters.
 pub(crate) struct ToolPlan {
@@ -341,19 +365,17 @@ pub(crate) struct ToolPlan {
 }
 
 /// The `image_generation` tool with the bot's defaults (see the module docs):
-/// [`TOOL_MODEL`], its highest quality, the size from the options,
+/// [`TOOL_MODEL`], OpenAI's default quality, the size from the options,
 /// `moderation: "low"`, the background from `bg=`, three partial images. Its
 /// `complexity` is left to OpenAI, which takes it from the request's
 /// reasoning effort when that is one of its levels (else `high`).
 pub(crate) fn tool(chat_model: &str, req: &Requested, user: &Requested) -> Result<ToolPlan, LlmError> {
     let spec = image_spec(TOOL_MODEL).expect("the tool model is in the table");
     check_quality_background(TOOL_MODEL, Some(spec), req)?;
-    let quality = req.quality.clone().unwrap_or_else(|| spec.qualities[0].to_string());
     let size = choose_size(TOOL_MODEL, spec.flexible, req.image_size.as_deref(), req.aspect_ratio.as_deref())?;
     let mut tool = json!({
         "type": "image_generation",
         "model": TOOL_MODEL,
-        "quality": quality,
         "moderation": "low",
         "partial_images": PARTIAL_IMAGES,
     });
@@ -361,10 +383,14 @@ pub(crate) fn tool(chat_model: &str, req: &Requested, user: &Requested) -> Resul
         source: "default".into(),
         patch: json!({"tools": [{"type": "image_generation", "model": TOOL_MODEL, "moderation": "low", "partial_images": PARTIAL_IMAGES}]}),
     }];
-    applied.push(Applied {
-        source: src(user.quality.is_some()),
-        patch: json!({"tools": [{"type": "image_generation", "quality": quality}]}),
-    });
+    let quality = req.quality.clone().unwrap_or_else(|| "auto".into());
+    if let Some(q) = &req.quality {
+        tool["quality"] = json!(q);
+        applied.push(Applied {
+            source: src(user.quality.is_some()),
+            patch: json!({"tools": [{"type": "image_generation", "quality": q}]}),
+        });
+    }
     let mut settings = vec![format!("image generation ({TOOL_MODEL})"), format!("image quality {quality}")];
     if let Some((w, h)) = size.wh {
         tool["size"] = json!(format!("{w}x{h}"));
@@ -383,7 +409,8 @@ pub(crate) fn tool(chat_model: &str, req: &Requested, user: &Requested) -> Resul
         settings.push(format!("background {b}"));
     }
     settings.push("moderation low".into());
-    let mut notes: Vec<String> = size.note.into_iter().collect();
+    let mut notes: Vec<String> = request::raise_note(&raises(spec, req, user)).into_iter().collect();
+    notes.extend(size.note);
     if req.effort.as_deref().is_some_and(|e| COMPLEXITY.contains(&e)) {
         notes.push(format!(
             "ℹ️ OpenAI uses the reasoning effort of `{chat_model}` as the image complexity too (e={})",
@@ -466,10 +493,15 @@ pub(crate) async fn prepare(
         });
     }
     if let Some(s) = spec {
-        let quality = req.quality.clone().unwrap_or_else(|| s.qualities[0].to_string());
-        body["quality"] = json!(quality);
-        applied.push(Applied { source: src(user.quality.is_some()), patch: json!({"quality": quality}) });
-        settings.insert(0, format!("quality {quality}"));
+        match &req.quality {
+            Some(q) => {
+                body["quality"] = json!(q);
+                applied.push(Applied { source: src(user.quality.is_some()), patch: json!({"quality": q}) });
+                settings.insert(0, format!("quality {q}"));
+            }
+            None => settings.insert(0, "quality auto".into()),
+        }
+        notes.extend(request::raise_note(&raises(s, req, user)));
         if s.complexity {
             let c = req.effort.clone().unwrap_or_else(|| COMPLEXITY[0].to_string());
             body["complexity"] = json!(c);
@@ -843,26 +875,38 @@ mod tests {
         assert_eq!(choose_size("m", true, None, None).unwrap().wh, None);
         let s = choose_size("m", true, Some("2K"), None).unwrap();
         assert_eq!((s.wh, s.desc.as_str()), (Some((2048, 2048)), "size 2048x2048 (2K, 1:1)"));
-        assert!(choose_size("m", true, None, Some("16:9")).unwrap().note.unwrap().contains("experimental"));
+        // `ar=` alone: the default size class (1K).
+        let s = choose_size("m", true, None, Some("16:9")).unwrap();
+        assert_eq!((s.wh, s.note), (Some((1280, 720)), None));
+        assert!(choose_size("m", true, Some("4K"), Some("16:9")).unwrap().note.unwrap().contains("experimental"));
     }
 
     #[tokio::test]
-    async fn defaults_are_the_most_the_model_offers() {
+    async fn defaults_are_openais_quality_with_a_note() {
         let p = prep("gpt-image-2.6-sunburst", &[]).await.unwrap();
         assert_eq!(p.dialect, DIALECT);
         assert_eq!(p.url, "https://api.openai.com/v1/images/generations");
+        // OpenAI's default quality and size (`auto`, not sent; D79).
         assert_eq!(
             p.body,
-            json!({"model": "gpt-image-2.6-sunburst", "prompt": "a cat", "quality": "max", "complexity": "high",
+            json!({"model": "gpt-image-2.6-sunburst", "prompt": "a cat", "complexity": "high",
                 "moderation": "low", "stream": true, "partial_images": 3, "safety_identifier": "u-hash"})
         );
-        assert_eq!(p.settings, ["quality max", "complexity high", "moderation low"]);
+        assert_eq!(p.settings, ["quality auto", "complexity high", "moderation low"]);
         assert!(p.applied.iter().all(|a| a.source == "default"));
-        assert!(p.warnings.is_empty() && p.notes.is_empty());
-        // 2.5: the same highest quality, no complexity (also by its dated alias).
+        assert!(p.warnings.is_empty());
+        assert_eq!(
+            p.notes,
+            ["image quality is auto, image size auto by default, not the highest (max, 4K); add +q=max+size=4K"]
+        );
+        // Asked for: no note.
+        let p = prep("gpt-image-2.6-sunburst", &[kv("q", "max"), kv("size", "4K")]).await.unwrap();
+        assert_eq!((p.body["quality"].as_str(), p.body["size"].as_str()), (Some("max"), Some("2880x2880")));
+        assert!(p.notes.iter().all(|n| n.contains("experimental")), "{:?}", p.notes);
+        // 2.5: the same default quality, no complexity (also by its dated alias).
         for model in ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare-2026-09-08"] {
             let p = prep(model, &[]).await.unwrap();
-            assert_eq!(p.body["quality"], "max", "{model}");
+            assert!(p.body.get("quality").is_none(), "{model}");
             assert!(p.body.get("complexity").is_none(), "{model}");
             assert!(p.warnings.is_empty(), "{model}: {:?}", p.warnings);
         }
@@ -898,7 +942,7 @@ mod tests {
         let b = &p.body;
         assert_eq!(
             (b["size"].clone(), b["quality"].clone(), b["background"].clone()),
-            (json!("3840x2160"), json!("low"), json!("transparent"))
+            (json!("1280x720"), json!("low"), json!("transparent"))
         );
         assert_eq!((b["n"].clone(), b["complexity"].clone()), (json!(3), json!("low")));
         // Several images: no stream (previews could not be told apart).
@@ -908,21 +952,28 @@ mod tests {
             [
                 "quality low",
                 "complexity low",
-                "size 3840x2160 (4K, 16:9)",
+                "size 1280x720 (1K, 16:9)",
                 "background transparent",
                 "3 images",
                 "moderation low"
             ]
         );
-        assert!(p.notes[0].contains("experimental"));
+        // `ar=` alone: the 1K class, noted with the option for the largest.
+        assert_eq!(p.notes, ["image size is 1K by default, not the largest (4K); add +size=4K"]);
+        let notes = prep("gpt-image-2.6-flare", &[kv("size", "4K"), kv("ar", "16:9")]).await.unwrap().notes;
+        assert!(notes.iter().any(|n| n.contains("experimental")), "{notes:?}");
         assert_eq!(
             prep("gpt-image-2.6-flare", &[kv("size", "1K"), kv("ar", "3:4")]).await.unwrap().body["size"],
             "864x1152"
         );
-        assert_eq!(prep("gpt-image-2.5-flare", &[kv("ar", "21:9")]).await.unwrap().body["size"], "3808x1632");
-        let p = prep("gpt-image-2.5-sunburst", &[kv("bg", "transparent")]).await.unwrap();
+        assert_eq!(
+            prep("gpt-image-2.5-flare", &[kv("size", "4K"), kv("ar", "21:9")]).await.unwrap().body["size"],
+            "3808x1632"
+        );
+        let p =
+            prep("gpt-image-2.5-sunburst", &[kv("bg", "transparent"), kv("q", "max"), kv("size", "4K")]).await.unwrap();
         assert_eq!(p.body["background"], "transparent");
-        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        assert!(p.notes.iter().all(|n| n.contains("experimental")), "{:?}", p.notes);
         assert_eq!(prep("gpt-image-2.5-sunburst", &[kv("q", "auto")]).await.unwrap().body["quality"], "auto");
     }
 
@@ -982,7 +1033,7 @@ mod tests {
         assert_eq!(p.body["prompt"], "add a hat");
         assert!(p.body.get("input_fidelity").is_none());
         assert!(p.settings.contains(&"edit of the previous image + 1 input image".to_string()));
-        assert!(p.notes.is_empty());
+        assert!(p.notes.iter().all(|n| n.starts_with("image quality is auto")), "{:?}", p.notes);
         // GIF input is not taken by edits.
         let (gif, b3) = photo("image/gif", b"GIF89a");
         let e = prep_with("gpt-image-2.6-flare", &[], &[user(vec![Part::text("x"), gif])], &MemBlobs(vec![b3]))

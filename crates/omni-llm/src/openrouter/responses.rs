@@ -134,6 +134,9 @@ pub fn body(model: &str, input: Vec<Value>, plan: &Plan) -> Value {
     if let Some(s) = plan.summary {
         reasoning.insert("summary".into(), json!(s));
     }
+    if let Some(c) = plan.context {
+        reasoning.insert("context".into(), json!(c));
+    }
     if !reasoning.is_empty() {
         b["reasoning"] = Value::Object(reasoning);
         // Stateless replay needs the encrypted reasoning items.

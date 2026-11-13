@@ -72,6 +72,8 @@ fn image(bytes: &[u8], generated: bool) -> (Part, (BlobRef, Vec<u8>)) {
 
 #[tokio::test]
 async fn defaults_are_the_largest_size_one_image_thinking_no_watermark() {
+    // Qwen-Image 3.0 pro: sizes above 2,250,000 pixels cost double, so the model's own size
+    // (D79), with a note naming the option.
     let p = prep("qwen-image-3.0-pro", &[]).await.unwrap();
     assert_eq!(p.dialect, DIALECT);
     assert_eq!(p.url, "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation");
@@ -80,20 +82,42 @@ async fn defaults_are_the_largest_size_one_image_thinking_no_watermark() {
         json!({
             "model": "qwen-image-3.0-pro",
             "input": {"messages": [{"role": "user", "content": [{"text": "一只猫"}]}]},
-            "parameters": {"size": "2048*2048", "n": 1, "enable_thinking": true, "watermark": false}
+            "parameters": {"n": 1, "enable_thinking": true, "watermark": false}
         })
     );
-    assert_eq!(p.settings, vec!["size 2048*2048", "thinking on", "no watermark"]);
-    assert!(p.warnings.is_empty() && p.notes.is_empty());
+    assert_eq!(p.settings, vec!["thinking on", "no watermark", "size: the model's choice"]);
+    assert!(p.warnings.is_empty());
+    assert_eq!(p.notes, ["image size is the model's choice by default, not the largest (2K); add +size=2K"]);
+    // `ar=` alone: the largest of that ratio within the cheaper tier (2,250,000 px).
+    let p = prep("qwen-image-3.0-pro", &[kv("ar", "16:9")]).await.unwrap();
+    let size = p.body["parameters"]["size"].as_str().unwrap().to_string();
+    let (w, h) = size.split_once('*').unwrap();
+    assert!(w.parse::<u64>().unwrap() * h.parse::<u64>().unwrap() <= 2_250_000, "{size}");
+    // Asked for: no note.
+    let p = prep("qwen-image-3.0-pro", &[kv("size", "2K")]).await.unwrap();
+    assert_eq!((p.body["parameters"]["size"].as_str(), p.notes.len()), (Some("2048*2048"), 0));
+    // The other models cost the same at every size: the largest.
+    let p = prep("qwen-image-3.0", &[]).await.unwrap();
+    assert_eq!((p.body["parameters"]["size"].as_str(), p.notes.len()), (Some("2048*2048"), 0));
     assert!(ali().knows("wan2.7-image-pro") && ali().knows("z-image-turbo"));
     // Wan 2.7 pro: 4K text-to-image; wan2.6-t2i: n 1 (its default is 4), the largest size.
     let p = prep("wan2.7-image-pro", &[]).await.unwrap();
     assert_eq!(p.body["parameters"], json!({"size": "4K", "n": 1, "thinking_mode": true, "watermark": false}));
     let p = prep("wan2.6-t2i", &[]).await.unwrap();
     assert_eq!(p.body["parameters"], json!({"size": "1440*1440", "n": 1, "watermark": false}));
-    // z-image: "智能思考" on, no n, no watermark field.
+    // z-image: its paid "智能思考" rewriting off (Alibaba's default) with a note; `rewrite=on` turns it on.
     let p = prep("z-image-turbo", &[]).await.unwrap();
-    assert_eq!(p.body["parameters"], json!({"size": "2048*2048", "prompt_extend": true}));
+    assert_eq!(p.body["parameters"], json!({"size": "2048*2048", "prompt_extend": false}));
+    assert_eq!(
+        p.notes,
+        [
+            "prompt rewriting with thinking (智能思考) is off by default; add +rewrite=on to turn it on (it doubles the price)"
+        ]
+    );
+    let p = prep("z-image-turbo", &[kv("rewrite", "on")]).await.unwrap();
+    assert_eq!((p.body["parameters"]["prompt_extend"].as_bool(), p.notes.len()), (Some(true), 0));
+    let e = prep("qwen-image-3.0", &[kv("rewrite", "on")]).await.unwrap_err().message;
+    assert!(e.contains("prompt-rewriting switch (`rewrite=`)"), "{e}");
     // Workspace domains keep their host.
     assert_eq!(
         native_root("https://ws-1.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"),
@@ -130,7 +154,8 @@ async fn options_per_model() {
         p.applied.iter().find(|a| a.patch["parameters"].get("enable_thinking").is_some()).unwrap().source,
         "option"
     );
-    assert_eq!(prep("z-image-turbo", &[kv("e", "none")]).await.unwrap().body["parameters"]["prompt_extend"], false);
+    // z-image's rewriting is `rewrite=`, not reasoning (owner, 2026-11-14).
+    assert!(prep("z-image-turbo", &[kv("e", "none")]).await.unwrap_err().message.contains("cannot turn reasoning off"));
     assert!(prep("wan2.6-t2i", &[kv("e", "none")]).await.unwrap_err().message.contains("cannot turn reasoning off"));
     assert!(prep("qwen-image-3.0", &[kv("e", "high")]).await.is_err());
     for (opt, what) in [(kv("q", "hd"), "(`q=`)"), (kv("bg", "transparent"), "(`bg=`)"), (flag("s"), "web search")] {
@@ -330,7 +355,7 @@ async fn end_to_end() {
     }
 
     // z-image: its reasoning, the image, then the rewritten prompt, in the order given.
-    let p = a.prepare(&input("z-image-turbo", &[], &h), &[], &Blobs(vec![])).await.unwrap();
+    let p = a.prepare(&input("z-image-turbo", &[kv("rewrite", "on")], &h), &[], &Blobs(vec![])).await.unwrap();
     let (r, _, evs) = run(&a, &p).await;
     assert!(r.is_ok());
     let kinds: Vec<&str> = evs

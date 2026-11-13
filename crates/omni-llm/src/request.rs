@@ -91,6 +91,11 @@ pub struct Requested {
     pub background: Option<String>,
     /// Video length in seconds (`sec=`; video generation models).
     pub seconds: Option<u32>,
+    /// Generated audio on or off (`audio=`; video models with an audio switch).
+    pub audio: Option<bool>,
+    /// Prompt rewriting by the platform on or off (`rewrite=`; image models
+    /// with a separate rewriting switch, such as z-image's `prompt_extend`).
+    pub rewrite: Option<bool>,
 }
 
 fn set<T: PartialEq + std::fmt::Debug>(slot: &mut Option<T>, v: T, what: &str) -> Result<(), String> {
@@ -183,6 +188,18 @@ pub fn parse(tokens: &[OptionToken]) -> Result<Requested, String> {
                         .filter(|n| *n >= 1)
                         .ok_or_else(|| format!("`sec=` needs a whole number of seconds, got `{v}`"))?;
                     set(&mut r.seconds, n, "video length")?;
+                }
+                "audio" | "rewrite" => {
+                    let on = match v.to_ascii_lowercase().as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("`{k}=` takes on or off, got `{v}`")),
+                    };
+                    if k == "audio" {
+                        set(&mut r.audio, on, "audio")?;
+                    } else {
+                        set(&mut r.rewrite, on, "prompt rewriting")?;
+                    }
                 }
                 other => return Err(format!("unknown option `{other}=`; see /help options")),
             },
@@ -331,9 +348,10 @@ pub fn resolve_reasoning(model: &str, r: &mut Requested, route: &dyn RouteCaps) 
                 r.effort = Some((*top).clone());
             } else if let Some((max, _)) = route.budget_range() {
                 r.budget = Some(max);
-            } else if !route.fixed_reasoning() {
+            } else if !route.fixed_reasoning() && !can_off {
                 return Err(format!("`{model}` has no reasoning level to raise (`+h`) via {via}"));
             }
+            // A route that can only switch reasoning off: `+h` keeps it on (its default).
             Ok(None)
         }
         Some(Level::Lowest) => {
@@ -380,6 +398,58 @@ pub struct Generation {
     pub count: bool,
     pub background: bool,
     pub seconds: bool,
+    /// `audio=`: the model's API has an audio switch.
+    pub audio: bool,
+    /// `rewrite=`: the model's API has a separate prompt-rewriting switch.
+    pub rewrite: bool,
+}
+
+/// A generation setting left at the platform's default although a higher one
+/// exists (owner's rule, 2026-11-14: image and video output at the default
+/// quality where more quality costs more, and a note that says how to raise it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Raise {
+    /// What it is: `image quality`, `image size`, `video resolution`.
+    pub what: &'static str,
+    /// The default the request uses (`auto`, `1K`, `480p`).
+    pub default: String,
+    /// The highest the model offers (`max`, `4K`, `1080p`).
+    pub top: String,
+    /// The options that give it (`+q=max`, `+size=4K`).
+    pub option: String,
+}
+
+impl Raise {
+    pub fn new(
+        what: &'static str,
+        default: impl Into<String>,
+        top: impl Into<String>,
+        option: impl Into<String>,
+    ) -> Self {
+        Raise { what, default: default.into(), top: top.into(), option: option.into() }
+    }
+}
+
+/// The note for generation settings below the highest:
+/// `image quality is auto, image size 1K by default, not the highest (max, 4K); add +q=max+size=4K`,
+/// `image size is 1K by default, not the largest (4K); add +size=4K`.
+pub fn raise_note(items: &[Raise]) -> Option<String> {
+    let (first, rest) = items.split_first()?;
+    let mut s = format!("{} is {}", first.what, first.default);
+    for r in rest {
+        s.push_str(&format!(", {} {}", r.what, r.default));
+    }
+    let tops: Vec<&str> = items.iter().map(|r| r.top.as_str()).collect();
+    let options: String = items.iter().map(|r| r.option.as_str()).collect();
+    // Sizes are "largest", qualities and resolutions "highest".
+    let word = if items.iter().all(|r| r.what.ends_with("size")) { "largest" } else { "highest" };
+    Some(format!("{s} by default, not the {word} ({}); add {options}", tops.join(", ")))
+}
+
+/// The note for a paid extra the platform leaves off by default:
+/// `audio is off by default; add +audio=on to turn it on (it doubles the price)`.
+pub fn switch_note(what: &str, option: &str, cost: &str) -> String {
+    format!("{what} is off by default; add {option} to turn it on ({cost})")
 }
 
 /// Check `r` against the vendor's capabilities and the route's. Returns the
@@ -473,6 +543,8 @@ pub fn validate(model: &str, r: &Requested, route: &dyn RouteCaps) -> Result<(),
         (r.count.is_some(), g.count, "a number of images", "n="),
         (r.background.is_some(), g.background, "a background", "bg="),
         (r.seconds.is_some(), g.seconds, "a video length", "sec="),
+        (r.audio.is_some(), g.audio, "an audio switch", "audio="),
+        (r.rewrite.is_some(), g.rewrite, "a prompt-rewriting switch", "rewrite="),
     ] {
         if asked && !ok {
             return Err(format!("`{model}` does not take {what} (`{opt}`) via {via}"));
@@ -562,6 +634,32 @@ mod tests {
         assert!(parse(&[OptionToken::Flag("hl".into())]).is_err());
         assert!(parse(&[OptionToken::Flag("h".into()), kv("e", "low")]).unwrap_err().contains("+h"));
         assert!(parse(&[OptionToken::Flag("l".into()), kv("budget", "10")]).is_err());
+        // audio= / rewrite=: on or off (owner, 2026-11-14: their own options, not h).
+        let r = parse(&[kv("audio", "OFF"), kv("rewrite", "on")]).unwrap();
+        assert_eq!((r.audio, r.rewrite), (Some(false), Some(true)));
+        assert!(parse(&[kv("audio", "yes")]).unwrap_err().contains("`audio=` takes on or off"));
+        assert!(parse(&[kv("audio", "on"), kv("audio", "off")]).is_err());
+    }
+
+    #[test]
+    fn notes_for_generation_below_the_highest() {
+        assert_eq!(raise_note(&[]), None);
+        assert_eq!(
+            raise_note(&[Raise::new("image size", "1K", "4K", "+size=4K")]).unwrap(),
+            "image size is 1K by default, not the largest (4K); add +size=4K"
+        );
+        assert_eq!(
+            raise_note(&[
+                Raise::new("image quality", "auto", "max", "+q=max"),
+                Raise::new("image size", "auto", "4K", "+size=4K")
+            ])
+            .unwrap(),
+            "image quality is auto, image size auto by default, not the highest (max, 4K); add +q=max+size=4K"
+        );
+        assert_eq!(
+            switch_note("audio", "+audio=on", "it doubles the price"),
+            "audio is off by default; add +audio=on to turn it on (it doubles the price)"
+        );
     }
 
     /// Defaults are the official ones; +h / +l pick the ends of the range.
@@ -652,6 +750,11 @@ mod tests {
                 .unwrap()
                 .starts_with("reasoning is off by default (the highest level is xhigh)")
         );
+        // A switch without levels (GLM-5.1, Qwen-Image thinking): +h keeps reasoning on, +l turns it off.
+        let switch = R { efforts: None, default: None, off: true, budget: None, fixed: false };
+        let (r, note) = go(&switch, Some(Level::Highest));
+        assert_eq!((r.effort, note.unwrap()), (None, None));
+        assert_eq!(go(&switch, Some(Level::Lowest)).0.effort.as_deref(), Some("none"));
         // Budget-only models: +h / +l are the largest / smallest budget; off by default.
         let budget =
             R { efforts: None, default: Some("none"), off: false, budget: Some((64_000, 1_024)), fixed: false };

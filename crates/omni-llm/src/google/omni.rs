@@ -58,14 +58,15 @@
 //!   Not taken (errors): system prompts ("System instructions … are not
 //!   supported"), audio ("Uploading audio inputs … is unsupported"), YouTube
 //!   links, documents. Earlier turns of another model are not sent (noted).
-//! - **Options**: `1` `2` `4` → `response_format.resolution` 720p / 1080p / 4k
-//!   (360p has no letter), `W` `H` / `ar=16:9|9:16` → `aspect_ratio`, `sec=`
+//! - **Options**: `size=1K` `2K` `4K` → `response_format.resolution` 720p /
+//!   1080p / 4k (360p has no size), `ar=16:9|9:16` → `aspect_ratio`, `sec=`
 //!   → `duration` (`"10s"`; whole seconds, 3–15 on 1.2, 3–10 on 1.1; Google
 //!   rejects more than 10 for first-and-last-frame interpolation and per-turn
 //!   extension). Nothing else applies: no count, quality, background, tools,
 //!   thinking level or service tier (Standard only).
-//! - **Defaults**: `resolution: "4k"` (the largest; 1080p and 4K are
-//!   upscaled, the API's default is 720p) with `delivery: "uri"` above 720p
+//! - **Defaults** (D79): the API's default resolution, 720p (not sent; the
+//!   reply notes the highest, 4k, and `+size=4K`; 1080p and 4K are upscaled),
+//!   `delivery: "uri"` above 720p
 //!   (the guide's best practice for videos over 4 MB), the model's own length
 //!   (10 s) and aspect ratio (16:9), `labels.safety_identifier` = the user
 //!   hash (as on generateContent). Not sent: safety settings (the adjustable
@@ -95,7 +96,7 @@ use crate::event::StreamEvent;
 use crate::openai::media::{self, MediaInput};
 use crate::openrouter::options::{Applied, overlay};
 use crate::provider::{self, DirectConfig};
-use crate::request::{self, Generation, Requested, RouteCaps, Tool};
+use crate::request::{self, Generation, Raise, Requested, RouteCaps, Tool};
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared};
 
 pub const DIALECT: &str = "google.interactions";
@@ -276,7 +277,8 @@ pub async fn prepare(
     basic.aspect_ratio = None;
     request::validate(model, &basic, &Caps).map_err(LlmError::request)?;
     let resolution = match req.image_size.as_deref() {
-        None => spec.map(|_| "4k"),
+        // The API's default (720p).
+        None => None,
         Some("1K") => Some("720p"),
         Some("2K") => Some("1080p"),
         Some("4K") => Some("4k"),
@@ -305,7 +307,7 @@ pub async fn prepare(
         )));
     }
     let previous = previous_interaction(input.history, model);
-    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, notes } =
+    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, mut notes } =
         media::media_input(input.history, model, "the Gemini API")?;
     let videos: Vec<&BlobRef> = answer_video.iter().filter(|_| previous.is_none()).chain(&own_videos).collect();
     let images: Vec<&BlobRef> = answer_images.iter().chain(&own_images).collect();
@@ -353,6 +355,17 @@ pub async fn prepare(
     }];
     let mut format = Map::new();
     format.insert("type".into(), json!("video"));
+    if user.image_size.is_none() && resolution != Some("4k") && spec.is_some() {
+        notes.extend(request::raise_note(&[Raise::new(
+            "video resolution",
+            resolution.unwrap_or("720p"),
+            "4k, upscaled",
+            "+size=4K",
+        )]));
+    }
+    if resolution.is_none() && spec.is_some() {
+        settings.push("resolution 720p".into());
+    }
     if let Some(r) = resolution {
         format.insert("resolution".into(), json!(r));
         settings.push(format!("resolution {r}"));

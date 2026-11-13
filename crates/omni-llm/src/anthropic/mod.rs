@@ -89,6 +89,9 @@ pub const NAME: &str = "Anthropic";
 pub const API_VERSION: &str = "2026-10-21";
 pub const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 pub const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// `context_management` (the bot uses `clear_thinking_20251015` with
+/// `keep: "all"` on models that strip earlier thinking).
+pub const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 
 /// Requests per turn at most: the first and its `pause_turn` continuations
 /// (the docs' own example caps the loop at 5).
@@ -150,6 +153,9 @@ pub fn betas(model: &str, body: &Value) -> Vec<&'static str> {
     let tools = body.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty());
     if spec.interleaved_beta && manual && tools {
         out.push(INTERLEAVED_THINKING_BETA);
+    }
+    if body.get("context_management").is_some() {
+        out.push(CONTEXT_MANAGEMENT_BETA);
     }
     out
 }
@@ -396,6 +402,16 @@ impl Provider for Anthropic {
             });
         }
         settings.extend(think.described);
+        // Earlier turns' thinking, which this model strips by default, stays in
+        // context (owner, 2026-11-14). The strategy needs thinking on.
+        let thinking_on =
+            think.thinking.as_ref().and_then(|t| t["type"].as_str()).is_some_and(|t| t == "enabled" || t == "adaptive");
+        if spec.is_some_and(|s| s.strips_thinking) && thinking_on {
+            let cm = json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]});
+            body["context_management"] = cm.clone();
+            applied.push(Applied { source: "default".into(), patch: json!({"context_management": cm}) });
+            settings.push("earlier thinking kept".into());
+        }
         let manual = think.thinking.as_ref().and_then(|t| t["type"].as_str()) == Some("enabled");
         if interleaved && manual {
             settings.push("interleaved thinking".into());

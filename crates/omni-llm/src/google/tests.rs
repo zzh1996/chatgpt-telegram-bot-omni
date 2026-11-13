@@ -213,13 +213,30 @@ async fn per_model_thinking_and_output_defaults() {
     assert_eq!(g["maxOutputTokens"], 32_768);
     assert_eq!(g["thinkingConfig"], json!({"thinkingLevel": "medium", "includeThoughts": true}));
     assert_eq!(g["responseModalities"], json!(["TEXT", "IMAGE"]));
-    assert!(g.get("imageConfig").is_none(), "no image size unless asked (presets set it)");
+    // Google's default size (1K, not sent; D79) with a note naming the option.
+    assert!(g.get("imageConfig").is_none(), "Google's default size");
+    assert_eq!(
+        p.notes,
+        [
+            "reasoning effort is medium by default, not the highest (high); add +h for the highest",
+            "image size is 1K by default, not the largest (4K); add +size=4K"
+        ]
+    );
+    let p = prep("gemini-nano-banana-2.1", &[kv("size", "4K")], &hi()).await.unwrap();
+    assert_eq!(p.body["generationConfig"]["imageConfig"], json!({"imageSize": "4K"}));
+    assert!(p.notes.iter().all(|n| !n.starts_with("image size")), "{:?}", p.notes);
+    // 3.1 Flash-Lite Image has one size: nothing to raise.
+    let p = prep("gemini-3.1-flash-lite-image", &[], &hi()).await.unwrap();
+    assert!(p.notes.iter().all(|n| !n.starts_with("image size")), "{:?}", p.notes);
 
+    // 3 Pro Image: 2K costs what 1K costs, so 2K by default.
     let p = prep("gemini-3-pro-image", &[], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["thinkingConfig"], json!({"includeThoughts": true}));
-    assert_eq!(p.settings, vec!["reasoning on"]);
+    assert_eq!(p.body["generationConfig"]["imageConfig"], json!({"imageSize": "2K"}));
+    assert_eq!(p.settings, vec!["reasoning on", "image size 2K"]);
+    assert_eq!(p.notes, ["image size is 2K by default, not the largest (4K); add +size=4K"]);
     let p = prep("gemini-3-pro-image", &[flag("h")], &hi()).await.unwrap();
-    assert_eq!((p.settings.clone(), p.notes.len()), (vec!["reasoning on".to_string()], 0), "fixed: +h changes nothing");
+    assert_eq!(p.settings, vec!["reasoning on".to_string(), "image size 2K".into()], "fixed: +h changes nothing");
 
     let p = prep("gemini-3.6-flash", &[kv("e", "minimal")], &hi()).await.unwrap();
     assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal");

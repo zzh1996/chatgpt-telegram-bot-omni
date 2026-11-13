@@ -140,9 +140,19 @@ async fn defaults_are_the_largest_resolution_without_watermark() {
     assert_eq!(p.settings, ["text-to-video", "resolution 1080P", "with audio", "no watermark"]);
     assert!(p.warnings.is_empty() && p.notes.is_empty(), "{:?} {:?}", p.warnings, p.notes);
     assert_eq!(p.max_tokens(), None);
-    // The audio switch where there is one.
+    // The audio switch where there is one: on (Alibaba's default); `audio=off` a silent video.
     let p = prep("wan3.0-video", &[]).await.unwrap();
     assert_eq!(p.body["parameters"], json!({"resolution": "1080P", "audio": true, "watermark": false}));
+    let p = prep("wan3.0-video", &[kv("audio", "off")]).await.unwrap();
+    assert_eq!(p.body["parameters"]["audio"], false);
+    assert!(p.settings.contains(&"no audio".to_string()), "{:?}", p.settings);
+    // No switch: an error (HappyHorse always has sound).
+    assert!(prep_err("happyhorse-1.1-t2v", &[kv("audio", "off")]).await.contains("(`audio=`)"));
+    // Wan 2.6 flash: a silent video costs half (¥0.15/s at 720P, ¥0.25/s at 1080P).
+    let s = |m: &str| spec(m).unwrap();
+    assert!((cost_cny(s("wan2.6-i2v-flash"), 10.0, Some("720P"), true) - 1.5).abs() < 1e-9);
+    assert!((cost_cny(s("wan2.6-r2v-flash"), 10.0, Some("1080P"), false) - 5.0).abs() < 1e-9);
+    assert!((cost_cny(s("wan3.0-video"), 10.0, Some("1080P"), true) - 12.0).abs() < 1e-9, "same price");
     // The older protocol: the largest `size`, 16:9.
     assert_eq!(prep("wan2.6-t2v", &[]).await.unwrap().body["parameters"]["size"], "1920*1080");
     assert_eq!(prep("wanx2.1-t2v-plus", &[]).await.unwrap().body["parameters"]["size"], "1280*720");
@@ -584,15 +594,15 @@ fn cost_by_billed_seconds_and_resolution() {
         json!({"usage": {"duration": 15.0, "input_video_duration": 5.0, "output_video_duration": 10.0, "SR": 1080}});
     assert_eq!(billed_seconds(&t["usage"]), Some(15.0));
     assert_eq!(billed_tier(&t, &Value::Null).as_deref(), Some("1080P"));
-    assert!((cost_cny(s("wan3.0-video"), 15.0, Some("1080P")) - 18.0).abs() < 1e-9);
+    assert!((cost_cny(s("wan3.0-video"), 15.0, Some("1080P"), false) - 18.0).abs() < 1e-9);
     // Wan 2.2: `video_duration` and the requested resolution.
     let t = json!({"usage": {"video_duration": 5, "video_count": 1}});
     let body = json!({"parameters": {"resolution": "480P"}});
     assert_eq!(billed_tier(&t, &body).as_deref(), Some("480P"));
-    assert!((cost_cny(s("wan2.2-i2v-flash"), 5.0, Some("480P")) - 0.5).abs() < 1e-9);
+    assert!((cost_cny(s("wan2.2-i2v-flash"), 5.0, Some("480P"), false) - 0.5).abs() < 1e-9);
     // The older `size`.
     let body = json!({"parameters": {"size": "832*480"}});
     assert_eq!(billed_tier(&json!({"usage": {"video_duration": 5}}), &body).as_deref(), Some("480P"));
     // Unknown resolution: the highest price.
-    assert!((cost_cny(s("happyhorse-1.1-t2v"), 2.0, None) - 2.4).abs() < 1e-9);
+    assert!((cost_cny(s("happyhorse-1.1-t2v"), 2.0, None, false) - 2.4).abs() < 1e-9);
 }

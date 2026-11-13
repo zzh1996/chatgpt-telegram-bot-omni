@@ -207,13 +207,18 @@ async fn defaults_are_the_official_ones() {
     assert_eq!(prep_ok("claude-opus-4-8", &["l"]).await.body["thinking"], json!({"type": "disabled"}));
     let p = prep_ok("claude-opus-5-5", &["l"]).await;
     assert_eq!(p.body["output_config"], json!({"effort": "low"}));
-    // 4.6: `summarized` is already the default; no `xhigh`, so `max` is the top.
-    for model in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+    // 4.6: `summarized` is already the default; no `xhigh`, so `max` is the top. Sonnet 4.6:
+    // "Medium effort (recommended)" (D78; its API default is high).
+    for (model, effort) in [("claude-opus-4-6", "high"), ("claude-sonnet-4-6", "medium")] {
         let p = prep_ok(model, &[]).await;
         assert_eq!(p.body["thinking"], json!({"type": "adaptive"}), "{model}");
-        assert_eq!(p.body["output_config"], json!({"effort": "high"}));
+        assert_eq!(p.body["output_config"], json!({"effort": effort}));
         assert_eq!(prep_ok(model, &["h"]).await.body["output_config"], json!({"effort": "max"}));
     }
+    assert_eq!(
+        prep_ok("claude-sonnet-4-6", &[]).await.notes,
+        ["reasoning effort is medium by default, not the highest (max); add +h for the highest"]
+    );
     // 4.5 generation: no thinking unless asked (the API's default); +h the largest valid budget.
     let p = prep_ok("claude-opus-4-5", &[]).await;
     assert_eq!(p.body["max_tokens"], 64_000);
@@ -227,10 +232,18 @@ async fn defaults_are_the_official_ones() {
         let p = prep_ok(model, &[]).await;
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
         assert_eq!(p.notes, ["reasoning is off by default; add +h to think with the largest budget"]);
+        assert!(p.body.get("context_management").is_none(), "{model}: needs thinking on");
         let p = prep_ok(model, &["h"]).await;
         assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 63_999}), "{model}");
         assert!(p.body.get("output_config").is_none(), "{model}: no effort parameter");
-        assert_eq!(p.settings, vec!["thinking budget 63999"]);
+        // Haiku 4.5 strips earlier thinking unless told to keep it (owner, 2026-11-14).
+        assert_eq!(
+            p.body["context_management"],
+            json!({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}),
+            "{model}"
+        );
+        assert_eq!(betas(model, &p.body), ["context-management-2025-06-27"]);
+        assert_eq!(p.settings, vec!["thinking budget 63999", "earlier thinking kept"]);
         let p = prep_ok(model, &["l"]).await;
         assert_eq!(p.body["thinking"], json!({"type": "disabled"}), "{model}");
     }
@@ -290,7 +303,9 @@ async fn effort_and_thinking_options() {
 async fn thinking_budget_option() {
     let p = prep_ok("claude-haiku-4-5", &["budget=20000"]).await;
     assert_eq!(p.body["thinking"], json!({"type": "enabled", "budget_tokens": 20_000}));
-    assert_eq!(p.settings, vec!["thinking budget 20000"]);
+    assert_eq!(p.settings, vec!["thinking budget 20000", "earlier thinking kept"]);
+    // Models that keep earlier thinking by themselves get no strategy.
+    assert!(prep_ok("claude-opus-4-5", &["h"]).await.body.get("context_management").is_none());
     // Opus 4.5 keeps its (highest) effort alongside the budget.
     let p = prep_ok("claude-opus-4-5", &["budget=8000"]).await;
     assert_eq!(p.body["output_config"], json!({"effort": "high"}));

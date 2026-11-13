@@ -5,8 +5,8 @@
 //! - `max_tokens` counts the **answer only** and defaults to 4096 (silent
 //!   truncation), so it is always sent; the reasoning has its own model limit.
 //!   Ark pre-deducts TPM quota by `prompt + max_tokens`, hence a cap.
-//! - Thinking is on by default at the model's official effort (2.1 and
-//!   Evolving `high`, 2.0 and Character `medium`); the highest effort is `high`
+//! - Thinking is on by default at the model's official effort (2.1, Evolving
+//!   and 2.0-code `high`, the other 2.0 models and Character `medium`); the highest effort is `high`
 //!   (`xhigh`/`max` are accepted and mapped to it).
 //! - Summary-mode models (2.1, Evolving, 2.0-lite-260428) return a summary in
 //!   `reasoning_content` plus the encrypted original in `encrypted_content`;
@@ -213,7 +213,8 @@ pub const MODELS: &[ModelSpec] = &[
     },
     ModelSpec {
         prefix: "doubao-seed-2-0-code",
-        effort: "medium",
+        // Volcengine's agent/coding go-live guide: `reasoning_effort` high or above (D78).
+        effort: "high",
         context: 262_144,
         max_answer: 131_072,
         standard: SEED_20_PRO,

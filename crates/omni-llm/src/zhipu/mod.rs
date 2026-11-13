@@ -1024,6 +1024,11 @@ mod tests {
         let e = prepare("glm-4.7", &[kv("e", "high")], &h).await.unwrap_err();
         assert!(e.message.contains("has no reasoning effort levels"), "{}", e.message);
         assert!(prepare("glm-4.7", &[kv("e", "none")], &h).await.is_ok());
+        // A switch without levels: +h keeps thinking on (the default), +l turns it off.
+        let p = prepare("glm-5.1", &[flag("h")], &h).await.unwrap();
+        assert_eq!(p.body["thinking"]["type"], "enabled");
+        assert!(p.body.get("reasoning_effort").is_none());
+        assert_eq!(prepare("glm-5.1", &[flag("l")], &h).await.unwrap().body["thinking"]["type"], "disabled");
     }
 
     #[tokio::test]

@@ -235,11 +235,13 @@ const TOPICS: &[Topic] = &[
 | `n=4` | how many images |
 | `bg=transparent` | image background: `auto`, `opaque` or `transparent` |
 | `sec=8` | video length in seconds |
+| `audio=off` | video sound `on` or `off` (models with an audio switch) |
+| `rewrite=on` | prompt rewriting by the platform `on` or `off` (models where it is a paid extra) |
 | `p=…` | another official provider of the model (through OpenRouter only) |
 | `tier=flex` | service tier: `flex` is cheaper; faster tiers only for priority users |
 
 - Which options a model has depends on it and its platform. Every option is checked before anything is sent: one the model does not have, or a value it does not have, is an error that says what it has. Anything not in this table is an error.
-- Without options a request reasons at the level the platform recommends for the model (its default); when that is not the highest, the answer says so, and `h` gives the highest. Everything else is the most the model allows: the longest output, the best image quality. I never add a system prompt.
+- Without options a request reasons at the level the platform recommends for the model; when that is not the highest, the answer says so, and `h` gives the highest. Generated images and videos come at the platform's default quality and size where more costs more, and the answer names the options for the most (`size=4K`, `q=max`). Everything else is the most the model allows: the longest output, the sharpest view of your images, videos and documents. Earlier answers' reasoning stays in the conversation where the platform allows it. I never add a system prompt.
 
 ::: More about p= and tier=
 - `p=` names another official provider of the model on OpenRouter, by OpenRouter's name for it; several, separated by a vertical bar, mean any of them. It is an error on a platform's own API.
@@ -266,11 +268,13 @@ const TOPICS: &[Topic] = &[
 | `n=4` | 生成几张图 |
 | `bg=transparent` | 图片背景：`auto`、`opaque` 或 `transparent` |
 | `sec=8` | 视频长度（秒） |
+| `audio=off` | 视频声音 `on` 或 `off`（有声音开关的模型） |
+| `rewrite=on` | 平台改写提示词 `on` 或 `off`（改写要另收费的模型） |
 | `p=…` | 换成该模型的另一个官方提供方（仅限经 OpenRouter） |
 | `tier=flex` | 服务等级：`flex` 更便宜；更快的等级只给优先用户 |
 
 - 一个模型有哪些选项，取决于模型本身和它的平台。所有选项在发出前都会检查：模型没有的选项或取值会报错，并告诉你它有哪些。表里没有的选项都会报错。
-- 不加选项时，推理强度用平台给这个模型推荐的默认档位；不是最高档时回答里会注明，加 `h` 就是最高档。其他都用模型允许的最大值：最长的输出、最好的图片质量。我从不额外加 system prompt。
+- 不加选项时，推理强度用平台给这个模型推荐的档位；不是最高档时回答里会注明，加 `h` 就是最高档。生成的图片和视频在更高质量要多花钱时用平台默认的质量和尺寸，回答里会写出拉到最高的选项（`size=4K`、`q=max`）。其他都用模型允许的最大值：最长的输出、看你的图片、视频和文档时的最高精度。平台允许的话，之前回答的推理会留在对话里。我从不额外加 system prompt。
 
 ::: 关于 p= 和 tier=
 - `p=` 指定该模型在 OpenRouter 上的另一个官方提供方，用 OpenRouter 对它的叫法；用竖线隔开几个，表示其中任意一个都可以。在平台自己的 API 上会报错。
@@ -315,7 +319,7 @@ const TOPICS: &[Topic] = &[
 - To edit, attach images, or reply to an image or video they made, saying what to change.
 - They take one prompt, not a conversation: replying to an answer they cannot edit is an error.
 
-**Options**: size `size=`, aspect ratio `ar=`, quality `q=`, how many `n=`, background `bg=`, video length `sec=`. By default: the highest quality, the largest size and no watermark. Values a model does not have are errors that list the valid ones.
+**Options**: size `size=`, aspect ratio `ar=`, quality `q=`, how many `n=`, background `bg=`, video length `sec=`, sound `audio=`, prompt rewriting `rewrite=`. By default: the platform's default quality, size and resolution where more costs more (the answer names the options for the most), the highest where it costs the same, and no watermark. Values a model does not have are errors that list the valid ones.
 
 - A preview shows while an image is drawn. Videos are made in the background and keep going if the bot restarts.
 - Reply /raw to an answer for the original files."#,
@@ -326,7 +330,7 @@ const TOPICS: &[Topic] = &[
 - 想编辑，就附上图片，或者回复它生成的图片或视频，写明要改什么。
 - 它们只接收一条提示词，不接收对话：回复一条它们没法编辑的回答会报错。
 
-**选项**：尺寸 `size=`，宽高比 `ar=`，质量 `q=`，张数 `n=`，背景 `bg=`，视频长度 `sec=`。默认是最高质量、最大尺寸、不加水印。模型没有的取值会报错，并列出可选值。
+**选项**：尺寸 `size=`，宽高比 `ar=`，质量 `q=`，张数 `n=`，背景 `bg=`，视频长度 `sec=`，声音 `audio=`，提示词改写 `rewrite=`。默认：更高质量要多花钱时用平台默认的质量、尺寸和分辨率（回答里会写出拉到最高的选项），价格一样时用最高的，不加水印。模型没有的取值会报错，并列出可选值。
 
 - 画图过程中会先显示预览。视频在后台生成，bot 重启后也会接着生成。
 - 对回答回复 /raw，可以拿到原始文件。"#,

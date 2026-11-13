@@ -20,12 +20,15 @@
 //! - Generations from the prompt; edits when there are images (the reply's
 //!   generated image first, then the message's own; one as `image`, up to
 //!   five as `images`; JPEG, PNG or WebP data URLs).
-//! - `resolution`: `2k` by default (the largest; `1` → `1k`, `2` → `2k`;
-//!   `1.5k` has no option). `aspect_ratio` from `S W H w h` / `ar=`, from
-//!   xAI's list (none: `auto` for generations, the first image's for edits).
-//! - `quality` (2.0 only): `medium` by default, the highest the model takes
-//!   (`auto`, the API default, serves `low` for generations and `medium` for
-//!   edits); `q=` takes `low`, `medium` and `auto`. `high` is in the API's
+//! - Output at xAI's default quality where more costs more (D79), with a note
+//!   saying what is below the highest and the option that raises it.
+//! - `resolution`: not sent on 2.0 (xAI's `1k`; `size=1K` → `1k`, `size=2K` →
+//!   `2k`; `1.5k` has no option); `2k` on grok-imagine-image, whose sizes
+//!   cost the same. `aspect_ratio` from `ar=`, from xAI's list (none: `auto`
+//!   for generations, the first image's for edits).
+//! - `quality` (2.0 only): not sent (`auto`, which serves `low` for
+//!   generations and `medium`, the highest the model takes, for edits);
+//!   `q=` takes `low`, `medium` and `auto`. `high` is in the API's
 //!   enum and price tiers, but the model rejects it (live, 2026-11-13: "This
 //!   model only supports the following quality value(s): low, medium,
 //!   auto."), so the bot rejects it before sending.
@@ -43,9 +46,9 @@
 //!   none on lite; at most 720p); a video edit (a reply to a generated video,
 //!   or an attached MP4; grok-imagine-video only; the result keeps the
 //!   source's length, ratio and resolution, at most 720p).
-//! - `resolution`: the largest for the mode by default (1080p on 1.5 and lite
-//!   for text- and image-to-video, else 720p); `1` → 720p, `2` → 1080p (480p
-//!   has no option). `duration` from `sec=` (1–15 s; reference-to-video on
+//! - `resolution`: not sent (xAI's 480p; the highest is 1080p on 1.5 and lite
+//!   for text- and image-to-video, else 720p); `size=1K` → 720p, `size=2K` →
+//!   1080p. `generate_audio` from `audio=` (xAI's default: on). `duration` from `sec=` (1–15 s; reference-to-video on
 //!   grok-imagine-video up to 10): xAI's default (8 s) otherwise — length is
 //!   content, not quality. `aspect_ratio` from the ratio options for text-
 //!   and reference-to-video (xAI's default 16:9). Options a mode cannot use
@@ -83,7 +86,7 @@ use crate::event::StreamEvent;
 use crate::openai::media::{self, Http, MediaInput};
 use crate::openrouter::options::Applied;
 use crate::provider::DirectConfig;
-use crate::request::{self, Generation, Requested, RouteCaps, Tool};
+use crate::request::{self, Generation, Raise, Requested, RouteCaps, Tool};
 use crate::{BlobLoader, CallInput, CallOutcome, EventSink, Observer, Prepared};
 
 pub const IMAGE_DIALECT: &str = "xai.images";
@@ -103,6 +106,8 @@ pub struct ImageSpec {
     pub quality: bool,
     /// USD per image at 1k / 2k (low quality, the lowest tier).
     pub per_image: (f64, f64),
+    /// USD more per image at `medium` quality.
+    pub per_image_medium: f64,
     /// USD per input image of an edit.
     pub per_input_image: f64,
 }
@@ -120,19 +125,28 @@ pub struct VideoSpec {
     pub reference_seconds: u32,
     /// Edits videos.
     pub edit: bool,
-    /// USD per second of video (the pricing page's single figure).
-    pub per_second: f64,
+    /// USD per second of video by resolution (the model pages' tiers).
+    pub per_second: &'static [(&'static str, f64)],
+}
+
+impl VideoSpec {
+    /// USD per second at `resolution` (xAI's default 480p when none was sent).
+    pub fn rate(&self, resolution: Option<&str>) -> Option<f64> {
+        let r = resolution.unwrap_or("480p");
+        self.per_second.iter().find(|(k, _)| *k == r).map(|(_, v)| *v)
+    }
 }
 
 /// xAI's image models, 2026-11-13: pricing page ($0.04 / $0.02 per image),
-/// migration note (2.0 at low: $0.04 per 1K image, $0.06 per 2K image, plus
-/// $0.01 per input image on edits).
+/// migration note and model page (2.0: $0.04 / $0.06 per 1K / 2K image at
+/// low, $0.06 / $0.08 at medium, plus $0.01 per input image on edits).
 pub const IMAGE_MODELS: &[ImageSpec] = &[
     ImageSpec {
         id: "grok-imagine-image-2.0",
         aliases: &[],
         quality: true,
         per_image: (0.04, 0.06),
+        per_image_medium: 0.02,
         per_input_image: 0.01,
     },
     ImageSpec {
@@ -140,12 +154,13 @@ pub const IMAGE_MODELS: &[ImageSpec] = &[
         aliases: &["grok-imagine-image-2026-03-02"],
         quality: false,
         per_image: (0.02, 0.02),
+        per_image_medium: 0.0,
         per_input_image: 0.0,
     },
 ];
 
 /// xAI's video models, 2026-11-13: the video overview's capability table, the
-/// reference-to-video limits and the pricing page.
+/// reference-to-video limits and the model pages' per-resolution prices.
 pub const VIDEO_MODELS: &[VideoSpec] = &[
     VideoSpec {
         id: "grok-imagine-video-1.5",
@@ -154,7 +169,7 @@ pub const VIDEO_MODELS: &[VideoSpec] = &[
         references: 14,
         reference_seconds: 15,
         edit: false,
-        per_second: 0.08,
+        per_second: &[("480p", 0.08), ("720p", 0.14), ("1080p", 0.25)],
     },
     VideoSpec {
         id: "grok-imagine-video-1.5-lite",
@@ -163,7 +178,7 @@ pub const VIDEO_MODELS: &[VideoSpec] = &[
         references: 0,
         reference_seconds: 0,
         edit: false,
-        per_second: 0.02,
+        per_second: &[("480p", 0.02), ("720p", 0.03), ("1080p", 0.14)],
     },
     VideoSpec {
         id: "grok-imagine-video",
@@ -172,7 +187,7 @@ pub const VIDEO_MODELS: &[VideoSpec] = &[
         references: 7,
         reference_seconds: 10,
         edit: true,
-        per_second: 0.05,
+        per_second: &[("480p", 0.05), ("720p", 0.07)],
     },
 ];
 
@@ -212,6 +227,7 @@ struct Caps {
     count: bool,
     background: bool,
     seconds: bool,
+    audio: bool,
 }
 
 impl RouteCaps for Caps {
@@ -241,7 +257,14 @@ impl RouteCaps for Caps {
         Vec::new()
     }
     fn generation(&self) -> Generation {
-        Generation { quality: self.quality, count: self.count, background: self.background, seconds: self.seconds }
+        Generation {
+            quality: self.quality,
+            count: self.count,
+            background: self.background,
+            seconds: self.seconds,
+            audio: self.audio,
+            rewrite: false,
+        }
     }
 }
 
@@ -300,7 +323,7 @@ pub(crate) async fn prepare_image(
     let model = input.model;
     let spec = image_spec(model);
     let quality_ok = spec.is_none_or(|s| s.quality);
-    let caps = Caps { quality: quality_ok, count: true, background: true, seconds: false };
+    let caps = Caps { quality: quality_ok, count: true, background: true, seconds: false, audio: false };
     validate(model, req, &caps, "an image model")?;
     if let Some(q) = &req.quality {
         one_of(model, "image quality", q, QUALITIES)?;
@@ -313,7 +336,8 @@ pub(crate) async fn prepare_image(
         return Err(LlmError::request(format!("`{model}` makes at most {MAX_N} images per request (n={n})")));
     }
     let resolution = match req.image_size.as_deref() {
-        None => spec.map(|_| "2k"),
+        // xAI's default (1k), unless 2k costs the same (grok-imagine-image).
+        None => spec.filter(|s| s.per_image.0 == s.per_image.1).map(|_| "2k"),
         Some("1K") => Some("1k"),
         Some("2K") => Some("2k"),
         Some(s) => {
@@ -324,7 +348,7 @@ pub(crate) async fn prepare_image(
         one_of(model, "aspect ratio", r, IMAGE_RATIOS)?;
     }
 
-    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, notes } =
+    let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, mut notes } =
         media::media_input(input.history, model, "xAI's image API")?;
     if !own_videos.is_empty() {
         return Err(LlmError::request(format!("`{model}` takes images, not video, via xAI")));
@@ -364,10 +388,24 @@ pub(crate) async fn prepare_image(
             (a, k) => format!("edit of the previous image{} + {k} source image{}", plural(a), plural(k)),
         });
     }
-    if let Some(q) = req.quality.as_deref().or(spec.filter(|s| s.quality).map(|_| "medium")) {
+    if let Some(q) = &req.quality {
         body["quality"] = json!(q);
         applied.push(Applied { source: src(user.quality.is_some()), patch: json!({"quality": q}) });
         settings.insert(0, format!("quality {q}"));
+    } else if spec.is_some_and(|s| s.quality) {
+        settings.insert(0, "quality auto".into());
+    }
+    if let Some(s) = spec.filter(|s| s.per_image.0 != s.per_image.1) {
+        let mut raise = Vec::new();
+        // `auto` serves low for generations, medium (the highest) for edits.
+        let q = req.quality.as_deref().unwrap_or(if edit { "medium" } else { "auto (low)" });
+        if s.quality && user.quality.is_none() && q != "medium" {
+            raise.push(Raise::new("image quality", q, "medium", "+q=medium"));
+        }
+        if user.image_size.is_none() && resolution != Some("2k") {
+            raise.push(Raise::new("image size", resolution.unwrap_or("1k").to_uppercase(), "2K", "+size=2K"));
+        }
+        notes.extend(request::raise_note(&raise));
     }
     if let Some(r) = resolution {
         body["resolution"] = json!(r);
@@ -439,8 +477,17 @@ fn media_usage(u: Option<&Value>, estimate: Option<f64>) -> Usage {
 /// List-price estimate of an images request (only used without a billed cost).
 fn image_estimate(p: &Prepared, images: usize) -> Option<f64> {
     let s = image_spec(&p.model)?;
-    let per =
+    let mut per =
         if p.body.get("resolution").and_then(Value::as_str) == Some("2k") { s.per_image.1 } else { s.per_image.0 };
+    let edit = p.body.get("image").is_some() || p.body.get("images").is_some();
+    // `auto` serves low for generations and medium for edits.
+    let medium = match p.body.get("quality").and_then(Value::as_str) {
+        Some(q) => q == "medium",
+        None => edit && s.quality,
+    };
+    if medium {
+        per += s.per_image_medium;
+    }
     let inputs = p
         .body
         .get("images")
@@ -536,7 +583,7 @@ pub(crate) async fn prepare_video(
 ) -> Result<Prepared, LlmError> {
     let model = input.model;
     let spec = video_spec(model);
-    let caps = Caps { quality: false, count: false, background: false, seconds: true };
+    let caps = Caps { quality: false, count: false, background: false, seconds: true, audio: true };
     validate(model, req, &caps, "a video model")?;
     let MediaInput { prompt, answer_images, answer_video, own_images, own_videos, mut notes } =
         media::media_input(input.history, model, "xAI's video API")?;
@@ -614,7 +661,8 @@ pub(crate) async fn prepare_video(
             unused.push(format!("size {s}"));
             None
         }
-        (_, None) => max_res,
+        // xAI's default (480p).
+        (_, None) => None,
         (_, Some("1K")) => Some("720p"),
         (_, Some("2K")) if max_res.is_none_or(|m| m == "1080p") => Some("1080p"),
         (_, Some(s)) => {
@@ -624,6 +672,13 @@ pub(crate) async fn prepare_video(
                 mode.describe()
             )));
         }
+    };
+    let audio = match (mode, req.audio) {
+        (Mode::Edit, Some(a)) => {
+            unused.push(format!("audio={}", if a { "on" } else { "off" }));
+            None
+        }
+        (_, a) => a,
     };
     let ratio = match (mode, &req.aspect_ratio) {
         (Mode::Edit | Mode::Image, Some(r)) => {
@@ -682,6 +737,17 @@ pub(crate) async fn prepare_video(
         body["resolution"] = json!(r);
         applied.push(Applied { source: src(user.image_size.is_some()), patch: json!({"resolution": r}) });
         settings.push(format!("resolution {r}"));
+    } else if mode != Mode::Edit {
+        settings.push("resolution 480p".into());
+    }
+    if let Some(top) = max_res.filter(|t| user.image_size.is_none() && resolution != Some(*t)) {
+        let option = if top == "1080p" { "+size=2K" } else { "+size=1K" };
+        notes.extend(request::raise_note(&[Raise::new("video resolution", resolution.unwrap_or("480p"), top, option)]));
+    }
+    if let Some(a) = audio {
+        body["generate_audio"] = json!(a);
+        applied.push(Applied { source: src(user.audio.is_some()), patch: json!({"generate_audio": a}) });
+        settings.push(if a { "with audio" } else { "no audio" }.into());
     }
     if let Some(d) = duration {
         body["duration"] = json!(d);
@@ -877,7 +943,8 @@ async fn finish_video(
         shown.insert("model".into(), m.clone());
     }
     let seconds = video.get("duration").and_then(Value::as_f64);
-    let estimate = video_spec(&p.model).zip(seconds).map(|(s, d)| s.per_second * d);
+    let resolution = p.body.get("resolution").and_then(Value::as_str);
+    let estimate = video_spec(&p.model).and_then(|s| s.rate(resolution)).zip(seconds).map(|(r, d)| r * d);
     let usage = media_usage(r.get("usage"), estimate);
     let Some(url) = url.filter(|_| video.get("respect_moderation").and_then(Value::as_bool) != Some(false)) else {
         // Filtered by moderation: no video (xAI: "the video url field will be empty").
@@ -974,20 +1041,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_defaults_are_the_largest_and_highest() {
+    async fn image_defaults_are_xais_with_a_note() {
+        // xAI's default quality and resolution (`auto` = low for a new image, 1k: not sent; D79).
         let p = prep("grok-imagine-image-2.0", &[]).await.unwrap();
         assert_eq!((p.dialect, p.url.as_str()), (IMAGE_DIALECT, "https://api.x.ai/v1/images/generations"));
         assert_eq!(
             p.body,
-            json!({"model": "grok-imagine-image-2.0", "prompt": "a lighthouse", "quality": "medium", "resolution": "2k",
-                "response_format": "b64_json", "user": "u-hash"})
+            json!({"model": "grok-imagine-image-2.0", "prompt": "a lighthouse", "response_format": "b64_json", "user": "u-hash"})
         );
-        assert_eq!(p.settings, ["quality medium", "resolution 2k"]);
-        assert!(p.warnings.is_empty() && p.notes.is_empty());
-        // 1.0 has no quality.
+        assert_eq!(p.settings, ["quality auto"]);
+        assert!(p.warnings.is_empty());
+        assert_eq!(
+            p.notes,
+            [
+                "image quality is auto (low), image size 1K by default, not the highest (medium, 2K); add +q=medium+size=2K"
+            ]
+        );
+        let p = prep("grok-imagine-image-2.0", &[kv("q", "medium"), kv("size", "2K")]).await.unwrap();
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
+        // 1.0 has no quality, and its sizes cost the same: 2k.
         let p = prep("grok-imagine-image", &[]).await.unwrap();
         assert!(p.body.get("quality").is_none());
         assert_eq!(p.body["resolution"], "2k");
+        assert!(p.notes.is_empty(), "{:?}", p.notes);
         // Options.
         let p = prep(
             "grok-imagine-image-2.0",
@@ -1099,22 +1175,28 @@ mod tests {
         assert_eq!(images, ["image/jpeg", "image/png"]);
         let u = evs.iter().find_map(|e| if let StreamEvent::Usage(u) = e { Some(u.clone()) } else { None }).unwrap();
         assert_eq!((u.cost_usd, u.cost_source, u.reasoning_tokens), (Some(0.14), CostSource::Reported, Some(200)));
-        // Without a billed cost: the list price (2k at low, a lower bound).
+        // Without a billed cost: the list price of what was sent (1k, `auto` = low).
         let u = media_usage(None, image_estimate(&p, 2));
-        assert_eq!((u.cost_usd, u.cost_source), (Some(0.12), CostSource::Estimated));
+        assert_eq!((u.cost_usd, u.cost_source), (Some(0.08), CostSource::Estimated));
+        let p2 = prep("grok-imagine-image-2.0", &[kv("q", "medium"), kv("size", "2K")]).await.unwrap();
+        assert!((image_estimate(&p2, 1).unwrap() - 0.08).abs() < 1e-12, "2k at medium");
     }
 
     #[tokio::test]
     async fn video_modes_and_their_defaults() {
-        // Text-to-video: the largest resolution, xAI's default length.
+        // Text-to-video: xAI's default resolution (480p, not sent; D79) and length, with the note.
         let p = prep("grok-imagine-video-1.5", &[]).await.unwrap();
         assert_eq!((p.dialect, p.url.as_str()), (VIDEO_DIALECT, "https://api.x.ai/v1/videos/generations"));
-        assert_eq!(
-            p.body,
-            json!({"model": "grok-imagine-video-1.5", "prompt": "a lighthouse", "resolution": "1080p", "user": "u-hash"})
-        );
-        assert_eq!(p.settings, ["text-to-video", "resolution 1080p"]);
-        assert_eq!(prep("grok-imagine-video", &[]).await.unwrap().body["resolution"], "720p");
+        assert_eq!(p.body, json!({"model": "grok-imagine-video-1.5", "prompt": "a lighthouse", "user": "u-hash"}));
+        assert_eq!(p.settings, ["text-to-video", "resolution 480p"]);
+        assert_eq!(p.notes, ["video resolution is 480p by default, not the highest (1080p); add +size=2K"]);
+        let p = prep("grok-imagine-video", &[]).await.unwrap();
+        assert!(p.body.get("resolution").is_none());
+        assert_eq!(p.notes, ["video resolution is 480p by default, not the highest (720p); add +size=1K"]);
+        // `audio=`: xAI's `generate_audio` (default on).
+        let p = prep("grok-imagine-video-1.5", &[kv("audio", "off")]).await.unwrap();
+        assert_eq!(p.body["generate_audio"], false);
+        assert!(p.settings.iter().any(|s| s == "no audio"));
         let p =
             prep("grok-imagine-video-1.5-lite", &[kv("sec", "12"), kv("size", "1K"), kv("ar", "9:16")]).await.unwrap();
         assert_eq!(
@@ -1136,7 +1218,9 @@ mod tests {
         assert!(p.body["image"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
         assert!(p.body.get("aspect_ratio").is_none());
         assert!(
-            p.notes[0].contains("aspect ratio 16:9 not sent: image-to-video takes the image's aspect ratio"),
+            p.notes
+                .iter()
+                .any(|n| n.contains("aspect ratio 16:9 not sent: image-to-video takes the image's aspect ratio")),
             "{:?}",
             p.notes
         );
@@ -1150,7 +1234,8 @@ mod tests {
         let (img2, b2) = photo("image/jpeg", b"\xff\xd8\xff-ref");
         let blobs3 = MemBlobs(vec![b1, b2]);
         let refs = vec![user(vec![Part::text("<IMAGE_0> meets <IMAGE_1>"), img.clone(), img2.clone()])];
-        let p = prep_with("grok-imagine-video-1.5", &[kv("sec", "15")], &refs, &blobs3).await.unwrap();
+        let p =
+            prep_with("grok-imagine-video-1.5", &[kv("sec", "15"), kv("size", "1K")], &refs, &blobs3).await.unwrap();
         assert_eq!(p.body["reference_images"].as_array().unwrap().len(), 2);
         assert_eq!((p.body["resolution"].clone(), p.body["duration"].clone()), (json!("720p"), json!(15)));
         assert_eq!(p.settings[0], "reference-to-video (2 images)");
@@ -1347,7 +1432,7 @@ mod tests {
         evs.into_iter().for_each(|e| acc.apply(e));
         let Part::ToolCall(t) = &acc.parts()[0] else { panic!("{:?}", acc.parts()) };
         assert_eq!(t.name, "video_generation");
-        assert_eq!(t.input, Some(json!({"prompt": "a lighthouse", "duration": 8, "resolution": "1080p"})));
+        assert_eq!(t.input, Some(json!({"prompt": "a lighthouse", "duration": 8})));
         assert_eq!(
             t.output,
             Some(json!({"duration": 8, "respect_moderation": true, "model": "grok-imagine-video-1.5"}))

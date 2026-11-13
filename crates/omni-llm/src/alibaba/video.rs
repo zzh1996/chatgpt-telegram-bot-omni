@@ -48,17 +48,20 @@
 //!   extension or a new video); `+u` sends the message's one URL as a `link`
 //!   (a web page Wan reads).
 //!
-//! **Defaults** (D3, the owner): the largest resolution (1080P; Wan 2.1 720P;
-//! the older `size` the largest of the tier, 16:9 unless a ratio is asked),
-//! `watermark: false` (HappyHorse's default adds "Happy Horse"), audio on
-//! (`audio: true` where it is a switch), Alibaba's own length and ratio.
+//! **Defaults** (D3, D79, the owner): Alibaba's default resolution, which is
+//! the largest (1080P; Wan 2.1 720P; the older `size` the largest of the
+//! tier, 16:9 unless a ratio is asked), `watermark: false` (HappyHorse's
+//! default adds "Happy Horse"), audio on where it is a switch (`audio: true`,
+//! Alibaba's default on Wan 3.0 and Wan 2.6 flash; `audio=off` makes a silent
+//! video, half the price on Wan 2.6 flash), Alibaba's own length and ratio.
 //! Alibaba's prompt rewriting (`prompt_extend`, default on) stays at its
 //! default, as for the image models; the rewritten prompt it returns
 //! (`actual_prompt`, Wan 2.5 and older) is in the tool call's output.
 //! Moderation is always on.
 //!
-//! **Options**: `1` `2` = 720P / 1080P (480P has no letter); `S W H w h ar=`
-//! from the model's ratios (HappyHorse also 4:5, 5:4, 9:21, 21:9); `sec=` from
+//! **Options**: `size=1K` `2K` = 720P / 1080P (480P has no size); `ar=`
+//! from the model's ratios (HappyHorse also 4:5, 5:4, 9:21, 21:9); `audio=`
+//! (Wan 3.0, Wan 2.6 flash); `sec=` from
 //! its lengths (2.5: 5 or 10; Wan 2.2, kf2v and wanx2.1 make 5 s only, so
 //! `sec=` is an error, except wanx2.1-i2v-turbo's 3–5); `+u` (wan3.0). Options
 //! a mode cannot use are not sent, with a note (a conversation's options carry
@@ -179,10 +182,12 @@ pub struct Spec {
     pub seconds: Seconds,
     /// The output has sound.
     pub audio: bool,
-    /// `parameters.audio` (sent as `true`).
+    /// `parameters.audio` (Alibaba's default `true`; `audio=off` sends `false`).
     pub audio_switch: bool,
     /// CNY per second by resolution tier.
     pub price: &'static [(&'static str, f64)],
+    /// CNY per second of a silent video (`audio: false`), where it differs.
+    pub silent_price: &'static [(&'static str, f64)],
 }
 
 const HH_RATIOS: &[&str] = &["16:9", "9:16", "1:1", "4:3", "3:4", "4:5", "5:4", "9:21", "21:9"];
@@ -214,6 +219,7 @@ const HH11_PRICE: &[(&str, f64)] = &[("480P", 0.45), ("720P", 0.9), ("1080P", 1.
 const HH10_PRICE: &[(&str, f64)] = &[("720P", 0.9), ("1080P", 1.6)];
 const WAN27_PRICE: &[(&str, f64)] = &[("720P", 0.6), ("1080P", 1.0)];
 const WAN26_FLASH_PRICE: &[(&str, f64)] = &[("720P", 0.3), ("1080P", 0.5)];
+const WAN26_FLASH_SILENT: &[(&str, f64)] = &[("720P", 0.15), ("1080P", 0.25)];
 const WAN25_PRICE: &[(&str, f64)] = &[("480P", 0.3), ("720P", 0.6), ("1080P", 1.0)];
 const WAN22_PLUS_PRICE: &[(&str, f64)] = &[("480P", 0.14), ("1080P", 0.7)];
 const WAN22_FLASH_PRICE: &[(&str, f64)] = &[("480P", 0.1), ("720P", 0.2), ("1080P", 0.48)];
@@ -227,6 +233,7 @@ const HH11: Spec = Spec {
     audio: true,
     audio_switch: false,
     price: HH11_PRICE,
+    silent_price: &[],
 };
 const HH10: Spec = Spec { resolutions: R2, price: HH10_PRICE, ..HH11 };
 const WAN27: Spec = Spec {
@@ -238,6 +245,7 @@ const WAN27: Spec = Spec {
     audio: true,
     audio_switch: false,
     price: WAN27_PRICE,
+    silent_price: &[],
 };
 const WAN26_T2V: Spec = Spec { api: Api::LegacyT2v, ..WAN27 };
 const WAN26_I2V: Spec = Spec { api: Api::LegacyI2v, ratios: &[], ..WAN27 };
@@ -251,6 +259,7 @@ const SILENT_5S: Spec = Spec {
     audio: false,
     audio_switch: false,
     price: WAN22_PLUS_PRICE,
+    silent_price: &[],
 };
 
 /// Alibaba's first-party video models in Beijing (2026-11-13).
@@ -271,6 +280,8 @@ pub const MODELS: &[Spec] = &[
         audio: true,
         audio_switch: true,
         price: &[("480P", 0.3), ("720P", 0.6), ("1080P", 1.2)],
+        // "开关声音价格相同".
+        silent_price: &[],
     },
     Spec {
         id: "wan3.0-video-prime",
@@ -281,6 +292,7 @@ pub const MODELS: &[Spec] = &[
         audio: true,
         audio_switch: true,
         price: &[("480P", 0.45), ("720P", 0.9), ("1080P", 1.8)],
+        silent_price: &[],
     },
     Spec { id: "wan2.7-t2v", ..WAN27 },
     Spec { id: "wan2.7-t2v-2026-06-12", ..WAN27 },
@@ -293,9 +305,21 @@ pub const MODELS: &[Spec] = &[
     Spec { id: "wan2.7-videoedit", api: Api::Wan27Edit, seconds: Seconds::Range(2, 10), ..WAN27 },
     Spec { id: "wan2.6-t2v", ..WAN26_T2V },
     Spec { id: "wan2.6-i2v", ..WAN26_I2V },
-    Spec { id: "wan2.6-i2v-flash", audio_switch: true, price: WAN26_FLASH_PRICE, ..WAN26_I2V },
+    Spec {
+        id: "wan2.6-i2v-flash",
+        audio_switch: true,
+        price: WAN26_FLASH_PRICE,
+        silent_price: WAN26_FLASH_SILENT,
+        ..WAN26_I2V
+    },
     Spec { id: "wan2.6-r2v", ..WAN26_R2V },
-    Spec { id: "wan2.6-r2v-flash", audio_switch: true, price: WAN26_FLASH_PRICE, ..WAN26_R2V },
+    Spec {
+        id: "wan2.6-r2v-flash",
+        audio_switch: true,
+        price: WAN26_FLASH_PRICE,
+        silent_price: WAN26_FLASH_SILENT,
+        ..WAN26_R2V
+    },
     Spec {
         id: "wan2.5-t2v-preview",
         api: Api::LegacyT2v,
@@ -438,7 +462,7 @@ impl RouteCaps for Caps {
         Vec::new()
     }
     fn generation(&self) -> Generation {
-        Generation { seconds: self.0.is_some(), ..Default::default() }
+        Generation { seconds: self.0.is_some(), audio: self.0.is_some_and(|s| s.audio_switch), ..Default::default() }
     }
 }
 
@@ -1029,11 +1053,14 @@ pub async fn prepare(
                 settings.push(format!("{sec} s"));
             }
         }
+        let silent = s.audio_switch && req.audio == Some(false);
         if s.audio_switch {
-            set("audio", json!(true), "default".into(), &mut parameters);
+            set("audio", json!(!silent), src(user.audio.is_some()), &mut parameters);
         }
-        if s.audio {
+        if s.audio && !silent {
             settings.push("with audio".into());
+        } else if silent {
+            settings.push("no audio".into());
         }
         set("watermark", json!(false), "default".into(), &mut parameters);
         settings.push("no watermark".into());
@@ -1390,10 +1417,11 @@ fn billed_tier(task: &Value, body: &Value) -> Option<String> {
 }
 
 /// CNY of a finished task: its billed seconds at the price of its resolution
-/// (the highest when unknown).
-pub fn cost_cny(spec: &Spec, seconds: f64, tier: Option<&str>) -> f64 {
-    let top = spec.price.last().map_or(0.0, |(_, p)| *p);
-    let per = tier.and_then(|t| spec.price.iter().find(|(x, _)| x.eq_ignore_ascii_case(t))).map_or(top, |(_, p)| *p);
+/// (the highest when unknown), silent or with audio.
+pub fn cost_cny(spec: &Spec, seconds: f64, tier: Option<&str>, silent: bool) -> f64 {
+    let table = if silent && !spec.silent_price.is_empty() { spec.silent_price } else { spec.price };
+    let top = table.last().map_or(0.0, |(_, p)| *p);
+    let per = tier.and_then(|t| table.iter().find(|(x, _)| x.eq_ignore_ascii_case(t))).map_or(top, |(_, p)| *p);
     seconds * per
 }
 
@@ -1401,7 +1429,10 @@ fn usage(p: &Prepared, task: &Value, cny_per_usd: f64) -> Usage {
     let u = task.get("usage").cloned().unwrap_or(Value::Null);
     let cost = spec(&p.model)
         .zip(billed_seconds(&u))
-        .map(|(s, secs)| cost_cny(s, secs, billed_tier(task, &p.body).as_deref()))
+        .map(|(s, secs)| {
+            let silent = p.body.pointer("/parameters/audio").and_then(Value::as_bool) == Some(false);
+            cost_cny(s, secs, billed_tier(task, &p.body).as_deref(), silent)
+        })
         .and_then(|c| usd(c, Currency::Cny, cny_per_usd));
     Usage {
         cost_usd: cost,

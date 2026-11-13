@@ -21,8 +21,8 @@
 //! tutorial), then the attached ones. Earlier turns are not sent (the API has no
 //! conversation); a system prompt is an error.
 //!
-//! **Defaults** (D3 and the owner): the largest resolution tier (5.5 / 5.0 pro
-//! / flash 2K, the others 4K) with the aspect ratio left to the model ("方式
+//! **Defaults** (D3, D79 and the owner): Ark's default resolution tier, which
+//! is also the largest (5.5 / 5.0 pro / flash 2K, the others 4K), with the aspect ratio left to the model ("方式
 //! 1（推荐）"; an aspect option sends the pixels of Ark's tier × ratio table, or
 //! computed ones for other ratios), `watermark: false` (Ark's default adds "AI
 //! 生成"), PNG where the format can be set (lossless; Ark's 5.0 default is
@@ -35,8 +35,8 @@
 //! search is shown before the images, where it ran (one `web_search` call per
 //! search in `usage.tool_usage.web_search`; 0, "未搜索", is noted).
 //!
-//! **Options**: `1 2 4` resolution tiers the model has (Ark's 1.5K and 3K have
-//! no option letter); `S W H w h ar=` aspect ratios (as pixels; Ark takes any
+//! **Options**: `size=1K` `2K` `4K`, the resolution tiers the model has (Ark's
+//! 1.5K and 3K have no option); `ar=` aspect ratios (as pixels; Ark takes any
 //! ratio in [1/16, 16] within the model's pixel range); `n=` image groups;
 //! `bg=` background; `q=` the prompt optimization mode (`standard`, Ark's
 //! "质量更高", or `fast` on 5.0 pro).
@@ -224,7 +224,7 @@ impl RouteCaps for Caps {
     }
     fn generation(&self) -> Generation {
         let Some(s) = self.0 else { return Generation::default() };
-        Generation { quality: true, count: s.groups, background: !s.backgrounds.is_empty(), seconds: false }
+        Generation { quality: true, count: s.groups, background: !s.backgrounds.is_empty(), ..Default::default() }
     }
 }
 

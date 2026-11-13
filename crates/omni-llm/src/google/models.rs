@@ -77,8 +77,12 @@ pub struct Inputs {
 /// Image output options of an image model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageOut {
+    /// Sizes, smallest first (the last is the largest).
     pub sizes: &'static [&'static str],
     pub ratios: &'static [&'static str],
+    /// The size sent when none is asked for (D79: Google's default, 1K, is
+    /// not sent; a larger size at the same price is sent instead).
+    pub free_size: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,7 +251,7 @@ pub const MODELS: &[ModelSpec] = &[
             Thinking::Levels(&["high", "medium", "minimal"]),
             SEARCH_ONLY,
             IMAGE_MODEL,
-            ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_EXTENDED },
+            ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_EXTENDED, free_size: None },
         )
     },
     ModelSpec {
@@ -260,7 +264,7 @@ pub const MODELS: &[ModelSpec] = &[
             Thinking::Levels(&["high", "minimal"]),
             SEARCH_ONLY,
             IMAGE_MODEL,
-            ImageOut { sizes: &["512", "1K", "2K", "4K"], ratios: RATIOS_EXTENDED },
+            ImageOut { sizes: &["512", "1K", "2K", "4K"], ratios: RATIOS_EXTENDED, free_size: None },
         )
     },
     // "Supported image_size values: 1024px (1K). (Note: 2K and 4K are unsupported)";
@@ -274,7 +278,7 @@ pub const MODELS: &[ModelSpec] = &[
             Thinking::Levels(&["high", "minimal"]),
             NO_TOOLS,
             IMAGE_MODEL,
-            ImageOut { sizes: &["1K"], ratios: RATIOS_BASE },
+            ImageOut { sizes: &["1K"], ratios: RATIOS_BASE, free_size: None },
         )
     },
     image_model(
@@ -284,7 +288,8 @@ pub const MODELS: &[ModelSpec] = &[
         Thinking::AlwaysOn,
         SEARCH_ONLY,
         PRO_IMAGE,
-        ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_BASE },
+        // 1K and 2K cost the same ($0.134, pricing page): 2K by default.
+        ImageOut { sizes: &["1K", "2K", "4K"], ratios: RATIOS_BASE, free_size: Some("2K") },
     ),
 ];
 
@@ -333,7 +338,11 @@ fn guess(model: &str) -> ModelSpec {
         image_search: false,
         tiers: TIERS,
         inputs: FULL,
-        image_out: image.then_some(ImageOut { sizes: &["512", "1K", "2K", "4K"], ratios: RATIOS_EXTENDED }),
+        image_out: image.then_some(ImageOut {
+            sizes: &["512", "1K", "2K", "4K"],
+            ratios: RATIOS_EXTENDED,
+            free_size: None,
+        }),
         per_part_media_resolution: matches!(family, Family::Gemini4 | Family::Gemini3) && !image,
         known: false,
     }

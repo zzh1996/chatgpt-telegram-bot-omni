@@ -265,6 +265,7 @@ impl RouteCaps for Caps {
         Generation {
             quality: s.is_some_and(|s| s.quality),
             seconds: s.is_some_and(|s| !s.durations.is_empty()),
+            audio: s.is_some_and(|s| s.audio),
             ..Default::default()
         }
     }
@@ -522,9 +523,12 @@ pub async fn prepare(
                 applied.push(Applied { source: src(user.seconds.is_some()), patch: json!({"duration": d}) });
             }
             if s.audio {
-                settings.push(if s.family == Family::Vidu { "background music" } else { "AI sound effects" }.into());
-                body["with_audio"] = json!(true);
-                applied.push(Applied { source: "default".into(), patch: json!({"with_audio": true}) });
+                // On by default: the price is per video either way (D79: free quality stays on).
+                let on = req.audio.unwrap_or(true);
+                let what = if s.family == Family::Vidu { "background music" } else { "AI sound effects" };
+                settings.push(if on { what.to_string() } else { format!("no {what}") });
+                body["with_audio"] = json!(on);
+                applied.push(Applied { source: src(user.audio.is_some()), patch: json!({"with_audio": on}) });
             }
             if s.watermark {
                 settings.push("no watermark".into());
