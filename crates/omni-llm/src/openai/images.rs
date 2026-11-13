@@ -552,9 +552,11 @@ fn plural(n: usize) -> &'static str {
 // ------------------------------------------------------------------ cost
 
 /// Cost in USD of an image `usage` object (the Images API's `usage`, or the
-/// Responses API's `tool_usage.image_gen`): text and image input (cached
-/// counts where reported), image and text output.
-pub fn usage_cost(p: &ImagePrice, u: &Value) -> f64 {
+/// Responses API's `tool_usage.image_gen`): text and image input, image and
+/// text output. `cache_discount`: cached counts (where reported) at the cached
+/// rates; not on the Images API ("cached input pricing … doesn't apply to
+/// direct Images API requests", OpenAI's image generation guide, 2026-11-13).
+pub fn usage_cost(p: &ImagePrice, u: &Value, cache_discount: bool) -> f64 {
     let g = |ptr: &str| u.pointer(ptr).and_then(Value::as_u64).unwrap_or(0) as f64;
     let input = g("/input_tokens");
     let (mut text_in, mut image_in) = (g("/input_tokens_details/text_tokens"), g("/input_tokens_details/image_tokens"));
@@ -562,8 +564,9 @@ pub fn usage_cost(p: &ImagePrice, u: &Value) -> f64 {
         text_in = input;
         image_in = 0.0;
     }
-    let cached_text = g("/cached_tokens_details/cached_text_tokens").min(text_in);
-    let cached_image = g("/cached_tokens_details/cached_image_tokens").min(image_in);
+    let cached = |ptr: &str, of: f64| if cache_discount { g(ptr).min(of) } else { 0.0 };
+    let cached_text = cached("/cached_tokens_details/cached_text_tokens", text_in);
+    let cached_image = cached("/cached_tokens_details/cached_image_tokens", image_in);
     let output = g("/output_tokens");
     let (mut image_out, mut text_out) =
         (g("/output_tokens_details/image_tokens"), g("/output_tokens_details/text_tokens"));
@@ -583,7 +586,7 @@ pub fn usage_cost(p: &ImagePrice, u: &Value) -> f64 {
 /// Normalized usage of an Images API response, with the estimated cost.
 fn image_usage(model: &str, u: &Value) -> Usage {
     let g = |p: &str| u.pointer(p).and_then(Value::as_u64);
-    let cost = image_spec(model).map(|s| usage_cost(&s.price, u));
+    let cost = image_spec(model).map(|s| usage_cost(&s.price, u, false));
     Usage {
         input_tokens: g("/input_tokens"),
         output_tokens: g("/output_tokens"),
@@ -1004,17 +1007,22 @@ mod tests {
         // 50 text + 1000 image input tokens, 4000 image output tokens.
         let u = json!({"input_tokens": 1050, "input_tokens_details": {"text_tokens": 50, "image_tokens": 1000},
             "output_tokens": 4000, "output_tokens_details": {"image_tokens": 4000, "text_tokens": 0}, "total_tokens": 5050});
-        let c = usage_cost(&p, &u);
+        let c = usage_cost(&p, &u, false);
         assert!((c - (50.0 * 5.0 + 1000.0 * 8.0 + 4000.0 * 30.0) / 1e6).abs() < 1e-12, "{c}");
         // The tool's usage reports cached counts; text output is not billed on GPT Image 2.x.
         let u = json!({"input_tokens": 1100, "input_tokens_details": {"text_tokens": 100, "image_tokens": 1000},
             "cached_tokens": 600, "cached_tokens_details": {"cached_text_tokens": 100, "cached_image_tokens": 500},
             "output_tokens": 300, "output_tokens_details": {"image_tokens": 200, "text_tokens": 100}});
-        let c = usage_cost(&image_spec("gpt-image-2.5-flare").unwrap().price, &u);
+        let flare = image_spec("gpt-image-2.5-flare").unwrap().price;
+        let c = usage_cost(&flare, &u, true);
         let want = (100.0 * 1.25 + 500.0 * 8.0 + 500.0 * 2.0 + 200.0 * 30.0) / 1e6;
         assert!((c - want).abs() < 1e-12, "{c} vs {want}");
+        // The Images API has no cached-input pricing: the same counts at the input rates.
+        let c = usage_cost(&flare, &u, false);
+        let want = (100.0 * flare.text_in + 1000.0 * 8.0 + 200.0 * 30.0) / 1e6;
+        assert!((c - want).abs() < 1e-12, "{c} vs {want}");
         // Without details: input as text, output as image tokens.
-        let c = usage_cost(&p, &json!({"input_tokens": 10, "output_tokens": 100}));
+        let c = usage_cost(&p, &json!({"input_tokens": 10, "output_tokens": 100}), false);
         assert!((c - (10.0 * 5.0 + 100.0 * 30.0) / 1e6).abs() < 1e-12);
     }
 

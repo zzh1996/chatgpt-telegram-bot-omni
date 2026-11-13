@@ -98,6 +98,8 @@ pub struct ModelSpec {
     pub image_detail: &'static str,
     /// Standard tier, prompts up to 272K input tokens (USD per 1M tokens).
     pub price: Price,
+    /// A dated change: from this Unix time (the response's `created_at`) on, this price.
+    pub price_from: Option<(i64, Price)>,
     /// Prompts over 272K input tokens bill the whole request at 2× input /
     /// cache and 1.5× output.
     pub long_context: bool,
@@ -132,6 +134,7 @@ const BASE: ModelSpec = ModelSpec {
     verbosity: true,
     image_detail: "high",
     price: price(0.0, 0.0, None, 0.0),
+    price_from: None,
     long_context: true,
     flex: true,
     fast: Some(2.0),
@@ -139,12 +142,17 @@ const BASE: ModelSpec = ModelSpec {
     cache_diagnostics: true,
 };
 
+/// 2026-12-01T00:00:00Z: GPT-5.6 Sol's promotional price ends.
+pub const DEC_1_2026: i64 = 1_796_083_200;
+
 /// OpenAI's models, 2026-11-12. Limits and reasoning levels: the model pages
 /// (docs/research/openai.md §1.1); image `original` detail: the images and
 /// vision guide; prices and tiers: developers.openai.com/api/docs/pricing
 /// (Standard, Flex, Fast and Ultrafast tables). `gpt-5.6-sol` is at its
-/// promotional price, "available until November 30, 2026" (the regular
-/// price is not published). Pro models list no cached-input price (billed
+/// promotional price, "available until November 30, 2026"; the regular price
+/// is not published, but the model page calls the promotion "a 20% reduction
+/// in input pricing and a 33% reduction in output pricing": $5 / $0.50 /
+/// $6.25 / $30 from December 1 (UNCONFIRMED). Pro models list no cached-input price (billed
 /// as input). Regional (data residency) endpoints cost 10% more for models
 /// from 2026-03-05 on: not modeled.
 pub const MODELS: &[ModelSpec] = &[
@@ -184,6 +192,7 @@ pub const MODELS: &[ModelSpec] = &[
         aliases: &["gpt-5.6"],
         image_detail: "original",
         price: price(4.0, 0.4, Some(5.0), 20.0),
+        price_from: Some((DEC_1_2026, price(5.0, 0.5, Some(6.25), 30.0))),
         ..BASE
     },
     ModelSpec { id: "gpt-5.6-terra", image_detail: "original", price: price(2.0, 0.2, Some(2.5), 12.0), ..BASE },
@@ -640,6 +649,13 @@ const CONTAINER_SESSION: f64 = 0.03;
 /// `priority`) and of its context length, plus tool fees.
 pub fn estimate_cost(model: &str, response: &Value, u: &Usage) -> Option<f64> {
     let s = model_spec(model)?;
+    let created = response.get("created_at").and_then(Value::as_i64).unwrap_or_else(|| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    });
+    let price = match s.price_from {
+        Some((from, p)) if created >= from => p,
+        _ => s.price,
+    };
     let long = s.long_context && u.input_tokens? > LONG_CONTEXT_ABOVE;
     let scale = if long { Scale { input: 2.0, output: 1.5 } } else { Scale::ONE };
     let tier = match response.get("service_tier").and_then(Value::as_str) {
@@ -653,7 +669,7 @@ pub fn estimate_cost(model: &str, response: &Value, u: &Usage) -> Option<f64> {
         .pointer("/input_tokens_details/cache_write_tokens_details/ttl_12h_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let tokens = wire::token_cost(&s.price, u, written_12h, scale.times(tier))?;
+    let tokens = wire::token_cost(&price, u, written_12h, scale.times(tier))?;
     Some(tokens + tool_fees(response) + image_tool_cost(response)?)
 }
 
@@ -676,7 +692,7 @@ fn image_tool_cost(response: &Value) -> Option<f64> {
         .and_then(|t| t.get("model"))
         .and_then(Value::as_str)
         .unwrap_or(images::TOOL_MODEL);
-    images::image_spec(model).map(|s| images::usage_cost(&s.price, u))
+    images::image_spec(model).map(|s| images::usage_cost(&s.price, u, true))
 }
 
 /// Web searches (`tool_usage.web_search.num_requests` counts the billable
@@ -1065,6 +1081,13 @@ mod tests {
         let r = json!({"output": [{"type": "web_search_call", "action": {"type": "search"}}, {"type": "web_search_call", "action": {"type": "open_page"}}]});
         assert!(close(estimate_cost("gpt-6-luna", &r, &usage(0, 0, 0, 0)).unwrap(), 0.01));
         assert!(estimate_cost("gpt-7", &std, &short).is_none());
+        // GPT-5.6 Sol: the promotional $4 / $20 until November 30, then $5 / $30
+        // (by the response's `created_at`).
+        let at = |t: i64| json!({"service_tier": "default", "created_at": t});
+        let u = usage(200_000, 0, 0, 100_000);
+        assert!(close(estimate_cost("gpt-5.6-sol", &at(DEC_1_2026 - 1), &u).unwrap(), 0.8 + 2.0));
+        assert!(close(estimate_cost("gpt-5.6-sol", &at(DEC_1_2026), &u).unwrap(), 1.0 + 3.0));
+        assert!(close(estimate_cost("gpt-5.6", &at(DEC_1_2026), &usage(200_000, 200_000, 0, 0)).unwrap(), 0.1));
     }
 
     #[test]
