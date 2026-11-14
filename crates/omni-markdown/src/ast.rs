@@ -196,7 +196,7 @@ impl<'a> Events<'a> {
 }
 
 pub fn parse(src: &str) -> Vec<Block> {
-    let math = latex_delimiters(src);
+    let math = math_delimiters(src);
     let text = math.as_ref().map_or(src, |m| m.text.as_str());
     let events: Vec<Ev<'_>> = Parser::new_ext(text, options())
         .into_offset_iter()
@@ -239,15 +239,23 @@ impl Rewritten {
 /// Characters that make a `\[ … \]` body math rather than an escaped bracket.
 const MATHY: &[char] = &['\\', '^', '_', '=', '{', '}', '+', '<', '>', '|'];
 
-/// LaTeX's own delimiters, `\( … \)` for inline math and `\[ … \]` for display
-/// math, which OpenAI, DeepSeek, Qwen, Grok and Doubao models write (seen
-/// 2026-11-14), are CommonMark escapes of brackets: they are rewritten to
-/// `$…$` and `$$…$$` so that the math extension takes them (outside code; an
-/// inline formula's inner spaces trimmed, which `$` needs). `\[ … \]` only
-/// when the body looks like math, so that an escaped bracket like `\[1\]`
-/// stays one. `None`: nothing to rewrite.
-fn latex_delimiters(src: &str) -> Option<Rewritten> {
-    if !src.contains("\\(") && !src.contains("\\[") {
+/// Math delimiters the parser would misread, rewritten (outside code):
+/// - LaTeX's own delimiters, `\( … \)` for inline math and `\[ … \]` for
+///   display math, which OpenAI, DeepSeek, Qwen, Grok and Doubao models write
+///   (seen 2026-11-14), are CommonMark escapes of brackets: they become `$…$`
+///   and `$$…$$` so that the math extension takes them (an inline formula's
+///   inner spaces trimmed, which `$` needs). `\[ … \]` only when the body
+///   looks like math, so that an escaped bracket like `\[1\]` stays one.
+/// - A single `$` that is no formula's delimiter is escaped: prices such as
+///   `**$1.50** / 百万 tokens、输出 **$6.00**` made a "formula" of the text in
+///   between (seen 2026-11-15). Pandoc's rule: a formula opens with a `$`
+///   followed by a non-space and closes with the next `$`, preceded by a
+///   non-space and not followed by a digit, without a blank line in between.
+///   `$$` is left alone.
+///
+/// `None`: nothing to rewrite.
+fn math_delimiters(src: &str) -> Option<Rewritten> {
+    if !src.contains("\\(") && !src.contains("\\[") && !src.contains('$') {
         return None;
     }
     // Code spans and blocks (and raw HTML) keep their text.
@@ -309,9 +317,53 @@ fn latex_delimiters(src: &str) -> Option<Rewritten> {
         edits.push((i..end, new));
         i = end;
     }
+    // Single dollars outside code and the formulas rewritten above.
+    let rewritten = |p: usize| edits.iter().any(|(r, _)| r.contains(&p));
+    let mut singles: Vec<usize> = Vec::new();
+    let mut j = 0;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'$' => {
+                let run = bytes[j..].iter().take_while(|&&b| b == b'$').count();
+                if run == 1 && !in_code(j) && !rewritten(j) {
+                    singles.push(j);
+                } else if run > 1 {
+                    // `$$`: a display formula's delimiter, and a closer for no single `$`.
+                    singles.push(usize::MAX);
+                }
+                j += run;
+            }
+            _ => j += 1,
+        }
+    }
+    let mut k = 0;
+    while k < singles.len() {
+        let open = singles[k];
+        if open == usize::MAX {
+            k += 1;
+            continue;
+        }
+        let close = singles.get(k + 1).copied().filter(|&c| c != usize::MAX);
+        let opens = bytes.get(open + 1).is_some_and(|b| !b.is_ascii_whitespace());
+        let closes = close.is_some_and(|c| {
+            let between = &src[open + 1..c];
+            !bytes[c - 1].is_ascii_whitespace()
+                && !bytes.get(c + 1).is_some_and(u8::is_ascii_digit)
+                && !between.contains("\n\n")
+                && !between.contains("\r\n\r\n")
+        });
+        if opens && closes {
+            k += 2;
+        } else {
+            edits.push((open..open + 1, "\\$".to_string()));
+            k += 1;
+        }
+    }
     if edits.is_empty() {
         return None;
     }
+    edits.sort_by_key(|(r, _)| r.start);
     let mut text = String::with_capacity(src.len());
     let mut pieces = Vec::new();
     let mut at = 0;
@@ -468,6 +520,12 @@ fn parse_inline_run(ev: &mut Events<'_>, depth: usize) -> (Vec<Inline>, usize) {
     (out, last_end)
 }
 
+/// `<br>`, `<br/>`, `<br />` in any case.
+fn is_br(html: &str) -> bool {
+    let inner = html.trim().strip_prefix('<').and_then(|h| h.strip_suffix('>'));
+    inner.is_some_and(|h| h.trim().trim_end_matches('/').trim().eq_ignore_ascii_case("br"))
+}
+
 fn push_simple_inline(out: &mut Vec<Inline>, event: Event<'_>, src: Src) {
     match event {
         Event::Text(t) => {
@@ -484,6 +542,8 @@ fn push_simple_inline(out: &mut Vec<Inline>, event: Event<'_>, src: Src) {
         Event::Code(t) => out.push(Inline::Code { code: t.into_string(), src }),
         Event::InlineMath(t) => out.push(Inline::Math { tex: t.into_string(), display: false, src }),
         Event::DisplayMath(t) => out.push(Inline::Math { tex: t.into_string(), display: true, src }),
+        // `<br>` (models write it for a line break, in table cells above all) is one.
+        Event::Html(t) | Event::InlineHtml(t) if is_br(&t) => out.push(Inline::HardBreak { src }),
         Event::Html(t) | Event::InlineHtml(t) => out.push(Inline::Html { html: t.into_string(), src }),
         Event::FootnoteReference(l) => out.push(Inline::FootnoteRef { label: l.into_string(), src }),
         Event::SoftBreak => out.push(Inline::SoftBreak { src }),
@@ -867,6 +927,75 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every formula in a paragraph's inlines, nested ones (in bold, links) included.
+    fn all_math(blocks: &[Block]) -> Vec<String> {
+        fn walk(i: &[Inline], out: &mut Vec<String>) {
+            for x in i {
+                match x {
+                    Inline::Math { tex, .. } => out.push(tex.clone()),
+                    Inline::Emph { children, .. }
+                    | Inline::Strong { children, .. }
+                    | Inline::Strike { children, .. } => walk(children, out),
+                    Inline::Link { children, .. } => walk(children, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for b in blocks {
+            match b {
+                Block::Paragraph { inlines, .. } | Block::TightParagraph { inlines, .. } => walk(inlines, &mut out),
+                Block::MathBlock { tex, .. } => out.push(tex.clone()),
+                Block::Table { header, rows, .. } => {
+                    header.iter().chain(rows.iter().flatten()).for_each(|c| walk(c, &mut out))
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Prices are not formulas (a production answer, 2026-11-15): only dollars
+    /// that pair under Pandoc's rule delimit one.
+    #[test]
+    fn dollars_that_are_prices_stay_text() {
+        let md = "输入 **$1.50** / 百万 tokens、输出 **$6.00** / 百万 tokens，约 $0.003~$0.01 一次。";
+        let blocks = parse(md);
+        assert_eq!(all_math(&blocks), Vec::<String>::new());
+        let text = format!("{blocks:?}");
+        assert!(text.contains("$1.50") && text.contains("$6.00") && text.contains("$0.003~$0.01"), "{text}");
+        assert!(text.contains("Strong"), "the bold stays bold: {text}");
+        // Formulas next to prices still are formulas.
+        assert_eq!(all_math(&parse("$x + y$ and $z$")), ["x + y", "z"]);
+        assert_eq!(all_math(&parse("costs $5 and $x$ is a variable")), ["x"]);
+        assert_eq!(all_math(&parse("$5$ and $a$-$b$")), ["5", "a", "b"]);
+        assert_eq!(all_math(&parse("between $ x $ and $")), Vec::<String>::new());
+        assert_eq!(all_math(&parse("$$a + b$$")), ["a + b"]);
+        assert_eq!(all_math(&parse("$a$\n\n$b")), ["a"]);
+        // In code and tables: code keeps its dollars, cells are separate.
+        let blocks = parse("`$5 and $6` vs $1\n\n| a | b |\n|---|---|\n| $5 | $10 |\n");
+        assert_eq!(all_math(&blocks), Vec::<String>::new());
+        assert!(format!("{blocks:?}").contains("code: \"$5 and $6\""));
+        // Source ranges stay the model's own text.
+        let md = "pay $5 now";
+        let Block::Paragraph { inlines, .. } = &parse(md)[0] else { panic!() };
+        let Inline::Text { text, src } = &inlines[0] else { panic!("{inlines:?}") };
+        assert_eq!((text.as_str(), &md[src.clone()]), ("pay $5 now", "pay $5 now"));
+    }
+
+    /// `<br>` in a table cell (and anywhere) is a line break, not text.
+    #[test]
+    fn br_is_a_line_break() {
+        let blocks = parse("| a | b |\n|---|---|\n| one<br>two | x<BR/>y<br />z |\n\nend<br>line");
+        let Block::Table { rows, .. } = &blocks[0] else { panic!("{blocks:?}") };
+        for cell in &rows[0] {
+            assert!(cell.iter().any(|i| matches!(i, Inline::HardBreak { .. })), "{cell:?}");
+            assert!(!cell.iter().any(|i| matches!(i, Inline::Html { .. })), "{cell:?}");
+        }
+        assert!(!format!("{blocks:?}").contains("<br"));
+        assert!(parse("<div>x</div>").iter().any(|b| matches!(b, Block::Html { .. })), "other HTML stays as written");
     }
 
     /// LaTeX's own delimiters, as chat-latest writes them (2026-11-14).
