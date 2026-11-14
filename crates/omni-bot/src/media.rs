@@ -560,7 +560,9 @@ pub fn mp4_info(b: &[u8]) -> Option<(f64, u32, u32)> {
     fn be64(b: &[u8], at: usize) -> Option<u64> {
         Some(u64::from_be_bytes(b.get(at..at + 8)?.try_into().ok()?))
     }
-    // Boxes inside `b[from..to]`: (type, payload start, end).
+    // Boxes inside `b[from..to]`: (type, payload start, end). The sizes come
+    // from the file (a model's code tool can write any bytes): every box must
+    // end after it starts and inside its parent, with no arithmetic that wraps.
     fn boxes(b: &[u8], from: usize, to: usize) -> Vec<([u8; 4], usize, usize)> {
         let mut out = Vec::new();
         let mut at = from;
@@ -568,15 +570,18 @@ pub fn mp4_info(b: &[u8]) -> Option<(f64, u32, u32)> {
             let Some(size) = be32(b, at) else { break };
             let kind: [u8; 4] = b[at + 4..at + 8].try_into().unwrap();
             let (start, end) = match size {
-                1 => match be64(b, at + 8) {
-                    Some(s) if s >= 16 => (at + 16, at + s as usize),
-                    _ => break,
+                1 => match be64(b, at + 8).filter(|s| *s >= 16).and_then(|s| usize::try_from(s).ok()) {
+                    Some(s) => match at.checked_add(s) {
+                        Some(end) => (at + 16, end),
+                        None => break,
+                    },
+                    None => break,
                 },
                 0 => (at + 8, to),
                 s if s >= 8 => (at + 8, at + s as usize),
                 _ => break,
             };
-            if end > to {
+            if end > to || end <= at || start > end {
                 break;
             }
             out.push((kind, start, end));
@@ -595,7 +600,7 @@ pub fn mp4_info(b: &[u8]) -> Option<(f64, u32, u32)> {
     for (_, s, e) in inner.iter().filter(|(k, ..)| k == b"trak") {
         if let Some(t) = boxes(b, *s, *e).into_iter().find(|(k, ..)| k == b"tkhd") {
             // Width and height are the last 8 bytes, as 16.16 fixed point.
-            let (tw, th) = (be32(b, t.2 - 8)? >> 16, be32(b, t.2 - 4)? >> 16);
+            let (tw, th) = (be32(b, t.2.checked_sub(8)?)? >> 16, be32(b, t.2.checked_sub(4)?)? >> 16);
             if tw > 0 && th > 0 {
                 (w, h) = (tw, th);
                 break;
@@ -634,6 +639,26 @@ mod probe_tests {
         assert!((d - 2.0).abs() < 0.1, "{d}");
         assert_eq!((w, h), (64, 48));
         assert!(super::mp4_info(b"not a video").is_none());
+        // Crafted sizes (a code tool can write any file): a 64-bit size that would
+        // wrap the box's end back to its start, a box ending before it starts, a
+        // tiny `tkhd`. Each returns at once instead of looping until memory runs out.
+        let mut wrap = Vec::new();
+        wrap.extend(8u32.to_be_bytes());
+        wrap.extend(b"free");
+        wrap.extend(1u32.to_be_bytes());
+        wrap.extend(b"moov");
+        wrap.extend(0xFFFF_FFFF_FFFF_FFF8u64.to_be_bytes());
+        assert!(super::mp4_info(&wrap).is_none());
+        let mut tiny = Vec::new();
+        tiny.extend(32u32.to_be_bytes());
+        tiny.extend(b"moov");
+        tiny.extend(8u32.to_be_bytes());
+        tiny.extend(b"mvhd");
+        tiny.extend(16u32.to_be_bytes());
+        tiny.extend(b"trak");
+        tiny.extend(8u32.to_be_bytes());
+        tiny.extend(b"tkhd");
+        assert!(super::mp4_info(&tiny).is_none());
         // 1.5 s of 16-bit mono at 8 kHz: 24,000 bytes of data at 16,000 bytes/s.
         let mut wav = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
         wav.extend(16u32.to_le_bytes());

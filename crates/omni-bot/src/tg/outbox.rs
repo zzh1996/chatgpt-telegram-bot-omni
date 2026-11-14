@@ -596,7 +596,9 @@ pub async fn send_file(
             file: uploaded.raw.clone(),
             thumb: None,
             mime_type: mime.to_string(),
-            attributes: vec![tl::types::DocumentAttributeFilename { file_name: filename.to_string() }.into()],
+            attributes: vec![
+                tl::types::DocumentAttributeFilename { file_name: super::upload::safe_filename(filename) }.into(),
+            ],
             stickers: None,
             video_cover: None,
             video_timestamp: None,

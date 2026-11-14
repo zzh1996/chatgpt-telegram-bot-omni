@@ -607,7 +607,26 @@ fn script_arg(chars: &[char], at: usize) -> Option<(String, usize)> {
     Some((arg, end))
 }
 
+/// How deep rewritten groups nest (`\boxed{\boxed{…}}`, each a recursion)
+/// before the rest is kept as written: no model output overflows the stack.
+const MAX_DEPTH: usize = 32;
+
+thread_local! {
+    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn rewrite(chars: &[char], out: &mut String) {
+    let depth = DEPTH.with(|d| d.get());
+    if depth >= MAX_DEPTH {
+        out.extend(chars);
+        return;
+    }
+    DEPTH.with(|d| d.set(depth + 1));
+    rewrite_at(chars, out);
+    DEPTH.with(|d| d.set(depth));
+}
+
+fn rewrite_at(chars: &[char], out: &mut String) {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -1218,6 +1237,18 @@ mod tests {
         // Unclosed or unknown: as written.
         assert_eq!(t(r"\boxed{x"), r"\boxed{x");
         assert_eq!(t(r"\boxedx"), r"\boxedx");
+    }
+
+    #[test]
+    fn deep_groups_cannot_overflow_the_stack() {
+        let tex = format!("{}x{}", r"\boxed{".repeat(20_000), "}".repeat(20_000));
+        let out = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || (t(&tex), d(&tex)))
+            .unwrap()
+            .join()
+            .expect("no stack overflow");
+        assert!(out.0.contains('x') && out.1.iter().any(|l| l.contains('x')));
     }
 
     #[test]

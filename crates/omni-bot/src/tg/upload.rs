@@ -166,7 +166,7 @@ async fn upload(
         }
     }
     let mut attributes: Vec<tl::enums::DocumentAttribute> =
-        vec![tl::types::DocumentAttributeFilename { file_name: filename.to_string() }.into()];
+        vec![tl::types::DocumentAttributeFilename { file_name: safe_filename(filename) }.into()];
     match want {
         Want::Video => {
             let (duration, w, h) = crate::media::mp4_info(&bytes).unwrap_or((0.0, 0, 0));
@@ -226,5 +226,55 @@ async fn upload(
             }))
         }
         other => bail!("unexpected document upload result: {other:?}"),
+    }
+}
+
+/// A file name as Telegram shows it. Names can come from models and providers
+/// (a code tool's output files): control characters, bidi overrides and
+/// zero-width characters are removed (`report\u{202E}fdp.exe` would read
+/// `reportexe.pdf`), path separators become `_`, and long names are shortened
+/// with their extension kept.
+pub fn safe_filename(name: &str) -> String {
+    const MAX_CHARS: usize = 100;
+    let invisible = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{061C}' | '\u{FEFF}')
+    };
+    let clean: String =
+        name.chars().filter(|&c| !invisible(c)).map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return "file".into();
+    }
+    if clean.chars().count() <= MAX_CHARS {
+        return clean.to_string();
+    }
+    // Keep a short extension (`.pdf`) after the shortened stem.
+    let ext = clean.rsplit_once('.').map(|(_, e)| e).filter(|e| !e.is_empty() && e.chars().count() <= 10);
+    let keep = MAX_CHARS - ext.map_or(0, |e| e.chars().count() + 1);
+    let stem: String = clean.chars().take(keep).collect();
+    match ext {
+        Some(e) => format!("{stem}.{e}"),
+        None => stem,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_filename;
+
+    #[test]
+    fn file_names_show_what_they_are() {
+        assert_eq!(safe_filename("plot.png"), "plot.png");
+        assert_eq!(safe_filename("报告 2026.pdf"), "报告 2026.pdf");
+        // A right-to-left override would make `report<RLO>fdp.exe` read `reportexe.pdf`.
+        assert_eq!(safe_filename("report\u{202E}fdp.exe"), "reportfdp.exe");
+        assert_eq!(safe_filename("a\u{200B}b\u{2066}c\nd\te.txt"), "abcde.txt");
+        assert_eq!(safe_filename("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(safe_filename(" \u{202E} "), "file");
+        let long = format!("{}.pdf", "x".repeat(300));
+        let short = safe_filename(&long);
+        assert_eq!(short.chars().count(), 100);
+        assert!(short.ends_with(".pdf"));
     }
 }

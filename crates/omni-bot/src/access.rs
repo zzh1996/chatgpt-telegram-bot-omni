@@ -122,6 +122,32 @@ pub async fn set_ban(db: &Db, bot: &str, chat_id: i64, user_id: i64, ban: bool, 
     .await
 }
 
+/// A basic group became a supergroup (a new chat id): it is the same group, so
+/// it keeps everything it had there — being allowed, its bans, spend limits
+/// and balances, and its prefixes — in one transaction.
+pub async fn migrate_chat(db: &Db, bot: &str, from: i64, to: i64) -> Result<()> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        for sql in [
+            "INSERT OR IGNORE INTO access_rules(bot, chat_id, user_id, status, note, set_by, set_at)
+             SELECT bot, ?3, user_id, status, note, set_by, set_at FROM access_rules WHERE bot = ?1 AND chat_id = ?2",
+            "INSERT OR IGNORE INTO quota_rules(bot, chat_id, target, user_id, capacity_usd, refill_usd_per_day, set_by, set_at)
+             SELECT bot, ?3, target, user_id, capacity_usd, refill_usd_per_day, set_by, set_at FROM quota_rules
+             WHERE bot = ?1 AND chat_id = ?2",
+            "INSERT OR IGNORE INTO quota_buckets(bot, chat_id, target, user_id, level_usd, updated_at)
+             SELECT bot, ?3, target, user_id, level_usd, updated_at FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2",
+            "INSERT OR IGNORE INTO chat_prefixes(bot, chat_id, name, spec, turns, created_by, created_at)
+             SELECT bot, ?3, name, spec, turns, created_by, created_at FROM chat_prefixes WHERE bot = ?1 AND chat_id = ?2",
+        ] {
+            tx.execute(sql, params![bot, from, to])?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 /// Whether a person is banned in this chat.
 pub async fn banned(db: &Db, bot: &str, chat_id: i64, user_id: i64) -> Result<bool> {
     let bot = bot.to_string();
@@ -495,6 +521,23 @@ mod tests {
         assert!(set_ban(&db, "a", g, u, false, 1).await.unwrap());
         assert!(set_place(&db, "a", g, false, 1).await.unwrap());
         assert_eq!(rules(&db, "a", Some(g)).await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn a_migrated_group_keeps_its_rules() {
+        let db = Db::open_in_memory().unwrap();
+        let (old, new, u) = (-123, -1_000_000_000_123, 7);
+        set_place(&db, "a", old, true, 1).await.unwrap();
+        set_ban(&db, "a", old, u, true, 1).await.unwrap();
+        set_rule(&db, "a", old, Target::Members, Some(Rule { capacity: 1.0, refill_per_day: 0.0 }), 9).await.unwrap();
+        charge(&db, "a", old, u, 0.25).await.unwrap();
+        migrate_chat(&db, "a", old, new).await.unwrap();
+        assert!(place_allowed(&db, "a", new).await.unwrap());
+        assert!(banned(&db, "a", new, u).await.unwrap());
+        let (l, _) = level(&db, "a", new, Target::Member(u)).await.unwrap().unwrap();
+        assert!((l - 0.75).abs() < 1e-9);
+        // Another bot's rules stay its own.
+        assert!(!place_allowed(&db, "b", new).await.unwrap());
     }
 
     #[test]

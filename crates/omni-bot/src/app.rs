@@ -142,6 +142,17 @@ impl App {
     }
 
     /// A chat's own prefixes, by name.
+    /// The prefixes of a group that became a supergroup, under its new id too.
+    pub fn migrate_chat_prefixes(&self, bot: &str, from: i64, to: i64) {
+        let mut all = self.chat_prefixes.write();
+        if let Some(old) = all.get(&(bot.to_string(), from)).cloned() {
+            let new = all.entry((bot.to_string(), to)).or_default();
+            for (name, p) in old {
+                new.entry(name).or_insert(p);
+            }
+        }
+    }
+
     pub fn chat_prefixes_of(&self, bot: &str, chat_id: i64) -> BTreeMap<String, Arc<crate::prefixes::ChatPrefix>> {
         self.chat_prefixes.read().get(&(bot.to_string(), chat_id)).cloned().unwrap_or_default()
     }

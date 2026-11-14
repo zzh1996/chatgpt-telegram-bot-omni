@@ -207,7 +207,7 @@ pub fn parse(src: &str) -> Vec<Block> {
         })
         .collect();
     let mut ev = Events { inner: events.into_iter().peekable() };
-    let blocks = parse_blocks(&mut ev, None);
+    let blocks = parse_blocks(&mut ev, None, 0);
     normalize_display_math(blocks)
 }
 
@@ -373,9 +373,38 @@ fn is_inline_start(e: &Event<'_>) -> bool {
     }
 }
 
+/// How deep blocks and inline formatting nest before the rest is kept as
+/// plain text: far beyond what renders (the rich conversion stops at 16), and
+/// shallow enough that a model writing thousands of `>` or `- ` cannot overflow
+/// the stack (each level is a recursion).
+const MAX_DEPTH: usize = 64;
+
+/// Everything up to the `End(end)` matching an already consumed start (nested
+/// starts of the same kind counted), as plain text, without recursion.
+fn text_until_end(ev: &mut Events<'_>, end: TagEnd) -> String {
+    let mut depth = 0usize;
+    let mut text = String::new();
+    while let Some((event, _)) = ev.next() {
+        match event {
+            Event::Start(t) if t.to_end() == end => depth += 1,
+            Event::End(e) if e == end => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            Event::Text(t) | Event::Code(t) | Event::InlineMath(t) | Event::DisplayMath(t) => text.push_str(&t),
+            Event::SoftBreak | Event::HardBreak => text.push(' '),
+            Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::Heading(_) | TagEnd::CodeBlock) => text.push('\n'),
+            _ => {}
+        }
+    }
+    text
+}
+
 /// Parse blocks until the matching `End(end)` (consumed) or end of input.
 #[allow(clippy::while_let_loop)]
-fn parse_blocks(ev: &mut Events<'_>, end: Option<TagEnd>) -> Vec<Block> {
+fn parse_blocks(ev: &mut Events<'_>, end: Option<TagEnd>, depth: usize) -> Vec<Block> {
     let mut blocks = Vec::new();
     loop {
         let Some(peeked) = ev.peek() else { break };
@@ -388,7 +417,7 @@ fn parse_blocks(ev: &mut Events<'_>, end: Option<TagEnd>) -> Vec<Block> {
         // Inline content directly at block level (tight list items).
         if is_inline_start(&peeked.0) && !matches!(peeked.0, Event::TaskListMarker(_)) {
             let start = peeked.1.start;
-            let (inlines, src_end) = parse_inline_run(ev);
+            let (inlines, src_end) = parse_inline_run(ev, depth);
             if !inlines.is_empty() {
                 blocks.push(Block::TightParagraph { inlines, src: start..src_end });
             }
@@ -397,7 +426,7 @@ fn parse_blocks(ev: &mut Events<'_>, end: Option<TagEnd>) -> Vec<Block> {
         let (event, src) = ev.next().unwrap();
         match event {
             Event::Start(tag) => {
-                if let Some(b) = parse_block_tag(ev, tag, src) {
+                if let Some(b) = parse_block_tag(ev, tag, src, depth) {
                     blocks.push(b);
                 }
             }
@@ -418,7 +447,7 @@ fn parse_blocks(ev: &mut Events<'_>, end: Option<TagEnd>) -> Vec<Block> {
 }
 
 /// Consume a run of inline events at block level (until a block-level event).
-fn parse_inline_run(ev: &mut Events<'_>) -> (Vec<Inline>, usize) {
+fn parse_inline_run(ev: &mut Events<'_>, depth: usize) -> (Vec<Inline>, usize) {
     let mut out = Vec::new();
     let mut last_end = 0;
     while let Some(p) = ev.peek() {
@@ -429,7 +458,7 @@ fn parse_inline_run(ev: &mut Events<'_>) -> (Vec<Inline>, usize) {
         last_end = last_end.max(src.end);
         match event {
             Event::Start(tag) => {
-                let (inl, end) = parse_inline_tag(ev, tag, src);
+                let (inl, end) = parse_inline_tag(ev, tag, src, depth);
                 last_end = last_end.max(end);
                 out.push(inl);
             }
@@ -464,7 +493,7 @@ fn push_simple_inline(out: &mut Vec<Inline>, event: Event<'_>, src: Src) {
 }
 
 /// Parse inline children until `End(end)` (consumed). Returns children and max src end.
-fn parse_inlines_until(ev: &mut Events<'_>, end: TagEnd) -> (Vec<Inline>, usize) {
+fn parse_inlines_until(ev: &mut Events<'_>, end: TagEnd, depth: usize) -> (Vec<Inline>, usize) {
     let mut out = Vec::new();
     let mut last_end = 0;
     while let Some((event, src)) = ev.next() {
@@ -474,7 +503,7 @@ fn parse_inlines_until(ev: &mut Events<'_>, end: TagEnd) -> (Vec<Inline>, usize)
             Event::End(_) => {}
             Event::Start(tag) => {
                 if is_inline_tag(&tag) {
-                    let (inl, e) = parse_inline_tag(ev, tag, src);
+                    let (inl, e) = parse_inline_tag(ev, tag, src, depth);
                     last_end = last_end.max(e);
                     out.push(inl);
                 } else {
@@ -517,9 +546,13 @@ fn skip_until_end(ev: &mut Events<'_>, end: TagEnd) {
     }
 }
 
-fn parse_inline_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> (Inline, usize) {
+fn parse_inline_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src, depth: usize) -> (Inline, usize) {
     let end = tag.to_end();
-    let (children, e) = parse_inlines_until(ev, end);
+    if depth >= MAX_DEPTH {
+        let text = text_until_end(ev, end);
+        return (Inline::Text { text, src: src.clone() }, src.end);
+    }
+    let (children, e) = parse_inlines_until(ev, end, depth + 1);
     let src_end = src.end.max(e);
     let src = src.start..src_end;
     let inl = match tag {
@@ -540,14 +573,20 @@ fn parse_inline_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> (Inline, usi
 }
 
 #[allow(clippy::while_let_loop)]
-fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block> {
+fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src, depth: usize) -> Option<Block> {
+    // Beyond MAX_DEPTH a nested block is its text (no deeper recursion).
+    if depth >= MAX_DEPTH && matches!(tag, Tag::BlockQuote(_) | Tag::List(_) | Tag::FootnoteDefinition(_)) {
+        let text = text_until_end(ev, tag.to_end());
+        let inlines = vec![Inline::Text { text, src: src.clone() }];
+        return Some(Block::Paragraph { inlines, src });
+    }
     match tag {
         Tag::Paragraph => {
-            let (inlines, _) = parse_inlines_until(ev, TagEnd::Paragraph);
+            let (inlines, _) = parse_inlines_until(ev, TagEnd::Paragraph, depth);
             Some(Block::Paragraph { inlines, src })
         }
         Tag::Heading { level, .. } => {
-            let (inlines, _) = parse_inlines_until(ev, TagEnd::Heading(level));
+            let (inlines, _) = parse_inlines_until(ev, TagEnd::Heading(level), depth);
             let level = match level {
                 HeadingLevel::H1 => 1,
                 HeadingLevel::H2 => 2,
@@ -584,7 +623,7 @@ fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block>
             Some(Block::CodeBlock { lang, code, src, code_src })
         }
         Tag::BlockQuote(kind) => {
-            let blocks = parse_blocks(ev, Some(TagEnd::BlockQuote(kind)));
+            let blocks = parse_blocks(ev, Some(TagEnd::BlockQuote(kind)), depth + 1);
             Some(Block::Quote { blocks, src })
         }
         Tag::HtmlBlock => {
@@ -613,7 +652,7 @@ fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block>
                             task = Some(c);
                         }
                         // Loose items begin with a paragraph; the marker may also follow the paragraph start.
-                        let mut blocks = parse_blocks(ev, Some(TagEnd::Item));
+                        let mut blocks = parse_blocks(ev, Some(TagEnd::Item), depth + 1);
                         if task.is_none() {
                             task = extract_task_marker(&mut blocks);
                         }
@@ -625,7 +664,7 @@ fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block>
             Some(Block::List { start, items, src })
         }
         Tag::FootnoteDefinition(label) => {
-            let blocks = parse_blocks(ev, Some(TagEnd::FootnoteDefinition));
+            let blocks = parse_blocks(ev, Some(TagEnd::FootnoteDefinition), depth + 1);
             Some(Block::FootnoteDef { label: label.into_string(), blocks, src })
         }
         Tag::Table(aligns) => {
@@ -664,7 +703,7 @@ fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block>
                         }
                     }
                     Event::Start(Tag::TableCell) => {
-                        let (cell, _) = parse_inlines_until(ev, TagEnd::TableCell);
+                        let (cell, _) = parse_inlines_until(ev, TagEnd::TableCell, depth);
                         current_row.get_or_insert_with(Vec::new).push(cell);
                     }
                     _ => {}
@@ -682,7 +721,7 @@ fn parse_block_tag(ev: &mut Events<'_>, tag: Tag<'_>, src: Src) -> Option<Block>
             None
         }
         t if is_inline_tag(&t) => {
-            let (inl, end) = parse_inline_tag(ev, t, src.clone());
+            let (inl, end) = parse_inline_tag(ev, t, src.clone(), depth);
             Some(Block::TightParagraph { inlines: vec![inl], src: src.start..end })
         }
         _ => None,
@@ -746,6 +785,34 @@ fn is_only_display_math(inlines: &[Inline]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_nesting_cannot_overflow_the_stack() {
+        // What a model can be made to write: thousands of `>` or `- `, nested
+        // emphasis. Parsed and converted on a thread with Tokio's 2 MiB stack.
+        let inputs = [
+            format!("{} deep quote", ">".repeat(5000)),
+            format!("{} deep list", "- ".repeat(5000)),
+            format!("{}deep{}", "*_".repeat(2000), "_*".repeat(2000)),
+        ];
+        let handle = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                inputs
+                    .iter()
+                    .map(|md| {
+                        let blocks = parse(md);
+                        let rich = crate::rich::markdown_to_blocks(md, 0, crate::rich::RichLimits::TELEGRAM);
+                        (format!("{blocks:?}").contains("deep"), rich.len())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+        for (kept, n) in handle.join().expect("no stack overflow") {
+            assert!(kept, "the deepest text is kept as plain text");
+            assert!(n > 0);
+        }
+    }
 
     #[test]
     fn parses_basic_structure() {

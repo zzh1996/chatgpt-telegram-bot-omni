@@ -211,8 +211,12 @@ async fn on_service(app: &Arc<App>, bot: &Arc<BotConn>, s: &tl::types::MessageSe
             app.set_member(&bot.name, chat_id, false).await
         }
         tl::enums::MessageAction::ChatMigrateTo(a) => {
-            info!(from = chat_id, to = a.channel_id, "group migrated to supergroup");
-            app.set_member(&bot.name, -(1_000_000_000_000 + a.channel_id), true).await
+            let to = -(1_000_000_000_000 + a.channel_id);
+            info!(from = chat_id, to, "group migrated to supergroup");
+            // The same group under a new id: it keeps being allowed, its bans, limits and prefixes.
+            crate::access::migrate_chat(&app.db, &bot.name, chat_id, to).await?;
+            app.migrate_chat_prefixes(&bot.name, chat_id, to);
+            app.set_member(&bot.name, to, true).await
         }
         _ => Ok(()),
     }

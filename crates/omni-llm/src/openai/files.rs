@@ -369,6 +369,10 @@ fn file_mime(name: &str, header: Option<&str>) -> String {
     .to_string()
 }
 
+/// Largest file the bot fetches from a container (as for Anthropic's code tools:
+/// the bot's default limit for files it takes).
+const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
 /// `GET url` (with the API key when `auth`): the body and its content type.
 async fn get(
     inner: &Inner,
@@ -390,8 +394,26 @@ async fn get(
             .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string()))
             .collect();
         let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_string);
-        let bytes = resp.bytes().await.map_err(|e| format!("download failed: {e}"))?;
-        Ok::<_, String>((bytes.to_vec(), ctype))
+        // A code tool can write a file of any size: refused above the limit, by its
+        // declared length and while it downloads, instead of filling memory.
+        let mut resp = resp;
+        if let Some(n) = resp.content_length()
+            && n > MAX_FILE_BYTES
+        {
+            return Err(format!(
+                "the file is {} MB, more than the bot's limit of {} MB",
+                n >> 20,
+                MAX_FILE_BYTES >> 20
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| format!("download failed: {e}"))? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > MAX_FILE_BYTES {
+                return Err(format!("the file is more than the bot's limit of {} MB", MAX_FILE_BYTES >> 20));
+            }
+        }
+        Ok::<_, String>((bytes, ctype))
     })
     .await;
     let out = match sent {
