@@ -274,8 +274,11 @@ impl crate::request::RouteCaps for ArkCaps {
     fn image_options(&self) -> bool {
         false
     }
+    /// The tiers this model has prices for: on another one a request would cost
+    /// an unknown amount (and count nothing against spend limits).
     fn tiers(&self) -> Vec<String> {
-        vec!["flex".into(), "fast".into()]
+        let Some(s) = self.0 else { return Vec::new() };
+        [("flex", s.flex), ("fast", s.fast)].into_iter().filter(|(_, t)| !t.is_empty()).map(|(n, _)| n.into()).collect()
     }
     /// A model outside the table: nothing is sent, Ark applies its default.
     fn default_effort(&self) -> Option<String> {
@@ -697,6 +700,17 @@ mod tests {
     use omni_core::content::{Part, Role};
 
     use super::*;
+
+    #[test]
+    fn only_priced_tiers_are_offered() {
+        use crate::request::RouteCaps;
+        let tiers = |m: &str| ArkCaps(model_spec(m)).tiers();
+        assert_eq!(tiers("doubao-seed-2-1-lite-260915"), ["flex", "fast"]);
+        assert_eq!(tiers("doubao-seed-2-1-pro-260915"), ["flex"]);
+        assert!(tiers("doubao-seed-2-0-code-260215").is_empty());
+        assert!(tiers("doubao-seed-evolving-261015").is_empty());
+        assert!(tiers("not-in-the-table").is_empty());
+    }
 
     #[test]
     fn model_table_prefers_longest_prefix() {

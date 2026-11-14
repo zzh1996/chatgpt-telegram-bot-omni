@@ -16,7 +16,7 @@
 //! chat of the bot, inside a group for that group only (see `commands`).
 
 use anyhow::Result;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::App;
 use crate::store::{Db, now_ms};
@@ -223,19 +223,18 @@ impl Target {
 /// default for members.
 pub async fn rule_for(db: &Db, bot: &str, chat_id: i64, target: Target) -> Result<Option<Rule>> {
     let bot = bot.to_string();
+    db.call(move |c| rule_in(c, &bot, chat_id, target)).await
+}
+
+fn rule_in(c: &Connection, bot: &str, chat_id: i64, target: Target) -> Result<Option<Rule>> {
     let (kind, user) = target.key();
-    db.call(move |c| {
-        let r = c
-            .query_row(
-                "SELECT capacity_usd, refill_usd_per_day FROM quota_rules
-                 WHERE bot = ?1 AND chat_id = ?2 AND target = ?3 AND user_id IN (?4, 0) ORDER BY user_id = ?4 DESC LIMIT 1",
-                params![bot, chat_id, kind, user],
-                |r| Ok(Rule { capacity: r.get(0)?, refill_per_day: r.get(1)? }),
-            )
-            .optional()?;
-        Ok(r)
-    })
-    .await
+    Ok(c.query_row(
+        "SELECT capacity_usd, refill_usd_per_day FROM quota_rules
+         WHERE bot = ?1 AND chat_id = ?2 AND target = ?3 AND user_id IN (?4, 0) ORDER BY user_id = ?4 DESC LIMIT 1",
+        params![bot, chat_id, kind, user],
+        |r| Ok(Rule { capacity: r.get(0)?, refill_per_day: r.get(1)? }),
+    )
+    .optional()?)
 }
 
 /// Whether a member has a limit of their own (not just the chat's default for members).
@@ -315,20 +314,20 @@ pub async fn quota_rules(db: &Db, bot: &str, only_chat: Option<i64>) -> Result<V
 /// Current bucket level (USD) after refill of the chat or of one member in
 /// it; `None` if no rule applies. (`Members` has no bucket of its own.)
 pub async fn level(db: &Db, bot: &str, chat_id: i64, target: Target) -> Result<Option<(f64, Rule)>> {
-    let Some(rule) = rule_for(db, bot, chat_id, target).await? else { return Ok(None) };
-    let b = bot.to_string();
+    let bot = bot.to_string();
+    db.call(move |c| level_in(c, &bot, chat_id, target, now_ms())).await
+}
+
+fn level_in(c: &Connection, bot: &str, chat_id: i64, target: Target, now: i64) -> Result<Option<(f64, Rule)>> {
+    let Some(rule) = rule_in(c, bot, chat_id, target)? else { return Ok(None) };
     let (kind, user) = target.key();
-    let stored: Option<(f64, i64)> = db
-        .call(move |c| {
-            Ok(c.query_row(
-                "SELECT level_usd, updated_at FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2 AND target = ?3 AND user_id = ?4",
-                params![b, chat_id, kind, user],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?)
-        })
-        .await?;
-    let now = now_ms();
+    let stored: Option<(f64, i64)> = c
+        .query_row(
+            "SELECT level_usd, updated_at FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2 AND target = ?3 AND user_id = ?4",
+            params![bot, chat_id, kind, user],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
     let lvl = match stored {
         None => rule.capacity,
         Some((l, t)) => {
@@ -341,20 +340,33 @@ pub async fn level(db: &Db, bot: &str, chat_id: i64, target: Target) -> Result<O
 
 /// Deduct `cost` spent by `user_id` in a chat from the chat's bucket and the
 /// member's (each only if a rule applies; may go negative: the next request
-/// is then blocked until refilled).
+/// is then blocked until refilled). One transaction, so that concurrent
+/// charges never overwrite each other. (The ledger uses [`charge_in`].)
+#[cfg(test)]
 pub async fn charge(db: &Db, bot: &str, chat_id: i64, user_id: i64, cost: f64) -> Result<()> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        charge_in(&tx, &bot, chat_id, user_id, cost)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
+/// [`charge`] inside the caller's transaction (the ledger charges together
+/// with the row it records). Reading the level and writing it back happen
+/// under the same database lock, so no other charge can come in between.
+pub fn charge_in(c: &Connection, bot: &str, chat_id: i64, user_id: i64, cost: f64) -> Result<()> {
+    let now = now_ms();
     for target in [Target::Chat, Target::Member(user_id)] {
-        let Some((lvl, _)) = level(db, bot, chat_id, target).await? else { continue };
-        let (b, (kind, user), new) = (bot.to_string(), target.key(), lvl - cost);
-        db.call(move |c| {
-            c.execute(
-                "INSERT INTO quota_buckets(bot, chat_id, target, user_id, level_usd, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(bot, chat_id, target, user_id) DO UPDATE SET level_usd = excluded.level_usd, updated_at = excluded.updated_at",
-                params![b, chat_id, kind, user, new, now_ms()],
-            )?;
-            Ok(())
-        })
-        .await?;
+        let Some((lvl, _)) = level_in(c, bot, chat_id, target, now)? else { continue };
+        let (kind, user) = target.key();
+        c.execute(
+            "INSERT INTO quota_buckets(bot, chat_id, target, user_id, level_usd, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(bot, chat_id, target, user_id) DO UPDATE SET level_usd = excluded.level_usd, updated_at = excluded.updated_at",
+            params![bot, chat_id, kind, user, lvl - cost, now],
+        )?;
     }
     Ok(())
 }
@@ -438,6 +450,27 @@ mod tests {
         assert!((l - 1.5).abs() < 0.01);
         assert_eq!(quota_rules(&db, "a", Some(g)).await.unwrap().len(), 3);
         assert_eq!(quota_rules(&db, "a", Some(h)).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_charges_all_count() {
+        let db = Db::open_in_memory().unwrap();
+        let (g, u) = (-100, 7);
+        set_rule(&db, "a", g, Target::Members, Some(Rule { capacity: 100.0, refill_per_day: 0.0 }), 9).await.unwrap();
+        set_rule(&db, "a", g, Target::Chat, Some(Rule { capacity: 100.0, refill_per_day: 0.0 }), 9).await.unwrap();
+        let tasks: Vec<_> = (0..50)
+            .map(|_| {
+                let db = db.clone();
+                tokio::spawn(async move { charge(&db, "a", g, u, 1.0).await.unwrap() })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        for target in [Target::Chat, Target::Member(u)] {
+            let (l, _) = level(&db, "a", g, target).await.unwrap().unwrap();
+            assert!((l - 50.0).abs() < 1e-9, "{target:?}: {l}");
+        }
     }
 
     #[tokio::test]

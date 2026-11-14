@@ -874,7 +874,7 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
             }
         }
     } else {
-        let name = format!("answer-{}.md", t.id);
+        let name = format!("answer-{}.md", crate::compose::file_stamp(&app.cfg.general.timezone, t.created_at));
         let md = crate::compose::raw_markdown(parts);
         let blob = app.blobs.put(md.into_bytes(), "text/markdown".into()).await?;
         let key = format!("{}/{name}", blob.sha256);
@@ -899,6 +899,9 @@ async fn cmd_raw(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()>
 /// signatures, tool calls, images, files; the provider's exact output), with
 /// its model and options, status and attempts (outcome, usage, error), and
 /// every image or file embedded once as base64. Request bodies: /info.
+/// How many bytes of images and files one /dump embeds (the dump is built in memory).
+const DUMP_EMBED_BYTES: u64 = 64 << 20;
+
 async fn cmd_dump(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()> {
     use base64::Engine;
     let Some(t) = target_turn(app, bot, ib).await? else { return Ok(()) };
@@ -910,10 +913,11 @@ async fn cmd_dump(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
     let iso = |ms: i64| jiff::Timestamp::from_millisecond(ms).map(|t| t.to_string()).unwrap_or_default();
     let mut turns = Vec::new();
     let mut blobs = std::collections::BTreeMap::new();
-    for row in &chain {
+    // Turns by their place in this conversation (`n`, each the reply to the one
+    // before): the database's global ids would tell how much the bot is used elsewhere.
+    for (n, row) in chain.iter().enumerate() {
         let mut v = json!({
-            "id": row.id,
-            "parent_id": row.parent_id,
+            "n": n,
             "role": row.turn.role,
             "origin": row.turn.origin,
             "status": row.status.as_str(),
@@ -942,29 +946,48 @@ async fn cmd_dump(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
             }
             v["attempts"] = json!(attempts);
         }
-        collect_blobs(&v, &mut blobs);
+        // The conversation's own images and files only: never an object that merely
+        // looks like a file reference inside tool input or output, provider data or
+        // errors, which models and providers control.
+        for p in &row.turn.parts {
+            if let Part::Image { blob, .. } | Part::File { blob, .. } = p
+                && omni_core::blob::is_sha256_hex(&blob.sha256)
+            {
+                blobs.insert(blob.sha256.clone(), blob.clone());
+            }
+        }
         turns.push(v);
     }
+    // Files are embedded up to DUMP_EMBED_BYTES in all (memory); the rest are listed.
     let mut media = serde_json::Map::new();
+    let mut embedded = 0u64;
     for (sha, r) in &blobs {
-        let entry = match app.blobs.get(r).await {
-            Ok(bytes) => json!({
-                "mime": r.mime, "size": r.size, "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
-            }),
-            Err(e) => json!({"mime": r.mime, "size": r.size, "error": format!("{e:#}")}),
+        let entry = if embedded + r.size > DUMP_EMBED_BYTES {
+            json!({"mime": r.mime, "size": r.size, "omitted": "too large to embed in one dump"})
+        } else {
+            match app.blobs.get(r).await {
+                Ok(bytes) => {
+                    embedded += bytes.len() as u64;
+                    json!({
+                        "mime": r.mime, "size": r.size, "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                    })
+                }
+                Err(e) => json!({"mime": r.mime, "size": r.size, "error": format!("{e:#}")}),
+            }
         };
         media.insert(sha.clone(), entry);
     }
     let n_turns = turns.len();
+    // The same conversation always dumps to the same bytes (no export time), so
+    // asking again stores and uploads nothing new.
     let dump = json!({
-        "format": "omni-conversation/1",
+        "format": "omni-conversation/2",
         "bot": bot.name,
         "chat_id": ib.chat_id,
-        "exported_at": jiff::Timestamp::now().to_string(),
         "turns": turns,
         "blobs": media,
     });
-    let name = format!("conversation-{}.json", t.id);
+    let name = format!("conversation-{}.json", crate::compose::file_stamp(&app.cfg.general.timezone, t.created_at));
     let blob = app.blobs.put(serde_json::to_vec_pretty(&dump)?, "application/json".into()).await?;
     let key = format!("{}/{name}", blob.sha256);
     let blocks = vec![
@@ -981,24 +1004,6 @@ async fn cmd_dump(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
         say(app, bot, ib, &format!("⚠️ {e:#}")).await;
     }
     Ok(())
-}
-
-/// Every blob reference (`{"sha256", "size", "mime"}`) anywhere in a value.
-fn collect_blobs(v: &serde_json::Value, out: &mut std::collections::BTreeMap<String, omni_core::blob::BlobRef>) {
-    match v {
-        serde_json::Value::Object(m) => {
-            if let Ok(r) = serde_json::from_value::<omni_core::blob::BlobRef>(v.clone())
-                && m.len() == 3
-                && r.sha256.len() == 64
-            {
-                out.insert(r.sha256.clone(), r);
-                return;
-            }
-            m.values().for_each(|x| collect_blobs(x, out));
-        }
-        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_blobs(x, out)),
-        _ => {}
-    }
 }
 
 /// A person's display name with id, from what the bot has seen.
@@ -1195,9 +1200,19 @@ async fn cmd_prefix(
         created_by: user,
         created_at: now_ms(),
     };
-    if !prefixes::insert(&app.db, &bot.name, chat, &name, &p).await? {
-        say(app, bot, ib, &format!("⚠️ {name}{marker} is taken: pick another name")).await;
-        return Ok(());
+    match prefixes::insert(&app.db, &bot.name, chat, &name, &p).await? {
+        prefixes::Inserted::Added => {}
+        prefixes::Inserted::Taken => {
+            say(app, bot, ib, &format!("⚠️ {name}{marker} is taken: pick another name")).await;
+            return Ok(());
+        }
+        prefixes::Inserted::Full => {
+            let here = if chat == ib.chat_id { access::this_chat(chat).to_string() } else { place_label(chat) };
+            let max = prefixes::MAX_PER_CHAT;
+            say(app, bot, ib, &format!("⚠️ {here} has {max} prefixes, the most a chat can have: /unprefix one first"))
+                .await;
+            return Ok(());
+        }
     }
     let (history, system) = (
         p.turns.iter().filter(|t| t.role != omni_core::content::Role::System).count(),
@@ -1259,7 +1274,7 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
             format!("{:?}", t.status).to_lowercase()
         ))));
     }
-    let mut dump = json!({"turn": t.id, "attempts": []});
+    let mut dump = json!({"attempts": []});
     for a in &attempts {
         let (req, _out, err, up, usage) = conv::attempt_json(&app.db, a.id).await?;
         let meta = conv::attempt_meta(&app.db, a.id).await.ok().flatten();
@@ -1281,7 +1296,7 @@ async fn cmd_info(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<()
         }));
     }
     // One message: the summary and the full request/response dump attached.
-    let name = format!("request-{}.json", t.id);
+    let name = format!("request-{}.json", crate::compose::file_stamp(&app.cfg.general.timezone, t.created_at));
     let blob = app.blobs.put(serde_json::to_vec_pretty(&dump)?, "application/json".into()).await?;
     let key = format!("{}/{name}", blob.sha256);
     blocks.insert(0, RBlock::Paragraph(RText::concat(vec![RText::plain("🤖 "), label("Request details")])));
@@ -1380,7 +1395,7 @@ async fn cmd_retry(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
 }
 
 /// The "🔁 Retry" button under a reply that finally failed (callback data
-/// `retry:<turn id>`). Anyone allowed to use the bot in the chat may press it,
+/// `retry`; `retry:<turn id>` on older buttons). Anyone allowed to use the bot in the chat may press it,
 /// like replying `/retry`; the retry runs (and is charged) as the original request.
 pub async fn on_callback(app: &Arc<App>, bot: &Arc<BotConn>, q: tl::types::UpdateBotCallbackQuery) -> Result<()> {
     let chat_id = crate::tg::convert::marked_peer_id(&q.peer);
@@ -1400,13 +1415,24 @@ pub async fn on_callback(app: &Arc<App>, bot: &Arc<BotConn>, q: tl::types::Updat
         }
     };
     let data = q.data.as_deref().and_then(|d| std::str::from_utf8(d).ok()).unwrap_or_default();
-    let Some(turn_id) = data.strip_prefix("retry:").and_then(|s| s.parse::<i64>().ok()) else {
-        answer(None).await;
-        return Ok(());
+    // `retry`: the reply the button is under (buttons carry no turn id, which would
+    // tell how much the bot is used elsewhere); `retry:<turn id>`: older buttons.
+    let claimed = match data {
+        "retry" => None,
+        d => match d.strip_prefix("retry:").and_then(|s| s.parse::<i64>().ok()) {
+            Some(id) => Some(id),
+            None => {
+                answer(None).await;
+                return Ok(());
+            }
+        },
     };
     // The button must belong to a message of that reply, in this chat, sent by this bot.
-    let shown = conv::turn_for_message(&app.db, &bot.name, chat_id, q.msg_id).await?.map(|(t, _)| t);
-    if shown != Some(turn_id) {
+    let Some(turn_id) = conv::turn_for_message(&app.db, &bot.name, chat_id, q.msg_id).await?.map(|(t, _)| t) else {
+        answer(Some("This button does not belong to this message.")).await;
+        return Ok(());
+    };
+    if claimed.is_some_and(|c| c != turn_id) {
         answer(Some("This button does not belong to this message.")).await;
         return Ok(());
     }

@@ -40,6 +40,9 @@ pub struct App {
     pub chat_prefixes: RwLock<HashMap<(String, i64), BTreeMap<String, Arc<crate::prefixes::ChatPrefix>>>>,
     /// Assistant turns currently being generated (dedupe of job runners).
     pub running: Mutex<HashSet<i64>>,
+    /// Inbound messages currently being handled (dedupe of dispatches: the
+    /// startup recovery and the update loop may dispatch the same one).
+    pub handling: Mutex<HashSet<i64>>,
     /// Fires with a turn id whenever an assistant turn finishes.
     pub turn_done: broadcast::Sender<i64>,
     pub shutdown: CancellationToken,

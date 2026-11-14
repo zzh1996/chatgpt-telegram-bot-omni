@@ -244,6 +244,7 @@ impl ChatGate {
     }
 
     /// A gate that only serializes (dev probes that measure Telegram's limits).
+    #[cfg(any(debug_assertions, test))]
     pub fn unlimited() -> Self {
         Self::with(Budget::default(), true, None)
     }

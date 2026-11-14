@@ -43,14 +43,14 @@ impl Content {
 }
 
 /// The inline keyboard under a reply that finally failed: one "🔁 Retry" button
-/// (callback data `retry:<turn id>`).
-pub fn retry_markup(turn_id: i64) -> tl::enums::ReplyMarkup {
+/// (callback data `retry`: the press is matched to the reply by its message).
+pub fn retry_markup() -> tl::enums::ReplyMarkup {
     let button = tl::types::KeyboardInlineButton {
         style: None,
         text: "🔁 Retry".into(),
         r#type: tl::enums::InlineButtonType::Callback(tl::types::InlineButtonTypeCallback {
             requires_password: false,
-            data: format!("retry:{turn_id}").into_bytes(),
+            data: b"retry".to_vec(),
         }),
     };
     tl::types::ReplyInlineMarkup {
@@ -460,7 +460,9 @@ pub async fn send(db: &Db, bot: &BotConn, req: SendReq<'_>) -> Result<i32, SendE
     }
 }
 
-/// Delete messages (highest priority, retried on flood waits).
+/// Delete messages (highest priority, retried on flood waits). Used by the dev
+/// injector's probes only.
+#[cfg(any(debug_assertions, test))]
 pub async fn delete(db: &Db, bot: &BotConn, chat_id: i64, ids: &[i32]) -> Result<()> {
     let gate = bot.gates.get(chat_id);
     let mut tries = 0u32;
@@ -667,15 +669,14 @@ mod tests {
     #[test]
     fn retry_button_changes_what_a_page_shows() {
         let c = Content::Text(Formatted::plain("failed"));
-        let m = retry_markup(42);
+        let m = retry_markup();
         assert_ne!(page_hash(&c, Some(&m)), page_hash(&c, None));
         assert_eq!(page_hash(&c, None), c.hash());
-        assert_eq!(page_hash(&c, Some(&m)), page_hash(&c, Some(&retry_markup(42))));
-        assert_ne!(page_hash(&c, Some(&m)), page_hash(&c, Some(&retry_markup(43))));
+        assert_eq!(page_hash(&c, Some(&m)), page_hash(&c, Some(&retry_markup())));
         let tl::enums::ReplyMarkup::ReplyInlineMarkup(k) = m else { panic!() };
         let tl::enums::KeyboardInlineButtonRow::Row(row) = &k.rows[0];
         let tl::enums::KeyboardInlineButton::Button(b) = &row.buttons[0];
         assert_eq!(b.text, "🔁 Retry");
-        assert!(matches!(&b.r#type, tl::enums::InlineButtonType::Callback(c) if c.data == b"retry:42"));
+        assert!(matches!(&b.r#type, tl::enums::InlineButtonType::Callback(c) if c.data == b"retry"));
     }
 }

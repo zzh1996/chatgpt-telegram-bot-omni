@@ -18,7 +18,20 @@ pub struct RichContent {
     pub document_ids: Vec<i64>,
     /// Map blocks: (latitude, longitude, accuracy in meters).
     pub maps: Vec<(f64, f64, Option<u32>)>,
+    /// How deep the conversion is nested now (blocks and inline text).
+    depth: usize,
 }
+
+/// Limits for crafted messages, far beyond what any real one has: this runs on
+/// every message before anything else (even from people who may not use the
+/// bot), so a deeply nested or hugely spanning one must not exhaust the stack
+/// or memory.
+/// - Nesting of blocks and inline text (lists, quotes, folds, formatting).
+const MAX_DEPTH: usize = 32;
+/// - Columns a table cell spans.
+const MAX_COLSPAN: i32 = 64;
+/// - Characters of a list item's own number (`num`).
+const MAX_NUM_CHARS: usize = 20;
 
 /// Convert the blocks of a rich message.
 pub fn convert(blocks: &[tl::enums::PageBlock]) -> RichContent {
@@ -70,6 +83,21 @@ fn checkbox(checkbox: bool, checked: bool) -> &'static str {
 }
 
 fn block(b: &tl::enums::PageBlock, c: &mut RichContent) -> String {
+    nested(c, |c| block_at(b, c))
+}
+
+/// `f` one level deeper; nothing beyond [`MAX_DEPTH`].
+fn nested(c: &mut RichContent, f: impl FnOnce(&mut RichContent) -> String) -> String {
+    if c.depth >= MAX_DEPTH {
+        return String::new();
+    }
+    c.depth += 1;
+    let s = f(c);
+    c.depth -= 1;
+    s
+}
+
+fn block_at(b: &tl::enums::PageBlock, c: &mut RichContent) -> String {
     use tl::enums::PageBlock as B;
     let heading = |level: usize, t: &tl::enums::RichText, c: &mut RichContent| {
         let s = inline(t, c);
@@ -121,8 +149,9 @@ fn block(b: &tl::enums::PageBlock, c: &mut RichContent) -> String {
                 .iter()
                 .enumerate()
                 .map(|(i, it)| {
-                    let n = |num: &Option<String>, value: Option<i32>| {
-                        num.clone().unwrap_or_else(|| value.unwrap_or(start + i as i32).to_string())
+                    let n = |num: &Option<String>, value: Option<i32>| match num {
+                        Some(num) => num.chars().take(MAX_NUM_CHARS).collect(),
+                        None => value.unwrap_or(start.saturating_add(i as i32)).to_string(),
                     };
                     match it {
                         tl::enums::PageListOrderedItem::Text(t) => {
@@ -243,7 +272,7 @@ fn table(x: &tl::types::PageBlockTable, c: &mut RichContent) -> String {
             let s = cell.text.as_ref().map(|t| inline(t, c)).unwrap_or_default();
             row.push(s.replace('\n', " ").replace('|', "\\|"));
             // A cell spanning several columns keeps the grid with empty cells.
-            for _ in 1..cell.colspan.unwrap_or(1).max(1) {
+            for _ in 1..cell.colspan.unwrap_or(1).clamp(1, MAX_COLSPAN) {
                 row.push(String::new());
             }
         }
@@ -279,6 +308,10 @@ fn plain(t: &tl::enums::RichText) -> String {
 }
 
 fn strip(t: &tl::enums::RichText, c: &mut RichContent) -> String {
+    nested(c, |c| strip_at(t, c))
+}
+
+fn strip_at(t: &tl::enums::RichText, c: &mut RichContent) -> String {
     use tl::enums::RichText as R;
     match t {
         R::TextEmpty => String::new(),
@@ -321,6 +354,10 @@ fn strip(t: &tl::enums::RichText, c: &mut RichContent) -> String {
 
 /// Inline text as Markdown.
 fn inline(t: &tl::enums::RichText, c: &mut RichContent) -> String {
+    nested(c, |c| inline_at(t, c))
+}
+
+fn inline_at(t: &tl::enums::RichText, c: &mut RichContent) -> String {
     use tl::enums::RichText as R;
     let wrap = |mark: &str, inner: String| {
         if inner.trim().is_empty() { inner } else { format!("{mark}{inner}{mark}") }
@@ -426,5 +463,52 @@ mod tests {
         );
         assert_eq!(c.photo_ids, vec![7]);
         assert_eq!(c.maps, vec![(31.23, 121.47, Some(20))]);
+    }
+
+    #[test]
+    fn crafted_messages_stay_small() {
+        // Lists nested 300 deep, bold nested 300 deep: converted up to the depth limit.
+        let mut b = para(p("deep"));
+        for _ in 0..300 {
+            b = tl::enums::PageBlock::List(tl::types::PageBlockList {
+                items: vec![tl::enums::PageListItem::Blocks(tl::types::PageListItemBlocks {
+                    checkbox: false,
+                    checked: false,
+                    blocks: vec![b],
+                })],
+            });
+        }
+        let mut t = p("bold");
+        for _ in 0..300 {
+            t = R::TextBold(Box::new(tl::types::TextBold { text: t }));
+        }
+        let c = convert(&[b, para(t)]);
+        assert!(c.markdown.matches('-').count() <= MAX_DEPTH, "{}", c.markdown.len());
+        assert!(!c.markdown.contains("deep") && !c.markdown.contains("bold"));
+        assert!(c.markdown.len() < 10_000, "{}", c.markdown.len());
+        // A cell spanning i32::MAX columns keeps at most MAX_COLSPAN of them.
+        let cell = |colspan| {
+            tl::enums::PageTableCell::Cell(tl::types::PageTableCell {
+                header: false,
+                align_center: false,
+                align_right: false,
+                valign_middle: false,
+                valign_bottom: false,
+                text: Some(p("x")),
+                colspan,
+                rowspan: None,
+            })
+        };
+        let table = tl::enums::PageBlock::Table(tl::types::PageBlockTable {
+            bordered: true,
+            striped: false,
+            compact: false,
+            title: R::TextEmpty,
+            rows: vec![tl::enums::PageTableRow::Row(tl::types::PageTableRow {
+                cells: vec![cell(Some(i32::MAX)), cell(Some(-5))],
+            })],
+        });
+        let c = convert(&[table]);
+        assert_eq!(c.markdown.lines().next().unwrap().matches('|').count(), MAX_COLSPAN as usize + 2);
     }
 }

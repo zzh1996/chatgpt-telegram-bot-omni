@@ -175,12 +175,22 @@ impl BotConn {
         } else {
             self.invoke(&tl::functions::messages::GetMessages { id }).await?
         };
-        Ok(match res {
+        let msgs = match res {
             tl::enums::messages::Messages::Messages(m) => m.messages,
             tl::enums::messages::Messages::Slice(m) => m.messages,
             tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
             tl::enums::messages::Messages::NotModified(_) => Vec::new(),
-        })
+        };
+        // Outside supergroups and channels, message ids count across all of the bot's
+        // private chats and basic groups: only this chat's messages are its.
+        Ok(msgs
+            .into_iter()
+            .filter(|m| match m {
+                tl::enums::Message::Message(m) => super::convert::marked_peer_id(&m.peer_id) == chat_id,
+                tl::enums::Message::Service(s) => super::convert::marked_peer_id(&s.peer_id) == chat_id,
+                tl::enums::Message::Empty(_) => false,
+            })
+            .collect())
     }
 }
 

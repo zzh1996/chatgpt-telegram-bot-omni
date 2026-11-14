@@ -21,6 +21,10 @@ use crate::reply;
 use crate::tg::bot::BotConn;
 
 pub fn dispatch(app: Arc<App>, inbound_id: i64) {
+    // One handler per message: two would both find it new and create its turns twice.
+    if !app.handling.lock().insert(inbound_id) {
+        return;
+    }
     tokio::spawn(async move {
         let span = info_span!("inbound", id = inbound_id);
         let res = handle(app.clone(), inbound_id).instrument(span).await;
@@ -32,6 +36,8 @@ pub fn dispatch(app: Arc<App>, inbound_id: i64) {
             warn!(inbound = inbound_id, error = %e, "inbound handling failed");
         }
         let _ = conv::set_inbound_status(&app.db, inbound_id, status, err).await;
+        // Only now: a later dispatch then sees the message handled.
+        app.handling.lock().remove(&inbound_id);
     });
 }
 
@@ -176,6 +182,43 @@ struct Attached {
     captions: Vec<String>,
 }
 
+/// Files one message may bring (its album and a replied-to album included).
+const MAX_ATTACHMENTS: usize = 40;
+
+/// Limits on what one message brings, far above what real messages need and
+/// low enough that a crafted one cannot exhaust memory: at most
+/// [`MAX_ATTACHMENTS`] files, 4 × `max_file_mb` in all, and that size times the
+/// models it goes to at most 10 × `max_file_mb` (each model's request holds its
+/// own copy). Returns (total, fan-out) in bytes.
+fn attachment_limits(app: &App) -> (u64, u64) {
+    let file = app.cfg.general_max_file_bytes();
+    (file.saturating_mul(4), file.saturating_mul(10))
+}
+
+fn mb(b: u64) -> String {
+    format!("{:.0} MB", b as f64 / 1e6)
+}
+
+/// `Err(notice)` if `parts` sent to `models` models would exceed the fan-out limit.
+fn check_fan_out(app: &App, parts: &[Part], models: usize) -> Result<(), String> {
+    let bytes: u64 = parts
+        .iter()
+        .map(|p| match p {
+            Part::Image { blob, .. } | Part::File { blob, .. } => blob.size,
+            _ => 0,
+        })
+        .sum();
+    let (_, fan_out) = attachment_limits(app);
+    if models > 1 && bytes.saturating_mul(models as u64) > fan_out {
+        return Err(format!(
+            "⚠️ too many models for files this large: {models} × {} is above {}; ask fewer models at once",
+            mb(bytes),
+            mb(fan_out)
+        ));
+    }
+    Ok(())
+}
+
 /// Collect the media of a message (album-aware) as blobs/parts.
 async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached> {
     let max = app.cfg.general_max_file_bytes();
@@ -219,13 +262,26 @@ async fn media_parts(app: &App, bot: &BotConn, ib: &Inbound) -> Result<Attached>
             }
         }
     }
+    let (max_total, _) = attachment_limits(app);
+    if refs.len() > MAX_ATTACHMENTS {
+        anyhow::bail!("this message brings {} files; at most {MAX_ATTACHMENTS} at once", refs.len());
+    }
+    let declared: u64 = refs.iter().filter_map(|r| r.size).sum();
+    if declared > max_total {
+        anyhow::bail!("the files of this message are {} in all; at most {} at once", mb(declared), mb(max_total));
+    }
     let mut parts = Vec::new();
+    let mut total = 0u64;
     // Every kind of Telegram media: photos, files, voice and video messages,
     // GIFs, stickers (an animated one as its still preview).
     for r in &refs {
         let blob = media::fetch(&app.db, &app.blobs, bot, ib.chat_id, r, max)
             .await
             .with_context(|| format!("cannot use {}", r.name()))?;
+        total += blob.size;
+        if total > max_total {
+            anyhow::bail!("the files of this message are more than {} in all", mb(max_total));
+        }
         parts.push(match r.kind {
             media::MediaKind::Photo => {
                 Part::Image { blob, filename: None, generated: false, dims: None, thought: false }
@@ -360,6 +416,10 @@ async fn new_conversation(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> R
             return Ok(());
         }
     };
+    if let Err(msg) = check_fan_out(app, &attached.parts, specs.len()) {
+        reply::notice(app, bot, ib.chat_id, ib.msg_id, &msg).await;
+        return Ok(());
+    }
     let turns = match user_turns(&t.text, attached.parts).map(|mut ts| {
         // Captions of the album's other items follow the message text.
         if let Some(last) = ts.iter_mut().rev().find(|t| t.role == Role::User) {
@@ -426,6 +486,10 @@ pub async fn continue_conversation(
             return Ok(());
         }
     };
+    if let Err(msg) = check_fan_out(app, &attached.parts, specs.len()) {
+        reply::notice(app, bot, ib.chat_id, ib.msg_id, &msg).await;
+        return Ok(());
+    }
     let mut parts = attached.parts;
     if !text.is_empty() {
         parts.push(Part::text(text));

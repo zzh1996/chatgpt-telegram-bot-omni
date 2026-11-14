@@ -744,6 +744,16 @@ async fn finish(run: &mut Run<'_>, p: &Prepared, id: &str, v: &Value) -> Result<
         None => format!("{}.mp4", p.model),
     };
     let n = urls.len();
+    // The task, not the last poll's log id, is the call's upstream id.
+    run.sink.event(StreamEvent::Meta { upstream_id: Some(id.to_string()), provider: None, model: None });
+    // Billed once the videos are made: counted even if downloading them fails.
+    let cost = spec.and_then(|s| usd(s.price_cny * n as f64, Currency::Cny, run.cfg.cny_per_usd));
+    run.sink.event(StreamEvent::Usage(Usage {
+        cost_usd: cost,
+        cost_source: if cost.is_some() { CostSource::Estimated } else { CostSource::Unknown },
+        raw: json!({"videos": n}),
+        ..Default::default()
+    }));
     for url in urls {
         let (data, header) = run.download(&url, "video").await?;
         let mime = header
@@ -752,15 +762,6 @@ async fn finish(run: &mut Run<'_>, p: &Prepared, id: &str, v: &Value) -> Result<
             .unwrap_or_else(|| "video/mp4".into());
         run.sink.event(StreamEvent::File { data, mime, name: Some(name.clone()) });
     }
-    // The task, not the last poll's log id, is the call's upstream id.
-    run.sink.event(StreamEvent::Meta { upstream_id: Some(id.to_string()), provider: None, model: None });
-    let cost = spec.and_then(|s| usd(s.price_cny * n as f64, Currency::Cny, run.cfg.cny_per_usd));
-    run.sink.event(StreamEvent::Usage(Usage {
-        cost_usd: cost,
-        cost_source: if cost.is_some() { CostSource::Estimated } else { CostSource::Unknown },
-        raw: json!({"videos": n}),
-        ..Default::default()
-    }));
     run.sink.event(StreamEvent::Finish { reason: Some("stop".into()), native: Some("SUCCESS".into()) });
     Ok(v.clone())
 }

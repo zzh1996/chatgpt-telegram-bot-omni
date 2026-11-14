@@ -330,7 +330,7 @@ async fn sync_loop(
         let ask = match current.as_ref() {
             Some(state) => {
                 let pages = pages_for(state, fallback, frame);
-                let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
+                let markup = state.retry_button.then(outbox::retry_markup);
                 let markup_of = |i: usize| if i + 1 == pages.len() { markup.as_ref() } else { None };
                 let weight =
                     next_page(&pages, &sent, markup_of).map_or(Weight::Light, |(i, c, _)| page_weight(&sent, i, c));
@@ -361,7 +361,7 @@ async fn sync_loop(
             fallback = Fallback::None;
         }
         let mut pages = pages_for(&state, fallback, frame);
-        let markup = state.retry_button.then(|| outbox::retry_markup(turn_id));
+        let markup = state.retry_button.then(outbox::retry_markup);
         // The progress icon moves on with every update, and only with one: when
         // something else changed (no edit of its own).
         if live_icon(&state, frame).is_some()
@@ -420,7 +420,7 @@ async fn sync_loop(
                 if let Some(problem) = verify(bot, chat_id, &sent, &state, fallback).await {
                     warn!(bot = %bot.name, chat = chat_id, turn = turn_id, %problem, "Telegram altered the stored reply text");
                     let mut st = state.clone();
-                    match attach_original(app, turn_id, &mut st).await {
+                    match attach_original(app, &mut st).await {
                         Ok(()) => {
                             if let Some(tx) = ctx.tx.upgrade() {
                                 tx.send_replace(Some(st));
@@ -561,13 +561,13 @@ async fn verify(
 }
 
 /// Attach the exact model output as a Markdown file, with a note.
-async fn attach_original(app: &App, turn_id: i64, st: &mut RenderState) -> anyhow::Result<()> {
+async fn attach_original(app: &App, st: &mut RenderState) -> anyhow::Result<()> {
     let md = compose::raw_markdown(&st.parts);
     if md.is_empty() {
         anyhow::bail!("no model output to attach");
     }
     let blob = app.blobs.put(md.into_bytes(), "text/markdown".into()).await?;
-    let filename = format!("answer-{turn_id}.md");
+    let filename = format!("answer-{}.md", compose::file_stamp(&app.cfg.general.timezone, crate::store::now_ms()));
     st.attachments.push(Attachment { key: format!("{}/{filename}", blob.sha256), filename, blob });
     st.notes.push("Telegram altered the stored text of this reply; the exact original is attached".into());
     Ok(())
@@ -715,12 +715,13 @@ async fn send_images_separately(
     parts: &[Part],
 ) {
     let mut idx = 0i64;
+    let stamp = compose::file_stamp(&app.cfg.general.timezone, crate::store::now_ms());
     for p in parts {
         if let Part::Image { blob, generated: true, .. } = p {
             idx += 1;
             let Ok(bytes) = app.blobs.get(blob).await else { continue };
             let ext = blob.mime.rsplit('/').next().unwrap_or("png");
-            let name = format!("image-{turn_id}-{idx}.{ext}");
+            let name = format!("image-{stamp}-{idx}.{ext}");
             let link = Link { turn_id, attempt_id: Some(attempt_id), part_index: 1000 + idx };
             let res =
                 outbox::send_file(&app.db, bot, chat_id, reply_to, bytes.clone(), &name, &blob.mime, true, "", link)

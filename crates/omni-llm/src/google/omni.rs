@@ -871,6 +871,8 @@ async fn finish(
         Some(s) => format!("{}-{s}s.mp4", p.model),
         None => format!("{}.mp4", p.model),
     };
+    // Billed once the interaction is done: counted even if fetching its video fails.
+    sink.event(StreamEvent::Usage(usage(&p.model, served.as_deref(), r.get("usage"), &p.body)));
     for o in outs {
         match o {
             Out::Thought(text, block) => {
@@ -913,7 +915,6 @@ async fn finish(
             }
         }
     }
-    sink.event(StreamEvent::Usage(usage(&p.model, served.as_deref(), r.get("usage"), &p.body)));
     if delivered == 0 {
         if !has_text {
             let mut e = LlmError::new(ErrorKind::InBand, Retry::Never, "the interaction completed without a video");

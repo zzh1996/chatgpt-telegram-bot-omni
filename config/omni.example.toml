@@ -531,4 +531,4 @@ spec = "openrouter:qwen/qwen3.8-max-prime"
 
 # ------------------------------------------------------------------ dev
 # [dev]
-# inject_dir = "data/inject"   # simulated user messages for end-to-end tests (never in production)
+# inject_dir = "data/inject"   # simulated user messages for end-to-end tests: debug builds only (release builds ignore it)

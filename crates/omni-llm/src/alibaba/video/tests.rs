@@ -500,9 +500,10 @@ async fn a_task_is_created_asynchronously_polled_and_downloaded() {
             "video_generation PENDING",
             "checkpoint {\"task_id\":\"t-1\"}",
             "video_generation RUNNING",
+            // Billed before the download: counted even if that fails.
+            &cost,
             "video_generation SUCCEEDED",
             &format!("file video/mp4 happyhorse-1.1-t2v-5s.mp4 {}", VIDEO.len()),
-            &cost,
             "finish stop SUCCEEDED",
         ]
     );

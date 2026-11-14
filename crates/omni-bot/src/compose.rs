@@ -1065,6 +1065,16 @@ fn pretty(v: &Value) -> String {
     }
 }
 
+/// The time part of a file the bot sends (`20261114-070132`, in
+/// `general.timezone`): names never carry the global ids of turns, which
+/// would tell any chat how much the bot is used elsewhere.
+pub fn file_stamp(tz_name: &str, ms: i64) -> String {
+    let tz = jiff::tz::TimeZone::get(tz_name).unwrap_or(jiff::tz::TimeZone::UTC);
+    jiff::Timestamp::from_millisecond(ms)
+        .map(|t| t.to_zoned(tz).strftime("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|_| "file".into())
+}
+
 /// Telegram's rich-message limits (32768 characters of text in all blocks,
 /// 500 blocks counting nested blocks, list items and table rows — measured
 /// against the live API, 2026-11-11), minus room for the header line that

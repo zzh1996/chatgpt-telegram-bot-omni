@@ -957,6 +957,8 @@ async fn finish_video(
         });
         return Ok(body.clone());
     };
+    // Billed once the video is made: counted even if downloading it fails.
+    sink.event(StreamEvent::Usage(usage));
     let (data, mime) = h.download(url).await?;
     let mime = mime.filter(|m| m.starts_with("video/")).unwrap_or_else(|| "video/mp4".into());
     let name = match seconds {
@@ -965,7 +967,6 @@ async fn finish_video(
     };
     sink.event(video_call(id, "done", None, Some(Value::Object(shown))));
     sink.event(StreamEvent::File { data, mime, name: Some(name) });
-    sink.event(StreamEvent::Usage(usage));
     sink.event(StreamEvent::Finish { reason: Some("stop".into()), native: Some("done".into()) });
     Ok(body.clone())
 }
@@ -1422,9 +1423,10 @@ mod tests {
                 "tool pending",
                 "checkpoint",
                 "tool pending 40%",
+                // Billed before the download: counted even if that fails.
+                "usage Some(0.64)",
                 "tool done",
                 &format!("file video/mp4 grok-imagine-video-1.5-8s.mp4 {}", mp4().len()),
-                "usage Some(0.64)",
                 "finish stop"
             ]
         );

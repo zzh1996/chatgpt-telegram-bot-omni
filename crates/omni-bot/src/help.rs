@@ -296,7 +296,7 @@ const TOPICS: &[Topic] = &[
 **What works**: photos and albums (one message, all images in order), files, voice messages, videos and round videos, GIFs, static and video stickers, rich messages (sent as Markdown), and polls, contacts, dice and checklists (sent as text).
 - A location is your position for a model's maps tool (`+m`).
 - `@` and a YouTube link in your message (`@https://youtu.be/…`) give the video to models that take YouTube links.
-- Files can be up to {MAX_FILE_MB} MB.
+- Files can be up to {MAX_FILE_MB} MB each, {MAX_MESSAGE_MB} MB in one message.
 - What a model cannot read (a PDF for some, audio, an animated sticker) is an error: nothing is converted or left out quietly."#,
         title_zh: "📎 图片、文件和其他附件",
         body_zh: r#"**随消息发送附件**：
@@ -307,7 +307,7 @@ const TOPICS: &[Topic] = &[
 **支持的内容**：图片和相册（算作一条消息，所有图片按顺序发送）、文件、语音、视频和圆形视频消息、GIF、静态和视频贴纸、富消息（按 Markdown 发送），以及投票、联系人、骰子和待办清单（按文字发送）。
 - 位置就是模型地图工具（`+m`）里你所在的位置。
 - 在消息里写 `@` 加 YouTube 链接（`@https://youtu.be/…`），能看 YouTube 链接的模型会收到这个视频。
-- 文件最大 {MAX_FILE_MB} MB。
+- 每个文件最大 {MAX_FILE_MB} MB，一条消息里的文件合计最大 {MAX_MESSAGE_MB} MB。
 - 模型读不了的内容（有的模型读不了 PDF、音频，所有模型都读不了动画贴纸）会报错：不会偷偷转换，也不会悄悄丢掉。"#,
     },
     Topic {
@@ -394,7 +394,7 @@ Arr!
 ```
 Then `pirate$Who are you?` sends that system prompt and history, then your message, to `c+s`.
 - Or reply `/prefix pirate` to one of my answers: that conversation, with its model and options, becomes the prefix.
-- Names: 3 to 16 letters or digits, not taken yet. Only this chat has the prefix.
+- Names: 3 to 16 letters or digits, not taken yet. Only this chat has the prefix (a chat has at most 200).
 - The history ends with an `::assistant` turn, or there is only a system prompt.
 - /prefix lists this chat's prefixes; `/prefix pirate` shows one.
 - `/unprefix pirate` deletes one (its creator or an admin). Answers made with it can still be continued.
@@ -412,7 +412,7 @@ Arr!
 ```
 之后发 `pirate$你是谁？`，就会把这段 system prompt 和历史，再加上你的消息，发给 `c+s`。
 - 也可以对我的某条回答回复 `/prefix pirate`：那段对话连同它的模型和选项就成了前缀。
-- 名字：3 到 16 个字母或数字，不能和已有的重名。前缀只属于这个聊天。
+- 名字：3 到 16 个字母或数字，不能和已有的重名。前缀只属于这个聊天（一个聊天最多 200 个）。
 - 历史要以一轮 `::assistant` 结尾，或者只有 system prompt。
 - /prefix 列出本聊天的前缀；`/prefix pirate` 查看其中一个。
 - `/unprefix pirate` 删除一个（创建者或管理员）。用它生成的回答仍然可以接着聊。
@@ -675,6 +675,7 @@ fn fill(text: &str, ctx: &Ctx) -> String {
         .replace("{DIRECT_IDS}", &direct)
         .replace("{IMAGE_MODELS}", &media_how)
         .replace("{MAX_FILE_MB}", &ctx.max_file_mb.to_string())
+        .replace("{MAX_MESSAGE_MB}", &(ctx.max_file_mb * 4).to_string())
         .replace("{BOLD_COST}", &bold)
         .replace("{ORDER}", order)
         // A dollar sign that is not the trigger marker (amounts in examples).
@@ -711,6 +712,7 @@ fn fill_zh(text: &str, ctx: &Ctx) -> String {
         .replace("{DIRECT_IDS}", &direct)
         .replace("{IMAGE_MODELS}", &media_how)
         .replace("{MAX_FILE_MB}", &ctx.max_file_mb.to_string())
+        .replace("{MAX_MESSAGE_MB}", &(ctx.max_file_mb * 4).to_string())
         .replace("{BOLD_COST}", &bold)
         .replace("{ORDER}", order)
         // A dollar sign that is not the trigger marker (amounts in examples).

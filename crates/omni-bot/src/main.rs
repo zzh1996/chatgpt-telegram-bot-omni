@@ -7,6 +7,8 @@ mod commands;
 mod compose;
 mod config;
 mod conv;
+// Simulated user messages for end-to-end tests: never part of a release build.
+#[cfg(any(debug_assertions, test))]
 mod devinject;
 mod handler;
 mod help;
@@ -199,6 +201,7 @@ async fn run(cfg: Config) -> Result<()> {
         aliases: RwLock::new(BTreeMap::new()),
         chat_prefixes: RwLock::new(Default::default()),
         running: Mutex::new(HashSet::new()),
+        handling: Mutex::new(HashSet::new()),
         turn_done,
         shutdown: CancellationToken::new(),
         started_at: jiff::Timestamp::now(),
@@ -219,7 +222,10 @@ async fn run(cfg: Config) -> Result<()> {
     jobs::recover(app.clone()).await?;
     ledger::spawn_settler(app.clone());
     if let Some(dir) = &cfg.dev.inject_dir {
+        #[cfg(any(debug_assertions, test))]
         devinject::spawn(app.clone(), dir.clone());
+        #[cfg(not(any(debug_assertions, test)))]
+        tracing::warn!(dir = %dir.display(), "[dev] inject_dir ignored: release builds cannot inject messages");
     }
 
     // Prefetch endpoint limits of the configured models, so `max_tokens` budgeting never waits.

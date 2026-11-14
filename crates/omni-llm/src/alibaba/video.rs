@@ -1378,6 +1378,8 @@ async fn finish(
         e.details = Some(task.clone());
         return Err(e);
     };
+    // Billed once the video is made: counted even if downloading it fails.
+    sink.event(StreamEvent::Usage(usage(p, task, cfg.cny_per_usd)));
     let (data, mime) = h.download(url).await?;
     let mime = mime.filter(|m| m.starts_with("video/")).unwrap_or_else(|| "video/mp4".into());
     sink.event(call(name, id, "SUCCEEDED", None, Some(tool_output(task))));
@@ -1391,7 +1393,6 @@ async fn finish(
         None => format!("{}.mp4", p.model),
     };
     sink.event(StreamEvent::File { data, mime, name: Some(file) });
-    sink.event(StreamEvent::Usage(usage(p, task, cfg.cny_per_usd)));
     sink.event(StreamEvent::Finish { reason: Some("stop".into()), native: Some("SUCCEEDED".into()) });
     Ok(task.clone())
 }

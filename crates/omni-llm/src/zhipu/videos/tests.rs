@@ -426,9 +426,10 @@ async fn a_video_task_is_created_checkpointed_polled_and_downloaded() {
             "meta cogvideox-3",
             "meta log-1",
             "tool SUCCESS",
-            &format!("file video/mp4 cogvideox-3-10s.mp4 {}", MP4.len()),
             "meta task-7",
+            // Billed before the download: counted even if that fails.
             "usage Some(1.0)",
+            &format!("file video/mp4 cogvideox-3-10s.mp4 {}", MP4.len()),
             "finish stop SUCCESS",
         ]
     );

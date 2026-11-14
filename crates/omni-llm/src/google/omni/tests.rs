@@ -409,10 +409,10 @@ async fn a_background_job_is_checkpointed_polled_and_its_video_decoded() {
             "checkpoint {\"interaction_id\":\"v1_abc\"}".into(),
             format!("meta v1_abc {OMNI}"),
             "tool completed".into(),
+            // 20 × $1.50 + 300 × $9.00 + 173,760 × $12.00 per 1M; before the video is fetched.
+            "usage Some(2.08785)".into(),
             "reasoning Summary Planning a continuous shot.".into(),
             format!("file video/mp4 {OMNI}.mp4 {}", MP4.len()),
-            // 20 × $1.50 + 300 × $9.00 + 173,760 × $12.00 per 1M.
-            "usage Some(2.08785)".into(),
             "finish stop completed".into(),
         ]
     );

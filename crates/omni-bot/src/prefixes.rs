@@ -109,17 +109,40 @@ pub async fn load_all(db: &Db) -> Result<Vec<(String, i64, String, ChatPrefix)>>
     .await
 }
 
-/// Store a new prefix; `false` if the chat already has one by that name.
-pub async fn insert(db: &Db, bot: &str, chat_id: i64, name: &str, p: &ChatPrefix) -> Result<bool> {
+/// Prefixes one chat may have (they are all kept in memory): far more than any
+/// chat uses, few enough that nobody can fill the bot's memory with them.
+pub const MAX_PER_CHAT: i64 = 200;
+
+/// What storing a new prefix did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Inserted {
+    Added,
+    /// The chat already has one by that name.
+    Taken,
+    /// The chat has [`MAX_PER_CHAT`] already.
+    Full,
+}
+
+/// Store a new prefix (the count and the insert in one call: two creations at
+/// once cannot pass the limit together).
+pub async fn insert(db: &Db, bot: &str, chat_id: i64, name: &str, p: &ChatPrefix) -> Result<Inserted> {
     let (bot, name, spec, turns, by) =
         (bot.to_string(), name.to_string(), p.spec.clone(), serde_json::to_string(&*p.turns)?, p.created_by);
     db.call(move |c| {
+        let count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM chat_prefixes WHERE bot = ?1 AND chat_id = ?2",
+            params![bot, chat_id],
+            |r| r.get(0),
+        )?;
+        if count >= MAX_PER_CHAT {
+            return Ok(Inserted::Full);
+        }
         let n = c.execute(
             "INSERT OR IGNORE INTO chat_prefixes(bot, chat_id, name, spec, turns, created_by, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![bot, chat_id, name, spec, turns, by, now_ms()],
         )?;
-        Ok(n > 0)
+        Ok(if n > 0 { Inserted::Added } else { Inserted::Taken })
     })
     .await
 }

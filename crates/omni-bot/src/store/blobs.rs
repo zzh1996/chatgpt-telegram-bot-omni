@@ -22,14 +22,18 @@ impl BlobStore {
         Ok(Self { root, db })
     }
 
-    pub fn path_of(&self, sha: &str) -> PathBuf {
-        self.root.join(omni_core::blob::rel_path_for(sha))
+    /// Where a blob is stored. Only a lowercase hex SHA-256 is a blob name:
+    /// references come from stored turns, which providers and models partly
+    /// control, so anything else (`../`, absolute paths) is refused.
+    pub fn path_of(&self, sha: &str) -> Result<PathBuf> {
+        let rel = omni_core::blob::rel_path_for(sha).context("not a blob name (a hex SHA-256)")?;
+        Ok(self.root.join(rel))
     }
 
     /// Store bytes synchronously (safe to call from blocking contexts and loggers).
     pub fn put_sync(&self, bytes: &[u8], mime: &str) -> Result<BlobRef> {
         let r = BlobRef::for_bytes(bytes, mime);
-        let path = self.path_of(&r.sha256);
+        let path = self.path_of(&r.sha256)?;
         if !path.exists() {
             write_atomic(&path, bytes)?;
         }
@@ -50,13 +54,13 @@ impl BlobStore {
     }
 
     pub async fn get(&self, r: &BlobRef) -> Result<Vec<u8>> {
-        let path = self.path_of(&r.sha256);
+        let path = self.path_of(&r.sha256)?;
         let bytes = tokio::fs::read(&path).await.with_context(|| format!("read blob {}", path.display()))?;
         Ok(bytes)
     }
 
     pub fn exists(&self, sha: &str) -> bool {
-        self.path_of(sha).exists()
+        self.path_of(sha).is_ok_and(|p| p.exists())
     }
 }
 
@@ -83,5 +87,9 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(store.get(&a).await.unwrap(), b"abc");
         assert!(store.exists(&a.sha256));
+        // A reference that is not a blob name never reads a file.
+        let outside = BlobRef { sha256: format!("../{}", "./".repeat(30)) + "x", size: 1, mime: "x".into() };
+        assert!(store.get(&outside).await.is_err());
+        assert!(!store.exists(&outside.sha256));
     }
 }

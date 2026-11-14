@@ -7,12 +7,14 @@
 //! - When a call's generation id becomes known (response headers), it is
 //!   registered in `pending_costs`.
 //! - When its usage arrives in the stream, a ledger row is inserted and the
-//!   pending entry removed (one transaction).
+//!   pending entry removed (one transaction); usage without a cost keeps the
+//!   entry, and the cost looked up later completes the row.
 //! - Calls whose usage never arrived (stream dropped, bot stopped or crashed)
 //!   are looked up later via OpenRouter's `/generation` endpoint by
 //!   [`spawn_settler`].
 //!
-//! Spend limits are charged exactly when a row is inserted.
+//! Spend limits are charged exactly when a row gets its cost, in the same
+//! transaction.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,16 +113,46 @@ pub async fn record_call(
                     raw
                 ],
             )?;
-            if let Some(g) = &gid {
+            let mut charge = if n > 0 { u.cost_usd } else { None };
+            // A call recorded without its cost (OpenRouter's usage had none) gets it
+            // when it is looked up later, and is charged then, once.
+            if n == 0
+                && let (Some(g), Some(cost)) = (&gid, u.cost_usd)
+                && tx.execute(
+                    "UPDATE usage_ledger SET cost_usd = ?1, cost_source = ?2,
+                       input_tokens = COALESCE(input_tokens, ?3), output_tokens = COALESCE(output_tokens, ?4),
+                       reasoning_tokens = COALESCE(reasoning_tokens, ?5), cached_tokens = COALESCE(cached_tokens, ?6),
+                       cache_write_tokens = COALESCE(cache_write_tokens, ?7)
+                     WHERE generation_id = ?8 AND cost_usd IS NULL",
+                    params![
+                        cost,
+                        source,
+                        u.input_tokens.map(|x| x as i64),
+                        u.output_tokens.map(|x| x as i64),
+                        u.reasoning_tokens.map(|x| x as i64),
+                        u.cached_input_tokens.map(|x| x as i64),
+                        u.cache_write_tokens.map(|x| x as i64),
+                        g
+                    ],
+                )? > 0
+            {
+                charge = Some(cost);
+            }
+            // The spend limits move in the same transaction as the ledger: exactly once,
+            // never lost in a crash in between, never overwritten by a concurrent charge.
+            if let Some(cost) = charge {
+                crate::access::charge_in(&tx, &m.bot, m.chat_id, m.user_id, cost)?;
+            }
+            // Looked up again later while the cost is unknown.
+            if let Some(g) = &gid
+                && u.cost_usd.is_some()
+            {
                 tx.execute("DELETE FROM pending_costs WHERE generation_id = ?1", params![g])?;
             }
             tx.commit()?;
             Ok(n > 0)
         })
         .await?;
-    if inserted && let Some(c) = usage.cost_usd {
-        crate::access::charge(db, &meta.bot, meta.chat_id, meta.user_id, c).await?;
-    }
     Ok(inserted)
 }
 
@@ -195,10 +227,11 @@ async fn settle_once(app: &App) -> Result<()> {
             let g = gid.clone();
             app.db
                 .call(move |c| {
-                    let n: i64 =
-                        c.query_row("SELECT COUNT(*) FROM usage_ledger WHERE generation_id = ?1", params![g], |r| {
-                            r.get(0)
-                        })?;
+                    let n: i64 = c.query_row(
+                        "SELECT COUNT(*) FROM usage_ledger WHERE generation_id = ?1 AND cost_usd IS NOT NULL",
+                        params![g],
+                        |r| r.get(0),
+                    )?;
                     if n > 0 {
                         c.execute("DELETE FROM pending_costs WHERE generation_id = ?1", params![g])?;
                     }
@@ -216,35 +249,36 @@ async fn settle_once(app: &App) -> Result<()> {
                 None
             }
         };
-        match found {
-            Some(d) => {
-                let Some(meta) = meta_for_attempt(&app.db, attempt_id).await? else {
-                    forget(&app.db, &gid).await?;
-                    continue;
-                };
-                let usage = usage_from_generation(&d);
-                record_call(&app.db, &meta, Some(gid.clone()), &usage, "fetched").await?;
-                info!(generation = %gid, cost = ?usage.cost_usd, "recorded usage of a call whose stream did not finish");
-            }
-            None if tries + 1 >= MAX_TRIES => {
-                warn!(generation = %gid, "giving up looking up the cost of an unfinished call");
+        if let Some(d) = found {
+            let Some(meta) = meta_for_attempt(&app.db, attempt_id).await? else {
                 forget(&app.db, &gid).await?;
+                continue;
+            };
+            let usage = usage_from_generation(&d);
+            record_call(&app.db, &meta, Some(gid.clone()), &usage, "fetched").await?;
+            if usage.cost_usd.is_some() {
+                info!(generation = %gid, cost = ?usage.cost_usd, "recorded the cost of a call looked up afterwards");
+                continue;
             }
-            None => {
-                let g = gid.clone();
-                // 15s, 30s, 1m, 2m, ... capped at 6h
-                let delay = (FIRST_LOOKUP_MS << (tries + 1).min(10)).min(6 * 3_600_000);
-                app.db
-                    .call(move |c| {
-                        c.execute(
-                            "UPDATE pending_costs SET tries = tries + 1, next_at = ?1 WHERE generation_id = ?2",
-                            params![now_ms() + delay, g],
-                        )?;
-                        Ok(())
-                    })
-                    .await?;
-            }
+            // Found without a cost yet: looked up again, like one not found.
         }
+        if tries + 1 >= MAX_TRIES {
+            warn!(generation = %gid, "giving up looking up the cost of a call");
+            forget(&app.db, &gid).await?;
+            continue;
+        }
+        let g = gid.clone();
+        // 15s, 30s, 1m, 2m, ... capped at 6h
+        let delay = (FIRST_LOOKUP_MS << (tries + 1).min(10)).min(6 * 3_600_000);
+        app.db
+            .call(move |c| {
+                c.execute(
+                    "UPDATE pending_costs SET tries = tries + 1, next_at = ?1 WHERE generation_id = ?2",
+                    params![now_ms() + delay, g],
+                )?;
+                Ok(())
+            })
+            .await?;
     }
     Ok(())
 }
@@ -292,6 +326,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((rows, pending), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_cost_known_later_is_charged_once() {
+        use crate::access::{Rule, Target, level, set_rule};
+        let db = Db::open_in_memory().unwrap();
+        let m = meta();
+        set_rule(&db, &m.bot, m.chat_id, Target::Members, Some(Rule { capacity: 1.0, refill_per_day: 0.0 }), 9)
+            .await
+            .unwrap();
+        let bal = || async { level(&db, &m.bot, m.chat_id, Target::Member(m.user_id)).await.unwrap().unwrap().0 };
+        begin_call(&db, "gen-2".into(), 1).await;
+        // OpenRouter's usage without its cost: recorded, nothing charged, still looked up.
+        let no_cost = Usage { input_tokens: Some(10), output_tokens: Some(5), ..Default::default() };
+        assert!(record_call(&db, &m, Some("gen-2".into()), &no_cost, "reported").await.unwrap());
+        assert_eq!(bal().await, 1.0);
+        let pending: i64 =
+            db.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM pending_costs", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(pending, 1);
+        // The lookup brings the cost: the row is completed and charged, once.
+        let fetched = Usage { cost_usd: Some(0.25), ..no_cost.clone() };
+        assert!(!record_call(&db, &m, Some("gen-2".into()), &fetched, "fetched").await.unwrap());
+        assert!((bal().await - 0.75).abs() < 1e-9);
+        assert!(!record_call(&db, &m, Some("gen-2".into()), &fetched, "fetched").await.unwrap());
+        assert!((bal().await - 0.75).abs() < 1e-9);
+        let (cost, pending): (f64, i64) = db
+            .call(|c| {
+                Ok((
+                    c.query_row("SELECT cost_usd FROM usage_ledger WHERE generation_id = 'gen-2'", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM pending_costs", [], |r| r.get(0))?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((cost, pending), (0.25, 0));
     }
 
     #[test]
