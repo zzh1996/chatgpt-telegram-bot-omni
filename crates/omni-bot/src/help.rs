@@ -533,13 +533,13 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
         commands: &["ping", "help", "start"],
         who: Who::Everyone,
         body: r#"- I only answer in chats an admin has allowed. Anywhere else I only answer /ping (and an admin's /allow).
-- /ping — this chat's id, your user id, whether this chat is allowed and whether you are banned here. Send it to an admin to get access.
+- /ping — this chat's id, your user id, whether this chat is allowed and whether you are banned here, and which version of me is running (`build` and a git commit). Send it to an admin to get access.
 - Someone banned in a chat can still use /help, /stats, /usage and /quota there, but cannot start requests.
 - I ignore messages from other bots and from anonymous group admins.
 - In a group with several of these bots, a command without `@` goes to each of them; `/stats@name` to one."#,
         title_zh: "🔐 我在哪里能用",
         body_zh: r#"- 我只在管理员允许的聊天里回答。在其他地方只回答 /ping（以及管理员的 /allow）。
-- /ping — 本聊天的 id、你的 user id、本聊天是否被允许、你在这里是否被封禁。把它发给管理员，就能申请使用。
+- /ping — 本聊天的 id、你的 user id、本聊天是否被允许、你在这里是否被封禁，以及正在运行的是哪个版本（`build` 后面是 git commit）。把它发给管理员，就能申请使用。
 - 在某个聊天被封禁的人，在那里仍然可以用 /help、/stats、/usage 和 /quota，但不能发起请求。
 - 我会忽略其他 bot 的消息，以及群里匿名管理员的消息。
 - 群里有好几个这样的 bot 时，不带 `@` 的命令每个 bot 都会处理；`/stats@name` 只发给其中一个。"#,

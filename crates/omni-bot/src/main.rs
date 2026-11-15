@@ -7,6 +7,9 @@ mod commands;
 mod compose;
 mod config;
 mod conv;
+/// The git commit this binary is built from (`build.rs`): `/ping` shows it.
+pub const BUILD: &str = env!("OMNI_GIT_COMMIT");
+
 // Simulated user messages for end-to-end tests: never part of a release build.
 #[cfg(any(debug_assertions, test))]
 mod devinject;
@@ -262,7 +265,7 @@ async fn run(cfg: Config) -> Result<()> {
         });
     }
 
-    info!(bots = bots.len(), "omni is running");
+    info!(bots = bots.len(), build = BUILD, "omni is running");
     shutdown_signal().await;
     info!("shutting down: in-flight generations will resume after restart");
     app.shutdown.cancel();

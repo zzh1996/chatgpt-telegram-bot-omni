@@ -123,13 +123,14 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
             bot,
             ib,
             &format!(
-                "pong · chat_id={} · user_id={}{}{} · {here} · bot={} · up {}",
+                "pong · chat_id={} · user_id={}{}{} · {here} · bot={} · up {} · build {}",
                 ib.chat_id,
                 user,
                 ib.payload.sender_username.as_ref().map(|u| format!(" (@{u})")).unwrap_or_default(),
                 if admin { " · admin" } else { "" },
                 bot.name,
-                fmt_uptime(up.as_secs().max(0) as u64)
+                fmt_uptime(up.as_secs().max(0) as u64),
+                crate::BUILD
             ),
         )
         .await;

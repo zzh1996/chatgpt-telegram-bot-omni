@@ -1,6 +1,10 @@
 target
 data
 .git
+# …but the commit the build is made from (build.rs reads it for /ping)
+!.git/HEAD
+!.git/refs
+!.git/packed-refs
 .env
 config/omni.toml
 **/*.swp

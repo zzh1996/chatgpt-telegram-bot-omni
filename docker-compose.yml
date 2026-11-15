@@ -1,6 +1,10 @@
 services:
   omni:
-    build: .
+    build:
+      context: .
+      args:
+        # Optional: the commit /ping shows is otherwise read from .git.
+        OMNI_GIT_COMMIT: ${OMNI_GIT_COMMIT:-}
     image: omni-bot:latest
     restart: unless-stopped
     init: true

@@ -263,7 +263,7 @@ effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) �
 | `/quota` | 本聊天的全部限额和余额：整个聊天的、成员默认的、每个单独设了的人；`/quota chat`、`/quota members`、`/quota <user_id>`（或回复某人的消息发 `/quota`）只看一条。谁都能看，只有管理员能修改（见下文"限额"） |
 | `/prefix` / `/prefix 名字` | 本聊天的前缀列表 / 查看一个（创建见上文"本聊天的前缀"） |
 | `/unprefix 名字` | 删除本聊天的一个前缀（创建者或管理员） |
-| `/ping` | 本聊天的 chat id、你的 user id（和 @用户名）、本聊天是否被允许、你在这里是否被封、你是不是管理员、bot 名和运行时间 |
+| `/ping` | 本聊天的 chat id、你的 user id（和 @用户名）、本聊天是否被允许、你在这里是否被封、你是不是管理员、bot 名、运行时间，以及构建所用的 git commit（`build efa8fdd`；构建时有未提交的改动则是 `efa8fdd-dirty`，读不到时是 `unknown`），用来确认正在运行的版本 |
 
 回复类命令用错对象时：
 - 回复一个**还在生成**的回答：`/raw` `/dump` `/retry` `/continue` `/prefix 名字` 都提示"还在生成，完成后再试"；`/info` 照常（显示到目前为止的尝试）；直接回复或 `/m` 会排队：先回一条"⏳ queued"，等那个回答完成后再开始。

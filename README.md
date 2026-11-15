@@ -21,6 +21,7 @@ docker compose logs -f
 ```
 
 - `api_id`/`api_hash` 来自 <https://my.telegram.org/apps>；bot token 来自 @BotFather。
+- 构建时把当前的 git commit 编进程序，`/ping` 里显示（`build efa8fdd`），用来确认正在运行的版本：从 `.git/HEAD` 读（Docker 构建也一样，`.dockerignore` 只放进这几个文件）；没有 `.git` 时用 `OMNI_GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build` 指定。
 - 群里使用需要在 @BotFather 关闭 bot 的 privacy mode，然后管理员在群里发 `/allow`（每个 bot 分别授权）。
 - 数据（SQLite、图片等 blob、日志）都在 `./data`；配置在 `./config`。日志默认 verbose 且永久保存（`[log] keep_days = 0`），磁盘会一直增长。
 - 同一个 bot token 不要同时跑在旧 bot 和新 bot 上，否则两边都会回答。
