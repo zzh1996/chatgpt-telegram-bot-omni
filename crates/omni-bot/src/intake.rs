@@ -34,6 +34,8 @@ use crate::tg::convert::marked_peer_id;
 pub const COMMANDS: &[&str] = &[
     "start", "help", "ping", "models", "model", "raw", "full", "dump", "prefix", "unprefix", "retry", "continue", "m",
     "info", "stats", "usage", "allow", "deny", "ban", "unban", "acl", "quota", "alias", "unalias", "credits",
+    // Unlisted on purpose (an easter egg, owner 2026-11-16): in no help, menu or doc.
+    "tibo",
 ];
 
 fn update_state(s: &State) -> Option<UpdateState> {

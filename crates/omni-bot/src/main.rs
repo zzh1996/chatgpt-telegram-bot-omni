@@ -327,6 +327,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("continue", "Reply: keep writing an answer that hit its long-decode budget"),
         ("stats", "Usage statistics"),
         ("usage", "Spend limits here: the chat's and yours"),
+        ("quota", "All spend limits here and their balances (admins change them)"),
         ("ping", "Check the bot: your and this chat's ids, access here"),
     ];
     let admin = [
@@ -335,7 +336,6 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("ban", "Admin: ban someone in a group"),
         ("unban", "Admin: lift a ban in a group"),
         ("acl", "Admin: allowed chats and bans"),
-        ("quota", "Admin: spend limits of a chat and its members"),
         ("alias", "Admin: add a model prefix"),
         ("unalias", "Admin: remove a model prefix"),
         ("credits", "Admin: OpenRouter key spending and platform balances"),

@@ -501,12 +501,13 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
     Topic {
         key: "usage",
         title: "📊 Costs, statistics and spend limits",
-        commands: &["stats", "usage"],
+        commands: &["stats", "usage", "quota"],
         who: Who::Everyone,
         body: r#"- /stats — this bot's usage in this chat over the last 30 days: API calls (each retry counts), tokens and cost by model (in a group also by person).
 - `/stats today`, `/stats 7d`, `/stats 30d`, `/stats all` — other periods, in calendar days of the bot's time zone.
 - In a group, `/stats user_id`, or /stats as a reply to someone's message: one member.
 - /usage — this chat's spend limits, and yours here.
+- /quota — all of this chat's spend limits and balances: the whole chat's, each member's, anyone's own (`/quota user_id`, or /quota as a reply). Only admins change them.
 
 **Spend limits**: an admin can give this chat, each member or one person a limit in USD that refills every day. When one runs out, new requests are refused until it refills; the message says which limit and when.
 
@@ -518,6 +519,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - `/stats today`、`/stats 7d`、`/stats 30d`、`/stats all` — 其他时间段，按 bot 所在时区的自然日计算。
 - 群里：`/stats user_id`，或者回复某人的消息发 /stats，只看这个成员。
 - /usage — 本聊天的限额，以及你在这里的限额。
+- /quota — 本聊天的全部限额和余额：整个聊天的、每个成员的、某个人单独的（`/quota user_id`，或者回复某人的消息发 /quota）。只有管理员能修改。
 
 **限额**：管理员可以给这个聊天、每个成员或者某个人设一个每天恢复的额度（USD）。用完后，新请求会被拒绝，直到额度恢复；提示里会写明是哪个限额、多久后恢复。
 
@@ -532,13 +534,13 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
         who: Who::Everyone,
         body: r#"- I only answer in chats an admin has allowed. Anywhere else I only answer /ping (and an admin's /allow).
 - /ping — this chat's id, your user id, whether this chat is allowed and whether you are banned here. Send it to an admin to get access.
-- Someone banned in a chat can still use /help, /stats and /usage there, but cannot start requests.
+- Someone banned in a chat can still use /help, /stats, /usage and /quota there, but cannot start requests.
 - I ignore messages from other bots and from anonymous group admins.
 - In a group with several of these bots, a command without `@` goes to each of them; `/stats@name` to one."#,
         title_zh: "🔐 我在哪里能用",
         body_zh: r#"- 我只在管理员允许的聊天里回答。在其他地方只回答 /ping（以及管理员的 /allow）。
 - /ping — 本聊天的 id、你的 user id、本聊天是否被允许、你在这里是否被封禁。把它发给管理员，就能申请使用。
-- 在某个聊天被封禁的人，在那里仍然可以用 /help、/stats 和 /usage，但不能发起请求。
+- 在某个聊天被封禁的人，在那里仍然可以用 /help、/stats、/usage 和 /quota，但不能发起请求。
 - 我会忽略其他 bot 的消息，以及群里匿名管理员的消息。
 - 群里有好几个这样的 bot 时，不带 `@` 的命令每个 bot 都会处理；`/stats@name` 只发给其中一个。"#,
     },
@@ -555,6 +557,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - `/quota chat 10 2` — the whole group: 10 USD, refilling 2 USD a day; `/quota chat off` removes it.
 - `/quota members 1 0.5` — a limit for each member; `/quota members off`.
 - `/quota user_id 2 1`, or `/quota 2 1` as a reply to their message — one person; `off` removes it.
+- `reset` instead of the two numbers puts a balance back to its limit: `/quota chat reset`, `/quota members reset` (each member), `/quota user_id reset` (or /quota reset as a reply); `/quota chat reset 3` sets it to 3 USD instead.
 - `/unprefix name` — delete anyone's prefix here.
 
 Limits apply to admins too. In a group with several of these bots, `/deny` without `@` removes the group for each of them; `/deny@name` for one. Everything else (other chats, the whole bot's statistics, its prefixes, balances) is in your private chat with me, where /help lists it."#,
@@ -567,6 +570,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - `/quota chat 10 2` — 整个群：10 USD，每天恢复 2 USD；`/quota chat off` 删除。
 - `/quota members 1 0.5` — 每个成员各自的限额；`/quota members off` 删除。
 - `/quota user_id 2 1`，或者回复某人的消息发 `/quota 2 1` — 单独设置一个人；`off` 删除。
+- 把两个数字换成 `reset` 就是把余额重置回上限：`/quota chat reset`、`/quota members reset`（每个成员）、`/quota user_id reset`（或者回复某人的消息发 /quota reset）；`/quota chat reset 3` 则是设成 3 USD。
 - `/unprefix name` — 删除本群任何人的前缀。
 
 管理员也受限额限制。群里有好几个这样的 bot 时，不带 `@` 的 /deny 会让每个 bot 都撤销本群；`/deny@name` 只对其中一个。其他命令（别的聊天、整个 bot 的统计、bot 的前缀、余额）在你和我的私聊里，在那里发 /help_zh 可以看到。"#,
@@ -589,6 +593,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - `/quota chat_id members 1 0.5` — each member of the chat.
 - `/quota chat_id user_id 2 1` — one person in the chat.
 - `off` instead of the two numbers removes a limit: `/quota chat_id members off`.
+- `reset` resets a balance to its limit, `reset 0.5` to 0.5 USD: `/quota chat_id members reset`, `/quota chat_id user_id reset 0.5`.
 
 **Statistics**
 - /stats — the whole bot: totals, and the top 10 by model, chat, person, and person in a chat. Periods as usual: `/stats 7d`.
@@ -616,6 +621,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - `/quota chat_id members 1 0.5` — 聊天里的每个成员。
 - `/quota chat_id user_id 2 1` — 聊天里的某个人。
 - 把两个数字换成 `off` 就是删除：`/quota chat_id members off`。
+- `reset` 把余额重置回上限，`reset 0.5` 则设成 0.5 USD：`/quota chat_id members reset`、`/quota chat_id user_id reset 0.5`。
 
 **统计**
 - /stats — 整个 bot：总额，以及按模型、聊天、人、"聊天里的人"的前 10 名。时间段的写法和平时一样：`/stats 7d`。
@@ -825,18 +831,25 @@ mod tests {
     /// Every command of the bot is explained by a topic its users can see.
     #[test]
     fn every_command_has_a_topic() {
-        for c in crate::intake::COMMANDS {
+        // `/tibo` is unlisted on purpose (an easter egg): no topic names it.
+        for c in crate::intake::COMMANDS.iter().filter(|c| **c != "tibo") {
             let (admin, group) = match *c {
                 "alias" | "unalias" | "credits" => (true, false),
-                "allow" | "deny" | "ban" | "unban" | "acl" | "quota" => (true, true),
+                "allow" | "deny" | "ban" | "unban" | "acl" => (true, true),
                 _ => (false, true),
             };
             assert!(topic(&ctx(admin, group), c).is_ok(), "/help {c}");
         }
         assert!(topic(&ctx(true, false), "allow").is_ok(), "private admin topic");
-        // Admin topics only for admins.
-        assert!(topic(&ctx(false, true), "quota").is_err());
+        // Admin topics only for admins; /quota (looking) is everyone's.
+        assert!(topic(&ctx(false, true), "acl").is_err());
+        assert!(topic(&ctx(false, true), "quota").is_ok());
         assert!(topic(&ctx(false, false), "admin").is_err());
+        for admin in [false, true] {
+            for group in [false, true] {
+                assert!(topic(&ctx(admin, group), "tibo").is_err(), "/tibo stays unlisted");
+            }
+        }
     }
 
     /// The marker is the configured one everywhere; nothing else uses `$` but

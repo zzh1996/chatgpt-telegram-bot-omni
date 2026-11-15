@@ -388,13 +388,108 @@ pub fn charge_in(c: &Connection, bot: &str, chat_id: i64, user_id: i64, cost: f6
     for target in [Target::Chat, Target::Member(user_id)] {
         let Some((lvl, _)) = level_in(c, bot, chat_id, target, now)? else { continue };
         let (kind, user) = target.key();
-        c.execute(
-            "INSERT INTO quota_buckets(bot, chat_id, target, user_id, level_usd, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(bot, chat_id, target, user_id) DO UPDATE SET level_usd = excluded.level_usd, updated_at = excluded.updated_at",
-            params![bot, chat_id, kind, user, lvl - cost, now],
-        )?;
+        c.execute(SET_BUCKET, params![bot, chat_id, kind, user, lvl - cost, now])?;
     }
     Ok(())
+}
+
+/// A bucket's level from now on (it refills from there).
+const SET_BUCKET: &str = "INSERT INTO quota_buckets(bot, chat_id, target, user_id, level_usd, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+     ON CONFLICT(bot, chat_id, target, user_id) DO UPDATE SET level_usd = excluded.level_usd, updated_at = excluded.updated_at";
+
+/// Every balance of a chat back to full: the chat's and each member's (the
+/// rules stay). Returns how many limits the chat has (0: nothing to reset).
+pub async fn reset_all(db: &Db, bot: &str, chat_id: i64) -> Result<usize> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        let rules: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM quota_rules WHERE bot = ?1 AND chat_id = ?2",
+            params![bot, chat_id],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2", params![bot, chat_id])?;
+        tx.commit()?;
+        Ok(rules as usize)
+    })
+    .await
+}
+
+/// What resetting a balance did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reset {
+    /// No limit applies there: nothing to reset.
+    NoRule,
+    /// The amount asked for is above the limit's capacity.
+    AboveCapacity(Rule),
+    /// The chat's or one member's balance is now this.
+    Balance(f64, Rule),
+    /// Each member on the chat's default limit: how many balances were reset.
+    Members(usize, Rule),
+}
+
+/// Reset a balance to its capacity (`amount` `None`: the bucket goes, which
+/// reads as full) or to `amount` USD (from which it refills; at most the
+/// capacity, negative is a debt). `Members` resets every member on the chat's
+/// default limit (not those with a limit of their own): back to full, or to
+/// `amount` for everyone the bot has seen use it there (anyone else is full
+/// anyway). One transaction.
+pub async fn reset(db: &Db, bot: &str, chat_id: i64, target: Target, amount: Option<f64>) -> Result<Reset> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        let tx = c.transaction()?;
+        let Some(rule) = rule_in(&tx, &bot, chat_id, target)? else { return Ok(Reset::NoRule) };
+        if amount.is_some_and(|a| a > rule.capacity) {
+            return Ok(Reset::AboveCapacity(rule));
+        }
+        let now = now_ms();
+        let out = match target {
+            Target::Chat | Target::Member(_) => {
+                let (kind, user) = target.key();
+                match amount {
+                    None => tx.execute(
+                        "DELETE FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2 AND target = ?3 AND user_id = ?4",
+                        params![bot, chat_id, kind, user],
+                    )?,
+                    Some(a) => tx.execute(SET_BUCKET, params![bot, chat_id, kind, user, a, now])?,
+                };
+                Reset::Balance(amount.unwrap_or(rule.capacity), rule)
+            }
+            Target::Members => {
+                // Members with a limit of their own are not on the default.
+                const OWN: &str = "SELECT user_id FROM quota_rules
+                     WHERE bot = ?1 AND chat_id = ?2 AND target = 'member' AND user_id <> 0";
+                let n = match amount {
+                    None => tx.execute(
+                        &format!(
+                            "DELETE FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2 AND target = 'member'
+                             AND user_id NOT IN ({OWN})"
+                        ),
+                        params![bot, chat_id],
+                    )?,
+                    Some(a) => {
+                        let users: Vec<i64> = {
+                            let mut s = tx.prepare(&format!(
+                                "SELECT user_id FROM usage_ledger WHERE bot = ?1 AND chat_id = ?2 AND user_id > 0
+                                 UNION SELECT user_id FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2 AND target = 'member'
+                                 EXCEPT {OWN}"
+                            ))?;
+                            s.query_map(params![bot, chat_id], |r| r.get(0))?.collect::<Result<_, _>>()?
+                        };
+                        for u in &users {
+                            tx.execute(SET_BUCKET, params![bot, chat_id, "member", u, a, now])?;
+                        }
+                        users.len()
+                    }
+                };
+                Reset::Members(n, rule)
+            }
+        };
+        tx.commit()?;
+        Ok(out)
+    })
+    .await
 }
 
 /// A spend-limit amount: two decimals, a minus sign when in debt (`-0.50`).
@@ -521,6 +616,77 @@ mod tests {
         assert!(set_ban(&db, "a", g, u, false, 1).await.unwrap());
         assert!(set_place(&db, "a", g, false, 1).await.unwrap());
         assert_eq!(rules(&db, "a", Some(g)).await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn balances_reset_to_full_or_an_amount() {
+        let db = Db::open_in_memory().unwrap();
+        let (g, u, v, own) = (-100, 7, 8, 9);
+        let bal = |t| {
+            let db = db.clone();
+            async move { level(&db, "a", g, t).await.unwrap().unwrap().0 }
+        };
+        // No limit: nothing to reset.
+        assert_eq!(reset(&db, "a", g, Target::Chat, None).await.unwrap(), Reset::NoRule);
+        let r = Rule { capacity: 5.0, refill_per_day: 0.0 };
+        set_rule(&db, "a", g, Target::Chat, Some(r), 1).await.unwrap();
+        set_rule(&db, "a", g, Target::Members, Some(Rule { capacity: 1.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        set_rule(&db, "a", g, Target::Member(own), Some(Rule { capacity: 3.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        for who in [u, v, own] {
+            charge(&db, "a", g, who, 0.5).await.unwrap();
+        }
+        // The chat: to full, to an amount, never above the capacity.
+        assert_eq!(reset(&db, "a", g, Target::Chat, None).await.unwrap(), Reset::Balance(5.0, r));
+        assert_eq!(bal(Target::Chat).await, 5.0);
+        assert_eq!(reset(&db, "a", g, Target::Chat, Some(-1.0)).await.unwrap(), Reset::Balance(-1.0, r));
+        assert_eq!(bal(Target::Chat).await, -1.0);
+        assert_eq!(reset(&db, "a", g, Target::Chat, Some(6.0)).await.unwrap(), Reset::AboveCapacity(r));
+        assert_eq!(bal(Target::Chat).await, -1.0);
+        // One member on the default limit, and one with their own.
+        reset(&db, "a", g, Target::Member(u), Some(0.2)).await.unwrap();
+        assert!((bal(Target::Member(u)).await - 0.2).abs() < 1e-9);
+        reset(&db, "a", g, Target::Member(own), None).await.unwrap();
+        assert_eq!(bal(Target::Member(own)).await, 3.0);
+        // Every member on the default: v back to full, u too; own keeps theirs.
+        charge(&db, "a", g, own, 1.0).await.unwrap();
+        assert!(matches!(reset(&db, "a", g, Target::Members, None).await.unwrap(), Reset::Members(2, _)));
+        assert_eq!((bal(Target::Member(u)).await, bal(Target::Member(v)).await), (1.0, 1.0));
+        assert_eq!(bal(Target::Member(own)).await, 2.0);
+        // To an amount: everyone seen using the bot here who is on the default.
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO usage_ledger(ts, bot, chat_id, user_id, provider, model) VALUES (1, 'a', -100, 7, 'p', 'm'),
+                 (1, 'a', -100, 9, 'p', 'm'), (1, 'a', -200, 8, 'p', 'm')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(matches!(reset(&db, "a", g, Target::Members, Some(0.3)).await.unwrap(), Reset::Members(1, _)));
+        assert!((bal(Target::Member(u)).await - 0.3).abs() < 1e-9);
+        assert_eq!((bal(Target::Member(v)).await, bal(Target::Member(own)).await), (1.0, 2.0));
+    }
+
+    #[tokio::test]
+    async fn everything_resets_at_once() {
+        let db = Db::open_in_memory().unwrap();
+        let (g, h, u, own) = (-100, -200, 7, 9);
+        assert_eq!(reset_all(&db, "a", g).await.unwrap(), 0);
+        set_rule(&db, "a", g, Target::Chat, Some(Rule { capacity: 5.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        set_rule(&db, "a", g, Target::Members, Some(Rule { capacity: 1.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        set_rule(&db, "a", g, Target::Member(own), Some(Rule { capacity: 3.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        set_rule(&db, "a", h, Target::Chat, Some(Rule { capacity: 5.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        for who in [u, own] {
+            charge(&db, "a", g, who, 0.5).await.unwrap();
+        }
+        charge(&db, "a", h, u, 0.5).await.unwrap();
+        assert_eq!(reset_all(&db, "a", g).await.unwrap(), 3);
+        for (t, full) in [(Target::Chat, 5.0), (Target::Member(u), 1.0), (Target::Member(own), 3.0)] {
+            assert_eq!(level(&db, "a", g, t).await.unwrap().unwrap().0, full);
+        }
+        // Another chat keeps its balance.
+        assert_eq!(level(&db, "a", h, Target::Chat).await.unwrap().unwrap().0, 4.5);
     }
 
     #[tokio::test]

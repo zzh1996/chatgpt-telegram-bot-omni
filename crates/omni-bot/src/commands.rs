@@ -141,6 +141,28 @@ pub async fn run(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, name: &str, a
     if access == Access::NotAllowed && !(admin && name == "allow") {
         return Ok(());
     }
+    // `/tibo`: an easter egg the owner asked for (2026-11-16), deliberately in no
+    // help, command menu or doc: like the Tibo who resets rate limits, it puts every
+    // balance of this chat back to full. An admin's; anyone else gets no answer.
+    if name == "tibo" {
+        if admin {
+            let text = match access::reset_all(&app.db, &bot.name, ib.chat_id).await? {
+                0 => format!("🪄 Tibo looked, but {} has no limits to reset.", access::this_chat(ib.chat_id)),
+                _ => format!(
+                    "🪄 Tibo reset the limits: {} and everyone in it are back to a full balance.",
+                    access::this_chat(ib.chat_id)
+                ),
+            };
+            say(app, bot, ib, &text).await;
+        }
+        return Ok(());
+    }
+    // Anyone may look at this chat's spend limits (owner, 2026-11-16); changing
+    // them, and other chats', is for admins.
+    if name == "quota" && !admin {
+        let words: Vec<&str> = args.split_whitespace().collect();
+        return cmd_quota(app, bot, ib, &words, user, false).await;
+    }
     if ADMIN_COMMANDS.contains(&name) {
         // In a group scoped to that group; everything else from the private chat.
         if !admin {
@@ -460,7 +482,7 @@ async fn admin_command(
             }
             send(app, bot, ib, title, blocks).await;
         }
-        "quota" => cmd_quota(app, bot, ib, &words, by).await?,
+        "quota" => cmd_quota(app, bot, ib, &words, by, true).await?,
         "alias" => {
             let mut it = args.trim().splitn(2, char::is_whitespace);
             let (Some(n), Some(spec)) = (it.next(), it.next()) else {
@@ -1776,13 +1798,18 @@ async fn cmd_usage(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound) -> Result<(
 /// (`chat`), each member by default (`members`), or one member (`<user_id>`,
 /// or as a reply). In a group it acts on that group; in an administrator's
 /// private chat the chat id comes first. Without numbers it shows them.
-async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str], by: i64) -> Result<()> {
+/// `/quota`: spend limits. Anyone sees this chat's; admins change them (in a
+/// group that group's, in their private chat any chat's).
+async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str], by: i64, admin: bool) -> Result<()> {
     use access::Target;
-    let group = ib.chat_id < 0;
-    let usage = if group {
-        "usage in a group: /quota [chat|members|<user_id> [<capacity_usd> <refill_usd_per_day> | off]]; as a reply: /quota [<capacity_usd> <refill_usd_per_day> | off] for that person"
+    // Someone who is not an admin only ever sees the chat they are in.
+    let group = ib.chat_id < 0 || !admin;
+    let usage = if !admin {
+        "usage: /quota [chat|members|<user_id>] (or /quota as a reply) shows this chat's spend limits; only admins change them"
+    } else if group {
+        "usage in a group: /quota [chat|members|<user_id> [<capacity_usd> <refill_usd_per_day> | off | reset [<balance_usd>]]]; as a reply: /quota [<capacity_usd> <refill_usd_per_day> | off | reset [<balance_usd>]] for that person"
     } else {
-        "usage: /quota [<chat_id> [chat|members|<user_id> [<capacity_usd> <refill_usd_per_day> | off]]]"
+        "usage: /quota [<chat_id> [chat|members|<user_id> [<capacity_usd> <refill_usd_per_day> | off | reset [<balance_usd>]]]]"
     };
     let mut w: Vec<&str> = w.to_vec();
     let chat = if group {
@@ -1809,7 +1836,7 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
     let target = match w.first().copied() {
         Some("chat") => Some(Target::Chat),
         Some("members") => Some(Target::Members),
-        Some(x) if x.parse::<i64>().is_ok_and(|u| u > 0) && (w.len() != 2 || w[1] == "off") => {
+        Some(x) if x.parse::<i64>().is_ok_and(|u| u > 0) && (w.len() != 2 || w[1] == "off" || w[1] == "reset") => {
             Some(Target::Member(x.parse().unwrap()))
         }
         _ => None,
@@ -1824,25 +1851,61 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
             return Ok(());
         }
         None if w.is_empty() && ib.reply_to_msg_id.is_none() => {
-            send(app, bot, ib, "Spend limits of this group", quota_blocks(app, &bot.name, Some(chat)).await?).await;
+            let title = format!("Spend limits of {}", access::this_chat(chat));
+            send(app, bot, ib, &title, quota_blocks(app, &bot.name, Some(chat)).await?).await;
             return Ok(());
         }
         None => match replied_sender(app, bot, ib).await {
-            Some(u) if group => Target::Member(u),
+            Some(u) if ib.chat_id < 0 => Target::Member(u),
             _ => {
                 say(app, bot, ib, usage).await;
                 return Ok(());
             }
         },
     };
+    let here = if chat == ib.chat_id { access::this_chat(chat).to_string() } else { place_label(chat) };
     let who = match target {
-        Target::Chat if group => "this group".to_string(),
-        Target::Chat => place_label(chat),
-        Target::Members if group => "each member of this group".to_string(),
-        Target::Members => format!("each member of {}", place_label(chat)),
-        Target::Member(u) if group => format!("user {u} in this group"),
-        Target::Member(u) => format!("user {u} in {}", place_label(chat)),
+        Target::Chat => here.clone(),
+        Target::Members => format!("each member of {here}"),
+        Target::Member(u) => format!("user {u} in {here}"),
     };
+    if !admin && !w.is_empty() {
+        say(app, bot, ib, &format!("⛔ only admins change spend limits; /quota shows {here}'s")).await;
+        return Ok(());
+    }
+    // `reset [<balance_usd>]`: the balance back to the limit's capacity, or to an amount.
+    if w.first() == Some(&"reset") {
+        let amount = match w.get(1) {
+            None => None,
+            Some(x) => match x.parse::<f64>() {
+                Ok(v) if v.is_finite() && w.len() == 2 => Some(v),
+                _ => {
+                    say(app, bot, ib, usage).await;
+                    return Ok(());
+                }
+            },
+        };
+        let text = match access::reset(&app.db, &bot.name, chat, target, amount).await? {
+            access::Reset::NoRule => format!("{who}: no limit, so there is no balance to reset"),
+            access::Reset::AboveCapacity(r) => {
+                format!("⚠️ {who}: a balance is at most the limit, {} USD", access::usd(r.capacity))
+            }
+            access::Reset::Balance(l, r) => format!("✅ {who}: {}", access::balance_text(l, &r)),
+            access::Reset::Members(n, r) => match amount {
+                None => {
+                    format!("✅ {who}: every balance is back to the full {} USD ({n} reset)", access::usd(r.capacity))
+                }
+                Some(a) => format!(
+                    "✅ {who}: balance {} USD for the {n} who have used the bot here (anyone else is at the full {} USD; \
+                     members with a limit of their own keep theirs)",
+                    access::usd(a),
+                    access::usd(r.capacity)
+                ),
+            },
+        };
+        say(app, bot, ib, &text).await;
+        return Ok(());
+    }
     let rule = match (w.first(), w.get(1)) {
         (None, None) => {
             // Show it.
