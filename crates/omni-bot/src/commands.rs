@@ -356,9 +356,34 @@ fn credits_blocks(v: &serde_json::Value) -> Result<Vec<RBlock>> {
     ])
 }
 
-/// How a chat id reads: a group, or a user's private chat.
+/// How a chat id reads when the bot knows no name for it.
 fn place_label(chat_id: i64) -> String {
     if chat_id > 0 { format!("private chat {chat_id}") } else { format!("group {chat_id}") }
+}
+
+/// How a chat reads in replies to admins, as in /stats: a group by its title,
+/// a private chat by its person (`private · Name`), each with its id; just the
+/// id while the bot has seen no name.
+async fn place_name(app: &App, chat_id: i64) -> String {
+    let name: Option<String> = app
+        .db
+        .call(move |c| {
+            use rusqlite::OptionalExtension;
+            let sql = if chat_id > 0 {
+                "SELECT NULLIF(TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')), '') FROM users WHERE user_id = ?1"
+            } else {
+                "SELECT NULLIF(TRIM(title), '') FROM chats WHERE chat_id = ?1"
+            };
+            Ok(c.query_row(sql, params![chat_id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())
+        })
+        .await
+        .ok()
+        .flatten();
+    match name {
+        Some(n) if chat_id > 0 => format!("private · {n} ({chat_id})"),
+        Some(n) => format!("{n} ({chat_id})"),
+        None => place_label(chat_id),
+    }
 }
 
 /// The sender of the message `ib` replies to (for `/ban` as a reply).
@@ -413,7 +438,7 @@ async fn admin_command(
             }
             let allow = name == "allow";
             let changed = access::set_place(&app.db, &bot.name, target, allow, by).await?;
-            let what = if target == here && group { "this group".to_string() } else { place_label(target) };
+            let what = if target == here && group { "this group".to_string() } else { place_name(app, target).await };
             let text = match (allow, changed) {
                 (true, true) => format!("✅ allowed: {what}"),
                 (true, false) => format!("already allowed: {what}"),
@@ -460,20 +485,15 @@ async fn admin_command(
             say(app, bot, ib, &text).await;
         }
         "acl" => {
-            let rows = access::rules(&app.db, &bot.name, group.then_some(here)).await?;
-            let rows: Vec<Vec<String>> = rows
-                .into_iter()
-                .map(|r| {
-                    let rule = if r.status == "allow" { "allowed" } else { "banned" };
-                    let place = if group { "this group".to_string() } else { place_label(r.chat_id) };
-                    let who = if r.user_id == 0 { "everyone".to_string() } else { r.user_id.to_string() };
-                    let names =
-                        [r.place.filter(|_| !group), r.user].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-                    vec![rule.to_string(), place, who, names]
-                })
-                .collect();
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for r in access::rules(&app.db, &bot.name, group.then_some(here)).await? {
+                let rule = if r.status == "allow" { "allowed" } else { "banned" };
+                let place = if group { "this group".to_string() } else { place_name(app, r.chat_id).await };
+                let who = if r.user_id == 0 { "everyone".to_string() } else { user_label(app, r.user_id).await };
+                rows.push(vec![rule.to_string(), place, who]);
+            }
             let title = if group { "Access rules of this group" } else { "Access rules" };
-            let mut blocks = vec![table(&["rule", "where", "who", "names"], rows.clone())];
+            let mut blocks = vec![table(&["rule", "where", "who"], rows.clone())];
             if rows.is_empty() {
                 blocks = vec![RBlock::Paragraph(RText::plain(if group {
                     "This group is not allowed and nobody is banned here."
@@ -1048,7 +1068,7 @@ async fn user_label(app: &App, id: i64) -> String {
         .flatten();
     match name {
         Some(n) => format!("{n} ({id})"),
-        None => id.to_string(),
+        None => format!("user {id}"),
     }
 }
 
@@ -1102,7 +1122,7 @@ async fn cmd_prefix(
         let title = if chat == ib.chat_id {
             format!("Prefixes of {}", access::this_chat(chat))
         } else {
-            format!("Prefixes of {}", place_label(chat))
+            format!("Prefixes of {}", place_name(app, chat).await)
         };
         send(app, bot, ib, &title, blocks).await;
         return Ok(());
@@ -1230,7 +1250,8 @@ async fn cmd_prefix(
             return Ok(());
         }
         prefixes::Inserted::Full => {
-            let here = if chat == ib.chat_id { access::this_chat(chat).to_string() } else { place_label(chat) };
+            let here =
+                if chat == ib.chat_id { access::this_chat(chat).to_string() } else { place_name(app, chat).await };
             let max = prefixes::MAX_PER_CHAT;
             say(app, bot, ib, &format!("⚠️ {here} has {max} prefixes, the most a chat can have: /unprefix one first"))
                 .await;
@@ -1745,9 +1766,9 @@ async fn cmd_stats(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, args: &str,
             }
             [c] => {
                 dims.push(Dim::User);
-                (Some(c), None, place_label(c))
+                (Some(c), None, place_name(app, c).await)
             }
-            [c, u, ..] => (Some(c), Some(u), format!("user {u} in {}", place_label(c))),
+            [c, u, ..] => (Some(c), Some(u), format!("{} in {}", user_label(app, u).await, place_name(app, c).await)),
         }
     } else {
         (Some(chat), None, access::this_chat(chat).into())
@@ -1864,11 +1885,11 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
             }
         },
     };
-    let here = if chat == ib.chat_id { access::this_chat(chat).to_string() } else { place_label(chat) };
+    let here = if chat == ib.chat_id { access::this_chat(chat).to_string() } else { place_name(app, chat).await };
     let who = match target {
         Target::Chat => here.clone(),
         Target::Members => format!("each member of {here}"),
-        Target::Member(u) => format!("user {u} in {here}"),
+        Target::Member(u) => format!("{} in {here}", user_label(app, u).await),
     };
     if !admin && !w.is_empty() {
         say(app, bot, ib, &format!("⛔ only admins change spend limits; /quota shows {here}'s")).await;
@@ -1970,12 +1991,12 @@ async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Ve
                 access::level(&app.db, bot, q.chat_id, q.target).await?,
             ),
             Target::Members => ("each member".to_string(), None),
-            Target::Member(u) => (format!("user {u}"), access::level(&app.db, bot, q.chat_id, q.target).await?),
+            Target::Member(u) => (user_label(app, u).await, access::level(&app.db, bot, q.chat_id, q.target).await?),
         };
         let balance = balance.map(|(l, _)| access::usd(l)).unwrap_or("-".into());
         let mut row = vec![target, access::usd(q.rule.capacity), access::usd(q.rule.refill_per_day), balance];
         if only_chat.is_none() {
-            row.insert(0, place_label(q.chat_id));
+            row.insert(0, place_name(app, q.chat_id).await);
         }
         rows.push(row);
     }
