@@ -507,7 +507,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - `/stats today`, `/stats 7d`, `/stats 30d`, `/stats all` — other periods, in calendar days of the bot's time zone.
 - In a group, `/stats user_id`, or /stats as a reply to someone's message: one member.
 - /usage — this chat's spend limits, and yours here.
-- /quota — all of this chat's spend limits and balances: the whole chat's, each member's, anyone's own (`/quota user_id`, or /quota as a reply). Only admins change them.
+- /quota — all of this chat's spend limits and balances: the whole chat's, each member's, anyone's own (`/quota user_id`, or /quota as a reply); `/quota members` lists every member's balance, lowest first. Only admins change them.
 
 **Spend limits**: an admin can give this chat, each member or one person a limit in USD that refills every day. When one runs out, new requests are refused until it refills; the message says which limit and when.
 
@@ -519,7 +519,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - `/stats today`、`/stats 7d`、`/stats 30d`、`/stats all` — 其他时间段，按 bot 所在时区的自然日计算。
 - 群里：`/stats user_id`，或者回复某人的消息发 /stats，只看这个成员。
 - /usage — 本聊天的限额，以及你在这里的限额。
-- /quota — 本聊天的全部限额和余额：整个聊天的、每个成员的、某个人单独的（`/quota user_id`，或者回复某人的消息发 /quota）。只有管理员能修改。
+- /quota — 本聊天的全部限额和余额：整个聊天的、每个成员的、某个人单独的（`/quota user_id`，或者回复某人的消息发 /quota）；`/quota members` 列出每个成员的余额，余额最少的在前。只有管理员能修改。
 
 **限额**：管理员可以给这个聊天、每个成员或者某个人设一个每天恢复的额度（USD）。用完后，新请求会被拒绝，直到额度恢复；提示里会写明是哪个限额、多久后恢复。
 
@@ -553,7 +553,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - /allow — allow this group (also before it is allowed); /deny — remove it.
 - `/ban user_id`, or /ban as a reply to their message — ban someone here; /unban the same way.
 - /acl — whether this group is allowed, and who is banned here.
-- /quota — this group's spend limits and what is left of them.
+- /quota — this group's spend limits and what is left of them; `/quota members` — every member's balance, lowest first.
 - `/quota chat 10 2` — the whole group: 10 USD, refilling 2 USD a day; `/quota chat off` removes it.
 - `/quota members 1 0.5` — a limit for each member; `/quota members off`.
 - `/quota user_id 2 1`, or `/quota 2 1` as a reply to their message — one person; `off` removes it.
@@ -566,7 +566,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - /allow — 允许本群（本群还没被允许时也能用）；/deny — 撤销。
 - `/ban user_id`，或者回复某人的消息发 /ban — 在本群封禁他；/unban 的用法相同。
 - /acl — 本群是否被允许，以及谁在本群被封禁。
-- /quota — 本群的限额和剩余额度。
+- /quota — 本群的限额和剩余额度；`/quota members` — 每个成员的余额，余额最少的在前。
 - `/quota chat 10 2` — 整个群：10 USD，每天恢复 2 USD；`/quota chat off` 删除。
 - `/quota members 1 0.5` — 每个成员各自的限额；`/quota members off` 删除。
 - `/quota user_id 2 1`，或者回复某人的消息发 `/quota 2 1` — 单独设置一个人；`off` 删除。
@@ -588,7 +588,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - /acl — every allowed chat and every ban.
 
 **Spend limits** (capacity and daily refill in USD; they apply to admins too)
-- /quota — every limit of this bot; `/quota chat_id` — one chat's.
+- /quota — every limit of this bot; `/quota chat_id` — one chat's; `/quota chat_id members` — every member's balance there.
 - `/quota chat_id chat 10 2` — the whole chat.
 - `/quota chat_id members 1 0.5` — each member of the chat.
 - `/quota chat_id user_id 2 1` — one person in the chat.
@@ -616,7 +616,7 @@ Limits apply to admins too. In a group with several of these bots, `/deny` witho
 - /acl — 所有被允许的聊天和所有封禁。
 
 **限额**（容量和每日恢复量，单位 USD；管理员也受限）
-- /quota — 这个 bot 的所有限额；`/quota chat_id` — 某个聊天的。
+- /quota — 这个 bot 的所有限额；`/quota chat_id` — 某个聊天的；`/quota chat_id members` — 那里每个成员的余额。
 - `/quota chat_id chat 10 2` — 整个聊天。
 - `/quota chat_id members 1 0.5` — 聊天里的每个成员。
 - `/quota chat_id user_id 2 1` — 聊天里的某个人。

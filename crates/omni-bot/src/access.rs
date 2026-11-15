@@ -398,6 +398,50 @@ const SET_BUCKET: &str = "INSERT INTO quota_buckets(bot, chat_id, target, user_i
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
      ON CONFLICT(bot, chat_id, target, user_id) DO UPDATE SET level_usd = excluded.level_usd, updated_at = excluded.updated_at";
 
+/// One member's balance in a chat: who, the balance, the limit that applies,
+/// and whether it is their own (not the chat's default for members).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemberBalance {
+    pub user_id: i64,
+    pub level: f64,
+    pub rule: Rule,
+    pub own: bool,
+}
+
+/// The balance of every member a limit applies to in a chat, lowest first:
+/// everyone the bot has seen use it there, and anyone with a balance or a
+/// limit of their own (members it never saw are full).
+pub async fn member_balances(db: &Db, bot: &str, chat_id: i64) -> Result<Vec<MemberBalance>> {
+    let bot = bot.to_string();
+    db.call(move |c| {
+        let users: Vec<i64> = {
+            let mut s = c.prepare(
+                "SELECT user_id FROM usage_ledger WHERE bot = ?1 AND chat_id = ?2 AND user_id > 0
+                 UNION SELECT user_id FROM quota_buckets WHERE bot = ?1 AND chat_id = ?2 AND target = 'member'
+                 UNION SELECT user_id FROM quota_rules WHERE bot = ?1 AND chat_id = ?2 AND target = 'member' AND user_id <> 0",
+            )?;
+            s.query_map(params![bot, chat_id], |r| r.get(0))?.collect::<Result<_, _>>()?
+        };
+        let now = now_ms();
+        let mut out = Vec::new();
+        for u in users {
+            let Some((level, rule)) = level_in(c, &bot, chat_id, Target::Member(u), now)? else { continue };
+            let own = c
+                .query_row(
+                    "SELECT 1 FROM quota_rules WHERE bot = ?1 AND chat_id = ?2 AND target = 'member' AND user_id = ?3",
+                    params![bot, chat_id, u],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            out.push(MemberBalance { user_id: u, level, rule, own });
+        }
+        out.sort_by(|a, b| a.level.total_cmp(&b.level).then(a.user_id.cmp(&b.user_id)));
+        Ok(out)
+    })
+    .await
+}
+
 /// Every balance of a chat back to full: the chat's and each member's (the
 /// rules stay). Returns how many limits the chat has (0: nothing to reset).
 pub async fn reset_all(db: &Db, bot: &str, chat_id: i64) -> Result<usize> {
@@ -666,6 +710,28 @@ mod tests {
         assert!(matches!(reset(&db, "a", g, Target::Members, Some(0.3)).await.unwrap(), Reset::Members(1, _)));
         assert!((bal(Target::Member(u)).await - 0.3).abs() < 1e-9);
         assert_eq!((bal(Target::Member(v)).await, bal(Target::Member(own)).await), (1.0, 2.0));
+    }
+
+    #[tokio::test]
+    async fn every_members_balance_lowest_first() {
+        let db = Db::open_in_memory().unwrap();
+        let (g, a, b, own, unseen) = (-100, 7, 8, 9, 10);
+        assert!(member_balances(&db, "a", g).await.unwrap().is_empty());
+        set_rule(&db, "a", g, Target::Members, Some(Rule { capacity: 1.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        set_rule(&db, "a", g, Target::Member(own), Some(Rule { capacity: 3.0, refill_per_day: 0.0 }), 1).await.unwrap();
+        // a used the bot here (a ledger row, no charge yet); b and own were charged.
+        db.call(|c| {
+            c.execute("INSERT INTO usage_ledger(ts, bot, chat_id, user_id, provider, model) VALUES (1, 'a', -100, 7, 'p', 'm')", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        charge(&db, "a", g, b, 0.75).await.unwrap();
+        charge(&db, "a", g, own, 0.5).await.unwrap();
+        let got: Vec<(i64, f64, bool)> =
+            member_balances(&db, "a", g).await.unwrap().iter().map(|m| (m.user_id, m.level, m.own)).collect();
+        assert_eq!(got, vec![(b, 0.25, false), (a, 1.0, false), (own, 2.5, true)]);
+        assert!(!got.iter().any(|g| g.0 == unseen));
     }
 
     #[tokio::test]

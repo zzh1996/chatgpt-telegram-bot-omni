@@ -260,7 +260,7 @@ effort max · web search · in 1,234 (cached 1,000) · out 567 (reasoning 400) �
 | 回复 + `/m spec$正文` | 换模型继续 |
 | `/stats [today\|7d\|30d\|all]` | 本 bot 在这个聊天里的用量统计。周期按 `general.timezone` 的自然日算：today = 今天 0 点起，7d / 30d 含今天，all = 全部时间，默认 30d；回复里写明起始时间。群里：本群；`/stats <user_id>`，或不带周期回复某人的消息，只看这个成员在本群的用量（群里有权限用 bot 的人都可以）。私聊：只有这个私聊（管理员见下）。模型和回复第一行一样写成 `平台:模型 ID`（经 OpenRouter 的是 `openrouter:author/model`）；表里的 token 数按 K / M 显示（`1.2K`、`45K`、`1.2M`，不到 1000 时是原数）；每条回答页脚里的用量仍是精确数 |
 | `/usage` | 本聊天的限额和你在本聊天的限额（见下文"限额"） |
-| `/quota` | 本聊天的全部限额和余额：整个聊天的、成员默认的、每个单独设了的人；`/quota chat`、`/quota members`、`/quota <user_id>`（或回复某人的消息发 `/quota`）只看一条。谁都能看，只有管理员能修改（见下文"限额"） |
+| `/quota` | 本聊天的全部限额和余额：整个聊天的、成员默认的、每个单独设了的人；`/quota chat`、`/quota <user_id>`（或回复某人的消息发 `/quota`）只看一条；`/quota members` 是成员的默认限额和每个成员的余额（在本聊天用过 bot 的人和有余额、有单独限额的人，余额最少的在前，标明用的是默认限额还是自己的；没用过的人都是满的）。谁都能看，只有管理员能修改（见下文"限额"） |
 | `/prefix` / `/prefix 名字` | 本聊天的前缀列表 / 查看一个（创建见上文"本聊天的前缀"） |
 | `/unprefix 名字` | 删除本聊天的一个前缀（创建者或管理员） |
 | `/ping` | 本聊天的 chat id、你的 user id（和 @用户名）、本聊天是否被允许、你在这里是否被封、你是不是管理员、bot 名、运行时间，以及构建所用的 git commit（`build efa8fdd`；构建时有未提交的改动则是 `efa8fdd-dirty`，读不到时是 `unknown`），用来确认正在运行的版本 |
@@ -314,7 +314,7 @@ bot 每次启动都会注册命令菜单：所有聊天、所有语言共用一�
 谁都可以用 `/quota` 看本聊天的全部限额和余额（私聊里看的是这个私聊自己的）；修改、看别的聊天只有管理员能做。管理员设置限额（金额单位 USD：容量、每日恢复量）：
 
 - 群里：`/quota` 显示本群的限额和余额；`/quota chat <容量> <每日恢复>` / `/quota chat off` 设置/删除整个群的限额；`/quota members <容量> <每日恢复>` / `/quota members off` 设置/删除每个成员的默认限额；`/quota <user_id> <容量> <每日恢复>` / `/quota <user_id> off` 单独设置某个成员；回复某人的消息发 `/quota <容量> <每日恢复>` / `/quota off`，就是设置这个人。把容量和恢复量换成 `reset` 是把余额重置回上限，`reset <金额>` 是设成这个金额（不能超过上限，可以是负数，从这个数开始恢复）：`/quota chat reset`、`/quota <user_id> reset 0.5`、回复某人的消息发 `/quota reset`；`/quota members reset` 把每个按默认限额的成员都重置回上限，`/quota members reset <金额>` 把在本群用过 bot 的这些成员都设成这个金额（没用过的本来就是满的；单独设了限额的人不受影响，用他自己的那条）。每次重置都在一个数据库事务里完成。
-- 私聊：`/quota` 列出本 bot 的全部限额；`/quota <chat_id>` 显示那个聊天的；`/quota <chat_id> chat|members|<user_id> <容量> <每日恢复>`（或末尾写 `off`）设置/删除其中一条，末尾写 `reset [金额]` 是重置余额（同上）。
+- 私聊：`/quota` 列出本 bot 的全部限额；`/quota <chat_id>` 显示那个聊天的，`/quota <chat_id> members` 是那里每个成员的余额；`/quota <chat_id> chat|members|<user_id> <容量> <每日恢复>`（或末尾写 `off`）设置/删除其中一条，末尾写 `reset [金额]` 是重置余额（同上）。
 
 费用按每次上游调用记账、按 generation id 去重，不重复扣：经 OpenRouter 的调用因为流中断、bot 重启或崩溃没收到用量时，会稍后向 OpenRouter `/generation` 补查；收到了用量却没有费用的（OpenRouter 有时这样）也稍后补查费用，补上时才扣限额；直连官方 API 的调用不补查，没收到用量就记不上。视频在生成完成时就记账，下载失败也照样记上。记账和扣限额在同一个数据库事务里：每笔只扣一次，崩溃不会丢，同时完成的几笔也不会互相覆盖。
 

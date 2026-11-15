@@ -1928,6 +1928,38 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
         say(app, bot, ib, &text).await;
         return Ok(());
     }
+    // `/quota members`: the default, then every member's balance.
+    if target == Target::Members && w.is_empty() {
+        let mut blocks = Vec::new();
+        match access::rule_for(&app.db, &bot.name, chat, Target::Members).await? {
+            Some(r) => blocks.push(RBlock::Paragraph(RText::plain(format!(
+                "Each member by default: a limit of {} USD, refilling {} USD/day.",
+                access::usd(r.capacity),
+                access::usd(r.refill_per_day)
+            )))),
+            None => blocks.push(RBlock::Paragraph(RText::plain("No default limit for members."))),
+        }
+        let mut rows = Vec::new();
+        for m in access::member_balances(&app.db, &bot.name, chat).await? {
+            rows.push(vec![
+                user_label(app, m.user_id).await,
+                access::usd(m.level),
+                access::usd(m.rule.capacity),
+                access::usd(m.rule.refill_per_day),
+                if m.own { "own" } else { "default" }.to_string(),
+            ]);
+        }
+        if rows.is_empty() {
+            blocks.push(RBlock::Paragraph(RText::plain("No member has a balance here yet.")));
+        } else {
+            blocks.push(table(&["member", "balance USD", "limit USD", "refill USD/day", "limit"], rows));
+            blocks.push(RBlock::Footer(RText::plain(
+                "Lowest balance first; everyone who has used the bot here, members it never saw are full.",
+            )));
+        }
+        send(app, bot, ib, &format!("Members' balances in {here}"), blocks).await;
+        return Ok(());
+    }
     let rule = match (w.first(), w.get(1)) {
         (None, None) => {
             // Show it.
@@ -1984,7 +2016,9 @@ async fn cmd_quota(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, w: &[&str],
 async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Vec<RBlock>> {
     use access::Target;
     let mut rows = Vec::new();
+    let mut has_members = false;
     for q in access::quota_rules(&app.db, bot, only_chat).await? {
+        has_members |= q.target == Target::Members;
         let (target, balance) = match q.target {
             Target::Chat => (
                 if q.chat_id < 0 { "whole group" } else { "whole chat" }.to_string(),
@@ -2008,5 +2042,10 @@ async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Ve
     } else {
         &["applies to", "limit USD", "refill USD/day", "balance USD"]
     };
-    Ok(vec![table(header, rows)])
+    let mut blocks = vec![table(header, rows)];
+    if has_members {
+        let how = if only_chat.is_none() { "/quota chat_id members" } else { "/quota members" };
+        blocks.push(RBlock::Footer(RText::plain(format!("Each member's balance: {how}"))));
+    }
+    Ok(blocks)
 }
