@@ -286,13 +286,19 @@ spec = "moonshot:kimi-k3"
 [[aliases]]
 name = "k31"
 spec = "moonshot:kimi-k3.1-pro"
-# Alibaba Qwen (old `qwen` branch; on OpenRouter its `qwen3.8-max` is this dated release)
+# Alibaba Qwen (old `qwen` branch): `q` the newest and strongest; on OpenRouter Qwen3.8 Max is the dated `qwen3.8-max-0902`
 [[aliases]]
 name = "q"
+spec = "alibaba:qwen4-max"
+[[aliases]]
+name = "q38"
 spec = "alibaba:qwen3.8-max"
 [[aliases]]
 name = "q37"
 spec = "alibaba:qwen3.7-max"
+[[aliases]]
+name = "q37p"
+spec = "alibaba:qwen3.7-plus"
 [[aliases]]
 name = "qf"
 spec = "alibaba:qwen3.8-flash"
@@ -506,10 +512,16 @@ name = "ok31"
 spec = "openrouter:moonshotai/kimi-k3.1-pro"
 [[aliases]]
 name = "oq"
+spec = "openrouter:qwen/qwen4-max"
+[[aliases]]
+name = "oq38"
 spec = "openrouter:qwen/qwen3.8-max-0902"
 [[aliases]]
 name = "oq37"
 spec = "openrouter:qwen/qwen3.7-max"
+[[aliases]]
+name = "oq37p"
+spec = "openrouter:qwen/qwen3.7-plus"
 [[aliases]]
 name = "oqf"
 spec = "openrouter:qwen/qwen3.8-flash"

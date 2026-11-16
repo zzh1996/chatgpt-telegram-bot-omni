@@ -91,21 +91,48 @@ fn native(dialect: &str, model: &str, payload: Value, text: &str) -> Turn {
 
 #[test]
 fn model_table() {
-    for id in ["qwen3.8-max", "qwen3.8-max-0902", "qwen3.8-max-2026-09-02", "qwen3.7-max"] {
+    for id in ["qwen4-max", "qwen3.8-max", "qwen3.8-max-0902", "qwen3.8-max-2026-09-02", "qwen3.7-max"] {
         assert!(model_spec(id).is_some(), "{id}");
     }
+    // Qwen4 Max (2026-11-16): low | high | xhigh, default high; 262,144 output tokens when thinking.
+    let q4 = model_spec("qwen4-max").unwrap();
+    assert!(q4.vision && q4.code_needs_thinking);
+    assert_eq!((q4.efforts, q4.default_effort), (&["xhigh", "high", "low"][..], Some("high")));
+    assert_eq!((q4.max_output, q4.max_output_thinking, q4.max_cot), (131_072, Some(262_144), Some(262_144)));
+    let p = q4.tiers[0].price;
+    assert_eq!((q4.tiers.len(), p.input, p.cached_input, p.output), (1, 10.0, 0.5, 30.0));
     let m = model_spec("qwen3.8-max-0902").unwrap();
-    assert!(m.vision && m.effort);
+    assert!(m.vision && !m.efforts.is_empty());
+    assert_eq!((m.efforts, m.default_effort), (&["xhigh", "medium", "low"][..], Some("xhigh")));
     assert_eq!((m.context, m.max_output, m.max_cot), (1_000_000, 131_072, Some(262_144)));
     let p = m.tiers[0].price;
     assert_eq!((p.input, p.cached_input, p.output), (12.0, 1.5, 36.0));
     let q37 = model_spec("qwen3.7-max").unwrap();
-    assert!(!q37.vision && !q37.effort);
+    assert!(!q37.vision && q37.efforts.is_empty());
     assert_eq!(q37.tiers[0].price.cached_input, 2.4);
     assert_eq!(model_spec("qwen3.7-max-preview").unwrap().thinking, Thinking::Always);
     assert!(model_spec("qwen3.7-max-2026-06-08").unwrap().vision);
     assert_eq!(model_spec("qwen3.7-plus").unwrap().tiers.len(), 2);
     assert!(model_spec("qwen3.8").is_none());
+}
+
+#[tokio::test]
+async fn qwen4_max_defaults() {
+    let p = prepare("qwen4-max", &[]).await.unwrap();
+    assert_eq!(p.dialect, DIALECT);
+    assert_eq!(p.body["enable_thinking"], true);
+    // Its default level, sent explicitly, with the note that it is not the highest.
+    assert_eq!(p.body["reasoning_effort"], "high");
+    assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+    assert!(p.notes[0].contains("high") && p.notes[0].contains("xhigh") && p.notes[0].contains("+h"), "{:?}", p.notes);
+    assert_eq!(p.body["preserve_thinking"], true);
+    let h = prepare("qwen4-max", &[flag("h")]).await.unwrap();
+    assert_eq!((h.body["reasoning_effort"].as_str(), h.notes.len()), (Some("xhigh"), 0));
+    assert_eq!(prepare("qwen4-max", &[flag("l")]).await.unwrap().body["enable_thinking"], false);
+    // `medium` was Qwen3.8's: refused with Qwen4 Max's own levels.
+    let e = prepare("qwen4-max", &[kv("e", "medium")]).await.unwrap_err();
+    assert!(format!("{e:?}").contains("xhigh") && format!("{e:?}").contains("high"), "{e:?}");
+    assert_eq!(prepare("qwen4-max", &[kv("e", "low")]).await.unwrap().body["reasoning_effort"], "low");
 }
 
 #[tokio::test]

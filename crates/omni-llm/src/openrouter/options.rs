@@ -226,7 +226,11 @@ pub fn direct_default(model: &str) -> Option<String> {
         "deepseek" => id.starts_with("deepseek-v4").then(|| crate::deepseek::DEFAULT_EFFORT.to_string()),
         "z-ai" => crate::zhipu::model_spec(id).and_then(|s| s.thinking.efforts().first()).map(|e| e.to_string()),
         "moonshotai" => crate::moonshot::model_spec(id).map(|_| "max".to_string()),
-        "qwen" => id.starts_with("qwen3.8").then(|| "xhigh".to_string()),
+        // The direct API's table (Qwen4 Max `high`, Qwen3.8 `xhigh`); OpenRouter-only Qwen3.8 ids too.
+        "qwen" => crate::alibaba::model_spec(id)
+            .and_then(|s| s.default_effort)
+            .or_else(|| id.starts_with("qwen3.8").then_some("xhigh"))
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -629,6 +633,8 @@ mod tests {
         assert_eq!(d("z-ai/glm-5.3").as_deref(), Some("max"));
         assert_eq!(d("moonshotai/kimi-k3").as_deref(), Some("max"));
         assert_eq!(d("qwen/qwen3.8-max-0902").as_deref(), Some("xhigh"));
+        assert_eq!(d("qwen/qwen4-max").as_deref(), Some("high"));
+        assert_eq!(d("qwen/qwen3.8-max-prime").as_deref(), Some("xhigh"));
         assert_eq!(d("qwen/qwen3.7-max"), None);
         // A default OpenRouter cannot request (Nano Banana 2.1's medium): nothing sent, but noted.
         let i: ModelInfo = serde_json::from_value(json!({

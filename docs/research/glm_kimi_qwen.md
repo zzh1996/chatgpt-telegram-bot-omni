@@ -528,6 +528,18 @@ When a stream breaks, the usage chunk is lost. The docs suggest counting the par
 [k-openapi]: https://platform.kimi.ai/docs/openapi.json
 
 ## 3. Alibaba Qwen: Model Studio / Bailian (DashScope)
+### 3.0 Qwen4 Max (added 2026-11-16)
+
+Released 2026-11-16, pay-as-you-go in Beijing (help.aliyun.com/zh/model-studio/qwen4-max, newly-released-models, model-pricing):
+- Id `qwen4-max` only (no dated snapshot). `qwen4-max-preview` (2026-11-11 to 11-25) is Token Plan only on its own domain: not used.
+- Window 1,000,000; input 991,808 (983,616 thinking); output 131,072, or 262,144 with thinking (chain of thought + answer); chain of thought up to 262,144, `thinking_budget` default 131,072.
+- Hybrid thinking, on by default. `reasoning_effort` low | high | xhigh, default **high** (medium is gone; minimal→low, medium→high, max→xhigh, none = off); `thinking_budget` cannot be combined with an effort. `preserve_thinking` default true.
+- Images (new per-image `detail`, default high) and video in; PDFs only as Responses `input_file` URLs. Tools: Chat `enable_search`; Responses `web_search` (agent-style, ¥4 per 1000), `code_interpreter` (needs thinking), `web_extractor` (needs search + thinking).
+- CNY per 1M (原价, one tier up to 1M): input 10, output 30, cache hit 0.5 (explicit cache writes 12.5 / 20 by TTL, not used).
+- New and opt-in: reasoning summaries with encrypted reasoning (`thinking_display: "summarized"`, Responses `reasoning.summary`), explicit cache options. Responses usage has a new structure (`input_tokens_details.cache_write_tokens`; tool counts only in top-level `tool_usage`).
+- OpenRouter: `qwen/qwen4-max` (canonical `qwen/qwen4-max-20261115`), Alibaba the only provider, efforts xhigh | high | low | none, default high.
+- Tested with real keys (2026-11-16): the legacy domain `dashscope.aliyuncs.com` serves it (its `/models` list does not show it yet); defaults, `+h`, `+l`, replay, `+s`, `+c`, an image with `vl_high_resolution_images`, OpenRouter all work.
+
 ### 3.1 API surfaces, regions, models
 | Surface | Path (on the base host) | Notes |
 |---|---|---|

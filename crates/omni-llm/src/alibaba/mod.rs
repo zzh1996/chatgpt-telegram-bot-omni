@@ -8,9 +8,10 @@
 //!
 //! - **Chat Completions** (`alibaba.chat`) for every request without a tool.
 //!   Thinking is hybrid (`enable_thinking`, on by default, sent explicitly);
-//!   Qwen3.8 adds `reasoning_effort` low | medium | xhigh, sent as `xhigh`
-//!   (D78: Alibaba's samples send it and its release blog calls it the
-//!   default; omitted, the thinking budget is 131,072 instead of 262,144);
+//!   `reasoning_effort` (sent explicitly, D78): Qwen4 Max low | high | xhigh,
+//!   default `high` (its model page, 2026-11-16); Qwen3.8 low | medium | xhigh,
+//!   sent as `xhigh` (Alibaba's samples send it and its release blog calls it
+//!   the default; omitted, the thinking budget is 131,072 instead of 262,144);
 //!   `budget=` maps to `thinking_budget`.
 //! - **Web search and the code interpreter** (`+s`, `+c`, together too, and
 //!   `+su` with the web extractor): the Responses API (`alibaba.responses`, see
@@ -105,13 +106,18 @@ pub struct ModelSpec {
     pub context: u64,
     /// Output limit of the model page (the default and maximum `max_completion_tokens`).
     pub max_output: u64,
+    /// The output limit with thinking on, where the page gives a larger one
+    /// (Qwen4 Max: 262,144 for the chain of thought and the answer together).
+    pub max_output_thinking: Option<u64>,
     /// Longest chain of thought (`thinking_budget` maximum), where documented.
     pub max_cot: Option<u64>,
     /// Image and video input.
     pub vision: bool,
     pub thinking: Thinking,
-    /// `reasoning_effort` low | medium | xhigh (Qwen3.8).
-    pub effort: bool,
+    /// `reasoning_effort` levels, highest first (empty: none; Qwen3.7).
+    pub efforts: &'static [&'static str],
+    /// The level sent when none is asked for (D78: the vendor's recommended one).
+    pub default_effort: Option<&'static str>,
     /// The code interpreter needs thinking mode (Alibaba's list).
     pub code_needs_thinking: bool,
     /// CNY per 1M tokens by input length, ascending.
@@ -127,6 +133,7 @@ const WINDOW: u64 = 1_000_000;
 const MAX_OUT: u64 = 131_072;
 const MAX_COT: u64 = 262_144;
 
+const QWEN4_MAX: &[Tier] = &[Tier { up_to: WINDOW, price: cny(10.0, 0.5, 30.0) }];
 const QWEN38_MAX: &[Tier] = &[Tier { up_to: WINDOW, price: cny(12.0, 1.5, 36.0) }];
 const QWEN38_FLASH: &[Tier] = &[Tier { up_to: WINDOW, price: cny(0.8, 0.1, 2.7) }];
 const QWEN37_MAX: &[Tier] = &[Tier { up_to: WINDOW, price: cny(12.0, 2.4, 36.0) }];
@@ -135,15 +142,34 @@ const QWEN37_MAX_PREVIEW: &[Tier] = &[Tier { up_to: WINDOW, price: cny(12.0, 12.
 const QWEN37_PLUS: &[Tier] =
     &[Tier { up_to: 256_000, price: cny(2.0, 0.4, 8.0) }, Tier { up_to: WINDOW, price: cny(6.0, 1.2, 24.0) }];
 
+/// Qwen4 Max: low | high | xhigh, default high; up to 262,144 output tokens when thinking.
+const fn qwen4(id: &'static str, tiers: &'static [Tier]) -> ModelSpec {
+    ModelSpec {
+        id,
+        context: WINDOW,
+        max_output: MAX_OUT,
+        max_output_thinking: Some(MAX_COT),
+        max_cot: Some(MAX_COT),
+        vision: true,
+        thinking: Thinking::Hybrid,
+        efforts: &["xhigh", "high", "low"],
+        default_effort: Some("high"),
+        code_needs_thinking: true,
+        tiers,
+    }
+}
+
 const fn qwen38(id: &'static str, tiers: &'static [Tier]) -> ModelSpec {
     ModelSpec {
         id,
         context: WINDOW,
         max_output: MAX_OUT,
+        max_output_thinking: None,
         max_cot: Some(MAX_COT),
         vision: true,
         thinking: Thinking::Hybrid,
-        effort: true,
+        efforts: &["xhigh", "medium", "low"],
+        default_effort: Some("xhigh"),
         code_needs_thinking: true,
         tiers,
     }
@@ -154,22 +180,27 @@ const fn qwen37(id: &'static str, vision: bool, max_cot: Option<u64>, tiers: &'s
         id,
         context: WINDOW,
         max_output: MAX_OUT,
+        max_output_thinking: None,
         max_cot,
         vision,
         thinking: Thinking::Hybrid,
-        effort: false,
+        efforts: &[],
+        default_effort: None,
         code_needs_thinking: true,
         tiers,
     }
 }
 
 /// Qwen models in the China (Beijing) region: help.aliyun.com/zh/model-studio
-/// model pages (`qwen3-8-max`, `qwen3-8-flash`, `qwen3-7-max`, `qwen3-7-plus`),
-/// `model-pricing`, `deep-thinking`, `web-search`, `qwen-code-interpreter`,
-/// `context-cache`, fetched 2026-11-12. CNY list prices ("原价", without
-/// limited-time discounts). All: 1,000,000-token window, output 131,072, input
-/// limited separately (991,808; 983,616 when thinking).
+/// model pages (`qwen4-max` 2026-11-16; `qwen3-8-max`, `qwen3-8-flash`,
+/// `qwen3-7-max`, `qwen3-7-plus` 2026-11-12), `model-pricing`, `deep-thinking`,
+/// `web-search`, `qwen-code-interpreter`, `context-cache`. CNY list prices
+/// ("原价", without limited-time discounts). All: 1,000,000-token window, output
+/// 131,072 (Qwen4 Max: 262,144 when thinking), input limited separately
+/// (991,808; 983,616 when thinking).
 pub const MODELS: &[ModelSpec] = &[
+    // Released 2026-11-16: no dated snapshot yet (`qwen4-max-preview` is Token Plan only).
+    qwen4("qwen4-max", QWEN4_MAX),
     qwen38("qwen3.8-max", QWEN38_MAX),
     qwen38("qwen3.8-max-0902", QWEN38_MAX),
     // The snapshot's documented alias.
@@ -189,9 +220,6 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|m| m.id == model)
 }
 
-/// Qwen3.8 effort levels, highest first.
-const EFFORTS: [&str; 3] = ["xhigh", "medium", "low"];
-
 /// What Alibaba's API offers for a model (the vendor's own API: official = route).
 struct Caps<'a> {
     spec: &'a ModelSpec,
@@ -210,7 +238,7 @@ impl RouteCaps for Caps<'_> {
         matches!(tool, Tool::Search | Tool::Fetch | Tool::Code)
     }
     fn efforts(&self) -> Option<Vec<String>> {
-        self.spec.effort.then(|| EFFORTS.map(String::from).to_vec())
+        (!self.spec.efforts.is_empty()).then(|| self.spec.efforts.iter().map(|e| e.to_string()).collect())
     }
     fn can_disable_reasoning(&self) -> bool {
         self.spec.thinking == Thinking::Hybrid
@@ -227,18 +255,18 @@ impl RouteCaps for Caps<'_> {
     fn tiers(&self) -> Vec<String> {
         Vec::new()
     }
-    /// Qwen3.8: `xhigh`, sent explicitly (Alibaba's samples, "xhigh (default)").
+    /// Sent explicitly: Qwen4 Max `high` (its default), Qwen3.8 `xhigh` (Alibaba's samples).
     fn default_effort(&self) -> Option<String> {
-        self.spec.effort.then(|| EFFORTS[0].to_string())
+        self.spec.default_effort.map(str::to_string)
     }
     /// Thinking-only models without a budget (Qwen3.7 Max previews): nothing to set.
     fn fixed_reasoning(&self) -> bool {
-        self.spec.thinking == Thinking::Always && !self.spec.effort
+        self.spec.thinking == Thinking::Always && self.spec.efforts.is_empty()
     }
     /// Budget models (Qwen3.7) on Chat Completions: `+h` the largest budget, `+l` the
     /// smallest the API takes ("a positive integer").
     fn budget_range(&self) -> Option<(u64, u64)> {
-        (!self.responses && !self.spec.effort).then_some(self.spec.max_cot?).map(|max| (max, 1))
+        (!self.responses && self.spec.efforts.is_empty()).then_some(self.spec.max_cot?).map(|max| (max, 1))
     }
 }
 
@@ -269,7 +297,7 @@ fn check(spec: &ModelSpec, req: &Requested) -> Result<(), LlmError> {
             return Err(LlmError::request(format!(
                 "`{}`: {why} Alibaba's Responses API, which has no thinking budget (budget=){}",
                 spec.id,
-                if spec.effort { "; use e=xhigh|medium|low" } else { "" }
+                if spec.efforts.is_empty() { String::new() } else { format!("; use e={}", spec.efforts.join("|")) }
             )));
         }
         if let Some(max) = spec.max_cot
@@ -326,15 +354,17 @@ impl Alibaba {
     }
 
     /// An explicit output budget only when it lowers the default (the model's
-    /// maximum): after a context overflow, or with a configured cap.
-    fn output_budget(&self, input: &CallInput<'_>, spec: Option<&ModelSpec>) -> Option<u64> {
+    /// maximum in the mode the request runs in): after a context overflow, or
+    /// with a configured cap.
+    fn output_budget(&self, input: &CallInput<'_>, spec: Option<&ModelSpec>, thinking: bool) -> Option<u64> {
         if let Some(n) = input.max_tokens_override {
             return Some(n);
         }
         let cap = self.cfg.max_tokens_cap?;
         match spec {
-            Some(s) if cap >= s.max_output => None,
-            _ => Some(cap),
+            Some(s) if cap >= s.max_output_thinking.filter(|_| thinking).unwrap_or(s.max_output) => None,
+            Some(s) => Some(cap.min(s.max_output_thinking.filter(|_| thinking).unwrap_or(s.max_output))),
+            None => Some(cap),
         }
     }
 
@@ -380,7 +410,7 @@ impl Alibaba {
             }
             None => {}
         }
-        let auto_max = self.output_budget(input, spec);
+        let auto_max = self.output_budget(input, spec, req.effort.as_deref() != Some("none"));
         let mut p = match spec {
             Some(s) if responses => self.responses_request(input, s, &req, &user, blobs, &mut notes).await?,
             _ => self.chat_request(input, spec, &req, &user, blobs).await?,
@@ -450,7 +480,7 @@ impl Alibaba {
                     if s.thinking == Thinking::Hybrid {
                         set("enable_thinking", json!(true));
                     }
-                    if s.effort {
+                    if !s.efforts.is_empty() {
                         // Nothing asked: Qwen's own default (no `reasoning_effort`).
                         match e {
                             Some(e) => {
@@ -528,7 +558,7 @@ impl Alibaba {
         let mut settings = Vec::new();
         let by_user = user.effort.is_some() || user.level.is_some();
         let off = req.effort.as_deref() == Some("none");
-        let described = if spec.effort {
+        let described = if !spec.efforts.is_empty() {
             match req.effort.as_deref() {
                 Some(e) => {
                     body["reasoning"] = json!({"effort": e});
@@ -710,8 +740,8 @@ async fn user_content(
 ) -> Result<Vec<Content>, LlmError> {
     let text_only = || {
         LlmError::request(format!(
-            "`{model}` takes text only on Alibaba Model Studio (no image or video input; qwen3.8-max, qwen3.7-plus \
-             and qwen3.7-max-2026-06-08 take both)"
+            "`{model}` takes text only on Alibaba Model Studio (no image or video input; qwen4-max, qwen3.8-max, \
+             qwen3.7-plus and qwen3.7-max-2026-06-08 take both)"
         ))
     };
     let mut out = Vec::new();
