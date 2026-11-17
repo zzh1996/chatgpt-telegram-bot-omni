@@ -52,10 +52,12 @@ For generic OR behaviour (routing, plugins, other providers) see the sibling fil
 
 ## 1. Responses API request parameters (`POST /v1/responses`)
 
-### 1.1 Current OpenAI models (model pages, 2026-11-11)
+### 1.1 Current OpenAI models (model pages, 2026-11-11; GPT-6.2 2026-11-18)
 
 | Model id | `reasoning.effort` values (default) | Context / max out | Price in / cached / out per 1M | Notes |
 |---|---|---|---|---|
+| `gpt-6.2-astra` (2026-11-17) | low, medium, high, xhigh, max (medium; live: the 400 errors list them, a response without effort reports `medium`); `none`/`minimal` → 400 | 1.05M (max input 922K) / 128K | $8 / $0.4 / $40; cache write $10 (30m), $20 (12h) | "Most capable". No Flex (400: "Use background=true with background_options.completion_window instead"). Ultrafast 3× until 2027-02-28 (Pacific), 6× from March 1. `original` detail works (live) though the vision guide's table omits it. No dated snapshot. Knowledge cutoff 2026-05-18 [oa-gpt62] |
+| `gpt-6.2-sol` (2026-11-17) | as Astra | 1.05M (922K) / 128K | $2 / $0.1 / $10; cache write $2.5, $5 (12h) | "Go-to model for everyday work". Same tiers as Astra. Knowledge cutoff 2026-06-01 [oa-gpt62] |
 | `gpt-6-astra` | low, medium, high, xhigh, max (medium); `none` → HTTP 400 | 1.05M (max input 922K) / 128K | $10 / $1 / $50; cache write $12.5 | Flagship. CC supported, but no tool calling in CC [oa-gpt6]. Tools: web_search, file_search, image_generation, code_interpreter, hosted_shell, apply_patch, skills, computer_use, mcp, tool_search |
 | `gpt-6.1-sol` | low…max (medium); no `none`/`minimal` | 1.05M / 128K | $2 / $0.1 / $10 | Ultrafast tier available [oa-ultrafast] |
 | `gpt-6.1-terra` | none, low…max (medium) | 1.05M / 128K | $1 / $0.05 / $5 | Vision/writing |
@@ -79,7 +81,7 @@ Sources: [oa-models] and the per-model pages. "Not all reasoning models support 
 | `instructions` | string | System/developer message. **Not carried over** with `previous_response_id` |
 | `reasoning.effort` | `none\|minimal\|low\|medium\|high\|xhigh\|max` | Model-dependent (§1.1). An unsupported value → 400 (e.g. Astra + `none`) [oa-reasoning] |
 | `reasoning.summary` | `auto\|concise\|detailed` | Opt-in. Without it, `reasoning.summary[]` is empty. `concise` works on computer-use and all reasoning models after gpt-5. `auto` ≈ `detailed` today. *May require organization verification* [oa-reasoning]. `generate_summary` is the deprecated alias |
-| `reasoning.context` | `auto\|current_turn\|all_turns` | GPT-5.6 family and GPT-6.1 Sol support `all_turns` (5.6 default). Earlier models default to `current_turn`. The response reports the effective value |
+| `reasoning.context` | `auto\|current_turn\|all_turns` | GPT-5.6 family, GPT-6.x and GPT-6.2 support `all_turns` (5.6 default; 6.2 accepts it, live). Earlier models default to `current_turn`. The response reports the effective value |
 | `reasoning.mode` | `standard\|pro` | GPT-5.6/GPT-6 in RSP. Independent of effort. Billed at standard token rates, but uses more tokens |
 | `text.verbosity` | `low\|medium\|high` (default medium) | |
 | `text.format` | `{type:"text"}` \| `{type:"json_schema", name, schema, strict, description}` \| legacy `{type:"json_object"}` | Structured Outputs. `name` is ≤64 chars `[A-Za-z0-9_-]` |
@@ -89,7 +91,7 @@ Sources: [oa-models] and the per-model pages. "Not all reasoning models support 
 | `tool_choice` | `none\|auto\|required` \| `{type:"allowed_tools", mode:"auto"\|"required", tools:[…]}` \| `{type:"function",name}` \| `{type:"mcp",server_label,name?}` \| `{type:"custom",name}` \| `{type:"file_search"\|"web_search_preview"\|"computer"\|"computer_use_preview"\|"computer_use"\|"code_interpreter"\|"image_generation"}` \| `{type:"apply_patch"}` \| `{type:"shell"}` \| `{type:"programmatic_tool_calling"}` | To force `web_search` (non-preview), use `required` or `allowed_tools` [oa-websearch] |
 | `tools` | function, custom, namespace, file_search, web_search(+_2025_08_26), web_search_preview(+_2025_03_11), code_interpreter, image_generation, shell, local_shell, apply_patch, computer, computer_use_preview, mcp, tool_search, programmatic_tool_calling | §3 |
 | `service_tier` | `auto\|default\|flex\|scale\|priority\|fast\|ultrafast` (default auto) | `fast` = `priority` (renamed 2026-07-30). The response echoes `priority` for ≤GPT-5.6. Flex costs 50% but can return 429 "Resource Unavailable", which is not charged [oa-flex]. Fast mode can silently downgrade to `default` when you ramp too fast [oa-fast]. `ultrafast`: the reference says it is available for `gpt-5.6-sol`; the guide says Astra / 6.1 Sol and recommends WebSockets [oa-ultrafast]. The response's `service_tier` is the tier actually used |
-| `safety_identifier` | string ≤128 | Stable hashed per-end-user id. Recommended because GPT-5.6+ safeguards block or pause output [oa-gpt56] |
+| `safety_identifier` | string ≤128 | Stable hashed per-end-user id. Recommended because GPT-5.6+ safeguards block or pause output [oa-gpt56]. From GPT-6.2 on, reasoning made with another identifier, or with one where the new request has none (or the reverse), is withheld (`end_user_mismatch`) [oa-reasoning]: in a group thread, other people's turns lose their reasoning (§1.5) |
 | `user` | string | Deprecated. Replaced by `safety_identifier` + `prompt_cache_key` |
 | `prompt_cache_key` | string | Cache routing/bucketing. For GPT-5.6+ it is "optional, for separate cache accounting" [oa-cache] |
 | `prompt_cache_options` | `{mode:"implicit"\|"explicit", ttl:"30m"\|"12h", prewarm:bool, comparison_response_id}` | GPT-5.6+. Explicit breakpoints go on content blocks: `prompt_cache_breakpoint:{mode:"explicit", ttl?}`, up to 4 written per request. Cache writes cost 1.25× (30m) or 2.5× (12h) on GPT-5.6+ |
@@ -133,6 +135,24 @@ Sources: [oa-models] and the per-model pages. "Not all reasoning models support 
 * **`phase`** on assistant messages: `commentary` or `final_answer` (GPT-5.3-codex+/5.4/5.5). Preserve it on replay; dropping it causes early stopping [oa-reasoning].
 
 ---
+
+### 1.5 GPT-6.2: what changed (2026-11-17)
+
+* **Withheld reasoning.** From GPT-6.2 on the API drops replayed reasoning items it would have kept before; `input_transformations` names the reason [oa-gpt62][oa-reasoning]. Measured on gpt-6.2-sol (2026-11-18): one turn, then a stateless follow-up replaying it with one change each:
+
+  | Change in the follow-up | Earlier reasoning |
+  |---|---|
+  | nothing; `reasoning.effort`; `text.verbosity`; `max_output_tokens`; a `configuration_update` item | kept |
+  | another `safety_identifier`, or none (the first request had one) | withheld: `end_user_mismatch` |
+  | request-level `tools` (`[]` → `[web_search]`) | withheld: `prefix_mismatch` (and +4.4K input tokens: the search tool's definition) |
+  | the same tool as an `additional_tools` developer item | kept, but only +4 input tokens: whether the hosted tool really works that way is **UNVERIFIED** |
+
+  **With `store: true` (what the bot sends) the drop is silent**: the same probe with `store: true` reports `input_transformations: []` for another or a missing identifier, yet the input is 54 tokens instead of 66 (the reasoning item is gone); the bot's own group test (another member replying) showed the same. So the bot keeps what each answer was made with (fingerprints of its `safety_identifier` and `tools`, `made_with` in the native payload) and says the withholding ahead.
+  The guides recommend append-only changes (`configuration_update` for effort and `text.format`, `additional_tools` / `allowed_tools` for tools) [oa-gpt62]. The bot keeps the per-user `safety_identifier` (the owner's choice: abuse is then blocked per person) and says in plain words why reasoning was withheld.
+* **No Flex** on GPT-6.2: `service_tier: "flex"` → 400 pointing to **background completion windows** (public beta, 2026-11-17: GPT-6.2 Astra/Sol, GPT-6.1 Terra, GPT-6 Luna): `background: true`, `background_options.completion_window: "2h" | "8h"` (30% / 40% below Standard token rates), `service_tier: "default"`, no streaming; polled or a webhook; `continuation_id` for follow-ups. Not used (the owner: not now).
+* **Ultrafast** (HTTP works; this account has it, live): 3× Standard through 2027-02-28, 6× from 2027-03-01 (Pacific) on GPT-6.2; GPT-6 Astra and 6.1 Sol stay 6×. US data residency only.
+* **Caching** as on GPT-5.6+: cache reads 0.05×, writes 1.25× (`30m`, default) or 2.5× (`12h`).
+* Also listed for 6.2 but not new: Multi-agent beta (6.1 Sol and GPT-5.6 too), `reasoning.mode: pro`.
 
 ## 2. Stateless multi-turn on OA (`store:false`)
 
@@ -374,6 +394,7 @@ event: response.completed            data: {"type":"response.completed","respons
 * Shape: `{"type":"input_image","image_url":"https://…" | "data:image/png;base64,…","file_id":"file-…","detail":"auto|low|high|original"}`. Default `detail` is `auto`. `file_id` comes from the Files API (`purpose:"user_data"` recommended for model inputs).
 * **Formats**: PNG, JPEG, WEBP, non-animated GIF. Up to 1,500 images and 512 MB total payload per request. Each image ≤30,000 patches after resizing, or the request is rejected [oa-vision].
 * **`original` detail**: gpt-6-astra, gpt-5.6-*, gpt-5.5, gpt-5.4 family. **Not** gpt-5.2/5.1/4.1/4o.
+  * Not in the guide's table but measured (2026-11-18, one 2560×1440 PNG): gpt-6.2-astra, gpt-6.2-sol, gpt-6.1-sol, gpt-6.1-terra, gpt-6-sol and gpt-6-luna take 4,332 input tokens at `original` and 2,942 at `high`, so `original` keeps the full resolution there too.
   * Astra / 5.6: `auto` = `original`. `high` = ≤2,500 patches. `low` fits 512×512.
   * Image tokens = 32 px patches × 1.2 multiplier on GPT-5.2+. Example: a 1024² image at `high` = 1,229 tokens [oa-vision].
 
@@ -489,7 +510,7 @@ Sources: [oa-chat][oa-chat-stream][oa-migrate][oa-reasoning][oa-gpt6][oa-files].
 * **Endpoint**: `POST https://openrouter.ai/api/v1/responses` ("OpenResponses" format). This is the only `/responses` method; there is no GET, cancel, input_items, compact or input_tokens [or-oas][or-rsp].
   * Generation id: the `X-Generation-Id` header. Response ids look like `gen-…`/`resp_…` [or-stream].
   * Assistant messages in replayed history **must** carry `id` and `status` [or-rsp-basic].
-* **Model slugs**: `openai/gpt-6-astra`, `openai/gpt-6.1-sol`, `openai/gpt-6.1-terra`, `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-{sol,terra,luna}`, `openai/gpt-5.5`, `openai/gpt-5.4`, …
+* **Model slugs**: `openai/gpt-6.2-astra`, `openai/gpt-6.2-sol` (and `-pro`; OpenAI the only provider, with `openai/fast` and `openai/ultrafast` endpoints, 2026-11-18), `openai/gpt-6-astra`, `openai/gpt-6.1-sol`, `openai/gpt-6.1-terra`, `openai/gpt-6-sol`, `openai/gpt-6-luna`, `openai/gpt-5.6-{sol,terra,luna}`, `openai/gpt-5.5`, `openai/gpt-5.4`, …
   * Pro variants: `openai/<model>-pro`, also selectable via `reasoning.mode:"pro"`.
   * Floating aliases: `~openai/gpt-{astra,sol,terra,luna,mini}-latest`.
   * `chat-latest` is `openai/gpt-chat-latest`.
@@ -656,6 +677,7 @@ OpenAI (all fetched 2026-11-11; the `.md` twins are at the same URL + `.md`):
 * [oa-chat-stream] https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
 * [oa-migrate] https://developers.openai.com/api/docs/guides/migrate-to-responses
 * [oa-gpt6] https://developers.openai.com/api/docs/guides/latest-model/gpt-6-astra
+* [oa-gpt62] https://developers.openai.com/api/docs/models/gpt-6.2-astra, …/gpt-6.2-sol, https://developers.openai.com/api/docs/guides/latest-model ("Using GPT-6.2"), https://developers.openai.com/api/docs/guides/keep-prefix-unchanged, https://developers.openai.com/api/docs/guides/background (completion windows), changelog 2026-11-17 (all fetched 2026-11-18 as `.md`)
 * [oa-gpt56] https://developers.openai.com/api/docs/guides/latest-model/gpt-5.6
 * [oa-gpt54] https://developers.openai.com/api/docs/guides/latest-model/gpt-5.4 (also gpt-5.2 "parameter compatibility")
 * [oa-models] https://developers.openai.com/api/docs/models, https://developers.openai.com/api/docs/models/all, and per-model pages `https://developers.openai.com/api/docs/models/{gpt-6-astra,gpt-6.1-sol,gpt-6.1-terra,gpt-6-sol,gpt-6-luna,gpt-5.6-sol,gpt-5.5,gpt-5.5-pro,gpt-5.4,gpt-5.4-mini,gpt-5.2,chat-latest}`

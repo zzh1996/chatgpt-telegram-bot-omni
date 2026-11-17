@@ -966,11 +966,16 @@ fn plural(n: usize) -> &'static str {
 }
 
 /// OpenAI's `input_transformations` (earlier inputs withheld from the model:
-/// `{id, type: "reasoning", action: "removed", reason}`): `organization_mismatch`,
-/// `end_user_mismatch`, `model_mismatch`, `prefix_mismatch` (the conversation
-/// changed before it), and `turn_boundary` where it is not expected: on a model
-/// the bot asks for `reasoning.context: "all_turns"` (on the others the request
-/// says so in advance).
+/// `{id, type: "reasoning", action: "removed", reason}`), said in plain words
+/// with the reason: `organization_mismatch`, `end_user_mismatch` (from GPT-6.2
+/// on: made with another `safety_identifier`, i.e. for another user; in a
+/// group, someone else's turns), `model_mismatch`, `prefix_mismatch` (from
+/// GPT-6.2 on: the conversation before it changed, e.g. the tools after `/m`),
+/// and `turn_boundary` where it is not expected: on a model the bot asks for
+/// `reasoning.context: "all_turns"` (on the others the request says so in
+/// advance). Measured on gpt-6.2-sol (2026-11-18): another or a missing
+/// `safety_identifier` and other request-level tools withhold it; another
+/// effort, verbosity or output budget does not.
 fn withheld(r: &Value, turn_boundary_expected: bool) -> Option<String> {
     let mut reasons: Vec<(String, usize)> = Vec::new();
     for t in r.get("input_transformations").and_then(Value::as_array).into_iter().flatten() {
@@ -987,11 +992,34 @@ fn withheld(r: &Value, turn_boundary_expected: bool) -> Option<String> {
             None => reasons.push((what, 1)),
         }
     }
-    let n: usize = reasons.iter().map(|(_, n)| n).sum();
+    withheld_note(&reasons, "withheld")
+}
+
+/// The notice for earlier reasoning OpenAI keeps from the model, by reason
+/// with counts (`verb`: "withheld" as the response reports it, "withholds"
+/// when the bot says it ahead): in plain words, the reason code after.
+pub(crate) fn withheld_note(reasons: &[(String, usize)], verb: &str) -> Option<String> {
+    let reasons: Vec<&(String, usize)> = reasons.iter().filter(|(_, k)| *k > 0).collect();
+    let n: usize = reasons.iter().map(|(_, k)| k).sum();
+    let explain = |what: &str| match what {
+        "end_user_mismatch" => "made for another user (end_user_mismatch: from GPT-6.2 on, OpenAI reuses reasoning \
+                                only for the user it was made for)"
+            .to_string(),
+        "prefix_mismatch" => {
+            "after a change earlier in the conversation, such as different tools (prefix_mismatch)".into()
+        }
+        "model_mismatch" => "made by another model (model_mismatch)".into(),
+        "organization_mismatch" => "made under another OpenAI organization (organization_mismatch)".into(),
+        "turn_boundary" => "from earlier turns (turn_boundary)".into(),
+        other => other.to_string(),
+    };
     (n > 0).then(|| {
-        let list: Vec<String> =
-            reasons.iter().map(|(w, k)| if *k == 1 { w.clone() } else { format!("{w} ×{k}") }).collect();
-        format!("ℹ️ OpenAI withheld {n} earlier reasoning item{} from the model: {}", plural(n), list.join(", "))
+        // One reason: it covers them all; several: each with its count.
+        let list: Vec<String> = match &reasons[..] {
+            [(what, _)] => vec![explain(what)],
+            _ => reasons.iter().map(|(w, k)| format!("{k} {}", explain(w))).collect(),
+        };
+        format!("ℹ️ OpenAI {verb} {n} earlier reasoning item{} from the model: {}", plural(n), list.join("; "))
     })
 }
 

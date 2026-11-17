@@ -20,7 +20,8 @@
 //!   (earlier turns' reasoning stays in context; the API default keeps only
 //!   the current turn's before GPT-5.6; GPT-5.2, 5.1 and 5 reject it); the full output budget
 //!   (`max_output_tokens`, which counts reasoning too); images at
-//!   `detail: "original"` where the vision guide documents it, else `"high"`;
+//!   `detail: "original"` where the vision guide documents it or a live test
+//!   shows it keeps more pixels (GPT-6.2, 6.1, 6 Sol and Luna), else `"high"`;
 //!   PDFs at `detail: "high"`. `chat-latest` documents no effort levels: only
 //!   the summary is requested, as the old bot did.
 //! - Left at OpenAI's defaults: `reasoning.mode`,
@@ -56,7 +57,11 @@
 //!   audio and video are errors (the Responses API has no such input).
 //! - What responses report about their input: earlier reasoning OpenAI
 //!   withheld from the model (`input_transformations`) for any reason but
-//!   `turn_boundary` is a notice.
+//!   `turn_boundary` is a notice. From GPT-6.2 on OpenAI also withholds the
+//!   reasoning of answers made for another user (`safety_identifier`) or with
+//!   other request-level tools, and with `store: true` reports nothing: each
+//!   answer keeps what it was made with (`made_with` in its native payload)
+//!   and the bot says it ahead ([`withheld_ahead`]).
 //! - No cost in responses: estimated from the dated price table below.
 
 pub(crate) mod files;
@@ -96,9 +101,10 @@ pub struct ModelSpec {
     pub efforts: Option<&'static [&'static str]>,
     /// The default level, as OpenAI recommends it (D78): `medium` on the
     /// GPT-6, GPT-5.6, GPT-5.5 and pro families ("Default configuration for
-    /// most workloads"), also on GPT-5.4/5.2/5.1 whose API default `none` is
-    /// "ideal for latency-sensitive workloads"; `high` on gpt-5.5-pro (its API
-    /// default). Checked live 2026-11-14 (`response.reasoning.effort`).
+    /// most workloads"; GPT-6.2's guide: "Start with `medium`"), also on
+    /// GPT-5.4/5.2/5.1 whose API default `none` is "ideal for
+    /// latency-sensitive workloads"; `high` on gpt-5.5-pro (its API default).
+    /// Checked live 2026-11-14, GPT-6.2 2026-11-18 (`response.reasoning.effort`).
     /// `None`: no effort parameter.
     pub effort: Option<&'static str>,
     /// Takes `reasoning.context: "all_turns"` (live 2026-11-14: GPT-5.4 and
@@ -109,7 +115,11 @@ pub struct ModelSpec {
     pub summary: bool,
     /// Takes `text.verbosity`.
     pub verbosity: bool,
-    /// `input_image.detail` sent: `original` where documented, else `high`.
+    /// `input_image.detail` sent: `original` where the vision guide documents
+    /// it, or where a live test shows it keeps more pixels (GPT-6.2, 6.1, 6 Sol
+    /// and 6 Luna, which its sizing table does not list, 2026-11-18: a
+    /// 2560×1440 image is 4,332 input tokens at `original`, 2,942 at `high`),
+    /// else `high`.
     pub image_detail: &'static str,
     /// Standard tier, prompts up to 272K input tokens (USD per 1M tokens).
     pub price: Price,
@@ -123,10 +133,17 @@ pub struct ModelSpec {
     /// Fast mode (`service_tier: "fast"` or its old name `"priority"`), as a
     /// multiple of the standard price.
     pub fast: Option<f64>,
-    /// `service_tier: "ultrafast"` (6× the standard price).
-    pub ultrafast: bool,
+    /// `service_tier: "ultrafast"`, as a multiple of the standard price.
+    pub ultrafast: Option<f64>,
+    /// A dated change of that multiple: from this Unix time (the response's
+    /// `created_at`) on, this one.
+    pub ultrafast_from: Option<(i64, f64)>,
     /// Prompt cache diagnostics ("GPT-5.6 and later supported models").
     pub cache_diagnostics: bool,
+    /// OpenAI reuses an answer's reasoning only for the same `safety_identifier`
+    /// and request-level tools (GPT-6.2 on), without saying so when `store:
+    /// true`: the bot says it ahead ([`withheld_ahead`]).
+    pub reuse_checks: bool,
 }
 
 const MAX_TO_LOW: &[&str] = &["max", "xhigh", "high", "medium", "low"];
@@ -155,17 +172,28 @@ const BASE: ModelSpec = ModelSpec {
     long_context: true,
     flex: true,
     fast: Some(2.0),
-    ultrafast: false,
+    ultrafast: None,
+    ultrafast_from: None,
     cache_diagnostics: true,
+    reuse_checks: false,
 };
 
 /// 2026-12-01T00:00:00Z: GPT-5.6 Sol's promotional price ends.
 pub const DEC_1_2026: i64 = 1_796_083_200;
 
-/// OpenAI's models, 2026-11-12. Limits and reasoning levels: the model pages
-/// (docs/research/openai.md §1.1); image `original` detail: the images and
-/// vision guide; prices and tiers: developers.openai.com/api/docs/pricing
-/// (Standard, Flex, Fast and Ultrafast tables). `gpt-5.6-sol` is at its
+/// 2027-03-01T00:00 Pacific (08:00 UTC): GPT-6.2's Ultrafast promotion ends
+/// ("3 times the Standard rate through February 28, 2027, and 6 times the
+/// Standard rate starting March 1, 2027 (Pacific time)").
+pub const MAR_1_2027_PACIFIC: i64 = 1_803_888_000;
+
+/// OpenAI's models, 2026-11-12; GPT-6.2 Astra and Sol (released 2026-11-17)
+/// 2026-11-18. Limits and reasoning levels: the model pages
+/// (docs/research/openai.md §1.1; GPT-6.2's levels as its 400 errors list
+/// them, its default as a response reports it); image `original` detail: the
+/// images and vision guide, or a live test (see `image_detail`); prices and
+/// tiers: developers.openai.com/api/docs/pricing (Standard, Flex, Fast and
+/// Ultrafast tables). GPT-6.2 has no Flex: the API answers 400 and points to
+/// background completion windows (`2h`/`8h`, not streamed; not used). `gpt-5.6-sol` is at its
 /// promotional price, "available until November 30, 2026"; the regular price
 /// is not published, but the model page calls the promotion "a 20% reduction
 /// in input pricing and a 33% reduction in output pricing": $5 / $0.50 /
@@ -187,24 +215,48 @@ pub const MODELS: &[ModelSpec] = &[
         cache_diagnostics: false,
         ..BASE
     },
+    // No `none` effort, no Flex; Ultrafast 3× until March 1, 2027 (Pacific), 6× from then.
+    ModelSpec {
+        id: "gpt-6.2-astra",
+        efforts: Some(MAX_TO_LOW),
+        image_detail: "original",
+        price: price(8.0, 0.4, Some(10.0), 40.0),
+        flex: false,
+        ultrafast: Some(3.0),
+        ultrafast_from: Some((MAR_1_2027_PACIFIC, 6.0)),
+        reuse_checks: true,
+        ..BASE
+    },
+    ModelSpec {
+        id: "gpt-6.2-sol",
+        efforts: Some(MAX_TO_LOW),
+        image_detail: "original",
+        price: price(2.0, 0.1, Some(2.5), 10.0),
+        flex: false,
+        ultrafast: Some(3.0),
+        ultrafast_from: Some((MAR_1_2027_PACIFIC, 6.0)),
+        reuse_checks: true,
+        ..BASE
+    },
     ModelSpec {
         id: "gpt-6-astra",
         efforts: Some(MAX_TO_LOW),
         image_detail: "original",
         price: price(10.0, 1.0, Some(12.5), 50.0),
-        ultrafast: true,
+        ultrafast: Some(6.0),
         ..BASE
     },
     ModelSpec {
         id: "gpt-6.1-sol",
         efforts: Some(MAX_TO_LOW),
+        image_detail: "original",
         price: price(2.0, 0.1, Some(2.5), 10.0),
-        ultrafast: true,
+        ultrafast: Some(6.0),
         ..BASE
     },
-    ModelSpec { id: "gpt-6.1-terra", price: price(1.0, 0.05, Some(1.25), 5.0), ..BASE },
-    ModelSpec { id: "gpt-6-sol", price: price(2.0, 0.2, Some(2.5), 10.0), ..BASE },
-    ModelSpec { id: "gpt-6-luna", price: price(0.1, 0.01, Some(0.125), 0.5), ..BASE },
+    ModelSpec { id: "gpt-6.1-terra", image_detail: "original", price: price(1.0, 0.05, Some(1.25), 5.0), ..BASE },
+    ModelSpec { id: "gpt-6-sol", image_detail: "original", price: price(2.0, 0.2, Some(2.5), 10.0), ..BASE },
+    ModelSpec { id: "gpt-6-luna", image_detail: "original", price: price(0.1, 0.01, Some(0.125), 0.5), ..BASE },
     ModelSpec {
         id: "gpt-5.6-sol",
         aliases: &["gpt-5.6"],
@@ -393,7 +445,7 @@ impl RouteCaps for Caps {
     }
     fn tiers(&self) -> Vec<String> {
         let (flex, fast, ultrafast) = match self.spec {
-            Some(s) => (s.flex, s.fast.is_some(), s.ultrafast),
+            Some(s) => (s.flex, s.fast.is_some(), s.ultrafast.is_some()),
             None => (true, true, true),
         };
         let mut t = Vec::new();
@@ -622,6 +674,8 @@ impl OpenAi {
             .filter(|s| s.efforts.is_some() && !s.all_turns && req.effort.as_deref() != Some("none"))
             .filter(|_| crate::provider::has_earlier_reasoning(input.history, model))
             .map(|_| crate::provider::reasoning_dropped(&format!("OpenAI's {model}")));
+        let dropped = dropped
+            .or_else(|| spec.filter(|s| s.reuse_checks).and_then(|_| withheld_ahead(input.history, model, &body)));
         Ok(Prepared {
             dialect: DIALECT,
             model: model.to_string(),
@@ -683,8 +737,64 @@ impl Provider for OpenAi {
             idle_timeout: self.cfg.idle_timeout,
             recovery: Some(&self.recovery),
         };
-        wire::stream(&run, &WIRE, p, sink, observer, cancel).await
+        let (result, outcome) = wire::stream(&run, &WIRE, p, sink, observer, cancel).await;
+        // What OpenAI checks before it reuses this answer's reasoning (see `withheld_ahead`).
+        let result = result.map(|mut payload| {
+            if payload.is_object() {
+                payload["made_with"] = made_with(&p.body);
+            }
+            payload
+        });
+        (result, outcome)
     }
+}
+
+/// What OpenAI checks before it lets a model reuse an answer's reasoning
+/// (GPT-6.2 on): the `safety_identifier` and the request-level `tools` it was
+/// made with, kept with the answer as fingerprints (only equality matters, and
+/// the identifier stays out of exports).
+fn made_with(body: &Value) -> Value {
+    json!({"user": body.get("safety_identifier").map(fingerprint), "tools": body.get("tools").map(fingerprint)})
+}
+
+/// A short, stable fingerprint of a JSON value (64-bit FNV-1a, hex).
+fn fingerprint(v: &Value) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in v.to_string().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The earlier reasoning OpenAI will keep from the model in this request
+/// (GPT-6.2 on), said ahead: answers of this model replayed natively that
+/// were made for another user (another or a missing `safety_identifier`:
+/// someone else in a group) or with other request-level tools. With `store:
+/// true` the response's `input_transformations` stay empty although the
+/// reasoning is gone (measured 2026-11-18: 12 input tokens fewer). Answers
+/// made before the bot kept `made_with` are not counted.
+fn withheld_ahead(history: &[omni_core::Turn], model: &str, body: &Value) -> Option<String> {
+    let now = made_with(body);
+    let (mut other_user, mut other_tools) = (0, 0);
+    for t in history {
+        let Some(n) = t.native.as_ref().filter(|n| n.model == model && n.dialect == DIALECT) else { continue };
+        let Some(then) = n.payload.get("made_with") else { continue };
+        let reasoning = n
+            .payload
+            .get("output")
+            .and_then(Value::as_array)
+            .map_or(0, |items| items.iter().filter(|i| i["type"] == "reasoning").count());
+        if then["user"] != now["user"] {
+            other_user += reasoning;
+        } else if then["tools"] != now["tools"] {
+            other_tools += reasoning;
+        }
+    }
+    wire::withheld_note(
+        &[("end_user_mismatch".to_string(), other_user), ("prefix_mismatch".to_string(), other_tools)],
+        "withholds",
+    )
 }
 
 // ------------------------------------------------------------------ cost
@@ -715,7 +825,10 @@ pub fn estimate_cost(model: &str, response: &Value, u: &Usage) -> Option<f64> {
     let tier = match response.get("service_tier").and_then(Value::as_str) {
         Some("flex") => 0.5,
         Some("priority" | "fast") => s.fast.unwrap_or(2.0),
-        Some("ultrafast") => 6.0,
+        Some("ultrafast") => match s.ultrafast_from {
+            Some((from, times)) if created >= from => times,
+            _ => s.ultrafast.unwrap_or(6.0),
+        },
         _ => 1.0,
     };
     let written_12h = u
@@ -869,6 +982,8 @@ mod tests {
         // OpenRouter ids of config/omni.example.toml → official ids.
         for (or, official) in [
             ("openai/gpt-chat-latest", "chat-latest"),
+            ("openai/gpt-6.2-astra", "gpt-6.2-astra"),
+            ("openai/gpt-6.2-sol", "gpt-6.2-sol"),
             ("openai/gpt-6.1-sol", "gpt-6.1-sol"),
             ("openai/gpt-6.1-terra", "gpt-6.1-terra"),
             ("openai/gpt-6-astra", "gpt-6-astra"),
@@ -971,6 +1086,22 @@ mod tests {
             "6.1 Sol has no none"
         );
         assert_eq!(prep("gpt-6-luna", &[flag("l")]).await.unwrap().body["reasoning"]["effort"], "none");
+        // GPT-6.2 (live 2026-11-18): low…max, `medium` when none is sent (and its guide's starting point).
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            let p = prep(model, &[]).await.unwrap();
+            assert_eq!(
+                p.body["reasoning"],
+                json!({"effort": "medium", "summary": "detailed", "context": "all_turns"}),
+                "{model}"
+            );
+            assert_eq!(p.body["max_output_tokens"], 128_000, "{model}");
+            assert_eq!(
+                p.notes,
+                ["reasoning effort is medium by default, not the highest (max); add +h for the highest"]
+            );
+            assert_eq!(prep(model, &[flag("h")]).await.unwrap().body["reasoning"]["effort"], "max", "{model}");
+            assert_eq!(prep(model, &[flag("l")]).await.unwrap().body["reasoning"]["effort"], "low", "no none: {model}");
+        }
         // chat-latest: no effort levels documented, only the summary (as the old bot sent), and context.
         let p = prep("chat-latest", &[]).await.unwrap();
         assert_eq!(p.body["reasoning"], json!({"summary": "detailed", "context": "all_turns"}));
@@ -1044,6 +1175,10 @@ mod tests {
         assert_eq!(prep("gpt-6-sol", &[kv("tier", "priority")]).await.unwrap().body["service_tier"], "priority");
         assert_eq!(prep("gpt-6-sol", &[kv("tier", "fast")]).await.unwrap().body["service_tier"], "fast");
         assert_eq!(prep("gpt-6-astra", &[kv("tier", "ultrafast")]).await.unwrap().body["service_tier"], "ultrafast");
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            assert_eq!(prep(model, &[kv("tier", "ultrafast")]).await.unwrap().body["service_tier"], "ultrafast");
+            assert_eq!(prep(model, &[kv("tier", "fast")]).await.unwrap().body["service_tier"], "fast");
+        }
         // default / auto change nothing.
         assert!(prep("gpt-6-sol", &[kv("tier", "default")]).await.unwrap().body.get("service_tier").is_none());
         // Presets apply under the user's options.
@@ -1080,6 +1215,15 @@ mod tests {
         assert!(err("gpt-6-sol", &[kv("v", "max")]).await.contains("levels: low, medium, high"));
         assert!(err("chat-latest", &[kv("tier", "flex")]).await.contains("has no service tiers via OpenAI"));
         assert!(err("gpt-6-luna", &[kv("tier", "ultrafast")]).await.contains("tiers: flex, priority, fast"));
+        // GPT-6.2: no Flex (the API answers 400), no `none` or `minimal`.
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+            assert!(err(model, &[kv("tier", "flex")]).await.contains("tiers: priority, fast, ultrafast"), "{model}");
+            assert!(err(model, &[kv("e", "none")]).await.contains("cannot turn reasoning off"), "{model}");
+            assert!(
+                err(model, &[kv("e", "minimal")]).await.contains("levels: max, xhigh, high, medium, low"),
+                "{model}"
+            );
+        }
         assert!(err("gpt-5.4-nano", &[kv("tier", "fast")]).await.contains("tiers: flex"));
         assert!(err("gpt-6-sol", &[kv("tier", "scale")]).await.contains("not available"));
         assert!(err("gpt-6-sol", &[kv("budget", "1000")]).await.contains("no reasoning token budget"));
@@ -1094,10 +1238,17 @@ mod tests {
         let (pdf, b2) = file("a.pdf", "application/pdf", b"%PDF");
         let blobs = MemBlobs(vec![b1, b2]);
         let history = vec![user(vec![img, pdf, Part::text("?")])];
+        // `original` where documented or measured (GPT-6.2, 6.1, 6 Sol and Luna: live 2026-11-18).
         for (model, detail) in [
+            ("gpt-6.2-astra", "original"),
+            ("gpt-6.2-sol", "original"),
             ("gpt-6-astra", "original"),
+            ("gpt-6.1-sol", "original"),
+            ("gpt-6.1-terra", "original"),
+            ("gpt-6-sol", "original"),
+            ("gpt-6-luna", "original"),
             ("gpt-5.4-nano", "original"),
-            ("gpt-6.1-sol", "high"),
+            ("gpt-5.2", "high"),
             ("chat-latest", "high"),
         ] {
             let input = CallInput {
@@ -1147,7 +1298,12 @@ mod tests {
         // …but not on models without long-context pricing.
         let c = estimate_cost("gpt-5.4-mini", &std, &usage(300_000, 0, 0, 0)).unwrap();
         assert!(close(c, 300_000.0 * 0.75 / 1e6), "{c}");
-        // The tier the response reports: flex half, fast (reported as priority) per model, ultrafast 6×.
+        // GPT-6.2 Astra: $8 in, $0.4 cached, $10 cache write, $40 out; long context 2× / 1.5×.
+        let c = estimate_cost("gpt-6.2-astra", &std, &usage(200_000, 100_000, 50_000, 10_000)).unwrap();
+        assert!(close(c, (50_000.0 * 8.0 + 100_000.0 * 0.4 + 50_000.0 * 10.0 + 10_000.0 * 40.0) / 1e6), "{c}");
+        let c = estimate_cost("gpt-6.2-astra", &std, &usage(300_000, 0, 0, 10_000)).unwrap();
+        assert!(close(c, (300_000.0 * 16.0 + 10_000.0 * 60.0) / 1e6), "{c}");
+        // The tier the response reports: flex half, fast (reported as priority) per model, ultrafast per model.
         let short = usage(200_000, 0, 0, 0);
         assert!(close(estimate_cost("gpt-6-sol", &json!({"service_tier": "flex"}), &short).unwrap(), 0.2));
         assert!(close(estimate_cost("gpt-6-sol", &json!({"service_tier": "priority"}), &short).unwrap(), 0.8));
@@ -1171,6 +1327,13 @@ mod tests {
         assert!(close(estimate_cost("gpt-5.6-sol", &at(DEC_1_2026 - 1), &u).unwrap(), 0.8 + 2.0));
         assert!(close(estimate_cost("gpt-5.6-sol", &at(DEC_1_2026), &u).unwrap(), 1.0 + 3.0));
         assert!(close(estimate_cost("gpt-5.6", &at(DEC_1_2026), &usage(200_000, 200_000, 0, 0)).unwrap(), 0.1));
+        // GPT-6.2's Ultrafast: 3× through February 28, 2027, 6× from March 1 (Pacific time).
+        let ultra = |t: i64| json!({"service_tier": "ultrafast", "created_at": t});
+        let u = usage(200_000, 0, 0, 0);
+        assert!(close(estimate_cost("gpt-6.2-sol", &ultra(MAR_1_2027_PACIFIC - 1), &u).unwrap(), 1.2));
+        assert!(close(estimate_cost("gpt-6.2-sol", &ultra(MAR_1_2027_PACIFIC), &u).unwrap(), 2.4));
+        assert!(close(estimate_cost("gpt-6.2-astra", &ultra(MAR_1_2027_PACIFIC - 1), &u).unwrap(), 4.8));
+        assert!(close(estimate_cost("gpt-6.1-sol", &ultra(MAR_1_2027_PACIFIC - 1), &u).unwrap(), 2.4), "6.1 Sol: 6×");
     }
 
     #[test]
@@ -1304,6 +1467,9 @@ mod tests {
         let (r, outcome, evs) = call(base, &p).await;
         let native = r.unwrap();
         assert_eq!(native["output"][1]["phase"], "final_answer");
+        // What OpenAI checks before reusing its reasoning (GPT-6.2 on), kept with the answer.
+        assert_eq!(native["made_with"], made_with(&p.body));
+        assert_eq!(native["made_with"]["tools"], fingerprint(&json!([{"type": "web_search"}])));
         assert_eq!(outcome.upstream_id.as_deref(), Some("resp_9"));
         let req = captured.lock().unwrap().take().unwrap();
         assert_eq!(req.path, "/v1/responses");

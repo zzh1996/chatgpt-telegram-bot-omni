@@ -167,6 +167,12 @@ delays_secs = [2, 10, 30, 60]  # wait before retry 1, 2, 3, …; the last value 
 name = ""
 spec = "openai:chat-latest"
 [[aliases]]
+name = "62"
+spec = "openai:gpt-6.2-astra"
+[[aliases]]
+name = "62s"
+spec = "openai:gpt-6.2-sol"
+[[aliases]]
 name = "61s"
 spec = "openai:gpt-6.1-sol"
 [[aliases]]
@@ -382,11 +388,17 @@ spec = "ark:doubao-seedance-2-0-fast-260128"
 name = "dbvm"
 spec = "ark:doubao-seedance-2-0-mini-260615"
 # The same models through OpenRouter: `o` + the prefix (`oc$`; `o$` for the empty one).
-# o6p, o61sp, o61tp, oqp: the strongest models OpenRouter has as their own ids
+# o62p, o62sp, o6p, o61sp, o61tp, oqp: the strongest models OpenRouter has as their own ids
 # (GPT pro variants, Qwen3.8 Max Prime); the platforms' own APIs have no such ids
 [[aliases]]
 name = "o"
 spec = "openrouter:openai/gpt-chat-latest"
+[[aliases]]
+name = "o62"
+spec = "openrouter:openai/gpt-6.2-astra"
+[[aliases]]
+name = "o62s"
+spec = "openrouter:openai/gpt-6.2-sol"
 [[aliases]]
 name = "o61s"
 spec = "openrouter:openai/gpt-6.1-sol"
@@ -423,6 +435,12 @@ spec = "openrouter:openai/gpt-5.4-mini"
 [[aliases]]
 name = "o54n"
 spec = "openrouter:openai/gpt-5.4-nano"
+[[aliases]]
+name = "o62p"
+spec = "openrouter:openai/gpt-6.2-astra-pro"
+[[aliases]]
+name = "o62sp"
+spec = "openrouter:openai/gpt-6.2-sol-pro"
 [[aliases]]
 name = "o6p"
 spec = "openrouter:openai/gpt-6-astra-pro"

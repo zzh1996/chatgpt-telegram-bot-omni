@@ -618,7 +618,7 @@ fn withheld_reasoning_and_cache_misses_are_noted() {
     // Not expected where the bot asks for `all_turns`: said.
     let mut sol = Parser::new(Platform::OpenAi, "gpt-6.1-sol", price, error_from_json);
     assert!(sol.event(&progress(turn)).unwrap().iter().any(|e| matches!(e, StreamEvent::Notice(n)
-        if n == "ℹ️ OpenAI withheld 1 earlier reasoning item from the model: turn_boundary")));
+        if n == "ℹ️ OpenAI withheld 1 earlier reasoning item from the model: from earlier turns (turn_boundary)")));
     let mut p = Parser::new(Platform::OpenAi, "gpt-5.2", price, error_from_json);
     let mixed = json!([
         {"id": "rs_1", "type": "reasoning", "action": "removed", "reason": "prefix_mismatch"},
@@ -628,7 +628,18 @@ fn withheld_reasoning_and_cache_misses_are_noted() {
     ]);
     let evs = p.event(&progress(mixed.clone())).unwrap();
     assert!(matches!(&evs[..], [StreamEvent::Meta { .. }, StreamEvent::Notice(n)]
-        if n == "ℹ️ OpenAI withheld 3 earlier reasoning items from the model: prefix_mismatch ×2, end_user_mismatch"));
+        if n == "ℹ️ OpenAI withheld 3 earlier reasoning items from the model: 2 after a change earlier in the \
+                 conversation, such as different tools (prefix_mismatch); 1 made for another user \
+                 (end_user_mismatch: from GPT-6.2 on, OpenAI reuses reasoning only for the user it was made for)"));
+    // GPT-6.2 in a group: someone else continues the thread.
+    let other_user = json!([
+        {"id": "rs_5", "type": "reasoning", "action": "removed", "reason": "end_user_mismatch"},
+        {"id": "rs_6", "type": "reasoning", "action": "removed", "reason": "end_user_mismatch"}
+    ]);
+    let mut q = Parser::new(Platform::OpenAi, "gpt-6.2-sol", price, error_from_json);
+    assert!(q.event(&progress(other_user)).unwrap().iter().any(|e| matches!(e, StreamEvent::Notice(n)
+        if n == "ℹ️ OpenAI withheld 2 earlier reasoning items from the model: made for another user \
+                 (end_user_mismatch: from GPT-6.2 on, OpenAI reuses reasoning only for the user it was made for)")));
     // Said once: the completed response repeats it.
     let completed = |t: &Value, d: Value| {
         json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed", "output": [],
@@ -666,6 +677,88 @@ fn withheld_reasoning_and_cache_misses_are_noted() {
     }
     // Reported only in the completed response: said there.
     assert_eq!(notices(&mut fresh(), completed(&mixed, Value::Null)).len(), 1);
+}
+
+#[tokio::test]
+async fn gpt_6_2_withholding_is_said_ahead() {
+    let o = OpenAi::new(cfg("https://api.openai.com/v1")).unwrap();
+    // An earlier answer with one reasoning item, made for `user` with `tools` (absent: none sent).
+    let answer = |model: &str, user: Option<&str>, tools: Option<Value>, stamped: bool| {
+        let mut made = serde_json::Map::new();
+        if let Some(u) = user {
+            made.insert("safety_identifier".into(), json!(u));
+        }
+        if let Some(t) = tools {
+            made.insert("tools".into(), t);
+        }
+        let mut payload = json!({"id": "resp_1", "output": [
+            {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "e"},
+            {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "2", "annotations": []}]}]});
+        if stamped {
+            payload["made_with"] = made_with(&Value::Object(made));
+        }
+        let mut t = Turn::assistant_text("2");
+        t.native = Some(omni_core::content::NativeOutput {
+            dialect: DIALECT.into(),
+            model: model.into(),
+            payload,
+            context_tokens: None,
+        });
+        t
+    };
+    let notes = |model: &'static str, opts: Vec<OptionToken>, a: Turn| {
+        let o = &o;
+        async move {
+            let history = vec![Turn::user_text("1+1?"), a, Turn::user_text("×10?")];
+            let input = CallInput {
+                model,
+                options: &opts,
+                history: &history,
+                session_id: Some("tg-1".into()),
+                user: Some("u-me".into()),
+                known_context: None,
+                max_tokens_override: None,
+            };
+            o.prepare(&input, &[], &MemBlobs(vec![])).await.unwrap().notes
+        }
+    };
+    let withholds = |n: &Vec<String>| n.iter().find(|n| n.starts_with("ℹ️ OpenAI withholds")).cloned();
+    // Someone else in the group continues the thread: OpenAI keeps it from the model (and, with
+    // `store: true`, says nothing), so the bot says it.
+    let other = notes("gpt-6.2-sol", vec![], answer("gpt-6.2-sol", Some("u-other"), None, true)).await;
+    assert_eq!(
+        withholds(&other).as_deref(),
+        Some(
+            "ℹ️ OpenAI withholds 1 earlier reasoning item from the model: made for another user (end_user_mismatch: \
+             from GPT-6.2 on, OpenAI reuses reasoning only for the user it was made for)"
+        )
+    );
+    // The same user: kept. Other tools (`/m` with +s): withheld.
+    assert_eq!(withholds(&notes("gpt-6.2-sol", vec![], answer("gpt-6.2-sol", Some("u-me"), None, true)).await), None);
+    let search = OptionToken::Flag("s".into());
+    let tools = notes("gpt-6.2-astra", vec![search], answer("gpt-6.2-astra", Some("u-me"), None, true)).await;
+    assert!(withholds(&tools).is_some_and(|n| n.ends_with("such as different tools (prefix_mismatch)")), "{tools:?}");
+    // Not before GPT-6.2, and not for answers that did not keep what they were made with.
+    assert_eq!(
+        withholds(&notes("gpt-6.1-sol", vec![], answer("gpt-6.1-sol", Some("u-other"), None, true)).await),
+        None
+    );
+    assert_eq!(
+        withholds(&notes("gpt-6.2-sol", vec![], answer("gpt-6.2-sol", Some("u-other"), None, false)).await),
+        None
+    );
+    // No user id sent now, one sent then: withheld too.
+    let input = CallInput {
+        model: "gpt-6.2-sol",
+        options: &[],
+        history: &[Turn::user_text("1+1?"), answer("gpt-6.2-sol", Some("u-other"), None, true), Turn::user_text("?")],
+        session_id: None,
+        user: None,
+        known_context: None,
+        max_tokens_override: None,
+    };
+    assert!(withholds(&o.prepare(&input, &[], &MemBlobs(vec![])).await.unwrap().notes).is_some());
 }
 
 #[tokio::test]

@@ -75,7 +75,7 @@ blob（图片、文件、生成图、长 base64）以 sha256 内容寻址存于 
 ## 6. OpenRouter 请求构建
 
 1. 接口（`options::dialect_for`）：OpenAI、xAI 走 Responses，Anthropic 走 Messages，其余走 Chat Completions；方舟用同一套 Chat Completions 转换（图片 `detail: xhigh`）。
-2. 历史转换（`chat` / `responses` / `messages` 的 `convert_history`）：同方言同模型的 assistant 回合回放 native（CC：`content` + `reasoning_details`；Responses：全部输出项，含加密推理与 `phase`；Messages：原始 content block），否则只发文本（别的模型生成的图片、文件放不进 assistant 消息，报错，`provider::unsent_media`）；用户内容按模态转换（图片：OpenAI `detail` original 或 high、xAI high、CC 不发 detail；PDF 走各接口的原生文件输入；音频 `input_audio`、视频/YouTube `video_url` 只在 CC 上；文本文件内联为独立 text 段）；不支持的输入模态直接报错。
+2. 历史转换（`chat` / `responses` / `messages` 的 `convert_history`）：同方言同模型的 assistant 回合回放 native（CC：`content` + `reasoning_details`；Responses：全部输出项，含加密推理与 `phase`，OpenAI 的还记下 `made_with`——当时 `safety_identifier` 和工具的指纹，GPT-6.2 起对不上时 OpenAI 悄悄拿掉那段推理，bot 预先提示；Messages：原始 content block），否则只发文本（别的模型生成的图片、文件放不进 assistant 消息，报错，`provider::unsent_media`）；用户内容按模态转换（图片：OpenAI `detail` original 或 high、xAI high、CC 不发 detail；PDF 走各接口的原生文件输入；音频 `input_audio`、视频/YouTube `video_url` 只在 CC 上；文本文件内联为独立 text 段）；不支持的输入模态直接报错。
 3. 选项（`request::parse`：封闭的小集合，没有任意 JSON）：配置预设 → 用户选项逐项覆盖（`options::overlay`）→ 先按官方能力、再按 OpenRouter 能力校验（`request::validate`）→ `options::plan`：没指定的取能力拉满的默认值（来自 `/models` 实时目录），每项记录来源（`/info`）。
 4. 额外检查：原生搜索在所选 endpoint 不存在时拒绝；service tier 自动加入对应 tier endpoint；PDF 强制 native 引擎；最终请求体再按 provider 白名单和 priority 名单检查（`policy::check`）。
 5. 流解析（`chat::ChunkParser`，Responses/Messages 各有 `EventParser`）：跳过 `:` 注释心跳；`reasoning_details` 按 `index` 合并；图片 data URL 解码；`url_citation` 转为引用；带内错误（HTTP 200 后的 `error` 块）按 `error_type` 分类；没有 finish/`[DONE]` 就断开视为可重试的网络错误；空闲超时（默认 3600 秒，方舟 1800 秒；保活注释也算数据，每个请求结束时日志记录最长间隔 `longest_gap_ms`）。

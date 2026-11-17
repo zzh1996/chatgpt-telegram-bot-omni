@@ -627,6 +627,10 @@ mod tests {
         assert_eq!(d("google/gemini-nano-banana-2.1").as_deref(), Some("medium"));
         assert_eq!(d("openai/gpt-5.4").as_deref(), Some("medium"));
         assert_eq!(d("openai/gpt-6-astra-pro").as_deref(), Some("medium"), "the base model's");
+        for m in ["openai/gpt-6.2-astra", "openai/gpt-6.2-sol", "openai/gpt-6.2-astra-pro", "openai/gpt-6.2-sol-pro"] {
+            assert_eq!(d(m).as_deref(), Some("medium"), "{m}");
+            assert!(direct_all_turns(m), "{m}");
+        }
         assert_eq!(d("openai/gpt-chat-latest"), None);
         assert_eq!(d("x-ai/grok-4.3").as_deref(), Some("low"));
         assert_eq!(d("deepseek/deepseek-v4.1-flash-1017").as_deref(), Some("high"));
