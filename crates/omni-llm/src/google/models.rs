@@ -7,7 +7,9 @@
 //! levels of the image models), the Maps / Search / URL context guides
 //! (supported models), the deprecation page (auto-routed ids) and
 //! docs/research/gemini.md §0.1. Gemini 4 Hydrogen: model page and "What's new
-//! in Gemini 4 Hydrogen" (GA 2026-11-12).
+//! in Gemini 4 Hydrogen" (GA 2026-11-12). Gemini 4 Neon: model page and "What's
+//! new in Gemini 4 Neon" (GA 2026-11-18; "sits between Gemini 4 Hydrogen and
+//! Gemini 4 Carbon"), fetched 2026-11-19.
 //!
 //! **Image generation** on the Gemini API is the Nano Banana models only
 //! (`generateContent`, images as parts; edits are conversational: earlier
@@ -133,7 +135,9 @@ const NO_TIERS: &[&str] = &[];
 
 const LEVELS_HML: &[&str] = &["high", "medium", "low"];
 /// Gemini 4 Hydrogen: "a fourth thinking level, `xhigh`, alongside `low`,
-/// `medium`, and the default `high`"; `minimal` is rejected.
+/// `medium`, and the default `high`"; `minimal` is rejected. Gemini 4 Neon the
+/// same ("`low`, `medium`, `high` (default), and `xhigh`"; "rejects `minimal`
+/// with an error").
 const LEVELS_XHML: &[&str] = &["xhigh", "high", "medium", "low"];
 const LEVELS_ALL: &[&str] = &["high", "medium", "low", "minimal"];
 
@@ -218,6 +222,7 @@ const GEMINI_36_FLASH: ModelSpec =
 /// tools from the model pages' capability lists and the tools' "supported
 /// models" tables; Search together with Maps on "Gemini 3.5 Flash and later".
 pub const MODELS: &[ModelSpec] = &[
+    ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), default_level: Some("high"), ..gemini4("gemini-4-neon") },
     ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), default_level: Some("high"), ..gemini4("gemini-4-hydrogen") },
     ModelSpec { default_level: Some("medium"), ..gemini4("gemini-4-carbon") },
     ModelSpec { default_level: Some("medium"), ..gemini4("gemini-4-argon") },

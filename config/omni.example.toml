@@ -233,16 +233,20 @@ spec = "anthropic:claude-sonnet-5"
 [[aliases]]
 name = "ch"
 spec = "anthropic:claude-haiku-5-5"
-# Google (old `gemini` branch; g4h: Gemini 4 Hydrogen, added 2026-11-13)
+# Google (old `gemini` branch; g4h: Gemini 4 Hydrogen, added 2026-11-13; g4n: Gemini 4 Neon,
+# 2026-11-19, between Hydrogen and Carbon: `g` stays Carbon, the strongest)
 [[aliases]]
 name = "g"
 spec = "google:gemini-4-carbon"
 [[aliases]]
-name = "g4"
+name = "g4a"
 spec = "google:gemini-4-argon"
 [[aliases]]
 name = "g4h"
 spec = "google:gemini-4-hydrogen"
+[[aliases]]
+name = "g4n"
+spec = "google:gemini-4-neon"
 [[aliases]]
 name = "g31"
 spec = "google:gemini-3.1-pro-preview"
@@ -259,7 +263,7 @@ spec = "google:gemini-3.6-flash"
 name = "gi"
 spec = "google:gemini-nano-banana-2.1"
 [[aliases]]
-name = "gl"
+name = "gfl"
 spec = "google:gemini-3.5-flash-lite"
 # xAI (old `grok` branch)
 [[aliases]]
@@ -478,11 +482,14 @@ spec = "openrouter:anthropic/claude-haiku-5.5"
 name = "og"
 spec = "openrouter:google/gemini-4-carbon"
 [[aliases]]
-name = "og4"
+name = "og4a"
 spec = "openrouter:google/gemini-4-argon"
 [[aliases]]
 name = "og4h"
 spec = "openrouter:google/gemini-4-hydrogen"
+[[aliases]]
+name = "og4n"
+spec = "openrouter:google/gemini-4-neon"
 [[aliases]]
 name = "og31"
 spec = "openrouter:google/gemini-3.1-pro-preview"
@@ -499,7 +506,7 @@ spec = "openrouter:google/gemini-3.6-flash"
 name = "ogi"
 spec = "openrouter:google/gemini-nano-banana-2.1"
 [[aliases]]
-name = "ogl"
+name = "ogfl"
 spec = "openrouter:google/gemini-3.5-flash-lite"
 [[aliases]]
 name = "ox"

@@ -23,6 +23,7 @@ Research snapshot: **2026-11-11**. Every claim links to a page fetched that day 
 
 | Model id | Role | `thinkingLevel` (\*=default) | Context / max output | Notes |
 |---|---|---|---|---|
+| `gemini-4-neon` (GA 2026-11-18) | between Hydrogen and Carbon ("frontier-level intelligence with fast end-to-end task completion") | low / medium / high\* / xhigh (`minimal` → error) | 1,048,576 unified; 64K per request (stream and non-stream); long decode to 1M | paid tier only; $3 / $15, cache reads $0.15, flat over the window; Flex $1.50 / $7.50, Priority $5.40 / $27; implicit caching only; every tool incl. Maps and URL context; OpenRouter `google/gemini-4-neon` (AI Studio incl. flex/priority, Vertex) ([neon][g-neon]) |
 | `gemini-4-carbon` | strongest reasoning | low / medium\* / high (no `minimal`, cannot disable) | 1,048,576 **unified** in+out; 32K non-stream / 64K stream per request; long decode to 1M | explicit caching → error; sampling ignored; not on free tier; set ≥20 min HTTP timeouts ([carbon][g-carbon]) |
 | `gemini-4-argon` | efficient Gemini 4 | same | same | same ([argon][g-argon], [model page][g-m-argon]) |
 | `gemini-3.8-flash` | default Flash | low / medium\* / high (`minimal` → error) | 1M in / 64K out | ([3.8][g-38]) |
@@ -613,6 +614,7 @@ Google (fetched 2026-11-11; `.md` twins used):
 [g-terms]: https://aistudio.google.com/docs/terms#grounding-with-google-search
 [g-apiver]: https://aistudio.google.com/api-reference/api-versions
 [g-carbon]: https://aistudio.google.com/docs/whats-new-gemini-4-carbon?generate-content=true
+[g-neon]: https://aistudio.google.com/docs/whats-new-gemini-4-neon?generate-content=true (and https://aistudio.google.com/docs/models/gemini-4-neon, pricing, changelog 2026-11-18; fetched 2026-11-19)
 [g-argon]: https://aistudio.google.com/docs/whats-new-gemini-4-argon?generate-content=true
 [g-m-argon]: https://aistudio.google.com/docs/models/gemini-4-argon
 [g-38]: https://aistudio.google.com/docs/whats-new-gemini-3.8?generate-content=true

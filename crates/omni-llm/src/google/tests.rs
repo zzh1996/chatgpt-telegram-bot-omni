@@ -122,6 +122,7 @@ fn table_covers_the_configured_aliases() {
     // The Gemini aliases of config/omni.example.toml (retiring models are not in the table).
     let g = google();
     for id in [
+        "gemini-4-neon",
         "gemini-4-hydrogen",
         "gemini-4-carbon",
         "gemini-4-argon",
@@ -257,6 +258,23 @@ async fn per_model_thinking_and_output_defaults() {
     assert!(prep("gemini-4-hydrogen", &[kv("e", "medium")], &hi()).await.is_ok());
     let e = prep_err("gemini-4-hydrogen", &[kv("e", "minimal")], &hi()).await;
     assert!(e.contains("levels: xhigh, high, medium, low"), "{e}");
+
+    // Gemini 4 Neon (2026-11-18): Hydrogen's levels and default, every tool, both tiers, long decode.
+    let p = prep("gemini-4-neon", &[], &hi()).await.unwrap();
+    assert_eq!(p.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high");
+    assert_eq!(p.body["generationConfig"]["maxOutputTokens"], 393_216);
+    assert!(p.long_decode);
+    assert_eq!(p.notes, ["reasoning effort is high by default, not the highest (xhigh); add +h for the highest"]);
+    let h = prep("gemini-4-neon", &[flag("h")], &hi()).await.unwrap();
+    assert_eq!(h.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "xhigh");
+    let l = prep("gemini-4-neon", &[flag("l")], &hi()).await.unwrap();
+    assert_eq!(l.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+    let e = prep_err("gemini-4-neon", &[kv("e", "minimal")], &hi()).await;
+    assert!(e.contains("levels: xhigh, high, medium, low"), "{e}");
+    let neon = models::spec("gemini-4-neon");
+    assert!(neon.known && neon.unified && neon.search_with_maps && neon.tool_invocations);
+    assert_eq!((neon.context, neon.max_output, neon.tiers), (1_048_576, 65_536, &["flex", "priority"][..]));
+    assert_eq!(neon.tools.len(), 4);
 }
 
 #[tokio::test]
@@ -559,7 +577,7 @@ async fn end_user_label_and_models_outside_the_table() {
 
     // A new Gemini 4 model, a retired one, something else: their price is unknown to the bot,
     // so they are not supported.
-    for id in ["gemini-4-neon", "gemini-2.5-flash", "gemma-5-27b-it"] {
+    for id in ["gemini-4-xenon", "gemini-2.5-flash", "gemma-5-27b-it"] {
         assert!(!google().knows(id), "{id}");
         assert_eq!(
             prep_err(id, &[], &hi()).await,
@@ -1690,6 +1708,15 @@ fn prices_by_tier_date_and_modality() {
     );
     assert!(pricing::estimate("gemini-9", &json!({}), None, NOW, false).is_none());
     assert!(pricing::price("gemini-nano-banana-2.1", Tier::Flex, NOW).is_none(), "image models have no flex tier");
+
+    // Gemini 4 Neon: $3 / $15, flat, no introductory price; Flex half, Priority 1.8×.
+    let m = |tier, now| pricing::estimate("gemini-4-neon", &million_in, Some(tier), now, false).unwrap();
+    assert!((m(Tier::Standard, NOW) - 3.00).abs() < 1e-9);
+    assert!((m(Tier::Standard, pricing::JAN_1_2027) - 3.00).abs() < 1e-9);
+    assert!((m(Tier::Flex, NOW) - 1.50).abs() < 1e-9);
+    assert!((m(Tier::Priority, NOW) - 5.40).abs() < 1e-9);
+    let p = pricing::price("gemini-4-neon", Tier::Standard, NOW).unwrap();
+    assert_eq!((p.base.cached, p.base.output, p.over_200k), (0.15, 15.00, None));
 
     // Gemini 4 Hydrogen: flat, no introductory price.
     let m = |tier, now| pricing::estimate("gemini-4-hydrogen", &million_in, Some(tier), now, false).unwrap();

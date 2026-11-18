@@ -624,6 +624,7 @@ mod tests {
         assert_eq!(d("anthropic/claude-fable-5.2").as_deref(), Some("high"));
         assert_eq!(d("google/gemini-3.1-pro-preview").as_deref(), Some("high"), "the catalog says medium");
         assert_eq!(d("google/gemini-4-hydrogen").as_deref(), Some("high"));
+        assert_eq!(d("google/gemini-4-neon").as_deref(), Some("high"), "the catalog says medium");
         assert_eq!(d("google/gemini-nano-banana-2.1").as_deref(), Some("medium"));
         assert_eq!(d("openai/gpt-5.4").as_deref(), Some("medium"));
         assert_eq!(d("openai/gpt-6-astra-pro").as_deref(), Some("medium"), "the base model's");

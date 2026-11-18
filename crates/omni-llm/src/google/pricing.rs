@@ -2,7 +2,7 @@
 //!
 //! Prices: <https://aistudio.google.com/docs/pricing>, fetched 2026-11-12
 //! (Gemini 4 Hydrogen and Gemini 2.5 Flash Image from the page as
-//! re-fetched 2026-11-13), paid tier, USD per 1M tokens, by service tier
+//! re-fetched 2026-11-13, Gemini 4 Neon 2026-11-19), paid tier, USD per 1M tokens, by service tier
 //! (Standard / Flex / Priority). Dated changes are applied by the date of the call (UTC):
 //! Gemini 4 doubles on 2026-12-01 (end of the introductory price), 3.8 / 3.6
 //! Flash double on 2027-01-01, and 2.5 Pro / 2.5 Flash are routed to (and
@@ -142,6 +142,11 @@ pub fn price(model: &str, tier: Tier, now: i64) -> Option<Price> {
     };
     Some(match model {
         // No introductory price; flat across the 1M window, implicit cache reads at 5%.
+        "gemini-4-neon" => single(match tier {
+            Standard => r(3.00, 0.15, 15.00),
+            Flex => r(1.50, 0.075, 7.50),
+            Priority => r(5.40, 0.27, 27.00),
+        }),
         "gemini-4-hydrogen" => single(match tier {
             Standard => r(1.50, 0.075, 7.50),
             Flex => r(0.75, 0.0375, 3.75),
