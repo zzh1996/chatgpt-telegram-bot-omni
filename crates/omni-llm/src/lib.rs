@@ -16,6 +16,7 @@ pub mod alibaba;
 pub mod anthropic;
 pub mod ark;
 pub mod budget;
+pub mod card;
 pub mod chatstream;
 pub mod deepseek;
 pub mod error;

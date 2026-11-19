@@ -232,6 +232,56 @@ pub fn is_video_model(model: &str) -> bool {
     spec(model).is_some() || model.starts_with("cogvideo") || model.starts_with("vidu")
 }
 
+/// What `/model` shows for a video model of the table.
+pub fn card(s: &'static Spec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, OUTPUT, PRICE};
+    let mut c = card::ModelCard::default();
+    c.caps(&Caps(Some(s)));
+    let modes: Vec<&str> = s
+        .modes
+        .iter()
+        .map(|m| match m {
+            Mode::Text => "text to video",
+            Mode::FirstFrame => "one image: the first frame",
+            Mode::FirstLast => "two images: the first and last frames",
+            Mode::References => "1 to 3 reference images",
+        })
+        .collect();
+    c.row(INPUT, "modes", modes.join("; "));
+    c.row(
+        INPUT,
+        "images",
+        format!(
+            "{} up to {} MB",
+            s.image_types.iter().map(|t| t.trim_start_matches("image/")).collect::<Vec<_>>().join(", "),
+            s.max_image_bytes / (1 << 20)
+        ),
+    );
+    let sizes: Vec<String> = s.sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
+    c.row(OUTPUT, "sizes", sizes.join(", "));
+    if !s.durations.is_empty() {
+        c.row(
+            OUTPUT,
+            "length (sec=)",
+            format!(
+                "{} s (the API's default first)",
+                s.durations.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    if !s.fps.is_empty() {
+        c.row(OUTPUT, "frame rates", s.fps.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
+    }
+    if !s.ratios.is_empty() {
+        c.row(OUTPUT, "aspect ratios", s.ratios.join(", "));
+    }
+    if s.audio {
+        c.row(OUTPUT, "sound (audio=)", "can be on");
+    }
+    c.row(PRICE, "per video", if s.price_cny == 0.0 { "free".to_string() } else { card::cny(s.price_cny) });
+    c
+}
+
 /// What Zhipu's video API takes for a model (official = route).
 struct Caps(Option<&'static Spec>);
 

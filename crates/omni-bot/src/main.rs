@@ -318,7 +318,7 @@ async fn set_commands(app: &App, bot: &BotConn) -> Result<()> {
         ("help", "How to use this bot"),
         ("help_zh", "使用帮助（中文）"),
         ("models", "List model prefixes / search models"),
-        ("model", "Show which model a prefix calls"),
+        ("model", "A prefix's model: limits, prices, defaults"),
         ("m", continue_with.as_str()),
         ("raw", "Reply: get the original Markdown and files"),
         ("full", "Reply: the answer's complete reasoning and tool calls"),

@@ -217,6 +217,51 @@ pub fn spec(model: &str) -> Option<&'static Spec> {
 }
 
 /// What Ark's video API takes for a model (the vendor's own API: official = route).
+/// What `/model` shows for a Seedance model of the table.
+pub fn card(s: &'static Spec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, OUTPUT, PRICE, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "length (sec=)", format!("{} to {} seconds", s.seconds.0, s.seconds.1));
+    c.caps(&Caps(s));
+    c.row(OUTPUT, "resolutions", format!("{} (Ark's default 720p)", s.resolutions.join(", ")));
+    c.row(OUTPUT, "sound", if s.audio { "generated (audio=)" } else { "none" });
+    if s.draft {
+        c.row(OUTPUT, "draft mode", "yes");
+    }
+    let mut takes = vec!["text".to_string(), "a first frame".to_string()];
+    if s.first_last {
+        takes.push("first and last frames".into());
+    }
+    if let Some(r) = s.refs {
+        takes.push(format!(
+            "full-modal references: up to {} images, {} videos, {} audio clips{}",
+            r.images,
+            r.videos,
+            r.audios,
+            if r.audio_alone { " (audio alone too)" } else { "" }
+        ));
+    }
+    c.row(INPUT, "takes", takes.join("; "));
+    if s.web_search {
+        c.row(TOOLS, "web_search", "available");
+    }
+    for (r, plain, with_video) in s.price {
+        c.row(
+            PRICE,
+            r.to_string(),
+            format!("{} / 1M tokens ({} with video input)", card::cny(*plain), card::cny(*with_video)),
+        );
+    }
+    if s.flex {
+        c.row(PRICE, "tier=flex", "offered");
+    }
+    c.row(NOTES, "name in Ark's docs", s.name);
+    if s.prefix {
+        c.row(NOTES, "matches", format!("ids starting with {}", s.id));
+    }
+    c
+}
+
 struct Caps(&'static Spec);
 
 impl RouteCaps for Caps {

@@ -261,6 +261,53 @@ pub(crate) fn choose_size(
     Ok(Size { wh: Some((width, height)), desc: format!("size {width}x{height} ({c}, {r})"), note })
 }
 
+// ------------------------------------------------------------------ card
+
+/// What `/model` shows for an image model of the table.
+pub fn card(model: &str) -> Option<crate::card::ModelCard> {
+    use crate::card::{self, INPUT, OUTPUT, PRICE, REASONING, usd_m};
+    let s = image_spec(model)?;
+    let mut c = card::ModelCard::default();
+    c.caps(&Caps(Some(s)));
+    if s.complexity {
+        c.row(REASONING, "what e= sets", "complexity, the image model's planning effort");
+    }
+    c.row(
+        OUTPUT,
+        "quality (q=)",
+        format!("{}, auto (the bot leaves OpenAI's default unless asked)", s.qualities.join(", ")),
+    );
+    let sizes = if s.flexible {
+        format!(
+            "any WIDTHxHEIGHT up to {MAX_EDGE} px a side and {} to {} pixels (above 2560x1440 experimental)",
+            card::n(MIN_PIXELS),
+            card::n(MAX_PIXELS)
+        )
+    } else {
+        "1024x1024, 1536x1024, 1024x1536".to_string()
+    };
+    c.row(OUTPUT, "sizes", sizes);
+    c.row(OUTPUT, "backgrounds (bg=)", BACKGROUNDS.join(", "));
+    c.row(OUTPUT, "images per request (n=)", format!("1 to {MAX_N}"));
+    c.row(INPUT, "images to edit", format!("up to {MAX_INPUT_IMAGES} (PNG, JPEG, WebP)"));
+    if s.input_fidelity {
+        c.row(INPUT, "input fidelity", "high on edits");
+    }
+    let p = s.price;
+    c.row(PRICE, "text input", usd_m(p.text_in));
+    c.row(PRICE, "cached text input", usd_m(p.text_cached));
+    c.row(PRICE, "image input", usd_m(p.image_in));
+    c.row(PRICE, "cached image input", usd_m(p.image_cached));
+    c.row(PRICE, "image output", usd_m(p.image_out));
+    if p.text_out > 0.0 {
+        c.row(PRICE, "text output", usd_m(p.text_out));
+    }
+    if !s.aliases.is_empty() {
+        c.row(card::NOTES, "also called", s.aliases.join(", "));
+    }
+    Some(c)
+}
+
 // ------------------------------------------------------------------ options
 
 /// What the Images API takes for a model (the vendor's own API: official = route).

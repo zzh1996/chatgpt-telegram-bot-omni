@@ -128,6 +128,24 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|m| m.id == model)
 }
 
+/// What `/model` shows for a model of the table.
+fn card(s: &'static ModelSpec, cny_per_usd: f64) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, PRICE, REASONING, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.row(LIMITS, "max output", card::tokens(s.max_output));
+    c.caps(&Caps(s));
+    c.row(REASONING, "earlier turns' reasoning", "kept (Preserved Thinking)");
+    c.row(TOOLS, "API", if s.responses { "Responses (with its web_search tool)" } else { "Chat Completions" });
+    c.row(INPUT, "takes", "images and videos (as data URLs), text files inline");
+    c.row(INPUT, "PDFs, documents", "not taken (they need Moonshot's stateful file upload)");
+    c.row(PRICE, "tokens", card::token_price(Currency::Cny, &s.price));
+    c.row(PRICE, "cache write", "the 5-minute default");
+    c.row(PRICE, "+s web search", format!("{} per search", card::cny(WEB_SEARCH_CNY)));
+    c.cny_rate(cny_per_usd);
+    c
+}
+
 /// K3 effort levels, highest first.
 const EFFORTS: [&str; 3] = ["max", "high", "low"];
 
@@ -458,6 +476,9 @@ impl Provider for Moonshot {
     }
     fn knows(&self, model: &str) -> bool {
         model_spec(model).is_some()
+    }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        model_spec(model).map(|s| card(s, self.cfg.cny_per_usd))
     }
     async fn prepare(
         &self,

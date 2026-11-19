@@ -74,6 +74,12 @@ impl Provider for Google {
     fn knows(&self, model: &str) -> bool {
         models::known(model) || omni::spec(model).is_some()
     }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        if let Some(s) = omni::spec(model) {
+            return Some(omni::card(s));
+        }
+        models::known(model).then(|| models::card(&models::spec(model), self.cfg.long_decode_budget))
+    }
     async fn prepare(
         &self,
         input: &CallInput<'_>,

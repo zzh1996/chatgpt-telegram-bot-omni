@@ -147,6 +147,35 @@ pub fn is_video_model(model: &str) -> bool {
     model.starts_with("gemini-omni") || model.starts_with("veo-")
 }
 
+/// What `/model` shows for an Omni model.
+pub fn card(s: &Spec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, OUTPUT, PRICE, usd, usd_m};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "video length", format!("3 to {} seconds", s.max_seconds));
+    if let Some(n) = s.max_images {
+        c.row(LIMITS, "reference images", format!("up to {n}"));
+    }
+    if let Some(n) = s.max_videos {
+        c.row(LIMITS, "videos", format!("up to {n} (references, or one to edit or extend)"));
+    }
+    c.caps(&Caps);
+    c.row(OUTPUT, "aspect ratios", RATIOS.join(", "));
+    c.row(INPUT, "takes", "text, images and videos");
+    c.row(PRICE, "input", usd_m(s.input));
+    c.row(PRICE, "text and thinking output", usd_m(s.text_output));
+    c.row(PRICE, "video output", usd_m(s.video_output));
+    for r in ["360p", "720p", "1080p", "4k"] {
+        if let Some(t) = tokens_per_second(r) {
+            c.row(
+                PRICE,
+                format!("{r} video"),
+                format!("{} per second ({} tokens)", usd(t * s.video_output / 1e6), card::n(t as u64)),
+            );
+        }
+    }
+    c
+}
+
 /// The video output tokens per second of each resolution (the price list).
 fn tokens_per_second(resolution: &str) -> Option<f64> {
     match resolution {

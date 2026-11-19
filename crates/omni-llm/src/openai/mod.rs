@@ -721,6 +721,12 @@ impl Provider for OpenAi {
         }
         self.build(input, presets, blobs).await
     }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        if images::is_image_model(model) {
+            return images::card(model);
+        }
+        model_spec(model).map(chat_card)
+    }
     async fn stream(
         &self,
         p: &Prepared,
@@ -795,6 +801,92 @@ fn withheld_ahead(history: &[omni_core::Turn], model: &str, body: &Value) -> Opt
         &[("end_user_mismatch".to_string(), other_user), ("prefix_mismatch".to_string(), other_tools)],
         "withholds",
     )
+}
+
+// ------------------------------------------------------------------ card
+
+/// A multiple of a price: `×2`, `×0.5`.
+fn times(v: f64) -> String {
+    format!("×{}", if v.fract() == 0.0 { format!("{v:.0}") } else { v.to_string() })
+}
+
+/// What `/model` shows for a chat model of the table.
+fn chat_card(s: &'static ModelSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, PRICE, REASONING, TOOLS, usd, usd_m};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.row(
+        LIMITS,
+        "max output",
+        format!("{} (reasoning included; the bot asks for all of it)", card::tokens(s.max_output)),
+    );
+    c.caps(&Caps { spec: Some(s), image_tool: false });
+    if s.summary {
+        c.row(REASONING, "summary", "detailed (sent)");
+    }
+    if s.efforts.is_some() {
+        let earlier = if s.all_turns {
+            "kept (reasoning.context: all_turns, sent)"
+        } else {
+            "dropped by the API (it keeps only the current turn's)"
+        };
+        c.row(REASONING, "earlier turns' reasoning", earlier);
+    }
+    if s.reuse_checks {
+        c.row(
+            REASONING,
+            "reuse",
+            "only for the same user and the same tools (else OpenAI withholds it and the bot says so)",
+        );
+    }
+    c.row(TOOLS, "+i", "GPT-Image-2.6 Sunburst as a tool (q=, bg=, size=, ar=)");
+    c.row(INPUT, "images", format!("detail {}", s.image_detail));
+    c.row(
+        INPUT,
+        "files",
+        "PDFs (detail high), Office documents, spreadsheets and about 100 text and code types natively; \
+         other text files inline",
+    );
+    c.row(INPUT, "audio, video", "not taken");
+    let p = s.price;
+    c.row(PRICE, "input", usd_m(p.input));
+    if p.cached < p.input {
+        c.row(PRICE, "cached input", usd_m(p.cached));
+    } else {
+        c.row(PRICE, "cached input", "no discount (billed as input)");
+    }
+    if let Some(w) = p.cache_write {
+        c.row(PRICE, "cache write", format!("{} (30-minute cache), {} (12-hour) / 1M tokens", usd(w), usd(2.0 * w)));
+    }
+    c.row(PRICE, "output", format!("{} (reasoning included)", usd_m(p.output)));
+    if s.long_context {
+        c.row(PRICE, "over 272K input tokens", "input and cache ×2, output ×1.5, for the whole request");
+    }
+    if let Some((from, q)) = s.price_from {
+        c.row(
+            PRICE,
+            format!("from {}", card::utc(from)),
+            format!("{} input, {} cached, {} output / 1M tokens", usd(q.input), usd(q.cached), usd(q.output)),
+        );
+    }
+    if s.flex {
+        c.row(PRICE, "tier=flex", times(0.5));
+    }
+    if let Some(f) = s.fast {
+        c.row(PRICE, "tier=priority / fast", times(f));
+    }
+    if let Some(u) = s.ultrafast {
+        let later = s.ultrafast_from.map(|(from, m)| format!(", {} from {}", times(m), card::utc(from)));
+        c.row(PRICE, "tier=ultrafast", format!("{}{}", times(u), later.unwrap_or_default()));
+    }
+    c.row(PRICE, "+s web search", format!("{} per call", usd(WEB_SEARCH_PER_CALL)));
+    c.row(PRICE, "+c code interpreter", format!("{} per container (a 20-minute 1 GB session)", usd(CONTAINER_SESSION)));
+    c.row(PRICE, "+i images", "at the image model's token rates");
+    if !s.aliases.is_empty() {
+        c.row(NOTES, "also called", s.aliases.join(", "));
+    }
+    c.row(NOTES, "dated snapshots", format!("{}-YYYY-MM-DD ids use this entry", s.id));
+    c
 }
 
 // ------------------------------------------------------------------ cost

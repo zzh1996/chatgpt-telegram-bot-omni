@@ -160,6 +160,59 @@ pub fn betas(model: &str, body: &Value) -> Vec<&'static str> {
     out
 }
 
+/// What `/model` shows for a model of the table.
+fn card(s: &'static ModelSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, PRICE, REASONING, TOOLS, usd, usd_m};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.row(LIMITS, "max output", format!("{} (thinking included)", card::tokens(s.max_output)));
+    c.caps(&Caps(Some(s), s.max_output));
+    let thinking = match s.thinking {
+        Thinking::Adaptive { budget: false } => "adaptive, with the effort level",
+        Thinking::Adaptive { budget: true } => "adaptive, with the effort level (a manual budget= still accepted)",
+        Thinking::Budget => "manual budget only (the bot sends the largest: max_tokens - 1)",
+    };
+    c.row(REASONING, "thinking", thinking);
+    let off = match s.off {
+        Off::Never => "cannot be turned off",
+        Off::Disabled => "e=none sends thinking: disabled",
+        Off::BetweenTools => "e=none sends between_tools (progress notes between tool calls only)",
+    };
+    c.row(REASONING, "off", off);
+    if s.display_omitted {
+        c.row(REASONING, "display", "summarized (sent; the API's default hides the thinking)");
+    }
+    if s.strips_thinking {
+        c.row(REASONING, "earlier turns' thinking", "kept (clear_thinking with keep: all; the API's default drops it)");
+    }
+    let web = if s.dynamic_web { "with dynamic filtering (the _20260318 versions)" } else { "the basic versions" };
+    c.row(TOOLS, "web tools", web);
+    c.row(INPUT, "images, PDFs", "natively; text files as text documents");
+    c.row(INPUT, "audio, video", "not taken");
+    c.row(PRICE, "input", usd_m(s.input));
+    c.row(PRICE, "cache read", format!("{} (×{} input)", usd_m(s.input * s.cache_read), s.cache_read));
+    c.row(
+        PRICE,
+        "cache write",
+        format!("{} (5 minutes), {} (1 hour) / 1M tokens", usd(s.input * 1.25), usd(s.input * 2.0)),
+    );
+    c.row(PRICE, "output", format!("{} (thinking included)", usd_m(s.output)));
+    if let Some(l) = s.long {
+        c.row(
+            PRICE,
+            format!("prompts over {} tokens", card::n(l.above)),
+            format!("{} input, {} output / 1M tokens", usd(l.input), usd(l.output)),
+        );
+    }
+    if let Some(f) = s.fast {
+        let beta = if f.beta { " (beta)" } else { "" };
+        c.row(PRICE, "tier=fast", format!("{} input, {} output / 1M tokens{beta}", usd(f.input), usd(f.output)));
+    }
+    c.row(PRICE, "+s web search", format!("{} per search", usd(models::WEB_SEARCH_USD)));
+    c.row(NOTES, "dated snapshots", format!("{}-YYYYMMDD ids use this entry", s.id));
+    c
+}
+
 /// What the Messages API offers for a model (the platform's own API, so this
 /// is the official capability set). Unknown models: everything the API has,
 /// left to the API to check. With the request's `max_tokens` (the largest
@@ -343,6 +396,9 @@ impl Provider for Anthropic {
     }
     fn knows(&self, model: &str) -> bool {
         models::model_spec(model).is_some()
+    }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        models::model_spec(model).map(card)
     }
 
     async fn prepare(

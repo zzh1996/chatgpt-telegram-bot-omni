@@ -267,6 +267,58 @@ pub fn native_root(base_url: &str) -> String {
     }
 }
 
+/// What `/model` shows for an image model of the table.
+pub fn card(s: &'static Spec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, OUTPUT, PRICE, REASONING};
+    let mut c = card::ModelCard::default();
+    c.caps(&Caps(Some(s)));
+    match s.thinking {
+        Thinking::EnableThinking => {
+            c.row(REASONING, "thinking", "enable_thinking (with prompt rewriting)");
+        }
+        Thinking::ThinkingMode => {
+            c.row(REASONING, "thinking", "thinking_mode (text to image only)");
+        }
+        Thinking::None => {}
+    }
+    if !s.tiers.is_empty() {
+        let tiers: Vec<String> =
+            s.tier_pixels.iter().map(|(t, px)| format!("{t} ({} px at 1:1)", card::n(*px))).collect();
+        c.row(OUTPUT, "size tiers (size=)", tiers.join(", "));
+    }
+    c.row(
+        OUTPUT,
+        "pixels",
+        format!(
+            "{} to {} (with input images {} to {})",
+            card::n(s.pixels.0),
+            card::n(s.pixels.1),
+            card::n(s.pixels_edit.0),
+            card::n(s.pixels_edit.1)
+        ),
+    );
+    if s.max_ratio > 0 {
+        c.row(OUTPUT, "aspect ratio", format!("within 1:{0} to {0}:1", s.max_ratio));
+    }
+    if let Some(d) = s.default_t2i {
+        c.row(OUTPUT, "default size", format!("{d} (the largest)"));
+    }
+    if s.max_n > 1 {
+        c.row(OUTPUT, "images per request (n=)", format!("1 to {}", s.max_n));
+    }
+    let refs =
+        if s.min_refs > 0 { format!("{} to {}", s.min_refs, s.max_refs) } else { format!("up to {}", s.max_refs) };
+    c.row(INPUT, "input images", refs);
+    if s.input_cny > 0.0 {
+        c.row(PRICE, "per input image", card::cny(s.input_cny));
+    }
+    c.pixel_tiers(s.output_cny, card::cny);
+    if let Some(e) = s.extended_cny {
+        c.row(PRICE, "with rewrite=on", format!("{} per image", card::cny(e)));
+    }
+    c
+}
+
 struct Caps(Option<&'static Spec>);
 
 impl RouteCaps for Caps {

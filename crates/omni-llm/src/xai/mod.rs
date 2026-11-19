@@ -387,6 +387,15 @@ impl Provider for Xai {
     fn knows(&self, model: &str) -> bool {
         model_spec(model).is_some() || imagine::image_spec(model).is_some() || imagine::video_spec(model).is_some()
     }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        if let Some(s) = imagine::image_spec(model) {
+            return Some(imagine::image_card(s));
+        }
+        if let Some(s) = imagine::video_spec(model) {
+            return Some(imagine::video_card(s));
+        }
+        model_spec(model).map(card)
+    }
     async fn prepare(
         &self,
         input: &CallInput<'_>,
@@ -431,6 +440,33 @@ pub fn video_continuation(p: &Prepared, item: &Value) -> Prepared {
 
 /// The dialect of xAI's video jobs (resumable from a checkpoint).
 pub const VIDEO_DIALECT: &str = imagine::VIDEO_DIALECT;
+
+// ------------------------------------------------------------------ card
+
+/// What `/model` shows for a Grok chat model.
+fn card(s: &'static ModelSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, PRICE, REASONING, TOOLS, usd, usd_m};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.caps(&Caps(Some(s)));
+    if s.reasoning {
+        c.row(REASONING, "earlier turns' reasoning", "kept (encrypted, replayed)");
+    }
+    c.row(TOOLS, "+i", "Grok Imagine images inside the conversation (edits in replies)");
+    c.row(INPUT, "takes", "JPEG and PNG images (detail high), PDFs and text files");
+    c.row(INPUT, "audio, video, other documents", "not taken");
+    c.row(PRICE, "input", usd_m(s.price.input));
+    c.row(PRICE, "cached input", usd_m(s.price.cached));
+    c.row(PRICE, "output", format!("{} (reasoning included)", usd_m(s.price.output)));
+    c.row(PRICE, format!("prompts of {}+ tokens", card::n(LONG_CONTEXT_FROM)), "every token ×2");
+    c.row(PRICE, "tier=priority / fast", "×2");
+    c.row(PRICE, "+s / +c tool calls", format!("{} per call", usd(TOOL_CALL)));
+    c.row(PRICE, "+i", format!("from {} per image (Imagine rates; xAI reports the billed cost)", usd(IMAGE_TOOL_CALL)));
+    if !s.aliases.is_empty() {
+        c.row(NOTES, "also called", s.aliases.join(", "));
+    }
+    c
+}
 
 // ------------------------------------------------------------------ cost
 

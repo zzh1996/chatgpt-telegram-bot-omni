@@ -221,6 +221,53 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
 }
 
 /// What Alibaba's API offers for a model (the vendor's own API: official = route).
+/// What `/model` shows for a chat model of the table.
+fn card(s: &'static ModelSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, PRICE, REASONING, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    let out = match s.max_output_thinking {
+        Some(t) => format!("{} ({} when thinking)", card::tokens(s.max_output), card::n(t)),
+        None => card::tokens(s.max_output),
+    };
+    c.row(LIMITS, "max output", out);
+    if let Some(cot) = s.max_cot {
+        c.row(LIMITS, "longest chain of thought", card::tokens(cot));
+    }
+    c.caps(&Caps { spec: s, responses: false });
+    let thinking = match s.thinking {
+        Thinking::Hybrid => "hybrid: on by default (sent), e=none turns it off",
+        Thinking::Always => "always on",
+    };
+    c.row(REASONING, "thinking", thinking);
+    c.row(REASONING, "earlier turns' reasoning", "kept (preserve_thinking, sent)");
+    c.row(TOOLS, "+s, +c, +u", "on Alibaba's Responses API (no thinking budget there)");
+    if s.code_needs_thinking {
+        c.row(TOOLS, "+c", "needs thinking on");
+    }
+    c.row(
+        INPUT,
+        "takes",
+        if s.vision {
+            "images (high resolution, sent) and video; text files inline"
+        } else {
+            "text only (text files inline)"
+        },
+    );
+    let mut low = 0;
+    for t in s.tiers {
+        let label = if s.tiers.len() == 1 {
+            "tokens".to_string()
+        } else {
+            format!("prompts of {}K to {}K tokens", low / 1000, t.up_to / 1000)
+        };
+        c.row(PRICE, label, card::token_price(Currency::Cny, &t.price));
+        low = t.up_to;
+    }
+    c.row(PRICE, "+s web search", format!("{} per search", card::cny(WEB_SEARCH_CNY)));
+    c
+}
+
 struct Caps<'a> {
     spec: &'a ModelSpec,
     /// The request goes to the Responses API (web search, the code
@@ -696,6 +743,17 @@ impl Provider for Alibaba {
     }
     fn knows(&self, model: &str) -> bool {
         model_spec(model).is_some() || images::spec(model).is_some() || video::spec(model).is_some()
+    }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        let mut c = if let Some(s) = images::spec(model) {
+            images::card(s)
+        } else if let Some(s) = video::spec(model) {
+            video::card(s)
+        } else {
+            card(model_spec(model)?)
+        };
+        c.cny_rate(self.cfg.cny_per_usd);
+        Some(c)
     }
     async fn prepare(
         &self,

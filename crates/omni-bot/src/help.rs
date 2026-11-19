@@ -117,9 +117,9 @@ const INTRO_ZH: &str = r#"我用各家的 AI 模型回答问题。每个模型�
 | 回复 /info | 请求详情 |
 | 回复 /retry | 重新生成失败的回答 |
 | 回复 /continue | 让写到长度预算停下的长回答接着写 |
-| /prefix | 本聊天自己的前缀（自定义 chatbot） |
-| /stats | 本聊天的用量和费用 |
-| /usage | 本聊天的限额 |
+| /prefix | 这个群或私聊自己的前缀（自定义 chatbot） |
+| /stats | 这个群或私聊的用量和费用 |
+| /usage | 这个群或私聊的限额 |
 | /ping | 各种 id，以及我在这里能不能用 |
 | /help_zh | 这份帮助；`/help_zh options` 单看一个主题 |
 
@@ -192,7 +192,7 @@ const TOPICS: &[Topic] = &[
         who: Who::Everyone,
         body: r#"- /models — every prefix of this bot and the model it calls.
 - `/models word` — search prefixes and models.
-- `/model c` — the model a prefix calls and which API serves it; for OpenRouter models also its inputs, reasoning levels, longest output, prices and endpoints.
+- `/model c` — the model a prefix calls, which API serves it, and what the bot knows of it: limits, reasoning levels and the default, tools, inputs, service tiers, prices, and the settings it sends by default; for OpenRouter models the whole catalog entry, readable, and every endpoint.
 
 **Prefixes**: a prefix is a short name for a model with its options.{DIRECT_IDS}
 
@@ -203,7 +203,7 @@ const TOPICS: &[Topic] = &[
         title_zh: "🧩 模型和前缀",
         body_zh: r#"- /models — 这个 bot 的所有前缀，以及它们调用的模型。
 - `/models 关键词` — 搜索前缀和模型。
-- `/model c` — 前缀调用的是哪个模型、由哪个 API 提供；OpenRouter 的模型还会列出输入类型、推理档位、最长输出、价格和 endpoint。
+- `/model c` — 前缀调用的是哪个模型、由哪个 API 提供，以及 bot 知道的全部信息：上下文和输出上限、推理档位和默认档、工具、能输入什么、服务等级、价格，还有默认发出的参数；OpenRouter 的模型显示完整的目录信息（整理成表格）和每个 endpoint。
 
 **前缀**：前缀是"模型 + 选项"的简称。{DIRECT_IDS}
 
@@ -400,8 +400,8 @@ Then `pirate$Who are you?` sends that system prompt and history, then your messa
 - `/unprefix pirate` deletes one (its creator or an admin). Answers made with it can still be continued.
 - When you use it you can add options (`pirate+e=low$…`) and `::user` / `::assistant` lines, but not `::system`.
 - A prefix starts a new conversation, so it does not work with /m."#,
-        title_zh: "🏷️ 本聊天自己的前缀",
-        body_zh: r#"这里的任何人都可以把"模型、选项、system prompt 和一小段历史"存成本聊天的前缀，相当于一个自定义 chatbot：
+        title_zh: "🏷️ 群或私聊自己的前缀",
+        body_zh: r#"这里的任何人都可以把"模型、选项、system prompt 和一小段历史"存成这里的前缀，相当于一个自定义 chatbot：
 ```
 /prefix pirate c+s$::system
 你是一个海盗。
@@ -414,7 +414,7 @@ Arr!
 - 也可以对我的某条回答回复 `/prefix pirate`：那段对话连同它的模型和选项就成了前缀。
 - 名字：3 到 16 个字母或数字，不能和已有的重名。前缀只属于这个聊天（一个聊天最多 200 个）。
 - 历史要以一轮 `::assistant` 结尾，或者只有 system prompt。
-- /prefix 列出本聊天的前缀；`/prefix pirate` 查看其中一个。
+- /prefix 列出这里的前缀；`/prefix pirate` 查看其中一个。
 - `/unprefix pirate` 删除一个（创建者或管理员）。用它生成的回答仍然可以接着聊。
 - 使用时可以加选项（`pirate+e=low$…`），也可以加 `::user` / `::assistant` 行，但不能加 `::system`。
 - 前缀会开始一段新对话，所以不能用在 /m 里。"#,
@@ -515,11 +515,11 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 
 **Faster tiers** (`tier=priority`, fast modes) cost more and are only for priority users."#,
         title_zh: "📊 费用、统计和限额",
-        body_zh: r#"- /stats — 最近 30 天这个 bot 在本聊天的用量：按模型统计的 API 调用次数（每次重试都算）、token 和费用（群里还按人统计）。
+        body_zh: r#"- /stats — 最近 30 天这个 bot 在这里的用量：按模型统计的 API 调用次数（每次重试都算）、token 和费用（群里还按人统计）。
 - `/stats today`、`/stats 7d`、`/stats 30d`、`/stats all` — 其他时间段，按 bot 所在时区的自然日计算。
 - 群里：`/stats user_id`，或者回复某人的消息发 /stats，只看这个成员。
-- /usage — 本聊天的限额，以及你在这里的限额。
-- /quota — 本聊天的全部限额和余额：整个聊天的、每个成员的、某个人单独的（`/quota user_id`，或者回复某人的消息发 /quota）；`/quota members` 列出每个成员的余额，余额最少的在前。只有管理员能修改。
+- /usage — 这里的限额，以及你在这里的限额。
+- /quota — 这里的全部限额和余额：整个群或私聊的、每个成员的、某个人单独的（`/quota user_id`，或者回复某人的消息发 /quota）；`/quota members` 列出每个成员的余额，余额最少的在前。只有管理员能修改。
 
 **限额**：管理员可以给这个聊天、每个成员或者某个人设一个每天恢复的额度（USD）。用完后，新请求会被拒绝，直到额度恢复；提示里会写明是哪个限额、多久后恢复。
 
@@ -539,7 +539,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - In a group with several of these bots, a command without `@` goes to each of them; `/stats@name` to one."#,
         title_zh: "🔐 我在哪里能用",
         body_zh: r#"- 我只在管理员允许的聊天里回答。在其他地方只回答 /ping（以及管理员的 /allow）。
-- /ping — 本聊天的 id、你的 user id、本聊天是否被允许、你在这里是否被封禁，以及正在运行的是哪个版本（`build` 后面是 git commit）。把它发给管理员，就能申请使用。
+- /ping — 这里的 chat id、你的 user id、这里是否被允许、你在这里是否被封禁，以及正在运行的是哪个版本（`build` 后面是 git commit）。把它发给管理员，就能申请使用。
 - 在某个聊天被封禁的人，在那里仍然可以用 /help、/stats、/usage 和 /quota，但不能发起请求。
 - 我会忽略其他 bot 的消息，以及群里匿名管理员的消息。
 - 群里有好几个这样的 bot 时，不带 `@` 的命令每个 bot 都会处理；`/stats@name` 只发给其中一个。"#,

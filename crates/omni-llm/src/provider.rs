@@ -91,6 +91,11 @@ pub trait Provider: Send + Sync {
     async fn balance(&self) -> Option<anyhow::Result<Value>> {
         None
     }
+    /// What the bot knows about a model of its table, for `/model` (limits,
+    /// reasoning, tools, inputs, tiers, prices); `None` outside the table.
+    fn card(&self, _model: &str) -> Option<crate::card::ModelCard> {
+        None
+    }
 }
 
 /// What the bot knows about each direct provider (config, help, docs).

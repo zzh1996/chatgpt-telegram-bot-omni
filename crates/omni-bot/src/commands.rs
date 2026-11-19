@@ -704,6 +704,111 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
     Ok(())
 }
 
+/// A model card: each section a heading and a table of label / value rows.
+fn card_blocks(card: &omni_llm::card::ModelCard) -> Vec<RBlock> {
+    let mut out = Vec::new();
+    for s in &card.sections {
+        out.push(RBlock::Heading { level: 3, text: RText::plain(&s.title) });
+        out.push(pairs_table(&s.rows));
+    }
+    out
+}
+
+/// Label / value rows, the labels as header cells.
+fn pairs_table(rows: &[(String, String)]) -> RBlock {
+    let rows = rows
+        .iter()
+        .map(|(k, v)| {
+            vec![
+                RCell { text: RText::plain(k), header: true, align: CellAlign::Left },
+                RCell { text: RText::plain(v), header: false, align: CellAlign::Left },
+            ]
+        })
+        .collect();
+    RBlock::Table { rows, bordered: true, striped: false }
+}
+
+/// What the bot sends for this prefix when nothing else is asked: a dry run of
+/// the request a one-line question would make (its options, the config's
+/// presets and the bot's defaults), as the settings it applies. Nothing is sent.
+async fn sent_by_default(app: &Arc<App>, spec: &crate::conv::ResolvedSpec) -> Vec<RBlock> {
+    let presets = app.presets_for(&spec.canonical());
+    let history = [omni_core::Turn::user_text("hi")];
+    let input = omni_llm::CallInput {
+        model: &spec.model,
+        options: &spec.options,
+        history: &history,
+        session_id: None,
+        user: None,
+        known_context: None,
+        max_tokens_override: None,
+    };
+    let blobs = crate::rawlog::Blobs(app.blobs.clone());
+    let prepared = match spec.provider.as_str() {
+        "openrouter" => app.openrouter.prepare_chat(&input, &presets, &blobs).await,
+        id => match app.direct(id) {
+            Some(p) => p.prepare(&input, &presets, &blobs).await,
+            None => return Vec::new(),
+        },
+    };
+    let p = match prepared {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![
+                RBlock::Heading { level: 3, text: RText::plain("Sent by default") },
+                RBlock::Paragraph(RText::plain(format!("a request would be refused: {}", e.message))),
+            ];
+        }
+    };
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for a in &p.applied {
+        let source = match a.source.as_str() {
+            "option" => " (the prefix's option)",
+            "preset" => " (config preset)",
+            _ => "",
+        };
+        match &a.patch {
+            serde_json::Value::Object(m) => {
+                for (k, v) in m {
+                    flatten(k, v, &mut |path, v| rows.push((format!("{path}{source}"), compact(v))));
+                }
+            }
+            v => rows.push((format!("{}{source}", a.source), compact(v))),
+        }
+    }
+    let mut out = vec![RBlock::Heading { level: 3, text: RText::plain("Sent by default") }];
+    if rows.is_empty() {
+        out.push(RBlock::Paragraph(RText::plain("nothing beyond the question: the platform's defaults apply")));
+    } else {
+        out.push(pairs_table(&rows));
+    }
+    for n in p.notes.iter().chain(p.warnings.iter()) {
+        out.push(RBlock::Paragraph(RText::plain(n)));
+    }
+    out
+}
+
+/// The leaves of a JSON value, objects as dotted paths (`reasoning.effort`);
+/// arrays and empty objects stay whole.
+fn flatten(path: &str, v: &serde_json::Value, out: &mut dyn FnMut(&str, &serde_json::Value)) {
+    match v {
+        serde_json::Value::Object(m) if !m.is_empty() => {
+            for (k, v) in m {
+                flatten(&format!("{path}.{k}"), v, out);
+            }
+        }
+        v => out(path, v),
+    }
+}
+
+/// A JSON value on one line (strings without quotes).
+fn compact(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.to_string(),
+    }
+}
+
 /// What `/model` says of a prefix served by a platform's own API: "the OpenAI
 /// API", but "the Gemini API" (Google's platform name already is one).
 fn served_directly(name: &str) -> String {
@@ -737,34 +842,73 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
     if spec.provider != "openrouter" {
         let title = format!("{}{marker} → {}:{}{}", spec.label, spec.provider, spec.model, spec.options_syntax());
         let name = omni_llm::provider::info(&spec.provider).map(|i| i.name).unwrap_or(spec.provider.as_str());
-        let text = served_directly(name);
-        send(app, bot, ib, &title, vec![RBlock::Paragraph(RText::plain(text))]).await;
+        let mut blocks = vec![RBlock::Paragraph(RText::plain(served_directly(name)))];
+        match app.direct(&spec.provider).and_then(|p| p.card(&spec.model)) {
+            Some(card) => blocks.extend(card_blocks(&card)),
+            None => {
+                blocks.push(RBlock::Paragraph(RText::plain("not in the bot's model table: limits and price unknown")))
+            }
+        }
+        blocks.extend(sent_by_default(app, &spec).await);
+        send(app, bot, ib, &title, blocks).await;
         return Ok(());
     }
     let info = app.openrouter.model_info(&spec.model).await;
     let mut blocks = vec![];
     match info {
         Some(m) => {
-            blocks.push(RBlock::Pre { text: serde_json::to_string_pretty(&*m)?, language: "json".into() });
+            use omni_llm::openrouter::catalog;
+            if let Some(d) = m.description.as_deref().filter(|d| !d.trim().is_empty()) {
+                blocks.push(RBlock::Paragraph(RText::plain(d)));
+            }
+            blocks.extend(card_blocks(&catalog::card(&m)));
             match app.openrouter.endpoints(&spec.model).await {
                 Ok(eps) => {
+                    blocks.push(RBlock::Heading { level: 3, text: RText::plain("Endpoints") });
                     let first = app.openrouter.config().fidelity.first_party_for(&spec.model).map(str::to_string);
+                    let name = |e: &catalog::EndpointInfo| {
+                        let tag = e.tag.clone().unwrap_or_default();
+                        let mark = if first.as_deref() == e.base_slug() { " (first-party)" } else { "" };
+                        format!("{tag}{mark}")
+                    };
                     let rows = eps
                         .iter()
                         .map(|e| {
-                            let tag = e.tag.clone().unwrap_or_default();
-                            let mark = if first.as_deref() == e.base_slug() { " (first-party)" } else { "" };
+                            let price = catalog::endpoint_price(e)
+                                .map(|(i, o)| format!("{} / {}", omni_llm::card::usd(i), omni_llm::card::usd(o)))
+                                .unwrap_or_default();
+                            let uptime = e
+                                .extra
+                                .get("uptime_last_1d")
+                                .and_then(serde_json::Value::as_f64)
+                                .map(|u| format!("{u:.1}%"))
+                                .unwrap_or_default();
                             vec![
-                                format!("{tag}{mark}"),
+                                name(e),
                                 e.quantization.clone().unwrap_or_default(),
-                                e.max_completion_tokens.map(|x| x.to_string()).unwrap_or_default(),
+                                e.max_completion_tokens.map(omni_llm::card::n).unwrap_or_default(),
+                                price,
+                                uptime,
                             ]
                         })
                         .collect();
-                    blocks.push(table(&["endpoint", "quant", "max out"], rows));
+                    blocks.push(table(&["endpoint", "quant", "max out", "$/1M in / out", "uptime 1d"], rows));
+                    for e in eps.iter() {
+                        blocks.push(RBlock::Details {
+                            open: false,
+                            title: RText::plain(format!("endpoint {}", name(e))),
+                            blocks: vec![pairs_table(&catalog::endpoint_rows(e))],
+                        });
+                    }
                 }
                 Err(e) => blocks.push(RBlock::Paragraph(RText::plain(format!("endpoints: {e:#}")))),
             }
+            blocks.extend(sent_by_default(app, &spec).await);
+            blocks.push(RBlock::Details {
+                open: false,
+                title: RText::plain("full catalog entry"),
+                blocks: vec![RBlock::Pre { text: serde_json::to_string_pretty(&*m)?, language: "json".into() }],
+            });
         }
         None => {
             blocks.push(RBlock::Paragraph(RText::plain(format!("{} is not in the OpenRouter catalog", spec.model))))

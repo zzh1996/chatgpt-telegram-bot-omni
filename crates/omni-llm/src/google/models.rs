@@ -353,6 +353,118 @@ fn guess(model: &str) -> ModelSpec {
     }
 }
 
+/// What `/model` shows for a model of the table (`budget`: the long-decode
+/// budget the bot asks for across continuations).
+pub fn card(s: &ModelSpec, budget: u64) -> crate::card::ModelCard {
+    use super::pricing::{self, Grounding, Rates, Tier};
+    use crate::card::{self, INPUT, LIMITS, OUTPUT, PRICE, REASONING, TOOLS, usd};
+    let mut c = card::ModelCard::default();
+    let shared = if s.unified { " (input, thinking and output share it)" } else { "" };
+    c.row(LIMITS, "context window", format!("{}{shared}", card::tokens(s.context)));
+    c.row(LIMITS, "max output", format!("{} per request", card::tokens(s.max_output)));
+    if s.long_decode {
+        c.row(
+            LIMITS,
+            "long decode",
+            format!(
+                "{} across continuations by default (at most the window minus the input; /continue goes on)",
+                card::tokens(budget)
+            ),
+        );
+    }
+    c.caps(&Caps(s));
+    if !matches!(s.thinking, Thinking::Unsupported) {
+        c.row(REASONING, "thought summaries", "included (includeThoughts, sent)");
+    }
+    if s.search_with_maps {
+        c.row(TOOLS, "+s with +m", "Search and Maps together in one request");
+    }
+    if s.tool_invocations {
+        c.row(TOOLS, "tool calls", "the tools' own calls and results are shown");
+    }
+    if s.image_search {
+        c.row(TOOLS, "+s", "searches images as well as the web");
+    }
+    let i = s.inputs;
+    let mut takes = vec!["text files"];
+    for (on, what) in [
+        (i.image, "images"),
+        (i.pdf, "PDFs"),
+        (i.audio, "audio"),
+        (i.video, "video and YouTube links"),
+        (i.office, "Office and OpenDocument files"),
+    ] {
+        if on {
+            takes.push(what);
+        }
+    }
+    c.row(INPUT, "takes", takes.join(", "));
+    if s.per_part_media_resolution {
+        c.row(INPUT, "media resolution", "the highest: images ultra high, PDFs and video high (sent per part)");
+    }
+    if let Some(o) = s.image_out {
+        c.row(OUTPUT, "sizes (size=)", o.sizes.join(", "));
+        c.row(OUTPUT, "aspect ratios (ar=)", o.ratios.join(", "));
+        if let Some(f) = o.free_size {
+            c.row(OUTPUT, "default size", format!("{f} (costs the same as the smaller one)"));
+        }
+    }
+    let rates = |r: &Rates| {
+        let mut parts = vec![format!("input {}", usd(r.input))];
+        if let Some(a) = r.input_audio {
+            parts.push(format!("audio input {}", usd(a)));
+        }
+        if r.cached < r.input {
+            parts.push(format!("cached {}", usd(r.cached)));
+        }
+        if let Some(a) = r.cached_audio {
+            parts.push(format!("cached audio {}", usd(a)));
+        }
+        parts.push(format!("output {}", usd(r.output)));
+        if let Some(img) = r.image_output {
+            parts.push(format!("images {}", usd(img)));
+        }
+        format!("{} / 1M tokens", parts.join(", "))
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let mut tiers = vec![Tier::Standard];
+    tiers.extend(s.tiers.iter().filter_map(|t| Tier::parse(t)));
+    let mut grounding = None;
+    for tier in tiers {
+        let Some(p) = pricing::price(s.id, tier, now) else { continue };
+        grounding.get_or_insert(p.grounding);
+        c.row(PRICE, tier.name(), rates(&p.base));
+        if let Some(o) = p.over_200k {
+            c.row(PRICE, format!("{} over 200K input tokens", tier.name()), rates(&o));
+        }
+        for change in [pricing::DEC_1_2026, pricing::JAN_1_2027] {
+            if change > now
+                && let Some(later) = pricing::price(s.id, tier, change).filter(|l| *l != p)
+            {
+                c.row(PRICE, format!("{} from {}", tier.name(), card::utc(change)), rates(&later.base));
+            }
+        }
+    }
+    match grounding {
+        Some(Grounding::PerQuery(q)) if s.tools.contains(&Tool::Search) => {
+            c.row(
+                PRICE,
+                "+s / +m queries",
+                format!("{} per 1,000 after a free monthly allowance (shown after the cost)", usd(q * 1000.0)),
+            );
+        }
+        Some(Grounding::PerPrompt { search, maps }) => {
+            c.row(
+                PRICE,
+                "grounded prompts",
+                format!("+s {}, +m {} per 1,000", usd(search * 1000.0), usd(maps * 1000.0)),
+            );
+        }
+        _ => {}
+    }
+    c
+}
+
 /// What the Gemini API offers for a model (the vendor's own API: official = route).
 pub struct Caps<'a>(pub &'a ModelSpec);
 

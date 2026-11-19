@@ -250,6 +250,36 @@ fn replay(p: &Value) -> Value {
 pub const FLAVOR: Flavor = Flavor { dialect: DIALECT, image_detail: Some("xhigh"), replay };
 
 /// What Ark's Chat API offers (the vendor's own API, so official = route).
+/// What `/model` shows for a chat model of the table.
+fn card(s: &'static ModelSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, PRICE, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.row(LIMITS, "max answer", format!("{} (reasoning not included)", card::tokens(s.max_answer)));
+    c.caps(&ArkCaps(Some(s)));
+    c.row(TOOLS, "+s", "Doubao search (web_search_options)");
+    c.row(INPUT, "images", "detail xhigh (up to 9 MP)");
+    let rates = |r: &Rates| {
+        let mut parts = vec![format!("input {}", card::cny(r.input)), format!("cached {}", card::cny(r.cached))];
+        if let Some((a, ac)) = r.audio {
+            parts.push(format!("audio input {}, cached audio {}", card::cny(a), card::cny(ac)));
+        }
+        parts.push(format!("output {}", card::cny(r.output)));
+        format!("{} / 1M tokens", parts.join(", "))
+    };
+    for (tier, tiers) in [("standard", s.standard), ("tier=fast", s.fast), ("tier=flex", s.flex)] {
+        let mut low = 0;
+        for (k, r) in tiers {
+            let label = if tiers.len() == 1 { tier.to_string() } else { format!("{tier}, prompts {low}K to {k}K") };
+            c.row(PRICE, label, rates(r));
+            low = *k;
+        }
+    }
+    c.row(PRICE, "+s web search", format!("up to {} per search (monthly packs cost less)", card::cny(WEB_SEARCH_CNY)));
+    c.row(NOTES, "matches", format!("ids starting with {} (dated versions)", s.prefix));
+    c
+}
+
 struct ArkCaps(Option<&'static ModelSpec>);
 
 impl crate::request::RouteCaps for ArkCaps {
@@ -466,6 +496,17 @@ impl crate::provider::Provider for Ark {
     }
     fn knows(&self, model: &str) -> bool {
         model_spec(model).is_some() || images::spec(model).is_some() || video::spec(model).is_some()
+    }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        let mut c = if let Some(s) = images::spec(model) {
+            images::card(s)
+        } else if let Some(s) = video::spec(model) {
+            video::card(s)
+        } else {
+            card(model_spec(model)?)
+        };
+        c.cny_rate(self.cfg.cny_per_usd);
+        Some(c)
     }
     async fn prepare(
         &self,

@@ -221,6 +221,63 @@ const MAX_EDIT_IMAGES: usize = 5;
 /// Images xAI takes as input ("JPEG, PNG, or WebP").
 const INPUT_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp"];
 
+/// What `/model` shows for a Grok Imagine image model.
+pub fn image_card(s: &ImageSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, NOTES, OUTPUT, PRICE, usd};
+    let mut c = card::ModelCard::default();
+    c.caps(&Caps { quality: s.quality, count: true, background: true, seconds: false, audio: false });
+    if s.quality {
+        c.row(OUTPUT, "quality (q=)", QUALITIES.join(", "));
+    }
+    c.row(OUTPUT, "sizes (size=)", "1K, 2K");
+    c.row(OUTPUT, "aspect ratios", IMAGE_RATIOS.join(", "));
+    c.row(OUTPUT, "backgrounds (bg=)", BACKGROUNDS.join(", "));
+    c.row(OUTPUT, "images per request (n=)", format!("1 to {MAX_N}"));
+    c.row(INPUT, "images to edit", format!("up to {MAX_EDIT_IMAGES} (JPEG, PNG, WebP)"));
+    c.row(PRICE, "1K image", usd(s.per_image.0));
+    c.row(PRICE, "2K image", usd(s.per_image.1));
+    if s.per_image_medium > 0.0 {
+        c.row(PRICE, "q=medium", format!("{} more per image", usd(s.per_image_medium)));
+    }
+    if s.per_input_image > 0.0 {
+        c.row(PRICE, "edits", format!("{} per input image", usd(s.per_input_image)));
+    }
+    if !s.aliases.is_empty() {
+        c.row(NOTES, "also called", s.aliases.join(", "));
+    }
+    c
+}
+
+/// What `/model` shows for a Grok Imagine video model.
+pub fn video_card(s: &VideoSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, OUTPUT, PRICE, usd};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "length (sec=)", "1 to 15 seconds (xAI's default 8)");
+    c.caps(&Caps { quality: false, count: false, background: false, seconds: true, audio: true });
+    c.row(
+        OUTPUT,
+        "resolution",
+        format!("up to {} (xAI's default 480p; size=1K → 720p, size=2K → 1080p)", s.max_resolution),
+    );
+    c.row(OUTPUT, "aspect ratios", VIDEO_RATIOS.join(", "));
+    c.row(OUTPUT, "sound (audio=)", "on by default");
+    let mut takes = vec!["a first frame".to_string()];
+    if s.references > 0 {
+        takes.push(format!("up to {} reference images (up to {} s)", s.references, s.reference_seconds));
+    }
+    if s.edit {
+        takes.push("a video to edit".into());
+    }
+    c.row(INPUT, "takes", takes.join(", "));
+    for (r, usd_s) in s.per_second {
+        c.row(PRICE, *r, format!("{} per second", usd(*usd_s)));
+    }
+    if !s.aliases.is_empty() {
+        c.row(NOTES, "also called", s.aliases.join(", "));
+    }
+    c
+}
+
 /// What the Imagine API takes for a model (official = route).
 struct Caps {
     quality: bool,

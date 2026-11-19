@@ -136,6 +136,31 @@ pub fn size_for(s: &Sizes, target: u64, ratio: (u64, u64)) -> Result<(u32, u32),
 }
 
 /// What Zhipu's image API takes (the vendor's own API: official = route).
+/// What `/model` shows for an image model of the table.
+pub fn card(s: &'static Spec) -> crate::card::ModelCard {
+    use crate::card::{self, OUTPUT, PRICE};
+    let mut c = card::ModelCard::default();
+    c.caps(&Caps(Some(s)));
+    c.row(OUTPUT, "quality (q=)", s.qualities.join(", "));
+    let z = s.sizes;
+    c.row(
+        OUTPUT,
+        "sizes",
+        format!(
+            "sides {} to {} px in steps of {}, at most {} pixels",
+            z.min_side,
+            z.max_side,
+            z.multiple,
+            card::n(z.max_pixels)
+        ),
+    );
+    if s.task {
+        c.row(OUTPUT, "runs as", "an async task (polled)");
+    }
+    c.row(PRICE, "per image", if s.price_cny == 0.0 { "free".to_string() } else { card::cny(s.price_cny) });
+    c
+}
+
 struct Caps(Option<&'static Spec>);
 
 impl RouteCaps for Caps {

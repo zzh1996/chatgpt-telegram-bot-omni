@@ -434,6 +434,37 @@ pub fn is_video_model(model: &str) -> bool {
         || matches!(model, "video-style-transform" | "videoretalk")
 }
 
+/// What `/model` shows for a video model of the table.
+pub fn card(s: &'static Spec) -> crate::card::ModelCard {
+    use crate::card::{self, LIMITS, OUTPUT, PRICE};
+    let mut c = card::ModelCard::default();
+    let length = match s.seconds {
+        Seconds::Range(a, b) => format!("{a} to {b} seconds"),
+        Seconds::Set(v) => format!("{} seconds", v.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),
+        Seconds::Fixed(n) => format!("always {n} seconds"),
+        Seconds::Input => "the input video's".to_string(),
+    };
+    c.row(LIMITS, "length", length);
+    c.caps(&Caps(Some(s)));
+    c.row(OUTPUT, "resolutions", format!("{} (the last is the default)", s.resolutions.join(", ")));
+    if !s.ratios.is_empty() {
+        c.row(OUTPUT, "aspect ratios", s.ratios.join(", "));
+    }
+    let sound = match (s.audio, s.audio_switch) {
+        (true, true) => "on (audio=off turns it off)",
+        (true, false) => "always",
+        (false, _) => "none",
+    };
+    c.row(OUTPUT, "sound", sound);
+    for (r, cny) in s.price {
+        c.row(PRICE, r.to_string(), format!("{} per second", card::cny(*cny)));
+    }
+    for (r, cny) in s.silent_price {
+        c.row(PRICE, format!("{r} silent"), format!("{} per second", card::cny(*cny)));
+    }
+    c
+}
+
 struct Caps(Option<&'static Spec>);
 
 impl RouteCaps for Caps {

@@ -195,6 +195,41 @@ pub fn spec(model: &str) -> Option<&'static Spec> {
 }
 
 /// What Ark's image API takes for a model (the vendor's own API: official = route).
+/// What `/model` shows for a Seedream model of the table.
+pub fn card(s: &'static Spec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, NOTES, OUTPUT, PRICE, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.caps(&Caps(Some(s)));
+    c.row(OUTPUT, "resolution tiers (size=)", s.tiers.join(", "));
+    c.row(OUTPUT, "explicit sizes", format!("{} to {} pixels", card::n(s.pixels.0), card::n(s.pixels.1)));
+    if s.groups {
+        c.row(OUTPUT, "image groups", "yes (several related images, streamed)");
+    }
+    if s.formats {
+        c.row(OUTPUT, "formats", "output_format can be set");
+    }
+    if !s.backgrounds.is_empty() {
+        c.row(OUTPUT, "backgrounds (bg=)", s.backgrounds.join(", "));
+    }
+    if !s.prompt_modes.is_empty() {
+        c.row(OUTPUT, "prompt optimization", s.prompt_modes.join(", "));
+    }
+    if s.web_search {
+        c.row(TOOLS, "web_search", "available");
+    }
+    c.row(INPUT, "reference images", format!("up to {}", s.max_refs));
+    if s.input_cny.0 > 0.0 || s.input_cny.1 > 0.0 {
+        c.row(
+            PRICE,
+            "input images",
+            format!("{} the first, {} each further one", card::cny(s.input_cny.0), card::cny(s.input_cny.1)),
+        );
+    }
+    c.pixel_tiers(s.output_cny, card::cny);
+    c.row(NOTES, "name in Ark's docs", s.name);
+    c
+}
+
 struct Caps(Option<&'static Spec>);
 
 impl RouteCaps for Caps {

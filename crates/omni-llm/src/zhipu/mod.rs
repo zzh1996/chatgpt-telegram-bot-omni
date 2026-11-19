@@ -226,6 +226,51 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
 
 /// What Zhipu's API offers for a model (the vendor's own API: official = route).
 /// Models outside the table get the general set; the API judges.
+/// What `/model` shows for a chat model of the table.
+fn card(s: &'static ModelSpec) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, PRICE, REASONING, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.row(LIMITS, "max output", card::tokens(s.max_output));
+    c.caps(&Caps(Some(s)));
+    let thinking = match s.thinking {
+        Thinking::Always(_) => "always on",
+        Thinking::Switch(_) => "on by default (e=none turns it off)",
+    };
+    c.row(REASONING, "thinking", thinking);
+    if s.search {
+        c.row(
+            TOOLS,
+            "+s",
+            format!("web_search with {SEARCH_ENGINE}, {SEARCH_COUNT} results, content {SEARCH_CONTENT_SIZE}"),
+        );
+    }
+    let mut takes = vec!["text files (inline)"];
+    for (on, what) in [(s.image, "images"), (s.video, "video"), (s.file, "PDF, Word, xlsx, pptx, txt and jsonl files")]
+    {
+        if on {
+            takes.push(what);
+        }
+    }
+    c.row(INPUT, "takes", takes.join(", "));
+    if s.prices.is_empty() {
+        c.row(PRICE, "tokens", "not on the CN price list (cost unknown)");
+    }
+    for t in s.prices {
+        let when = match (t.input_below, t.output_below) {
+            (Some(i), Some(o)) => format!("input under {}K and output under {} tokens", i / 1000, o),
+            (Some(i), None) => format!("input under {}K tokens", i / 1000),
+            (None, _) if s.prices.len() > 1 => "longer prompts".to_string(),
+            (None, _) => "tokens".to_string(),
+        };
+        c.row(PRICE, when, card::token_price(Currency::Cny, &t.price));
+    }
+    if s.search {
+        c.row(PRICE, "+s web search", format!("{} per search", card::cny(SEARCH_CNY)));
+    }
+    c
+}
+
 struct Caps(Option<&'static ModelSpec>);
 
 impl RouteCaps for Caps {
@@ -285,6 +330,17 @@ impl Provider for Zhipu {
     }
     fn knows(&self, model: &str) -> bool {
         model_spec(model).is_some() || images::spec(model).is_some() || videos::spec(model).is_some()
+    }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        let mut c = if let Some(s) = images::spec(model) {
+            images::card(s)
+        } else if let Some(s) = videos::spec(model) {
+            videos::card(s)
+        } else {
+            card(model_spec(model)?)
+        };
+        c.cny_rate(self.cfg.cny_per_usd);
+        Some(c)
     }
 
     async fn prepare(

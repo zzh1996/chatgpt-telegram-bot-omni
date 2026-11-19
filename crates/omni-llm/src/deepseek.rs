@@ -155,6 +155,33 @@ pub fn model_spec(model: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|m| m.id == model)
 }
 
+/// What `/model` shows for a model of the table.
+fn card(s: &'static ModelSpec, cny_per_usd: f64) -> crate::card::ModelCard {
+    use crate::card::{self, INPUT, LIMITS, NOTES, PRICE, TOOLS};
+    let mut c = card::ModelCard::default();
+    c.row(LIMITS, "context window", card::tokens(s.context));
+    c.row(LIMITS, "max output", card::tokens(s.max_output));
+    c.caps(&Caps(Some(s)));
+    match s.web {
+        WebTools::DeepSeek => {
+            c.row(TOOLS, "web tools", "deepseek_web_search (deep search when thinking) and deepseek_read_url");
+        }
+        WebTools::MessagesSearch => {
+            c.row(TOOLS, "web tools", "the Messages endpoint's web search tool");
+        }
+        WebTools::None => {}
+    }
+    c.row(INPUT, "images", if s.vision { "detail original" } else { "not taken" });
+    c.row(INPUT, "text files", "inline");
+    c.row(PRICE, "off-peak", card::token_price(Currency::Cny, &s.off_peak));
+    c.row(PRICE, "peak", card::token_price(Currency::Cny, &s.peak));
+    c.row(PRICE, "peak hours", "Beijing 9–12 and 14–18 on Chinese working days (judged at the request time)");
+    c.row(PRICE, "searches, fetches, image searches", format!("{} per 1,000 billed", card::cny(SEARCH_CNY * 1000.0)));
+    c.row(NOTES, "served by", s.serves);
+    c.cny_rate(cny_per_usd);
+    c
+}
+
 /// What DeepSeek's API offers for a model (the vendor's own API: official = route).
 struct Caps(Option<&'static ModelSpec>);
 
@@ -225,6 +252,9 @@ impl Provider for DeepSeek {
     }
     fn knows(&self, model: &str) -> bool {
         model_spec(model).is_some()
+    }
+    fn card(&self, model: &str) -> Option<crate::card::ModelCard> {
+        model_spec(model).map(|s| card(s, self.cfg.cny_per_usd))
     }
 
     async fn prepare(
