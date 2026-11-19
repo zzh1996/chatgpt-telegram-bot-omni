@@ -704,6 +704,13 @@ async fn cmd_models(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, query: &st
     Ok(())
 }
 
+/// What `/model` says of a prefix served by a platform's own API: "the OpenAI
+/// API", but "the Gemini API" (Google's platform name already is one).
+fn served_directly(name: &str) -> String {
+    let api = if name.ends_with(" API") { name.to_string() } else { format!("{name} API") };
+    format!("served by the {api} directly")
+}
+
 async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) -> Result<()> {
     let Some(cfg) = app.bot_cfg(&bot.name) else { return Ok(()) };
     let marker = app.marker();
@@ -730,7 +737,7 @@ async fn cmd_model(app: &Arc<App>, bot: &Arc<BotConn>, ib: &Inbound, arg: &str) 
     if spec.provider != "openrouter" {
         let title = format!("{}{marker} → {}:{}{}", spec.label, spec.provider, spec.model, spec.options_syntax());
         let name = omni_llm::provider::info(&spec.provider).map(|i| i.name).unwrap_or(spec.provider.as_str());
-        let text = format!("served by the {name} API directly");
+        let text = served_directly(name);
         send(app, bot, ib, &title, vec![RBlock::Paragraph(RText::plain(text))]).await;
         return Ok(());
     }
@@ -2048,4 +2055,20 @@ async fn quota_blocks(app: &App, bot: &str, only_chat: Option<i64>) -> Result<Ve
         blocks.push(RBlock::Footer(RText::plain(format!("Each member's balance: {how}"))));
     }
     Ok(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::served_directly;
+
+    #[test]
+    fn the_platform_api_is_named_once() {
+        assert_eq!(served_directly("Gemini API"), "served by the Gemini API directly");
+        assert_eq!(served_directly("OpenAI"), "served by the OpenAI API directly");
+        assert_eq!(served_directly("Volcengine Ark"), "served by the Volcengine Ark API directly");
+        for p in ["openai", "anthropic", "google", "xai", "deepseek", "zhipu", "moonshot", "alibaba", "ark"] {
+            let name = omni_llm::provider::info(p).unwrap().name;
+            assert!(!served_directly(name).contains("API API"), "{p}");
+        }
+    }
 }
