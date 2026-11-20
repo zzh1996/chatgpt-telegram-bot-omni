@@ -110,8 +110,9 @@ pub struct ModelSpec {
     /// Google Maps grounding searches "near me" around the position the bot
     /// sends (`toolConfig.retrievalConfig.latLng`). Gemini 4 Carbon ignores it
     /// (tested 2026-11-20: with a position in Beijing its "near me" searches
-    /// came back from the country Google places the bot's server in; named
-    /// places work), so a location there is an error (owner's choice).
+    /// came back from the country Google places the bot's server in); with the
+    /// position also in the prompt as text (every model, [`super::convert`])
+    /// it searches by the coordinates and answers at street level (8 places).
     pub maps_position: bool,
     /// The response can carry the built-in tools' own calls and results
     /// (`toolCall` / `toolResponse` parts) with
@@ -387,9 +388,9 @@ pub fn card(s: &ModelSpec, budget: u64) -> crate::card::ModelCard {
     }
     if s.tools.contains(&Tool::Maps) {
         let position = if s.maps_position {
-            "your latest Telegram location in the conversation, for \"near me\" searches"
+            "your latest Telegram location: Maps' \"near me\" centre, and as text for the model"
         } else {
-            "not used: this model ignores it (tested 2026-11-20), so a location is an error; named places work"
+            "your latest Telegram location, as text for the model (this model's Maps ignores the position itself)"
         };
         c.row(TOOLS, "+m position", position);
     }

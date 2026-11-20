@@ -37,6 +37,11 @@ struct Injected {
     /// to `<inject_dir>/out/<file name>.txt`, to check what was rendered.
     #[serde(default)]
     dump: Vec<i32>,
+    /// Instead of injecting: save the files and photos of these messages to
+    /// `<inject_dir>/out/<message id>-<file name>`, to read a file someone
+    /// posted or forwarded to the chat (at most 64 MiB each).
+    #[serde(default)]
+    download: Vec<i32>,
     /// Instead of injecting: send each named block list as a rich message,
     /// record whether Telegram accepts it, delete what was sent, and write the
     /// results to `<inject_dir>/out/<file name>.txt`. To learn Telegram's rules.
@@ -594,6 +599,22 @@ async fn inject(app: &Arc<App>, path: &Path) -> Result<i32> {
         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let text: String = msgs.iter().map(|m| format!("{m:#?}\n")).collect();
         std::fs::write(out_dir.join(format!("{name}.txt")), text)?;
+        return Ok(0);
+    }
+    if !req.download.is_empty() {
+        let msgs = bot.get_messages(req.chat_id, &req.download).await?;
+        let out_dir = path.parent().unwrap_or(Path::new(".")).join("out");
+        std::fs::create_dir_all(&out_dir)?;
+        for m in &msgs {
+            let grammers_tl_types::enums::Message::Message(m) = m else { continue };
+            for r in crate::media::media_of(m) {
+                let bytes = crate::media::download(&bot, &r, 64 << 20).await?;
+                let fname = r.filename.clone().unwrap_or_else(|| "file".into());
+                let safe: String =
+                    fname.chars().map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' }).collect();
+                std::fs::write(out_dir.join(format!("{}-{safe}", m.id)), bytes)?;
+            }
+        }
         return Ok(0);
     }
     if !req.album.is_empty() || req.location.is_some() || req.rich {

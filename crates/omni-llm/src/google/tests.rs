@@ -398,21 +398,30 @@ async fn maps_takes_the_latest_location() {
                "includeServerSideToolInvocations": true})
     );
     assert_eq!(p.settings, vec!["effort medium", "Google Maps near 31.2304,121.4737"]);
-    // A location has no content form: only the text is sent.
-    assert_eq!(p.body["contents"][2], json!({"role": "user", "parts": [{"text": "cafes near me?"}]}));
+    // The location also goes as text where it was (the model never sees `latLng`).
+    assert_eq!(
+        p.body["contents"][2],
+        json!({"role": "user", "parts": [
+            {"text": "[Location sent by the user: latitude 31.230400, longitude 121.473700]"},
+            {"text": "cafes near me?"}]})
+    );
+    assert_eq!(
+        convert::location_text(39.9992, 116.3239, Some(65), Some("清华大学"), Some("北京市海淀区")),
+        "[Location sent by the user: 清华大学, 北京市海淀区; latitude 39.999200, longitude 116.323900, within about 65 m]"
+    );
 
     let e = prep_err("gemini-3.8-flash", &[], &history).await;
     assert!(e.contains("add `+m`"), "{e}");
     let e = prep_err("gemini-nano-banana-2.1", &[], &history).await;
     assert!(e.contains("has no Google Maps grounding"), "{e}");
 
-    // Gemini 4 Carbon ignores the position (tested 2026-11-20): a location is an error, with +m or without;
-    // +m without one works (named places).
-    for opts in [vec![flag("m")], vec![]] {
-        let e = prep_err("gemini-4-carbon", &opts, &history).await;
-        assert!(e.contains("does not use a position for Google Maps") && e.contains("another Gemini model"), "{e}");
-    }
-    assert!(prep("gemini-4-carbon", &[flag("m")], &hi()).await.is_ok());
+    // Gemini 4 Carbon ignores `latLng` itself, but reads the position from the text (tested 2026-11-20).
+    let p = prep("gemini-4-carbon", &[flag("m")], &history).await.unwrap();
+    assert_eq!(
+        p.body["contents"][2]["parts"][0]["text"],
+        "[Location sent by the user: latitude 31.230400, longitude 121.473700]"
+    );
+    assert!(prep_err("gemini-4-carbon", &[], &history).await.contains("add `+m`"));
     assert!(
         prep("gemini-4-neon", &[flag("m")], &history).await.unwrap().body["toolConfig"]["retrievalConfig"].is_object()
     );

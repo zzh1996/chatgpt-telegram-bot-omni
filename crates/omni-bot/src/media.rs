@@ -512,7 +512,7 @@ pub async fn fetch(
     Ok(r)
 }
 
-async fn download(bot: &BotConn, m: &MediaRef, max_bytes: u64) -> Result<Vec<u8>> {
+pub(crate) async fn download(bot: &BotConn, m: &MediaRef, max_bytes: u64) -> Result<Vec<u8>> {
     let mut it = bot.client.iter_download(&Loc(m));
     let mut out = Vec::new();
     while let Some(chunk) = it.next().await.map_err(|e| anyhow!("{e}"))? {

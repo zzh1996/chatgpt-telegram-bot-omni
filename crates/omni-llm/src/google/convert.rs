@@ -20,8 +20,11 @@
 //!   natively as text `inlineData` (`text/plain` unless their type is one
 //!   Google lists); YouTube links as `fileData.fileUri`. Media resolution:
 //!   the highest per-part level on Gemini 3/4 (images `ULTRA_HIGH`, PDFs and
-//!   video `HIGH`). A Telegram location has no content form: it is returned
-//!   for `toolConfig.retrievalConfig` (Google Maps grounding).
+//!   video `HIGH`). A Telegram location is returned for
+//!   `toolConfig.retrievalConfig` (Google Maps grounding) and also goes as a
+//!   text part where it was ([`location_text`]): the model never sees
+//!   `latLng`, only the Maps tool does, and Google's own country hint (where
+//!   the bot's server is) often won over it (2026-11-20; owner's choice A).
 
 use omni_core::content::{Part, RemoteMediaKind, Role, Turn};
 use serde_json::{Value, json};
@@ -64,6 +67,30 @@ const OFFICE: &[(&str, &str)] = &[
     ("xls", "application/vnd.ms-excel"),
     ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
 ];
+
+/// A Telegram location as the model reads it: `[Location sent by the user:
+/// <venue>, <address>; latitude …, longitude …, within about N m]` (six
+/// decimals: about 0.1 m).
+pub fn location_text(
+    lat: f64,
+    lng: f64,
+    accuracy_m: Option<u32>,
+    title: Option<&str>,
+    address: Option<&str>,
+) -> String {
+    let place: Vec<&str> = [title, address].into_iter().flatten().filter(|s| !s.trim().is_empty()).collect();
+    let mut s = String::from("[Location sent by the user: ");
+    if !place.is_empty() {
+        s.push_str(&place.join(", "));
+        s.push_str("; ");
+    }
+    s.push_str(&format!("latitude {lat:.6}, longitude {lng:.6}"));
+    if let Some(a) = accuracy_m {
+        s.push_str(&format!(", within about {a} m"));
+    }
+    s.push(']');
+    s
+}
 
 pub const RES_ULTRA_HIGH: &str = "MEDIA_RESOLUTION_ULTRA_HIGH";
 pub const RES_HIGH: &str = "MEDIA_RESOLUTION_HIGH";
@@ -358,21 +385,30 @@ pub async fn convert(
                             out.media.video = true;
                             parts.push(with_resolution(json!({"fileData": {"fileUri": url}}), res(RES_HIGH)));
                         }
-                        Part::Location { latitude, longitude, .. } => {
+                        Part::Location { latitude, longitude, accuracy_m, title, address } => {
                             // Latest wins: the user's current position for Google Maps grounding.
                             out.location = Some((*latitude, *longitude));
+                            let text =
+                                location_text(*latitude, *longitude, *accuracy_m, title.as_deref(), address.as_deref());
+                            parts.push(json!({ "text": text }));
                         }
                         // Never in user turns.
                         Part::Reasoning(_) | Part::ToolCall(_) | Part::Refusal { .. } => {}
                     }
                 }
+                let only_location = turn.location().is_some()
+                    && turn.parts.iter().all(|p| match p {
+                        Part::Location { .. } => true,
+                        Part::Text { text, .. } => text.trim().is_empty(),
+                        _ => false,
+                    });
+                if only_location && Some(idx) == last_user {
+                    return Err(LlmError::request(
+                        "the message has nothing to send to the Gemini API besides a location \
+                         (your position for Google Maps grounding, `+m`): add a question",
+                    ));
+                }
                 if parts.is_empty() {
-                    if Some(idx) == last_user && turn.location().is_some() {
-                        return Err(LlmError::request(
-                            "the message has nothing to send to the Gemini API besides a location \
-                             (which only becomes the position for Google Maps grounding, `+m`): add a question",
-                        ));
-                    }
                     continue;
                 }
                 out.contents.push(json!({"role": "user", "parts": parts}));
