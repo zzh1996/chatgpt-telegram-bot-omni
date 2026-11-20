@@ -50,6 +50,9 @@ fn update_state(s: &State) -> Option<UpdateState> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     Command(String),
+    /// A command for this bot that it does not have (the command as written):
+    /// an error, never a message to a model.
+    UnknownCommand(String),
     Reply,
     Trigger,
     /// Private-chat message we cannot interpret (reply with a hint).
@@ -280,14 +283,40 @@ async fn remember_peers(app: &App, chat_id: i64, peers: &PeerMap) {
         .await;
 }
 
-/// Parse `/cmd`, `/cmd@bot` at the very start of a message.
-pub fn parse_command(text: &str, our_username: &str) -> Option<(String, String, bool)> {
+/// A message that starts with a command: what Telegram itself shows as one
+/// (a clickable `/command`): `/`, 1–32 Latin letters, digits or underscores,
+/// optionally `@botname`, then a space, a line break or the end. Anything else
+/// that starts with `/` is text (`/etc/hosts …`, `/你好`, `/12:30 …`, `/ hi`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slash {
+    /// One of this bot's commands: name, arguments, and whether it was written
+    /// as `/cmd@this_bot`.
+    Command(String, String, bool),
+    /// None of this bot's commands (`/foo`, `/foo@this_bot`): the command as
+    /// written, and whether it names this bot.
+    Unknown(String, bool),
+    /// For another bot (`/help@other_bot`).
+    Elsewhere(String),
+}
+
+/// What a message's leading command is, if it starts with one ([`Slash`]).
+pub fn slash(text: &str, our_username: &str) -> Option<Slash> {
     let rest = text.strip_prefix('/')?;
     let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
     let (head, args) = rest.split_at(end);
+    let word_ok = |w: &str| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     let (name, target) = match head.split_once('@') {
         Some((n, t)) => (n, Some(t)),
         None => (head, None),
+    };
+    if !word_ok(name) || name.len() > 32 || target.is_some_and(|t| !word_ok(t)) {
+        return None;
+    }
+    let written = format!("/{head}");
+    let addressed = match target {
+        Some(t) if !t.eq_ignore_ascii_case(our_username) => return Some(Slash::Elsewhere(written)),
+        Some(_) => true,
+        None => false,
     };
     // `/help_options` is `/help options`, `/help_zh options` `/help zh options`
     // (Telegram links the whole command).
@@ -296,23 +325,51 @@ pub fn parse_command(text: &str, our_username: &str) -> Option<(String, String, 
         _ => (name.to_ascii_lowercase(), args.to_string()),
     };
     if !COMMANDS.contains(&name.as_str()) {
-        return None;
+        return Some(Slash::Unknown(written, addressed));
     }
-    let addressed = match target {
-        Some(t) => {
-            if !t.eq_ignore_ascii_case(our_username) {
-                return None;
-            }
-            true
-        }
-        None => false,
+    Some(Slash::Command(name, args.trim_start().to_string(), addressed))
+}
+
+/// One of this bot's commands at the very start of a message: (name, arguments,
+/// written as `/cmd@this_bot`).
+pub fn parse_command(text: &str, our_username: &str) -> Option<(String, String, bool)> {
+    match slash(text, our_username)? {
+        Slash::Command(name, args, addressed) => Some((name, args, addressed)),
+        Slash::Unknown(..) | Slash::Elsewhere(_) => None,
+    }
+}
+
+/// What to do with a message that starts with a command this bot does not
+/// have (owner, 2026-11-20: such a message is never sent to a model). Where
+/// it is meant for this bot — a private chat, `/foo@this_bot`, a reply to one
+/// of its messages — it is an error that says how to send it as text; a
+/// command for another bot, or one in a group that is not aimed at this bot
+/// (it may be another bot's), is left alone.
+pub async fn unknown_command(app: &App, bot: &str, chat_id: i64, reply_to: Option<i32>, s: Slash) -> Option<Kind> {
+    let replies_to_us = match (&s, reply_to) {
+        (Slash::Unknown(..), Some(rt)) => crate::conv::sent_by(&app.db, bot, chat_id, rt).await.unwrap_or(false),
+        _ => false,
     };
-    Some((name, args.trim_start().to_string(), addressed))
+    unknown_for_us(s, chat_id, replies_to_us)
+}
+
+/// [`unknown_command`]'s decision, given whether the message replies to one of this bot's messages.
+fn unknown_for_us(s: Slash, chat_id: i64, replies_to_us: bool) -> Option<Kind> {
+    let private = chat_id > 0;
+    let (written, ours) = match s {
+        Slash::Command(..) => return None,
+        Slash::Elsewhere(w) => (w, private),
+        Slash::Unknown(w, addressed) => (w, private || addressed || replies_to_us),
+    };
+    ours.then_some(Kind::UnknownCommand(written))
 }
 
 async fn classify(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, m: &tl::types::Message) -> Option<Kind> {
     let text = crate::media::text_of(m);
     let text = text.as_str();
+    if let Some(s @ (Slash::Unknown(..) | Slash::Elsewhere(_))) = slash(text, &bot.username) {
+        return unknown_command(app, &bot.name, chat_id, reply_target(m), s).await;
+    }
     if let Some((name, _, addressed)) = parse_command(text, &bot.username) {
         // Every bot answers commands addressed to it or to everyone, like an
         // independent instance; `/m`, `/raw`, `/full`, `/dump`, `/retry`, `/continue`,
@@ -409,5 +466,57 @@ mod tests {
         assert_eq!(parse_command("/m@other g$ hi", "omnibot"), None);
         assert_eq!(parse_command("/usr/bin is", "omnibot"), None);
         assert_eq!(parse_command("not a command", "omnibot"), None);
+    }
+
+    /// What starts with a command (as Telegram shows one) and what is text.
+    #[test]
+    fn what_looks_like_a_command() {
+        let s = |t: &str| slash(t, "omnibot");
+        let unknown = |w: &str, at: bool| Some(Slash::Unknown(w.into(), at));
+        assert_eq!(s("/info"), Some(Slash::Command("info".into(), "".into(), false)));
+        assert_eq!(s("/foo"), unknown("/foo", false));
+        assert_eq!(s("/foo bar"), unknown("/foo", false));
+        assert_eq!(s("/foo\nsecond line"), unknown("/foo", false));
+        assert_eq!(s("/inf"), unknown("/inf", false), "a typo is not sent to a model");
+        assert_eq!(s("/foo@OmniBot hi"), unknown("/foo@OmniBot", true));
+        assert_eq!(s("/help@other_bot"), Some(Slash::Elsewhere("/help@other_bot".into())));
+        assert_eq!(s("/foo@other_bot"), Some(Slash::Elsewhere("/foo@other_bot".into())));
+        assert_eq!(s("/help_"), unknown("/help_", false));
+        assert_eq!(s(&format!("/{}", "a".repeat(32))), unknown(&format!("/{}", "a".repeat(32)), false));
+        // Text: not what Telegram shows as a command.
+        for t in [
+            "/etc/hosts 是什么文件？",
+            "/usr/bin",
+            "/你好 世界",
+            "/12:30 开会",
+            "/ hi",
+            "/",
+            "/foo@",
+            "/foo@bar/baz",
+            "/foo,bar",
+            "\\/foo",
+            "not /foo",
+        ] {
+            assert_eq!(s(t), None, "{t}");
+        }
+        assert_eq!(s(&format!("/{}", "a".repeat(33))), None, "longer than Telegram's 32");
+    }
+
+    /// An unknown command is an error where it is meant for this bot, else left alone.
+    #[test]
+    fn unknown_commands_meant_for_this_bot() {
+        let unknown = |at: bool| Slash::Unknown("/foo".into(), at);
+        let error = Some(Kind::UnknownCommand("/foo".into()));
+        // Private chat: always this bot's.
+        assert_eq!(unknown_for_us(unknown(false), 42, false), error);
+        // Group: a reply to one of this bot's messages, or `/foo@this_bot`.
+        assert_eq!(unknown_for_us(unknown(false), -100, true), error);
+        assert_eq!(unknown_for_us(unknown(true), -100, false), error);
+        // Group, neither: maybe another bot's command.
+        assert_eq!(unknown_for_us(unknown(false), -100, false), None);
+        // For another bot: left alone in groups, an error in a private chat.
+        let elsewhere = || Slash::Elsewhere("/help@other_bot".into());
+        assert_eq!(unknown_for_us(elsewhere(), -100, true), None);
+        assert_eq!(unknown_for_us(elsewhere(), 42, false), Some(Kind::UnknownCommand("/help@other_bot".into())));
     }
 }

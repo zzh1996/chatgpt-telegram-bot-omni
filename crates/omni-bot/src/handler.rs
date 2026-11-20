@@ -74,6 +74,12 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
             let args = parse_command(&ib.text, &bot.username).map(|(_, a, _)| a.to_string()).unwrap_or_default();
             return crate::commands::run(&app, &bot, &ib, name, &args).await;
         }
+        // A command this bot does not have: said, like a command's answer (never sent to a model).
+        if let Some(Kind::UnknownCommand(written)) = &kind {
+            reply::notice(&app, &bot, ib.chat_id, ib.msg_id, &crate::commands::unknown_command(written, app.marker()))
+                .await;
+            return Ok(());
+        }
         // Conversations are paid requests.
         match access::check(&app, &bot.name, ib.chat_id, user).await? {
             Access::Allowed => {}
@@ -114,8 +120,10 @@ async fn handle(app: Arc<App>, id: i64) -> Result<()> {
 }
 
 async fn kind_of(app: &App, bot: &BotConn, ib: &Inbound) -> Option<Kind> {
-    if let Some((name, _, _)) = parse_command(&ib.text, &bot.username) {
-        return Some(Kind::Command(name));
+    match crate::intake::slash(&ib.text, &bot.username) {
+        Some(crate::intake::Slash::Command(name, _, _)) => return Some(Kind::Command(name)),
+        Some(s) => return crate::intake::unknown_command(app, &bot.name, ib.chat_id, ib.reply_to_msg_id, s).await,
+        None => {}
     }
     if let Some(rt) = ib.reply_to_msg_id
         && conv::turn_for_message(&app.db, &bot.name, ib.chat_id, rt).await.ok().flatten().is_some()

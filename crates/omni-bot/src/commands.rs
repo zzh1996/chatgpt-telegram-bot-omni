@@ -20,6 +20,17 @@ use crate::tg::bot::BotConn;
 use crate::tg::upload::{Source, Want};
 use grammers_tl_types as tl;
 
+/// The error for a message that starts with a command this bot does not have
+/// (`written`: the command as written), and how to send such text to a model.
+pub fn unknown_command(written: &str, marker: &str) -> String {
+    let shown: String = written.chars().take(40).collect();
+    format!(
+        "⚠️ `{shown}` is not one of my commands (/help lists them). To send text that starts with `/` to the model, \
+         start your reply with a backslash: `\\{shown} …`; in a new conversation, write it after the prefix: \
+         `prefix{marker}{shown} …`."
+    )
+}
+
 /// The hint for messages that are neither a prefix nor a reply, with `marker`.
 pub fn hint(marker: &str) -> String {
     with_marker(HINT, marker)

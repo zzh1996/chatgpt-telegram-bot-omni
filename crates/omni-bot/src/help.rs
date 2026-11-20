@@ -143,7 +143,7 @@ const TOPICS: &[Topic] = &[
 
 **Continue**: reply to any of my messages (also a part of a long answer, or a generated image). Your whole reply is the next message, to the same model with the same options.
 - If I am still answering, your reply waits until I am done.
-- Start with `\` to send text that begins with `/`: `\/raw` sends the text `/raw`.
+- A reply that starts with a command (`/word`, the way Telegram shows commands) is a command, never text for the model: one I do not have is an error. Start with `\` to send it as text: `\/raw` sends the text `/raw`. Other text that starts with `/` (`/etc/hosts …`) is sent as it is.
 - Replies that quote part of my message are ignored.
 
 **Continue with another model**: reply `/m prefix$text` to an answer, e.g. `/m g$What do you think?`. Several prefixes work too: `/m c,g$Which is right?`.
@@ -169,7 +169,7 @@ const TOPICS: &[Topic] = &[
 
 **继续对话**：回复我的任何一条消息（长回答的任意一段、生成的图片也可以）。你回复的全部内容就是下一条消息，发给同一个模型，用同样的选项。
 - 如果我还在回答，你的回复会等我答完再处理。
-- 想发送以 `/` 开头的文字，就在最前面加 `\`：`\/raw` 发出的是文字 `/raw`。
+- 以命令开头的回复（`/单词`，也就是 Telegram 显示成可点命令的样子）是命令，不会发给模型：我没有的命令会报错。想把它当文字发出去，就在最前面加 `\`：`\/raw` 发出的是文字 `/raw`。其它以 `/` 开头的文字（如 `/etc/hosts …`）照常发送。
 - 引用（quote）了我某段话的回复会被忽略。
 
 **换个模型接着聊**：对一条回答回复 `/m 前缀$文字`，例如 `/m g$你怎么看？`。也可以写几个前缀：`/m c,g$哪个对？`。
