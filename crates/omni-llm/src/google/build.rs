@@ -152,6 +152,13 @@ pub async fn prepare(
 
     let conv = convert::convert(input.history, model, &spec, blobs).await?;
     let maps = req.tools.contains(&Tool::Maps);
+    if conv.location.is_some() && spec.tools.contains(&Tool::Maps) && !spec.maps_position {
+        return Err(err(format!(
+            "`{model}` does not use a position for Google Maps: it ignores the location and searches \"near me\" \
+             in the country Google places the bot's server in (tested 2026-11-20). Send the location to another \
+             Gemini model, or leave it out and name the place (`+m` works with named places)"
+        )));
+    }
     if conv.location.is_some() && !maps {
         return Err(err(if spec.tools.contains(&Tool::Maps) {
             "the conversation contains a location: the Gemini API takes one only as your position for Google Maps \

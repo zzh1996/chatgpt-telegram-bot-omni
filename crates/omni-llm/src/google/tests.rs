@@ -406,6 +406,17 @@ async fn maps_takes_the_latest_location() {
     let e = prep_err("gemini-nano-banana-2.1", &[], &history).await;
     assert!(e.contains("has no Google Maps grounding"), "{e}");
 
+    // Gemini 4 Carbon ignores the position (tested 2026-11-20): a location is an error, with +m or without;
+    // +m without one works (named places).
+    for opts in [vec![flag("m")], vec![]] {
+        let e = prep_err("gemini-4-carbon", &opts, &history).await;
+        assert!(e.contains("does not use a position for Google Maps") && e.contains("another Gemini model"), "{e}");
+    }
+    assert!(prep("gemini-4-carbon", &[flag("m")], &hi()).await.is_ok());
+    assert!(
+        prep("gemini-4-neon", &[flag("m")], &history).await.unwrap().body["toolConfig"]["retrievalConfig"].is_object()
+    );
+
     let p = prep("gemini-4-argon", &[flag("m")], &hi()).await.unwrap();
     assert_eq!(p.body["toolConfig"], json!({"includeServerSideToolInvocations": true}), "no position");
     assert_eq!(p.settings, vec!["effort medium", "Google Maps (no position sent)"]);

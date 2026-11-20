@@ -224,7 +224,7 @@ const TOPICS: &[Topic] = &[
 | `s` | web search (the platform's own tool) |
 | `c` | code execution (the platform's own tool) |
 | `u` | read the web pages your message links to |
-| `m` | maps; your latest Telegram location is your position |
+| `m` | maps; your latest Telegram location is your position (Gemini 4 Carbon ignores positions: a location there is an error) |
 | `i` | draw images in a chat |
 | `h` | the model's highest reasoning level |
 | `l` | its lowest: reasoning off where it can be turned off |
@@ -257,7 +257,7 @@ const TOPICS: &[Topic] = &[
 | `s` | 网页搜索（平台自己的工具） |
 | `c` | 代码执行（平台自己的工具） |
 | `u` | 读取你的消息里链接的网页 |
-| `m` | 地图；你最近发的 Telegram 位置就是你所在的位置 |
+| `m` | 地图；你最近发的 Telegram 位置就是你所在的位置（Gemini 4 Carbon 不用位置，带位置会报错） |
 | `i` | 在对话里画图 |
 | `h` | 该模型最高的推理强度 |
 | `l` | 最低的推理强度：能关闭推理的就关闭 |
@@ -294,7 +294,7 @@ const TOPICS: &[Topic] = &[
 - To add it to a conversation, reply to my answer with the photo, file or album.
 
 **What works**: photos and albums (one message, all images in order), files, voice messages, videos and round videos, GIFs, static and video stickers, rich messages (sent as Markdown), and polls, contacts, dice and checklists (sent as text).
-- A location is your position for a model's maps tool (`+m`).
+- A location is your position for a model's maps tool (`+m`): its "near me" searches start there. The model itself does not see it, so "where is this?" about a location gets no answer. Gemini 4 Carbon ignores positions, so a location there is an error.
 - `@` and a YouTube link in your message (`@https://youtu.be/…`) give the video to models that take YouTube links.
 - Files can be up to {MAX_FILE_MB} MB each, {MAX_MESSAGE_MB} MB in one message.
 - What a model cannot read (a PDF for some, audio, an animated sticker) is an error: nothing is converted or left out quietly."#,
@@ -305,7 +305,7 @@ const TOPICS: &[Topic] = &[
 - 想在对话中加入附件，就带着图片、文件或相册回复我的回答。
 
 **支持的内容**：图片和相册（算作一条消息，所有图片按顺序发送）、文件、语音、视频和圆形视频消息、GIF、静态和视频贴纸、富消息（按 Markdown 发送），以及投票、联系人、骰子和待办清单（按文字发送）。
-- 位置就是模型地图工具（`+m`）里你所在的位置。
+- 位置就是模型地图工具（`+m`）里你所在的位置："附近"的搜索从这里开始。模型本身看不到它，所以问"这是哪"得不到回答。Gemini 4 Carbon 不用位置，带位置会报错。
 - 在消息里写 `@` 加 YouTube 链接（`@https://youtu.be/…`），能看 YouTube 链接的模型会收到这个视频。
 - 每个文件最大 {MAX_FILE_MB} MB，一条消息里的文件合计最大 {MAX_MESSAGE_MB} MB。
 - 模型读不了的内容（有的模型读不了 PDF、音频，所有模型都读不了动画贴纸）会报错：不会偷偷转换，也不会悄悄丢掉。"#,

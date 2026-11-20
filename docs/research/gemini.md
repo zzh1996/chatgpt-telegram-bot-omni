@@ -352,6 +352,17 @@ No explicit GC rule found. IA guidance above suggests keeping them; the document
 
 ---
 
+### 3.4 Where the user is: Maps position, and the country Google adds (measured 2026-11-20)
+
+* **`toolConfig.retrievalConfig`** has `latLng` ("the location of the user") and `languageCode` (BCP-47) [g-ref]. `googleSearch` takes only `timeRangeFilter` and `searchTypes`; `googleMaps` only `enableWidget`: **no tool takes a country or region**.
+* **Google adds the user's country itself**, from where the request comes from (the bot's server): with `googleMaps` the prompt grows by ~610 tokens and the model says "the system prompt states the location is Finland" (this dev server); with `googleSearch` by ~180 tokens, same country; with no tool nothing. `latLng` does not change it.
+* **`latLng` steers only the Maps tool's "near me" searches** (as the Maps guide says), and the model never sees it: "这是哪" with a position gets "you sent no picture or place" on every model.
+  * Used by the Maps searches of gemini-4-neon, -hydrogen, -argon, 3.8 Flash, 3.6 Flash, 3.5 Flash-Lite, 3.1 Pro preview (cafés by Tsinghua for a Tsinghua position, thinking `low`). **But at the bot's default levels the model may trust Google's country over the results**: the bot's exact request ("cafés within ten minutes' walk", 3 runs each) answered Beijing / Helsinki: Hydrogen (high) 3/0 (and once Helsinki in the bot: it found the Tsinghua cafés, then searched "芬兰 附近的咖啡馆"), **Neon (high) 0/3**, Argon (medium) 2/1, 3.8 Flash (medium) 3/0. With the position also as text in the prompt: 12/12 Beijing.
+  * **Ignored by gemini-4-carbon**: its "near me" searches land in the server's country (Helsinki), also for Google's own example (Los Angeles coordinates). Named places work (Tsinghua, the Eiffel Tower). The bot refuses a location on Carbon (owner's choice; `ModelSpec::maps_position`).
+  * Google Search ignores `latLng` too ("my weather today" with a Beijing position: Helsinki).
+* Putting the position in the prompt as text fixed all of it ("这是哪" → 清华大学 on Carbon and Hydrogen; the repeated near-me runs 12/12), but the owner kept the position as Maps' input only (decided before the repeated runs).
+* **The Python SDK (google-genai 3.6.1, read 2026-11-20) has no country field either.** Its Gemini API converters send `googleSearch.searchTypes` / `timeRangeFilter` and `googleMaps.enableWidget` (deprecated) / `authConfig`, and refuse `exclude_domains`, `blocking_confidence` (Search), `grounding_types` (Maps), `person_generation`, `prominent_people`, the output format (images), `routing_config`, `model_selection_config`, `audio_timestamp`, `model_armor_config`, `generation_output_config` as Enterprise-only. `retrievalConfig` passes as is (`latLng`, `languageCode`); `languageCode: "zh-CN"` does not change the country Google adds. Fields it sends that the bot does not use: `enableEnhancedCivicAnswers`, `store` (per-request logging), `audioTranscriptionConfig`, the sampling and logprobs fields.
+
 ## 4. Grounding & citations
 
 ### 4.1 `candidate.groundingMetadata` ([reference: Candidate][g-ref], [search][g-search])

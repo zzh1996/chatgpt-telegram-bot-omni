@@ -107,6 +107,12 @@ pub struct ModelSpec {
     /// Google Search and Google Maps grounding in one request ("Gemini 3.5
     /// Flash and later").
     pub search_with_maps: bool,
+    /// Google Maps grounding searches "near me" around the position the bot
+    /// sends (`toolConfig.retrievalConfig.latLng`). Gemini 4 Carbon ignores it
+    /// (tested 2026-11-20: with a position in Beijing its "near me" searches
+    /// came back from the country Google places the bot's server in; named
+    /// places work), so a location there is an error (owner's choice).
+    pub maps_position: bool,
     /// The response can carry the built-in tools' own calls and results
     /// (`toolCall` / `toolResponse` parts) with
     /// `toolConfig.includeServerSideToolInvocations` (preview, "Gemini 4 and
@@ -169,6 +175,7 @@ const fn text_model(
         default_level: None,
         tools: ALL_TOOLS,
         search_with_maps,
+        maps_position: true,
         tool_invocations: matches!(family, Family::Gemini3 | Family::Gemini4),
         image_search: false,
         tiers: TIERS,
@@ -203,6 +210,7 @@ const fn image_model(
         default_level: None,
         tools,
         search_with_maps: false,
+        maps_position: false,
         tool_invocations: false,
         image_search: false,
         tiers: NO_TIERS,
@@ -224,7 +232,7 @@ const GEMINI_36_FLASH: ModelSpec =
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), default_level: Some("high"), ..gemini4("gemini-4-neon") },
     ModelSpec { thinking: Thinking::Levels(LEVELS_XHML), default_level: Some("high"), ..gemini4("gemini-4-hydrogen") },
-    ModelSpec { default_level: Some("medium"), ..gemini4("gemini-4-carbon") },
+    ModelSpec { default_level: Some("medium"), maps_position: false, ..gemini4("gemini-4-carbon") },
     ModelSpec { default_level: Some("medium"), ..gemini4("gemini-4-argon") },
     GEMINI_38_FLASH,
     GEMINI_36_FLASH,
@@ -338,6 +346,7 @@ fn guess(model: &str) -> ModelSpec {
         thinking,
         default_level: None,
         tools: ALL_TOOLS,
+        maps_position: true,
         search_with_maps: true,
         tool_invocations: matches!(family, Family::Gemini4 | Family::Gemini3) && !image,
         image_search: false,
@@ -375,6 +384,14 @@ pub fn card(s: &ModelSpec, budget: u64) -> crate::card::ModelCard {
     c.caps(&Caps(s));
     if !matches!(s.thinking, Thinking::Unsupported) {
         c.row(REASONING, "thought summaries", "included (includeThoughts, sent)");
+    }
+    if s.tools.contains(&Tool::Maps) {
+        let position = if s.maps_position {
+            "your latest Telegram location in the conversation, for \"near me\" searches"
+        } else {
+            "not used: this model ignores it (tested 2026-11-20), so a location is an error; named places work"
+        };
+        c.row(TOOLS, "+m position", position);
     }
     if s.search_with_maps {
         c.row(TOOLS, "+s with +m", "Search and Maps together in one request");
