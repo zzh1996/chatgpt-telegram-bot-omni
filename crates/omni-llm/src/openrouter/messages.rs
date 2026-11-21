@@ -51,7 +51,7 @@ pub async fn convert_history(
     info: Option<&ModelInfo>,
     blobs: &dyn BlobLoader,
 ) -> Result<(Option<Value>, Vec<Value>, Vec<String>), LlmError> {
-    let notes = Vec::new();
+    let mut notes = Vec::new();
     let mut system: Vec<Value> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
     for turn in history {
@@ -121,6 +121,8 @@ pub async fn convert_history(
             }
         }
     }
+    let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
+    notes.extend(crate::provider::text_only_note(history, own));
     Ok(((!system.is_empty()).then_some(Value::Array(system)), out, notes))
 }
 

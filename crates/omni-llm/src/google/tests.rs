@@ -1928,3 +1928,39 @@ async fn a_stopped_answer_fails_in_googles_words_after_billing() {
     assert_eq!(outcome.upstream_id.as_deref(), Some("img1"));
     assert_eq!(usages(&evs).len(), 1, "the usage is billed before the failure");
 }
+
+/// Answers of any Gemini API model go back as they came; another platform's
+/// answer goes as its text, without its reasoning (noted). `+c` after an
+/// answer with files says that the code environment is a new one.
+#[tokio::test]
+async fn answers_of_other_apis_and_earlier_files_are_noted() {
+    let reasoning =
+        || Part::Reasoning(omni_core::content::Reasoning { text: Some("think".into()), ..Default::default() });
+    let answer = |dialect: &str, model: &str, mut parts: Vec<Part>| {
+        parts.push(Part::text("a"));
+        let payload = json!({"parts": [{"text": "a"}], "output": []});
+        let native = NativeOutput { dialect: dialect.into(), model: model.into(), payload, context_tokens: None };
+        Turn { role: Role::Assistant, origin: Origin::Live, parts, native: Some(native) }
+    };
+    let q = || Turn::user_text("q");
+    let switched = "an earlier answer by another model or API is sent as text only, without its reasoning";
+    let code = "+c starts a new code environment: files from earlier answers are not in it";
+    let h = [q(), answer(DIALECT, "gemini-4-argon", vec![reasoning()]), q()];
+    let p = prep("gemini-4-carbon", &[], &h).await.unwrap();
+    assert!(!p.notes.iter().any(|n| n == switched), "{:?}", p.notes);
+    let h = [q(), answer("openai.responses", "gpt-6.2-sol", vec![reasoning()]), q()];
+    let p = prep("gemini-4-carbon", &[], &h).await.unwrap();
+    assert!(p.notes.iter().any(|n| n == switched), "{:?}", p.notes);
+    let image = Part::Image {
+        blob: BlobRef::for_bytes(b"png", "image/png"),
+        filename: None,
+        generated: true,
+        dims: None,
+        thought: false,
+    };
+    let h = [q(), answer(DIALECT, "gemini-4-carbon", vec![image]), q()];
+    let p = prep("gemini-4-carbon", &[flag("c")], &h).await.unwrap();
+    assert!(p.notes.iter().any(|n| n == code), "{:?}", p.notes);
+    let p = prep("gemini-4-carbon", &[], &h).await.unwrap();
+    assert!(!p.notes.iter().any(|n| n == code), "only when the request runs code: {:?}", p.notes);
+}

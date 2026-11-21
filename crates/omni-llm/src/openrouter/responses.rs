@@ -37,7 +37,7 @@ pub async fn convert_history(
     image_detail: &str,
     blobs: &dyn BlobLoader,
 ) -> Result<(Vec<Value>, Vec<String>), LlmError> {
-    let notes = Vec::new();
+    let mut notes = Vec::new();
     let mut out = Vec::new();
     for turn in history {
         match turn.role {
@@ -115,6 +115,8 @@ pub async fn convert_history(
             }
         }
     }
+    let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
+    notes.extend(crate::provider::text_only_note(history, own));
     Ok((out, notes))
 }
 

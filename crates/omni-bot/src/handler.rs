@@ -508,11 +508,18 @@ pub async fn continue_conversation(
         return Ok(());
     }
     let turns = vec![Turn { role: Role::User, origin: Origin::Live, parts, native: None }];
-    create_and_start(app, bot, ib, Some(turn_id), turns, specs).await?;
-    // It continues from an answer that is not finished: it waits for it (jobs).
-    if matches!(parent.status, TurnStatus::Pending | TurnStatus::Running) {
+    // It continues from an answer that is not finished: it waits for it (jobs). The
+    // notice goes first, so that the answer's first message always finds it to replace.
+    let waits = matches!(parent.status, TurnStatus::Pending | TurnStatus::Running);
+    if waits {
         let msg = "⏳ queued: the answer this continues is still being generated; this one starts when it is finished";
-        reply::notice(app, bot, ib.chat_id, ib.msg_id, msg).await;
+        reply::queued(app, bot, ib.chat_id, ib.msg_id, msg).await;
+    }
+    if let Err(e) = create_and_start(app, bot, ib, Some(turn_id), turns, specs).await {
+        if waits {
+            reply::drop_queued(app, bot, ib.chat_id, ib.msg_id).await;
+        }
+        return Err(e);
     }
     Ok(())
 }

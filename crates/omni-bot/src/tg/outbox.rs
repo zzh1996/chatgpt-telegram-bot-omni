@@ -460,9 +460,29 @@ pub async fn send(db: &Db, bot: &BotConn, req: SendReq<'_>) -> Result<i32, SendE
     }
 }
 
-/// Delete messages (highest priority, retried on flood waits). Used by the dev
-/// injector's probes only.
-#[cfg(any(debug_assertions, test))]
+/// The Telegram messages sent for any of `links` in a chat and not deleted.
+pub async fn sent_ids(db: &Db, bot: &str, chat_id: i64, links: &[Link]) -> Result<Vec<i32>> {
+    let (bot, links) = (bot.to_string(), links.to_vec());
+    db.call(move |c| {
+        let mut ids = Vec::new();
+        let mut q = c.prepare(
+            "SELECT msg_id FROM outbox WHERE bot = ?1 AND chat_id = ?2 AND turn_id = ?3 AND attempt_id IS ?4
+             AND part_index = ?5 AND state = 'sent' AND msg_id IS NOT NULL",
+        )?;
+        for l in links {
+            let rows = q.query_map(params![bot, chat_id, l.turn_id, l.attempt_id, l.part_index], |r| r.get(0))?;
+            for id in rows {
+                ids.push(id?);
+            }
+        }
+        Ok(ids)
+    })
+    .await
+}
+
+/// Delete messages (highest priority, retried on flood waits): the dev
+/// injector's probes, and the "queued" notice an answer's first message
+/// replaces ([`crate::reply::drop_queued`]).
 pub async fn delete(db: &Db, bot: &BotConn, chat_id: i64, ids: &[i32]) -> Result<()> {
     let gate = bot.gates.get(chat_id);
     let mut tries = 0u32;
@@ -667,6 +687,34 @@ pub async fn send_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sent_ids_finds_the_messages_of_a_link_still_shown() {
+        let db = Db::open_in_memory().unwrap();
+        let link = Link { turn_id: -7, attempt_id: None, part_index: -1 };
+        let other = Link { turn_id: -7, attempt_id: None, part_index: 5 };
+        db.call(move |c| {
+            for (rid, l, msg, state) in [
+                (1, link, Some(70), "sent"),
+                (2, other, Some(71), "sent"),
+                (3, link, Some(72), "deleted"),
+                (4, link, None, "pending"),
+            ] {
+                c.execute(
+                    "INSERT INTO outbox(bot, chat_id, turn_id, attempt_id, part_index, random_id, msg_id, state, created_at, updated_at)
+                     VALUES ('b', 9, ?1, ?2, ?3, ?4, ?5, ?6, 0, 0)",
+                    params![l.turn_id, l.attempt_id, l.part_index, rid, msg, state],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(sent_ids(&db, "b", 9, &[link]).await.unwrap(), vec![70]);
+        assert_eq!(sent_ids(&db, "b", 9, &[link, other]).await.unwrap(), vec![70, 71]);
+        assert!(sent_ids(&db, "b", 8, &[link]).await.unwrap().is_empty());
+        assert!(sent_ids(&db, "c", 9, &[link]).await.unwrap().is_empty());
+    }
 
     #[test]
     fn retry_button_changes_what_a_page_shows() {

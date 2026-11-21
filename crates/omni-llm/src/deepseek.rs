@@ -33,7 +33,7 @@
 //!   tools ignore it), Messages content blocks verbatim (thinking
 //!   with its signature, the search call and its results). Assistant messages
 //!   carry text only on both endpoints: media other models generated in
-//!   earlier turns are not sent (a warning says what).
+//!   earlier turns cannot be sent (an error says what).
 //! - **Searches**: `usage.server_tool_use` counts the billed ones: `tool_search`
 //!   (the Messages tool: successful non-empty calls; the web tools: the query
 //!   terms of each call that returned results), `tool_fetch` (pages fetched
@@ -390,6 +390,10 @@ impl Provider for DeepSeek {
                  DeepSeek's peak rate; extend the calendar"
             );
         }
+        // Each endpoint replays only its own answers of this model (the other one's go as text).
+        let switched = crate::provider::text_only_note(input.history, |t| {
+            t.native.as_ref().is_some_and(|n| n.dialect == dialect && n.model == model)
+        });
         Ok(Prepared {
             dialect,
             model: model.to_string(),
@@ -397,7 +401,7 @@ impl Provider for DeepSeek {
             body,
             applied,
             warnings,
-            notes: level_note.into_iter().chain(dropped).chain(notes).collect(),
+            notes: level_note.into_iter().chain(dropped).chain(notes).chain(switched).collect(),
             show_debug: false,
             auto_max_tokens: max_tokens,
             long_decode: false,

@@ -2017,3 +2017,28 @@ async fn a_refusal_fails_with_its_category() {
     );
     assert_eq!(p.refusal().unwrap().message, "refusal");
 }
+
+/// Another platform's answer goes to Claude as its text only: the answer
+/// says what it leaves out (a search here); Claude's own answers do not count.
+#[tokio::test]
+async fn other_models_answers_are_noted_as_text_only() {
+    let mut other = Turn::user_text("x");
+    other.role = Role::Assistant;
+    other.parts = vec![
+        Part::ToolCall(omni_core::content::ToolCall { name: "web_search".into(), ..Default::default() }),
+        Part::text("It rained."),
+    ];
+    other.native = Some(NativeOutput {
+        dialect: "openai.responses".into(),
+        model: "gpt-6.2-sol".into(),
+        payload: json!({"output": []}),
+        context_tokens: None,
+    });
+    let note = "an earlier answer by another model or API is sent as text only, without its tool calls";
+    let h = [Turn::user_text("weather?"), other, Turn::user_text("and tomorrow?")];
+    let p = prep("claude-opus-5-5", &[], &h).await.unwrap();
+    assert!(p.notes.iter().any(|n| n == note), "{:?}", p.notes);
+    let own = assistant("claude-opus-5-5", json!({"content": [{"type": "text", "text": "Hi."}]}), "Hi.");
+    let p = prep("claude-opus-5-5", &[], &[Turn::user_text("hi"), own, Turn::user_text("more")]).await.unwrap();
+    assert!(!p.notes.iter().any(|n| n.contains("sent as text only")), "{:?}", p.notes);
+}

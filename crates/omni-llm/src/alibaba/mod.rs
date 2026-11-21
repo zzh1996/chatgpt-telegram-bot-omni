@@ -478,6 +478,16 @@ impl Alibaba {
                 .is_some_and(|n| n.model == input.model && [DIALECT, RESPONSES_DIALECT].contains(&n.dialect.as_str()))
         };
         crate::provider::unsent_media(input.history, own)?;
+        // Chat Completions takes this model's Responses answers too (as messages); the
+        // Responses API only its own (a Chat answer goes as its text, without its reasoning).
+        let dialect = p.dialect;
+        let replayed = |t: &Turn| {
+            own(t) && (dialect == DIALECT || t.native.as_ref().is_some_and(|n| n.dialect == RESPONSES_DIALECT))
+        };
+        p.notes.extend(crate::provider::text_only_note(input.history, replayed));
+        if req.tools.contains(&Tool::Code) {
+            p.notes.extend(crate::provider::code_files_note(input.history));
+        }
         if spec.is_none() {
             p.warnings.push(format!(
                 "`{}` is not in the bot's Alibaba Model Studio model table: limits and price unknown (sent without \

@@ -364,7 +364,13 @@ impl Xai {
             body,
             applied,
             warnings,
-            notes: level_note.into_iter().chain(conv.notes).collect(),
+            notes: level_note
+                .into_iter()
+                .chain(conv.notes)
+                .chain(
+                    req.tools.contains(&Tool::Code).then(|| crate::provider::code_files_note(input.history)).flatten(),
+                )
+                .collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: false,

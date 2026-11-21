@@ -140,6 +140,9 @@ pub async fn convert(
                 .to_string(),
         );
     }
+    // Answers of other models or APIs (this model's with other tools have the note above).
+    let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
+    notes.extend(crate::provider::text_only_note(history, own));
     // Media of answers that go back as text cannot go along: an error (owner's rule).
     if let Some(why) = media_not_sent(as_text, ASSISTANT_TEXT_ONLY) {
         return Err(LlmError::request(why));

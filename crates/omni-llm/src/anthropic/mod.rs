@@ -509,7 +509,8 @@ impl Provider for Anthropic {
             applied.push(Applied { source: "default".into(), patch: json!({"anthropic-beta": betas.join(",")}) });
         }
 
-        let notes: Vec<String> = level_note.into_iter().chain(conv.notes).collect();
+        let code = req.tools.contains(&Tool::Code).then(|| crate::provider::code_files_note(input.history)).flatten();
+        let notes: Vec<String> = level_note.into_iter().chain(conv.notes).chain(code).collect();
         // Container time is billed apart and not in the estimate (free with web
         // search or fetch): a marker after the cost (`crate::Prepared::settings`).
         let free_code = spec.is_none_or(|s| s.dynamic_web)

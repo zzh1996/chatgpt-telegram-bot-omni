@@ -140,6 +140,8 @@ pub(crate) async fn convert_history(
     if let Some(why) = unsent.message() {
         return Err(LlmError::request(why));
     }
+    let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == inp.platform.dialect() && n.model == inp.model);
+    c.notes.extend(crate::provider::text_only_note(history, own));
     Ok(c)
 }
 

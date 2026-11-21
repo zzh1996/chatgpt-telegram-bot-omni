@@ -24,7 +24,7 @@
 //!   and the answer's sources. Zhipu's search-intent detection decides
 //!   whether to search: an answer without `web_search[]` says that none ran.
 //! - Assistant messages carry text only: media other models generated in
-//!   earlier turns are not sent (a warning says what).
+//!   earlier turns cannot be sent (an error says what).
 //! - Media per model: JPEG/PNG images and MP4/MKV/MOV videos (as data URLs)
 //!   on the vision models; files (PDF, Word, xlsx, pptx, as `file_data`) on
 //!   the GLM-5.3-Flash family; text files are inlined (the `file` part does
@@ -478,6 +478,7 @@ impl Provider for Zhipu {
         // This model's own answers are replayed (text and reasoning); other turns go as their text.
         let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == DIALECT && n.model == model);
         crate::provider::unsent_media(input.history, own)?;
+        notes.extend(crate::provider::text_only_note(input.history, own));
         match spec {
             None => warnings.push(format!(
                 "`{model}` is not in the bot's Zhipu model table: limits, price and reasoning options unknown \

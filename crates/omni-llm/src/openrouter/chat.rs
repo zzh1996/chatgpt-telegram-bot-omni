@@ -260,6 +260,8 @@ pub async fn convert_history_with(
             }
         }
     }
+    let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.dialect == flavor.dialect && n.model == target_model);
+    notes.notes.extend(crate::provider::text_only_note(history, own));
     Ok((out, notes))
 }
 

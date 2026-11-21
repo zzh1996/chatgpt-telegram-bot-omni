@@ -258,6 +258,35 @@ async fn output_budget() {
     assert_eq!(p.max_tokens(), Some(65_536));
 }
 
+/// A Chat answer goes to the Responses API as its text: its reasoning is left
+/// out, and the answer says so; Chat Completions takes both kinds of answers.
+#[tokio::test]
+async fn a_chat_answer_on_the_responses_api_is_noted() {
+    let (blobs, _) = Blobs::new(&[]);
+    let chat = Turn {
+        role: Role::Assistant,
+        origin: Origin::Live,
+        parts: vec![
+            Part::Reasoning(omni_core::content::Reasoning { text: Some("think".into()), ..Default::default() }),
+            Part::text("a"),
+        ],
+        native: Some(NativeOutput {
+            dialect: DIALECT.into(),
+            model: "qwen3.8-max".into(),
+            payload: json!({"role": "assistant", "content": "a", "reasoning_content": "think"}),
+            context_tokens: None,
+        }),
+    };
+    let h = [Turn::user_text("q"), chat, Turn::user_text("q2")];
+    let note = "an earlier answer by another model or API is sent as text only, without its reasoning";
+    let p = alibaba(None).prepare(&input("qwen3.8-max", &[flag("s")], &h), &[], &blobs).await.unwrap();
+    assert_eq!(p.dialect, RESPONSES_DIALECT);
+    assert!(p.notes.iter().any(|n| n == note), "{:?}", p.notes);
+    let p = alibaba(None).prepare(&input("qwen3.8-max", &[], &h), &[], &blobs).await.unwrap();
+    assert_eq!((p.dialect, p.body["messages"][1]["reasoning_content"].as_str()), (DIALECT, Some("think")));
+    assert!(!p.notes.iter().any(|n| n == note), "{:?}", p.notes);
+}
+
 /// `+s` goes to the Responses API: only there do the searches come back.
 #[tokio::test]
 async fn web_search_uses_the_responses_api() {

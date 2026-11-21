@@ -302,7 +302,7 @@ impl Moonshot {
             None => {}
         }
         let search = req.tools.contains(&Tool::Search);
-        let notes = Vec::new();
+        let mut notes = Vec::new();
         let mut applied = Vec::new();
         let mut settings = Vec::new();
         let auto_max = self.output_budget(input, spec);
@@ -383,6 +383,7 @@ impl Moonshot {
                 .is_some_and(|n| n.model == input.model && [DIALECT, RESPONSES_DIALECT].contains(&n.dialect.as_str()))
         };
         crate::provider::unsent_media(input.history, own)?;
+        notes.extend(crate::provider::text_only_note(input.history, own));
         if spec.is_none() {
             warnings.push(format!(
                 "`{}` is not in the bot's Moonshot model table: limits and price unknown (sent without reasoning \

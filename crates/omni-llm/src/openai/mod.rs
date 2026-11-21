@@ -622,6 +622,9 @@ impl OpenAi {
             tools.push(tool);
             include.extend(inc);
         }
+        if req.tools.contains(&Tool::Code) {
+            notes.extend(crate::provider::code_files_note(input.history));
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }

@@ -275,7 +275,18 @@ impl OpenRouter {
             body,
             applied: all_applied,
             warnings,
-            notes: level_note.into_iter().chain(plan.notes.iter().cloned()).chain(notes).chain(dropped).collect(),
+            notes: level_note
+                .into_iter()
+                .chain(plan.notes.iter().cloned())
+                .chain(notes)
+                .chain(dropped)
+                .chain(
+                    plan.tools
+                        .contains(&crate::request::Tool::Code)
+                        .then(|| crate::provider::code_files_note(input.history))
+                        .flatten(),
+                )
+                .collect(),
             show_debug: false,
             auto_max_tokens: auto_max,
             long_decode: dialect == options::Dialect::Chat && self.cfg.fidelity.is_long_decode(model),

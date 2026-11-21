@@ -142,11 +142,11 @@ const TOPICS: &[Topic] = &[
 **Several models at once**: separate the prefixes with commas, and each model answers on its own: `c,g$Compare tabs and spaces`.
 
 **Continue**: reply to any of my messages (also a part of a long answer, or a generated image). Your whole reply is the next message, to the same model with the same options.
-- If I am still answering, your reply waits until I am done.
+- If I am still answering, your reply waits until I am done: a ⏳ note says so, and goes when my answer to it starts.
 - A reply that starts with a command (`/word`, the way Telegram shows commands) is a command, never text for the model: one I do not have is an error. Start with `\` to send it as text: `\/raw` sends the text `/raw`. Other text that starts with `/` (`/etc/hosts …`) is sent as it is.
 - Replies that quote part of my message are ignored.
 
-**Continue with another model**: reply `/m prefix$text` to an answer, e.g. `/m g$What do you think?`. Several prefixes work too: `/m c,g$Which is right?`.
+**Continue with another model**: reply `/m prefix$text` to an answer, e.g. `/m g$What do you think?`. Several prefixes work too: `/m c,g$Which is right?`. The new model may get only the text of the earlier answers: a note under its answer says when their reasoning or tool calls are left out.
 
 **When an answer fails** it cannot be continued: tap 🔁 Retry under it, or reply /retry to it.
 
@@ -168,11 +168,11 @@ const TOPICS: &[Topic] = &[
 **同时问几个模型**：用逗号隔开几个前缀，每个模型各自回答：`c,g$比较一下 tab 和空格`。
 
 **继续对话**：回复我的任何一条消息（长回答的任意一段、生成的图片也可以）。你回复的全部内容就是下一条消息，发给同一个模型，用同样的选项。
-- 如果我还在回答，你的回复会等我答完再处理。
+- 如果我还在回答，你的回复会等我答完再处理：先有一条 ⏳ 排队提示，开始回答它时这条提示就删掉。
 - 以命令开头的回复（`/单词`，也就是 Telegram 显示成可点命令的样子）是命令，不会发给模型：我没有的命令会报错。想把它当文字发出去，就在最前面加 `\`：`\/raw` 发出的是文字 `/raw`。其它以 `/` 开头的文字（如 `/etc/hosts …`）照常发送。
 - 引用（quote）了我某段话的回复会被忽略。
 
-**换个模型接着聊**：对一条回答回复 `/m 前缀$文字`，例如 `/m g$你怎么看？`。也可以写几个前缀：`/m c,g$哪个对？`。
+**换个模型接着聊**：对一条回答回复 `/m 前缀$文字`，例如 `/m g$你怎么看？`。也可以写几个前缀：`/m c,g$哪个对？`。新模型可能只拿到之前回答的正文：之前回答的推理或工具调用没有传过去时，回答下面有一行提示。
 
 **回答失败时**不能接着聊：点它下面的 🔁 Retry，或者对它回复 /retry。
 
@@ -222,7 +222,7 @@ const TOPICS: &[Topic] = &[
 | Option | What it does |
 |---|---|
 | `s` | web search (the platform's own tool) |
-| `c` | code execution (the platform's own tool) |
+| `c` | code execution (the platform's own tool), in a new environment for each answer |
 | `u` | read the web pages your message links to |
 | `m` | maps; your latest Telegram location is your position |
 | `i` | draw images in a chat |
@@ -255,7 +255,7 @@ const TOPICS: &[Topic] = &[
 | 选项 | 作用 |
 |---|---|
 | `s` | 网页搜索（平台自己的工具） |
-| `c` | 代码执行（平台自己的工具） |
+| `c` | 代码执行（平台自己的工具），每个回答都在新的环境里运行 |
 | `u` | 读取你的消息里链接的网页 |
 | `m` | 地图；你最近发的 Telegram 位置就是你所在的位置 |
 | `i` | 在对话里画图 |

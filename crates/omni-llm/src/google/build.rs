@@ -353,7 +353,15 @@ pub async fn prepare(
         body,
         applied,
         warnings,
-        notes: level_note.into_iter().chain(image_note).collect(),
+        notes: level_note
+            .into_iter()
+            .chain(image_note)
+            // Gemini API answers of any model go back as they came ([`convert::convert`]).
+            .chain(crate::provider::text_only_note(input.history, |t| {
+                t.native.as_ref().is_some_and(|n| n.dialect == DIALECT)
+            }))
+            .chain(req.tools.contains(&Tool::Code).then(|| crate::provider::code_files_note(input.history)).flatten())
+            .collect(),
         show_debug: false,
         auto_max_tokens: max_tokens,
         long_decode: spec.long_decode,

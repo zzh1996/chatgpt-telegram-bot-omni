@@ -19,6 +19,50 @@ pub async fn notice(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, reply_to: 
     send_blocks(app, bot, chat_id, reply_to, blocks).await;
 }
 
+/// Pseudo part indexes of the "queued" notice (see [`queued`]) and of its
+/// plain-text fallback: below every index [`send_blocks`] uses, so the notice
+/// can be found again by the message it replies to.
+const QUEUED_PARTS: [i64; 2] = [-1, -2];
+
+fn queued_links(reply_to: i32) -> [Link; 2] {
+    QUEUED_PARTS.map(|part_index| Link { turn_id: -(reply_to as i64), attempt_id: None, part_index })
+}
+
+/// Tell the sender that their message waits for the answer it continues. The
+/// waiting answer's first message replaces it: [`drop_queued`] (owner,
+/// 2026-11-22: "真正处理的消息发送出来，就把这条排队的消息删掉").
+pub async fn queued(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, reply_to: i32, text: &str) {
+    let [rich_link, text_link] = queued_links(reply_to);
+    let blocks = vec![RBlock::Paragraph(crate::compose::with_code(text))];
+    let content = Content::Rich(blocks.clone());
+    let req = SendReq { chat_id, reply_to: Some(reply_to), content: &content, link: rich_link, media: None };
+    let res = match outbox::send(&app.db, bot, req).await {
+        Err(SendError::Rejected(_)) => {
+            let content = Content::Text(crate::compose::blocks_to_plain(&blocks));
+            let req = SendReq { chat_id, reply_to: Some(reply_to), content: &content, link: text_link, media: None };
+            outbox::send(&app.db, bot, req).await
+        }
+        r => r,
+    };
+    if let Err(e) = res {
+        warn!(error = %e, "failed to send the queued notice");
+    }
+}
+
+/// Delete the "queued" notice that replies to the message `reply_to`, if one
+/// is shown (the first message of an answer to it is out).
+pub async fn drop_queued(app: &Arc<App>, bot: &Arc<BotConn>, chat_id: i64, reply_to: i32) {
+    match outbox::sent_ids(&app.db, &bot.name, chat_id, &queued_links(reply_to)).await {
+        Ok(ids) if !ids.is_empty() => {
+            if let Err(e) = outbox::delete(&app.db, bot, chat_id, &ids).await {
+                warn!(error = %format!("{e:#}"), "failed to delete the queued notice");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %format!("{e:#}"), "failed to look up the queued notice"),
+    }
+}
+
 /// Output in several messages: each one says which part it is, the first too
 /// (owner, 2026-11-14), so that nobody takes it for all of it. An output that
 /// starts with a `🤖 title` line has it on every message with ` · part N`; any

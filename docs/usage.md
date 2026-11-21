@@ -31,7 +31,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 | 选项 | 作用 |
 |---|---|
 | `s` | 厂商自己的网页搜索（OpenAI、Claude、Gemini、Grok；DeepSeek、智谱、Kimi、千问的官方搜索只有直连能用，经 OpenRouter 不可用） |
-| `c` | 厂商自己的代码执行（直连：OpenAI、Claude、Gemini、Grok、千问；经 OpenRouter 只有 OpenAI 可用，且执行输出与生成的文件不返回） |
+| `c` | 厂商自己的代码执行（直连：OpenAI、Claude、Gemini、Grok、千问；经 OpenRouter 只有 OpenAI 可用，且执行输出与生成的文件不返回）。每个回答的代码都在新的环境里运行：之前的回答写出或生成的文件不在里面，之前的回答有文件时回答下面提示 `+c starts a new code environment: files from earlier answers are not in it` |
 | `u` | 让模型读取消息里的网址（Claude 的 web_fetch；Gemini 的 URL context、千问的 web_extractor 只有直连能用） |
 | `m` | Google Maps（只有直连的 `google:` 模型；对话里最新的位置作为用户所在位置，见"图片、文件、相册、位置、富消息"；位置同时以坐标文字发给模型） |
 | `i` | 在聊天里生成图片：厂商自己的出图工具（直连的 OpenAI、Grok 聊天模型，`image_generation`）。直接写出图模型的 ID 不需要它，见"生成图片和视频" |
@@ -57,6 +57,7 @@ spec   := <模型>[+<选项>...]        （空 spec = 名字为空的前缀）
 
 - 推理强度 = 厂商文档给该模型推荐的档位（显式发送；多数就是不加参数时 API 用的那一档，按通用推荐，不按"聊天场景"的建议）。不是最高档时，回答下面有一行提示，写明当前档位和最高档，`+h` 就是最高档（和其它请求提示一样，回复已经显示过它的回答时不再重复）。各家：OpenAI 都是 medium（gpt-5.5-pro 为 high；GPT-5.4 / 5.2 / 5.1 的 API 默认 none 是官方说的低延迟选项，按推理指南"多数工作负载的默认配置"用 medium）；Claude 多数为 high，Opus 5.5、Haiku 5.5、Sonnet 4.6（官方标 "Medium effort (recommended)"）为 medium，Opus/Sonnet 4.6–4.8 照 Anthropic 的推荐开 adaptive thinking，Opus 4.5、Haiku 4.5 默认不思考（官方没有建议默认开）；Gemini 4 Carbon/Argon、3.8/3.6 Flash、Nano Banana 2.1 为 medium，Gemini 4 Hydrogen、3.1 Pro 为 high，Flash-Lite 和 Flash Image 为 minimal；Grok 4.7/4.6/4.5 为 high，4.3 为 low；DeepSeek 为 high；智谱 GLM-5.2 起和 Kimi K3 为 max（已是最高）；千问 4 Max 为 high（它的模型页写明默认 high，最高 xhigh）；千问 3.8 为 xhigh（官方示例都显式发 xhigh；不发时思考预算只有 131,072）；豆包 2.1、Evolving 和 2.0-code（火山的 Agent/Coding 规范要求 high 以上）为 high，其它 2.0 和 character 为 medium；经 OpenRouter 和直连同一个模型的默认一样（OpenRouter 目录里的 `default_effort` 只是给客户端界面的预选值，不是厂商默认；OpenRouter 选不了直连的那一档时不发，由厂商默认，照样提示）。OpenAI 推理摘要 = detailed；Claude 思考显示 = summarized（官方默认 omitted 会看不到思考）；Gemini 带上思考摘要；
 - 之前回答的推理留在对话里（同一模型的回答原样回放）：平台默认就用的照旧（xAI、Claude、Gemini 3.5 Flash 起和 Gemini 4、GPT-6.x 和 5.6、Kimi、千问 3.8）；默认丢弃的打开：OpenAI GPT-5.4 起（含 pro 和 chat-latest）发 `reasoning.context: all_turns`（GPT-5.2、5.1、5 不支持），千问发 `preserve_thinking: true`，DeepSeek 在 Chat Completions 上发 `preserve_thinking: true`（文档没写、实测生效；联网工具忽略它所以不发），Claude Haiku 4.5 思考时用 `clear_thinking` 的 `keep: "all"`，智谱发 `clear_thinking: false`。豆包的服务端在下一轮丢弃之前的推理，没有开关。保留是常态，不另外提示；之前的回答有推理、平台却会丢掉时（豆包，GPT-5.2、5.1、5（直连和经 OpenRouter），智谱 GLM-4.5-Air 和 GLM-4.6V 系列，开着联网工具的 DeepSeek），回答下面有一条提示 `earlier reasoning is dropped: … keeps only the current turn's`。回放的推理按输入计费（多数是缓存价）；
+- 其它模型的回答只传正文（生成的图片、文件见下面"之前回合里别的模型生成的"；推理、工具调用和拒答都不传）；同一个模型换了 API 也一样：直连和经 OpenRouter 之间，DeepSeek 的搜索 API（Messages）和 Chat Completions 之间，千问的 Chat 回答到了 Responses API（`+s` `+u` `+c`；反过来 Responses 的回答在 Chat 上照样带推理）。Gemini API 上所有 Gemini 模型的回答都原样回放；Claude 用别的工具集做的回答只传正文，有它自己的提示。只传正文的回答里有推理或工具调用时，回答下面有一条提示，写明有几个回答、少了什么，如 `2 earlier answers by other models or APIs are sent as text only, without their reasoning and tool calls`（个数变了才会再出现）；
 - 输出上限 = 该模型的最大输出，但不超过上下文窗口剩余空间（经 OpenRouter 另有上限 393216，因为它按 `max_tokens` 冻结额度）；Gemini 4 long decode 为跨多次续写的总预算（回复 `/continue` 继续）；
 - 图片、视频、文档输入用官方最高精度（OpenAI `detail` = original 或 high，xAI = high，方舟 = xhigh，直连 Gemini = 最高的 media resolution，千问开高分辨率；视频帧率保持各平台默认；经 OpenRouter 走 Chat Completions 的其它厂商不发 `detail`）；
 - 生成的图片和视频：更高质量要多花钱时用平台默认的质量、尺寸和分辨率，回答下面写出默认值、最高值和拉到最高的选项（如 `image size is 1K by default, not the largest (4K); add +size=4K`）；价格一样时用最高的（智谱的图片和视频、Wan 2.7 图、千问图像 3.0 / 2.x、Gemini 3 Pro Image 的 2K）；
@@ -194,11 +195,11 @@ Arr!
 ## 2. 继续对话
 
 - **回复** bot 的任意一条消息（包括长回答的任意分段、生成的图片）即继续该对话，使用同一模型与选项。回复的全部文字原样作为一条 user 消息发送（`::system` 等标记行不解析）；以 `\` 开头时去掉这一个反斜杠（用来发送以 `/` 开头的字面量等）。以命令开头的回复是命令，不会发给模型（见"命令"开头）；其它以 `/` 开头的文字（如 `/etc/hosts 是什么`、`/你好`）照常发送。
-- 回复一条仍在生成中的消息：会排队，等它生成完再继续。
+- 回复一条仍在生成中的消息：会排队，等它生成完再继续。排队时先回一条 `⏳ queued: …` 提示，排队的回答发出第一条消息时删掉这条提示（bot 重启后也会删）。
 - 重试在同一组消息里进行，回复这一轮的任何一条消息都等同于回复最终成功的那次。
 - 没有正常完成的回答（所有尝试都失败，或被拒答/内容过滤拦下）不能继续对话，回复它会得到提示；按它下面的 **🔁 Retry** 按钮或回复 `/retry` 重新生成（群里有权限用 bot 的人都可以；重试和原请求一样记在提问的人名下）。
 - 带"引用"（quote）的回复会被忽略（与旧版一致）。
-- 回复 + `/m spec$正文`：换成别的模型/选项继续这段对话（可以多个 spec）。
+- 回复 + `/m spec$正文`：换成别的模型/选项继续这段对话（可以多个 spec，同一个 spec 写几次就分出几个回答）。换了模型时之前的回答只传正文（见"默认参数"），有提示。
 
 ## 3. 回答的样子
 

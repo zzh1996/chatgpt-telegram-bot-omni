@@ -192,6 +192,15 @@ struct Ctx {
     tx: Weak<watch::Sender<Option<RenderState>>>,
 }
 
+/// The reply has a message: the "queued" notice of the message it answers, if
+/// any, goes ([`crate::reply::queued`]); in its own task, so the reply's
+/// updates do not wait for it.
+fn drop_queued(ctx: &Ctx, answered: Option<i32>) {
+    let Some(msg) = answered else { return };
+    let (app, bot, chat_id) = (ctx.app.clone(), ctx.bot.clone(), ctx.chat_id);
+    tokio::spawn(async move { crate::reply::drop_queued(&app, &bot, chat_id, msg).await });
+}
+
 fn is_done(rx: &watch::Receiver<Option<RenderState>>) -> bool {
     rx.borrow().as_ref().is_some_and(|s| s.done)
 }
@@ -278,6 +287,12 @@ async fn sync_loop(
     let ids = |sent: &[(i32, Option<String>, Option<Shape>)]| sent.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
     // When Telegram last accepted an update of this reply (its pace counts from there).
     let mut last_update: Option<tokio::time::Instant> = None;
+    // The message the reply answers, which may have a "queued" notice the reply replaces.
+    let answered = reply_to;
+    if !sent.is_empty() {
+        // Resumed (restart, retry): a notice left by a restart right after the first message goes now.
+        drop_queued(&ctx, answered);
+    }
     let mut reply_to = reply_to;
     let mut fallback = Fallback::None;
     let mut media = RichMedia::default();
@@ -465,6 +480,9 @@ async fn sync_loop(
                     sent[i] = (id, Some(hash), Some(shape));
                 } else {
                     sent.push((id, Some(hash), Some(shape)));
+                    if sent.len() == 1 {
+                        drop_queued(&ctx, answered);
+                    }
                 }
             }
             // The gate is blocked for the wait; the next slot renders the newest version again.

@@ -297,6 +297,56 @@ pub fn reasoning_dropped(who: &str) -> String {
     format!("earlier reasoning is dropped: {who} keeps only the current turn's")
 }
 
+/// The note for earlier answers that go back as their text only although they
+/// carry reasoning or tool calls: answers of other models, or of this model
+/// through another API (owner, 2026-11-22: context the model does not get is
+/// worth a note). `own`: the answers this request replays as the API returned
+/// them. The count is in the note, so that it shows again only when more
+/// answers are left out (a note the replied-to answer showed is not repeated).
+pub fn text_only_note(history: &[omni_core::Turn], own: impl Fn(&omni_core::Turn) -> bool) -> Option<String> {
+    use omni_core::Part;
+    let (mut n, mut reasoning, mut tools) = (0usize, false, false);
+    for t in history.iter().filter(|t| t.role == omni_core::content::Role::Assistant && !own(t)) {
+        let r = t.parts.iter().any(|p| matches!(p, Part::Reasoning(_)));
+        let c = t.parts.iter().any(|p| matches!(p, Part::ToolCall(_)));
+        if r || c {
+            n += 1;
+            reasoning |= r;
+            tools |= c;
+        }
+    }
+    let what = match (reasoning, tools) {
+        (true, true) => "reasoning and tool calls",
+        (true, false) => "reasoning",
+        (false, true) => "tool calls",
+        (false, false) => return None,
+    };
+    Some(if n == 1 {
+        format!("an earlier answer by another model or API is sent as text only, without its {what}")
+    } else {
+        format!("{n} earlier answers by other models or APIs are sent as text only, without their {what}")
+    })
+}
+
+/// The note for `+c` after answers with files: every answer's code runs in a
+/// new environment, so the files earlier answers wrote or generated are not in
+/// it (owner, 2026-11-22). The callers send it when the request runs code.
+pub fn code_files_note(history: &[omni_core::Turn]) -> Option<String> {
+    use omni_core::Part;
+    history
+        .iter()
+        .any(|t| {
+            t.role == omni_core::content::Role::Assistant
+                && t.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        Part::File { generated: true, .. } | Part::Image { generated: true, thought: false, .. }
+                    )
+                })
+        })
+        .then(|| "+c starts a new code environment: files from earlier answers are not in it".to_string())
+}
+
 pub fn b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -382,6 +432,58 @@ pub fn unsent_media(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omni_core::content::{NativeOutput, Reasoning, Role, ToolCall};
+    use omni_core::{BlobRef, Origin, Part, Turn};
+    use serde_json::json;
+
+    fn answer(model: &str, parts: Vec<Part>) -> Turn {
+        let native =
+            NativeOutput { dialect: "d".into(), model: model.into(), payload: json!({}), context_tokens: None };
+        Turn { role: Role::Assistant, origin: Origin::Live, parts, native: Some(native) }
+    }
+
+    #[test]
+    fn text_only_note_counts_the_answers_left_out() {
+        let reasoning = Part::Reasoning(Reasoning { text: Some("hmm".into()), ..Default::default() });
+        let search = Part::ToolCall(ToolCall { name: "web_search".into(), ..Default::default() });
+        let own = |t: &Turn| t.native.as_ref().is_some_and(|n| n.model == "m");
+        let q = || Turn::user_text("q");
+        // This model's own answers go back as they came; other plain answers lose nothing.
+        let h =
+            [q(), answer("m", vec![reasoning.clone(), Part::text("a")]), q(), answer("x", vec![Part::text("b")]), q()];
+        assert_eq!(text_only_note(&h, own), None);
+        let h = [q(), answer("x", vec![reasoning.clone(), Part::text("a")]), q()];
+        assert_eq!(
+            text_only_note(&h, own).as_deref(),
+            Some("an earlier answer by another model or API is sent as text only, without its reasoning")
+        );
+        let h = [q(), answer("x", vec![search.clone(), Part::text("a")]), q()];
+        assert!(text_only_note(&h, own).unwrap().ends_with("without its tool calls"));
+        let h =
+            [q(), answer("x", vec![reasoning, Part::text("a")]), q(), answer("y", vec![search, Part::text("b")]), q()];
+        assert_eq!(
+            text_only_note(&h, own).as_deref(),
+            Some(
+                "2 earlier answers by other models or APIs are sent as text only, without their reasoning and tool calls"
+            )
+        );
+    }
+
+    #[test]
+    fn code_files_note_needs_a_file_from_an_answer() {
+        let blob = BlobRef::for_bytes(b"png", "image/png");
+        let image =
+            |generated, thought| Part::Image { blob: blob.clone(), filename: None, generated, dims: None, thought };
+        let file = Part::File { blob: blob.clone(), filename: Some("a.csv".into()), generated: true };
+        let q = Turn::user_text("q");
+        let note = Some("+c starts a new code environment: files from earlier answers are not in it".to_string());
+        assert_eq!(code_files_note(&[q.clone(), answer("m", vec![image(true, false)]), q.clone()]), note);
+        assert_eq!(code_files_note(&[q.clone(), answer("x", vec![file]), q.clone()]), note);
+        // A draft made while thinking is no file; nor is what the user attached.
+        assert_eq!(code_files_note(&[q.clone(), answer("m", vec![image(true, true)]), q.clone()]), None);
+        let attached = Turn { role: Role::User, origin: Origin::Live, parts: vec![image(false, false)], native: None };
+        assert_eq!(code_files_note(&[attached, answer("m", vec![Part::text("a")]), q]), None);
+    }
 
     #[test]
     fn token_price() {
