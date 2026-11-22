@@ -723,7 +723,9 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
                 Some(s) => Retry::After(s),
                 None => Retry::Backoff,
             },
-            "" => http_status.map(|s| retry_for_status(s, retry_after)).unwrap_or(Retry::Backoff),
+            "" => http_status
+                .map(|s| retry_for_status(s, retry_after))
+                .unwrap_or_else(|| crate::error::transient_or_never(&[Some(message.as_str())])),
             // Quotas, content blocks, invalid requests, auth, unknown models: retrying cannot help.
             _ => Retry::Never,
         }

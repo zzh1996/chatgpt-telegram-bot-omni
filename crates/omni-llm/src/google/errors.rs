@@ -59,7 +59,7 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
     let exhausted = lower.contains("already used output tokens");
     let wait = delay.or(retry_after);
     let rate_limited = status == Some(429) || (status.is_none() && grpc == "RESOURCE_EXHAUSTED");
-    let retry = if overflow || exhausted {
+    let retry = if overflow || exhausted || crate::error::about_money(&message) {
         Retry::Never
     } else if rate_limited {
         if daily { Retry::Never } else { Retry::After(wait.unwrap_or(20)) }
@@ -69,9 +69,14 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
             Some(499) => wait.map(Retry::After).unwrap_or(Retry::Backoff),
             Some(s) => retry_for_status(s, wait),
             None => match grpc {
-                "UNAVAILABLE" | "INTERNAL" | "DEADLINE_EXCEEDED" | "ABORTED" | "UNKNOWN" | "CANCELLED" | "" => {
+                "UNAVAILABLE" | "INTERNAL" | "DEADLINE_EXCEEDED" | "ABORTED" | "UNKNOWN" | "CANCELLED" => {
                     wait.map(Retry::After).unwrap_or(Retry::Backoff)
                 }
+                // Nothing classifies it: only a message that says it can pass.
+                "" => match crate::error::transient_or_never(&[Some(message.as_str())]) {
+                    Retry::Backoff => wait.map(Retry::After).unwrap_or(Retry::Backoff),
+                    r => r,
+                },
                 _ => Retry::Never,
             },
         }

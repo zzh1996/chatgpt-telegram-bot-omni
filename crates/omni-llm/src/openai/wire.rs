@@ -936,9 +936,9 @@ fn code_outputs(item: &Value, files: Option<&Fetcher>) -> Vec<Queued> {
 /// Retry for an error reported inside a stream (`response.failed`, `error`
 /// events), by its code: rate limits wait, server-side trouble can pass;
 /// anything else (policy blocks, invalid input, …) would fail again. Without
-/// a code it is taken as transient.
-pub(crate) fn in_band_retry(code: Option<&str>) -> Retry {
-    let Some(c) = code.map(str::to_ascii_lowercase) else { return Retry::Backoff };
+/// a code, only a message that says it can pass ([`crate::error::transient`]).
+pub(crate) fn in_band_retry(code: Option<&str>, message: &str) -> Retry {
+    let Some(c) = code.map(str::to_ascii_lowercase) else { return crate::error::transient_or_never(&[Some(message)]) };
     if c.contains("rate_limit") || c.contains("rate-limit") {
         Retry::After(20)
     } else if ["server", "timeout", "overload", "unavailable", "internal"].iter().any(|k| c.contains(k)) {

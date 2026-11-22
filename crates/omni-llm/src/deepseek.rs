@@ -957,8 +957,16 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
     let retry = match http_status {
         Some(429) => Retry::After(retry_after.unwrap_or(20)),
         Some(s) => retry_for_status(s, retry_after),
-        // In-band: the documented case is the wait for generation timing out.
-        None => retry_after.map_or(Retry::Backoff, Retry::After),
+        // In-band: the documented case is the wait for generation timing out; others
+        // only when they say they can pass.
+        None => match crate::error::transient_or_never(&[
+            err.get("type").and_then(Value::as_str),
+            err.get("code").and_then(Value::as_str),
+            Some(message.as_str()),
+        ]) {
+            Retry::Backoff => retry_after.map_or(Retry::Backoff, Retry::After),
+            r => r,
+        },
     };
     let error_type = if overflow {
         Some("context_length_exceeded".to_string())

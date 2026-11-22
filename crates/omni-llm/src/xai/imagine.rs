@@ -904,7 +904,7 @@ fn job_error(status: &str, body: &Value) -> LlmError {
     let mut e = match r.get("error").filter(|e| e.is_object()) {
         Some(err) => super::error_from_json(err, None, None, ErrorKind::InBand),
         None if status == "expired" => LlmError::new(ErrorKind::InBand, Retry::Backoff, "the video job expired"),
-        None => LlmError::new(ErrorKind::InBand, Retry::Backoff, format!("the video job ended with status {status}")),
+        None => LlmError::new(ErrorKind::InBand, Retry::Never, format!("the video job ended with status {status}")),
     };
     e.details = Some(body.clone());
     e

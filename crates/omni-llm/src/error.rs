@@ -151,6 +151,51 @@ impl fmt::Display for LlmError {
 
 impl std::error::Error for LlmError {}
 
+/// The retry for an error no status or known type classifies, from its own
+/// words (a code, a type or the message): rate limits wait, overload, server
+/// trouble and timeouts can pass; anything else is not retried (owner,
+/// 2026-11-22: only what can pass by itself is retried automatically, never a
+/// refusal, an unknown model or a bad request). `None`: the text says neither.
+pub fn transient(text: &str) -> Option<Retry> {
+    let t = text.to_ascii_lowercase();
+    let any = |ks: &[&str]| ks.iter().any(|k| t.contains(k));
+    if any(&["rate_limit", "rate limit", "rate-limit", "ratelimit", "too many requests", "throttl"]) {
+        Some(Retry::After(20))
+    } else if any(&[
+        "overload",
+        "server_error",
+        "server error",
+        "internal_error",
+        "internal error",
+        "internalerror",
+        "timeout",
+        "timed out",
+        "unavailable",
+        "bad gateway",
+        "temporarily",
+        "try again later",
+    ]) {
+        Some(Retry::Backoff)
+    } else {
+        None
+    }
+}
+
+/// Whether an error is about money (credits used up, arrears, a billing
+/// problem): never retried automatically, since a top-up does not happen within
+/// the retry window; the 🔁 Retry button is there for later (owner, 2026-11-22).
+pub fn about_money(text: &str) -> bool {
+    let t = text.to_lowercase();
+    ["credit", "balance", "billing", "payment", "insufficient_quota", "arrear", "prepay", "余额", "欠费", "充值"]
+        .iter()
+        .any(|k| t.contains(k))
+}
+
+/// [`transient`] over several texts (code, type, message), else `Never`.
+pub fn transient_or_never(texts: &[Option<&str>]) -> Retry {
+    texts.iter().flatten().find_map(|t| transient(t)).unwrap_or(Retry::Never)
+}
+
 /// Retry classification for HTTP statuses (used when no canonical error type is available).
 pub fn retry_for_status(status: u16, retry_after: Option<u64>) -> Retry {
     match status {

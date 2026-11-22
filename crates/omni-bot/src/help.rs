@@ -430,7 +430,7 @@ Arr!
 - **📚 Sources**: the links the answer cites.
 - **ℹ️** a note from me, e.g. that a search was asked for but none ran.
 - **Small text at the end**: settings, tokens, cost and time, then how the platform actually served the request.{BOLD_COST}
-- **⚠️** errors, with the full original error. I retry on my own when that can help; earlier attempts are folded above.
+- **⚠️** errors, with the full original error. I retry on my own only when the error can pass by itself (overload, rate limits, server trouble, timeouts), never after a refusal, a bad request, an unknown model or a used-up balance: tap 🔁 Retry for those. Earlier attempts are folded above.
 
 Everything I add is a fold or small text, so you can always tell which part is the model's answer.{ORDER} There is no stop button: once started, an answer is written to the end.
 
@@ -467,7 +467,7 @@ Long reasoning and tool calls are shortened to their latest part, with a note at
 - **📚 Sources**：回答引用的链接。
 - **ℹ️** 我加的提示，例如要求了搜索、但这次没有搜索。
 - **末尾的小字**：设置、token、费用和耗时，然后是平台实际怎么处理这个请求的。{BOLD_COST}
-- **⚠️** 错误，附带完整的原始错误。可能有用的时候我会自动重试；之前的尝试折叠在上面。
+- **⚠️** 错误，附带完整的原始错误。只有过一会儿可能自己好的错误（过载、限流、服务器故障、超时）我才自动重试；拒答、请求有误、找不到模型、余额用完都不自动重试，需要时点 🔁 Retry。之前的尝试折叠在上面。
 
 我加的内容都在折叠块或小字里，所以总能分清哪部分是模型的回答。{ORDER}没有停止按钮：回答一旦开始，就会写完。
 

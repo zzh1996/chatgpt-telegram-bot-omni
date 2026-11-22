@@ -223,11 +223,16 @@ fn citation(a: &Value) -> Option<Citation> {
 }
 
 pub fn error_from_event(v: &Value) -> LlmError {
-    let err = v.pointer("/response/error").or_else(|| v.get("error")).cloned().unwrap_or_else(|| v.clone());
-    let mut e = super::chat::error_from_json(&err, None, None, ErrorKind::InBand);
-    if e.error_type.is_none() {
-        e.error_type = v.pointer("/response/error_type").and_then(Value::as_str).map(str::to_string);
+    let mut err = v.pointer("/response/error").or_else(|| v.get("error")).cloned().unwrap_or_else(|| v.clone());
+    // The canonical `error_type` (`refusal`, `provider_unavailable`, …) sits beside
+    // `response.error`: classified with it, a refusal is never retried.
+    if let Some(t) = v.pointer("/response/error_type").or_else(|| v.get("error_type")).filter(|t| t.is_string())
+        && let Some(o) = err.as_object_mut()
+        && !o.contains_key("error_type")
+    {
+        o.insert("error_type".into(), t.clone());
     }
+    let mut e = super::chat::error_from_json(&err, None, None, ErrorKind::InBand);
     if e.error_type.as_deref() == Some("invalid_prompt")
         || err.get("code").and_then(Value::as_str) == Some("invalid_prompt")
     {
@@ -421,6 +426,31 @@ impl crate::chatstream::EventParser for EventParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A policy refusal of OpenAI through OpenRouter's Responses API (a test in the
+    /// test group, 2026-11-22): `response.failed` with `error.code: bio_policy` and the
+    /// canonical `error_type: refusal` beside the error. Never retried (it was, 4 times).
+    #[test]
+    fn a_refusal_in_response_failed_is_not_retried() {
+        let ev = json!({"type": "response.failed", "response": {"id": "gen-1", "status": "failed", "output": [],
+            "error": {"code": "bio_policy", "message": "This content was flagged for possible biological risk. If this seems wrong, try rephrasing your request."},
+            "error_type": "refusal"}});
+        let e = error_from_event(&ev);
+        assert_eq!((e.retry, e.error_type.as_deref()), (crate::error::Retry::Never, Some("refusal")));
+        assert_eq!(
+            e.message,
+            "This content was flagged for possible biological risk. If this seems wrong, try rephrasing your request."
+        );
+        // Without the canonical type: the code decides, and only server trouble is retried.
+        let bare = |code: &str| {
+            error_from_event(&json!({"type": "response.failed", "response": {"error": {"code": code, "message": "x"}}}))
+                .retry
+        };
+        assert_eq!(bare("bio_policy"), crate::error::Retry::Never);
+        assert_eq!(bare("invalid_prompt"), crate::error::Retry::Never);
+        assert_eq!(bare("server_error"), crate::error::Retry::Backoff);
+        assert_eq!(bare("rate_limit_exceeded"), crate::error::Retry::After(20));
+    }
 
     #[test]
     fn parses_a_stream_with_reasoning_code_and_text() {

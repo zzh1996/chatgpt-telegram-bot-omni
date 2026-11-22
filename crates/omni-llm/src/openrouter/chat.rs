@@ -602,23 +602,30 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
         .or_else(|| err.get("error_type"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let limit_source = err.pointer("/metadata/limit_source").and_then(Value::as_str);
     let lower = message.to_ascii_lowercase();
+    // Out of credits (402 `payment_required`, the in-flight budget too: the balance does
+    // not cover what the requests in flight reserve) or an upstream billing problem.
+    let money = error_type.as_deref() == Some("payment_required")
+        || crate::error::about_money(&message)
+        || err.pointer("/metadata/raw").is_some_and(|r| match r {
+            Value::String(s) => crate::error::about_money(s),
+            other => crate::error::about_money(&other.to_string()),
+        });
     let routing_dead_end = lower.contains("no endpoints found")
         || lower.contains("no allowed providers")
         || lower.contains("no providers available");
     let retry = match error_type.as_deref() {
-        _ if routing_dead_end => Retry::Never,
+        _ if routing_dead_end || money => Retry::Never,
         Some("rate_limit_exceeded") => Retry::After(retry_after.unwrap_or(20)),
         Some("server" | "unmapped" | "provider_unavailable" | "provider_overloaded" | "timeout") => match retry_after {
             Some(s) => Retry::After(s),
             None => Retry::Backoff,
         },
-        Some("payment_required") if limit_source == Some("openrouter_in_flight_budget") => {
-            Retry::After(retry_after.unwrap_or(30))
-        }
         Some(_) => Retry::Never,
-        None => status.map(|s| retry_for_status(s, retry_after)).unwrap_or(Retry::Backoff),
+        // No type and no status (an in-band error of the Responses API, …): only what says it can pass.
+        None => status.map(|s| retry_for_status(s, retry_after)).unwrap_or_else(|| {
+            crate::error::transient_or_never(&[err.get("code").and_then(Value::as_str), Some(message.as_str())])
+        }),
     };
     LlmError { kind, retry, status, error_type, message, details: Some(err.clone()), partial_output: false }
 }
@@ -662,6 +669,11 @@ mod tests {
 
     #[test]
     fn in_band_error_classification() {
+        // Out of credits, the in-flight budget included: no automatic retry (owner, 2026-11-22).
+        let budget = json!({"code": 402, "message": "Insufficient credits for the requests in flight", "metadata": {"error_type": "payment_required", "limit_source": "openrouter_in_flight_budget", "reason": "in_flight_budget_exhausted"}});
+        assert_eq!(error_from_json(&budget, Some(402), Some(30), ErrorKind::Http).retry, Retry::Never);
+        let upstream = json!({"code": 429, "message": "Provider returned error", "metadata": {"error_type": "rate_limit_exceeded", "provider_name": "X", "raw": "{\"error\":{\"message\":\"Your credit balance is too low.\"}}"}});
+        assert_eq!(error_from_json(&upstream, Some(429), None, ErrorKind::Http).retry, Retry::Never);
         let mut p = ChunkParser::default();
         let e = p
             .chunk(&json!({"id": "gen-x", "error": {"code": 429, "message": "Rate limit exceeded", "metadata": {"error_type": "rate_limit_exceeded"}}, "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}]}))

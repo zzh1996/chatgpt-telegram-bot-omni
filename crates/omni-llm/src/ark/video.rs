@@ -1134,7 +1134,7 @@ fn task_error(status: &str, task: &Value) -> LlmError {
                 "the video task expired (not finished within its execution_expires_after)",
             ),
             "cancelled" => LlmError::new(ErrorKind::InBand, Retry::Never, "the video task was cancelled"),
-            _ => LlmError::new(ErrorKind::InBand, Retry::Backoff, format!("the video task ended with status {status}")),
+            _ => LlmError::new(ErrorKind::InBand, Retry::Never, format!("the video task ended with status {status}")),
         },
     };
     if e.error_type.is_none() {

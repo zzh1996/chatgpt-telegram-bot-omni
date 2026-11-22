@@ -1299,7 +1299,7 @@ fn task_error(status: &str, task: &Value) -> LlmError {
                 "DashScope does not know the video task (task ids are kept 24 hours)",
             ),
             "CANCELED" => LlmError::new(ErrorKind::InBand, Retry::Never, "the video task was cancelled"),
-            _ => LlmError::new(ErrorKind::InBand, Retry::Backoff, format!("the video task ended with status {status}")),
+            _ => LlmError::new(ErrorKind::InBand, Retry::Never, format!("the video task ended with status {status}")),
         }
     };
     if e.error_type.is_none() {

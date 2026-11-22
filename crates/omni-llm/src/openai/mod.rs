@@ -1009,7 +1009,7 @@ pub fn error_from_json(err: &Value, status: Option<u16>, retry_after: Option<u64
     } else if let Some(s) = status {
         retry_for_status(s, retry_after)
     } else {
-        wire::in_band_retry(code.as_deref())
+        wire::in_band_retry(code.as_deref(), &message)
     };
     let error_type = if context { Some("context_length_exceeded".to_string()) } else { code.or(ty) };
     LlmError { kind, retry, status, error_type, message, details: Some(err.clone()), partial_output: false }
@@ -1508,7 +1508,9 @@ mod tests {
             Retry::Backoff
         );
         assert_eq!(ib(json!({"code": "rate_limit_exceeded", "message": "x"})).retry, Retry::After(20));
-        assert_eq!(ib(json!({"code": null, "message": "An error occurred"})).retry, Retry::Backoff);
+        // Without a code only a message that says it can pass is retried (owner, 2026-11-22).
+        assert_eq!(ib(json!({"code": null, "message": "An error occurred"})).retry, Retry::Never);
+        assert_eq!(ib(json!({"code": null, "message": "The server is overloaded"})).retry, Retry::Backoff);
         for code in ["invalid_prompt", "bio_policy", "misalignment_policy_violation", "invalid_image", "ERR_SOMETHING"]
         {
             let e = ib(json!({"code": code, "message": "x"}));

@@ -611,7 +611,7 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
         | "request_too_large" => Retry::Never,
         _ => match http_status {
             Some(s) => retry_for_status(s, retry_after),
-            None => Retry::Backoff,
+            None => crate::error::transient_or_never(&[Some(ty), Some(message.as_str())]),
         },
     };
     let error_type = if message.contains("prompt is too long") {

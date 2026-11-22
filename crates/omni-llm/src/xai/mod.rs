@@ -528,7 +528,7 @@ pub fn error_from_json(err: &Value, status: Option<u16>, retry_after: Option<u64
     } else if let Some(s) = status {
         retry_for_status(s, retry_after)
     } else {
-        wire::in_band_retry(code.as_deref())
+        wire::in_band_retry(code.as_deref(), &message)
     };
     let error_type = if context { Some("context_length_exceeded".to_string()) } else { code };
     LlmError { kind, retry, status, error_type, message, details: Some(err.clone()), partial_output: false }
@@ -791,7 +791,8 @@ mod tests {
         // In-band.
         let ib = |v: Value| error_from_json(&v, None, None, ErrorKind::InBand);
         assert_eq!(ib(json!({"code": "internal_error", "message": "x"})).retry, Retry::Backoff);
-        assert_eq!(ib(json!({"message": "stream failed"})).retry, Retry::Backoff);
+        assert_eq!(ib(json!({"message": "stream failed"})).retry, Retry::Never);
+        assert_eq!(ib(json!({"message": "upstream request timed out"})).retry, Retry::Backoff);
         assert_eq!(ib(json!({"code": "permission_denied", "message": "x"})).retry, Retry::Never);
     }
 
