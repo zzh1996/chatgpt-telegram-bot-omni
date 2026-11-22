@@ -437,10 +437,8 @@ mod tests {
             "error_type": "refusal"}});
         let e = error_from_event(&ev);
         assert_eq!((e.retry, e.error_type.as_deref()), (crate::error::Retry::Never, Some("refusal")));
-        assert_eq!(
-            e.message,
-            "This content was flagged for possible biological risk. If this seems wrong, try rephrasing your request."
-        );
+        // The message as sent, and the code beside it as sent.
+        assert_eq!(e.to_string(), "provider error [refusal]: the request was refused (code: bio_policy)");
         // Without the canonical type: the code decides, and only server trouble is retried.
         let bare = |code: &str| {
             error_from_event(&json!({"type": "response.failed", "response": {"error": {"code": code, "message": "x"}}}))

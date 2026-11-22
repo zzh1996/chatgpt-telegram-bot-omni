@@ -686,7 +686,9 @@ async fn recover_delivered(app: &App, gen_id: &str) -> Option<Vec<Part>> {
 
 /// An answer the provider stopped abnormally (refusal / content filter, or an
 /// error finish): a failure, with the provider's own details. Not retried
-/// automatically: it would most likely end the same way.
+/// automatically: it would most likely end the same way. The provider's reason
+/// codes (a refusal's category, …) are on the line too: without them one had to
+/// open the details to see why (owner, 2026-11-23).
 fn abnormal_stop(acc: &Accumulator) -> Option<LlmError> {
     let fr = acc.finish_reason.as_deref()?;
     let what = match fr {
@@ -695,11 +697,10 @@ fn abnormal_stop(acc: &Accumulator) -> Option<LlmError> {
         _ => return None,
     };
     let native = acc.native_finish_reason.as_deref().map(|n| format!(" / {n}")).unwrap_or_default();
-    let mut e = LlmError::new(
-        omni_llm::ErrorKind::InBand,
-        omni_llm::Retry::Never,
-        format!("{what} (finish_reason: {fr}{native})"),
-    );
+    let head = format!("{what} (finish_reason: {fr}{native}");
+    let codes = acc.finish_details.as_ref().map(|d| omni_llm::error::reason_codes(d, &head)).unwrap_or_default();
+    let codes: String = codes.iter().map(|c| format!("; {c}")).collect();
+    let mut e = LlmError::new(omni_llm::ErrorKind::InBand, omni_llm::Retry::Never, format!("{head}{codes})"));
     e.error_type = Some(fr.to_string());
     e.details = acc.finish_details.clone();
     e.partial_output = acc.has_output();
@@ -1547,6 +1548,25 @@ mod tests {
         assert_eq!(e.retry, omni_llm::Retry::Never);
         assert_eq!(e.details.unwrap()["category"], "cyber");
         assert!(e.message.contains("refusal"));
+        // The category is on the line, not only in the details (Claude through OpenRouter, a
+        // test in the test group); the explanation stays in the details.
+        let mut acc = Accumulator::new();
+        acc.apply(StreamEvent::FinishDetails(
+            json!({"type": "refusal", "category": "cyber", "explanation": "Cyber safeguards flagged this message."}),
+        ));
+        acc.apply(StreamEvent::Finish { reason: Some("content_filter".into()), native: Some("refusal".into()) });
+        assert_eq!(
+            abnormal_stop(&acc).unwrap().message,
+            "stopped by the provider's content filter (finish_reason: content_filter / refusal; category: cyber)"
+        );
+        // Nothing the line lacks (Grok through OpenRouter): as before.
+        let mut acc = Accumulator::new();
+        acc.apply(StreamEvent::FinishDetails(json!({"reason": "content_filter"})));
+        acc.apply(StreamEvent::Finish { reason: Some("content_filter".into()), native: Some("content_filter".into()) });
+        assert_eq!(
+            abnormal_stop(&acc).unwrap().message,
+            "stopped by the provider's content filter (finish_reason: content_filter / content_filter)"
+        );
         for normal in ["stop", "length", "tool_calls"] {
             let mut ok = Accumulator::new();
             ok.apply(StreamEvent::Finish { reason: Some(normal.into()), native: None });

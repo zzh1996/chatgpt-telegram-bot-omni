@@ -207,3 +207,109 @@ pub fn retry_for_status(status: u16, retry_after: Option<u64>) -> Retry {
         _ => Retry::Never,
     }
 }
+
+// ------------------------------------------------------------------ provider reasons
+//
+// The reason a provider gives (its category or code) belongs in the error's
+// title (owner, 2026-11-22/23); its explanation texts stay in the fold, which
+// shows the whole payload. No wording per reason: the codes go as they were
+// sent, whatever they are.
+
+/// Fields that carry a provider's reason as a code: types, categories,
+/// codes, statuses and finish or block reasons.
+const CODE_FIELDS: &[&str] = &[
+    "type",
+    "category",
+    "code",
+    "status",
+    "reason",
+    "reasons",
+    "error_type",
+    "provider_code",
+    "provider_error_code",
+    "limit_source",
+    "blockReason",
+    "block_reason",
+    "finishReason",
+    "finish_reason",
+    "native_finish_reason",
+    "respect_moderation",
+];
+
+/// Objects whose code fields count too: an error inside a stop, OpenRouter's
+/// `metadata`, a refusal's `stop_details`.
+const CODE_OBJECTS: &[&str] = &["error", "metadata", "stop_details"];
+
+/// A value that reads as a code (one word, not a sentence): `cyber`,
+/// `bio_policy`, `SAFETY`, `429`, `false`.
+fn as_code(v: &Value) -> Option<String> {
+    let token = |s: &str| (!s.is_empty() && s.len() <= 64 && !s.contains(char::is_whitespace)).then(|| s.to_string());
+    match v {
+        Value::String(s) => token(s.trim()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Array(a) if !a.is_empty() => {
+            let codes: Option<Vec<String>> = a.iter().map(|x| x.as_str().and_then(token)).collect();
+            codes.map(|c| c.join(", "))
+        }
+        _ => None,
+    }
+}
+
+/// The reason codes of a provider's payload that `title` does not show yet,
+/// as `name: value` in the payload's order, exactly as sent.
+pub fn reason_codes(v: &Value, title: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = title.to_lowercase();
+    collect_codes(v, &mut seen, &mut out, 0);
+    out
+}
+
+fn collect_codes(v: &Value, seen: &mut String, out: &mut Vec<String>, depth: usize) {
+    let Some(o) = v.as_object() else { return };
+    for (k, val) in o {
+        if CODE_OBJECTS.contains(&k.as_str()) && val.is_object() {
+            if depth < 3 {
+                collect_codes(val, seen, out, depth + 1);
+            }
+            continue;
+        }
+        if !CODE_FIELDS.contains(&k.as_str()) {
+            continue;
+        }
+        let Some(code) = as_code(val) else { continue };
+        if seen.contains(&code.to_lowercase()) {
+            continue;
+        }
+        seen.push(' ');
+        seen.push_str(&code.to_lowercase());
+        out.push(format!("{k}: {code}"));
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn codes_the_title_lacks_as_sent() {
+        // Claude through OpenRouter (a test in the test group): the category, not the explanation.
+        let d = json!({"type": "refusal", "category": "cyber", "explanation": "Cyber safeguards flagged this message. API integrators: …"});
+        assert_eq!(reason_codes(&d, "stopped (finish_reason: content_filter / refusal"), ["category: cyber"]);
+        // OpenAI through OpenRouter's Responses API.
+        let e = json!({"code": "bio_policy", "message": "This content was flagged for possible biological risk.", "error_type": "refusal"});
+        assert_eq!(
+            reason_codes(&e, "refusal This content was flagged for possible biological risk."),
+            ["code: bio_policy"]
+        );
+        // What the title says already is not repeated; prose and names are no codes.
+        let g = json!({"code": 403, "message": "Gemini blocked the request: OTHER", "metadata": {"error_type": "content_policy_violation", "provider_code": "OTHER", "provider_name": "Google AI Studio"}});
+        assert!(reason_codes(&g, "403 content_policy_violation Gemini blocked the request: OTHER").is_empty());
+        let m = json!({"code": 403, "message": "Your input was flagged.", "metadata": {"reasons": ["violence", "harassment"], "flagged_input": "…"}});
+        assert_eq!(reason_codes(&m, "403 Your input was flagged."), ["reasons: violence, harassment"]);
+        let r = json!({"code": 429, "message": "Provider returned error", "metadata": {"raw": "upstream text, any length", "provider_error_code": "429", "limit_source": "upstream_provider_shared_pool"}});
+        assert_eq!(reason_codes(&r, "429 Provider returned error"), ["limit_source: upstream_provider_shared_pool"]);
+        assert!(reason_codes(&json!({"reason": "a long sentence, not a code"}), "").is_empty());
+    }
+}

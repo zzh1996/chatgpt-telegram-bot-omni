@@ -627,6 +627,19 @@ pub fn error_from_json(err: &Value, http_status: Option<u16>, retry_after: Optio
             crate::error::transient_or_never(&[err.get("code").and_then(Value::as_str), Some(message.as_str())])
         }),
     };
+    // A refusal or a policy block: a short summary and the provider's codes (OpenAI's
+    // `bio_policy`, …) on the line, instead of only in the details; the provider's
+    // message, often a long explanation, stays in the details (owner, 2026-11-23).
+    let refused = matches!(error_type.as_deref(), Some("refusal" | "content_policy_violation"))
+        || err.pointer("/metadata/reasons").is_some_and(|r| r.is_array());
+    let codes = if refused {
+        let shown =
+            format!("{} {}", status.map(|s| s.to_string()).unwrap_or_default(), error_type.as_deref().unwrap_or(""));
+        crate::error::reason_codes(err, &shown)
+    } else {
+        Vec::new()
+    };
+    let message = if codes.is_empty() { message } else { format!("the request was refused ({})", codes.join("; ")) };
     LlmError { kind, retry, status, error_type, message, details: Some(err.clone()), partial_output: false }
 }
 
@@ -674,6 +687,20 @@ mod tests {
         assert_eq!(error_from_json(&budget, Some(402), Some(30), ErrorKind::Http).retry, Retry::Never);
         let upstream = json!({"code": 429, "message": "Provider returned error", "metadata": {"error_type": "rate_limit_exceeded", "provider_name": "X", "raw": "{\"error\":{\"message\":\"Your credit balance is too low.\"}}"}});
         assert_eq!(error_from_json(&upstream, Some(429), None, ErrorKind::Http).retry, Retry::Never);
+        // A policy block names the provider's code on the line; other errors keep their message.
+        let blocked = json!({"code": 403, "message": "Provider returned error", "metadata": {"error_type": "refusal", "provider_code": "cyber_policy", "provider_name": "OpenAI", "raw": "a long upstream text"}});
+        assert_eq!(
+            error_from_json(&blocked, Some(403), None, ErrorKind::Http).to_string(),
+            "HTTP 403 [refusal]: the request was refused (provider_code: cyber_policy)"
+        );
+        // Gemini through OpenRouter (a test in the test group): the code was in the message.
+        let gemini = json!({"code": 403, "message": "Gemini blocked the request: OTHER", "metadata": {"error_type": "content_policy_violation", "provider_code": "OTHER"}});
+        assert_eq!(
+            error_from_json(&gemini, None, None, ErrorKind::InBand).message,
+            "the request was refused (provider_code: OTHER)"
+        );
+        let rate = json!({"code": 429, "message": "Provider returned error", "metadata": {"error_type": "rate_limit_exceeded", "limit_source": "upstream_provider_shared_pool", "raw": "rate-limited upstream"}});
+        assert_eq!(error_from_json(&rate, Some(429), None, ErrorKind::Http).message, "Provider returned error");
         let mut p = ChunkParser::default();
         let e = p
             .chunk(&json!({"id": "gen-x", "error": {"code": 429, "message": "Rate limit exceeded", "metadata": {"error_type": "rate_limit_exceeded"}}, "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}]}))

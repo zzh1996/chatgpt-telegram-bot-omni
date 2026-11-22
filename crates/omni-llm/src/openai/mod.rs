@@ -1011,6 +1011,13 @@ pub fn error_from_json(err: &Value, status: Option<u16>, retry_after: Option<u64
     } else {
         wire::in_band_retry(code.as_deref(), &message)
     };
+    // A policy refusal (`bio_policy`, `cyber_policy`, `misalignment_policy_violation`): its code
+    // names it on the line; OpenAI's long explanation stays in the details (owner, 2026-11-23).
+    let message = if code.as_deref().is_some_and(|c| c.contains("policy")) {
+        "the request was refused".to_string()
+    } else {
+        message
+    };
     let error_type = if context { Some("context_length_exceeded".to_string()) } else { code.or(ty) };
     LlmError { kind, retry, status, error_type, message, details: Some(err.clone()), partial_output: false }
 }
@@ -1610,6 +1617,7 @@ mod tests {
         let (r, _, evs) = call(base, &p).await;
         let e = r.unwrap_err();
         assert_eq!((e.kind, e.retry, e.error_type.as_deref()), (ErrorKind::InBand, Retry::Never, Some("bio_policy")));
+        assert_eq!(e.to_string(), "provider error [bio_policy]: the request was refused");
         assert!(
             matches!(evs.last(), Some(StreamEvent::Usage(u)) if u.input_tokens == Some(10) && u.cost_usd.is_some())
         );
